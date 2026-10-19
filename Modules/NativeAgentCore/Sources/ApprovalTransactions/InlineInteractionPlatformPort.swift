@@ -25,6 +25,8 @@ public protocol InlineInteractionPlatformPort {
     func residentWakeHeld(sessionID: String, dataRoot: URL) -> Bool
     func routeInteractionAttention(id: String, title: String, body: String) async throws
     var telegramApprovalFiler: TelegramApprovalFiler? { get }
+    /// The Mac's live controls, for a door that answers a card away from it.
+    func interactionControls() -> (any InlineInteractionControlPort)?
 }
 
 /// A captured app door into existing connector, routing and Trust owners.
@@ -50,6 +52,6 @@ public typealias InlineInteractionConnectorStatus = (
 )
 
 public typealias InlineInteractionProviderStatus = (
-    providerID: String, displayName: String, authState: String,
+    providerID: String, displayName: String, authState: String, eligible: Bool,
     defaultModel: String?, firstModel: String?
 )

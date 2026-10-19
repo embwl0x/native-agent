@@ -209,11 +209,21 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         }
     }
 
+    /// One result is one transport. The app's own top-level object names the door
+    /// it read from (`agent` or `agent_id` as "peer:<id>", the attested id that
+    /// carries the person's grant); peer content nested inside it is that door's,
+    /// so it latches the attested id, never a display name the peer could have
+    /// written. Only a result whose top level names no door latches a nested
+    /// name, which grants nothing.
     static func remoteProvenance(in value: JSONValue, depth: Int) -> String? {
         guard depth < 6 else { return nil }
+        if depth == 0, case .object(let top) = value, let attested = attestedPeerID(top), carriesProvenanceFlag(value, depth: 0) {
+            return attested
+        }
         switch value {
         case .object(let object):
             if provenanceFlags.contains(where: { if case .bool(true)? = object[$0] { return true } else { return false } }) {
+                if let attested = attestedPeerID(object) { return attested }
                 if case .string(let agent)? = object["agent"],
                    !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return agent }
             }
@@ -228,6 +238,26 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
             return nil
         default:
             return nil
+        }
+    }
+
+    private static func attestedPeerID(_ object: [String: JSONValue]) -> String? {
+        for key in ["agent_id", "agent"] {
+            if case .string(let id)? = object[key], id.hasPrefix("peer:") { return id }
+        }
+        return nil
+    }
+
+    private static func carriesProvenanceFlag(_ value: JSONValue, depth: Int) -> Bool {
+        guard depth < 6 else { return false }
+        switch value {
+        case .object(let object):
+            if provenanceFlags.contains(where: { if case .bool(true)? = object[$0] { return true } else { return false } }) { return true }
+            return object.values.contains { carriesProvenanceFlag($0, depth: depth + 1) }
+        case .array(let items):
+            return items.contains { carriesProvenanceFlag($0, depth: depth + 1) }
+        default:
+            return false
         }
     }
 

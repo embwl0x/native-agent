@@ -726,8 +726,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                         status = "warn"
                         detail += "; notifier reported FAILURE — nothing delivered; fire-site mirror may retry"
                     } else if case .object(let d) = delivery {
-                        if d["delivery"] == .string("failed") || d["delivery_failed"] == .bool(true)
-                            || d["status"] == .string("failed") {
+                        if d["delivery"] == .string("failed") || d["status"] == .string("failed") {
                             status = "warn"
                             detail += "; card saved but notification delivery failed"
                         } else if d["deduped_against"] != nil || d["delivery"] == .string("previously_handled") {
@@ -992,30 +991,37 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
         }
 
         // Claims prevent duplicate effects; only successful work settles repair.
-        if inboxMasterOn, let inbox = try? await listInboxTriggers() {
-            if case .corrupt = Self.readStateRaw(inboxStatePath) {
-                Self.logger.error("inbox trigger_state.json is corrupt — all inbox time triggers DORMANT this pass until repaired")
-            } else {
-                for cfg in inbox where cfg.enabled {
-                    guard scheduledInstantIfDue(cfg) != nil else { continue }
-                    if fired.count >= Self.periodicFireCapPerTick { deferredDueToCap = true; break }
-                    guard await claimIfDue(cfg, statePath: inboxStatePath) else { continue }
-                    let result = await runClaimedTrigger(surface: "inbox", name: cfg.name)
-                    fired.append(result)
-                }
+        // A surface whose configuration cannot be read or whose state is
+        // damaged fires nothing until repaired, and the pass says so: its
+        // receipt is an error row, never an empty pass.
+        var unavailable: [TriggerFireResult] = []
+        for (surface, statePath) in [("inbox", inboxStatePath), ("workshop", workshopExecutionStatePath)] {
+            if surface == "inbox", !inboxMasterOn { continue }
+            let configs: [TriggerConfig]
+            do {
+                configs = try await surface == "inbox" ? listInboxTriggers() : listWorkshopTriggers()
+            } catch {
+                unavailable.append(TriggerFireResult(status: "error", name: "\(surface) triggers",
+                    error: "\(surface.capitalized) triggers could not be read; none fire until they can: \(error.localizedDescription)"))
+                continue
             }
-        }
-        if let executions = try? await listWorkshopTriggers() {
-            if case .corrupt = Self.readStateRaw(workshopExecutionStatePath) {
-                Self.logger.error("Workshop trigger_state.json is corrupt — all Workshop time triggers DORMANT this pass until repaired")
-            } else {
-                for cfg in executions where cfg.enabled {
-                    guard scheduledInstantIfDue(cfg) != nil else { continue }
-                    if fired.count >= Self.periodicFireCapPerTick { deferredDueToCap = true; break }
-                    guard await claimIfDue(cfg, statePath: workshopExecutionStatePath) else { continue }
-                    let result = await runClaimedTrigger(surface: "workshop", name: cfg.name)
-                    fired.append(result)
+            if case .corrupt = Self.readStateRaw(statePath) {
+                Self.logger.error("\(surface, privacy: .public) trigger_state.json is corrupt — its time triggers are DORMANT this pass until repaired")
+                unavailable.append(TriggerFireResult(status: "error", name: "\(surface) triggers",
+                    error: "\(statePath.path) is damaged; \(surface) time triggers stay dormant until it is repaired or restored."))
+                continue
+            }
+            for cfg in configs where cfg.enabled {
+                guard scheduledInstantIfDue(cfg) != nil else { continue }
+                if fired.count >= Self.periodicFireCapPerTick { deferredDueToCap = true; break }
+                do {
+                    guard try await claimIfDue(cfg, statePath: statePath) else { continue }
+                } catch {
+                    unavailable.append(TriggerFireResult(status: "error", name: cfg.name,
+                        error: "Trigger \(cfg.name) is due but could not be claimed, so it did not fire: \(error.localizedDescription)"))
+                    continue
                 }
+                fired.append(await runClaimedTrigger(surface: surface, name: cfg.name))
             }
         }
         if deferredDueToCap {
@@ -1023,7 +1029,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
                 "periodic trigger fire cap (\(Self.periodicFireCapPerTick, privacy: .public)) hit this tick — fired \(fired.count, privacy: .public), remaining due triggers deferred to next tick"
             )
         }
-        return fired
+        return fired + unavailable
     }
 
     public func repairTrigger(surface: String, name: String, occurrence: String? = nil) async -> TriggerFireResult {
@@ -1374,7 +1380,9 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
     /// and wins, the second re-reads the fresh stamp and loses. A corrupt state
     /// file makes the claim fail safe (returns false, no stamp). A persistence
     /// failure is logged and returns false — no fire, no torn state.
-    private func claimIfDue(_ cfg: TriggerConfig, statePath: URL) async -> Bool {
+    /// False: not due, or already claimed. A claim that cannot be read or
+    /// written throws: a due occurrence is owed, never "nothing due".
+    private func claimIfDue(_ cfg: TriggerConfig, statePath: URL) async throws -> Bool {
         // Cheap unlocked PRE-GATE only — skip taking the lock when the trigger
         // isn't even clock-due. NOT the authoritative decision: the clock may
         // move (even backward, e.g. an NTP step) between here and lock
@@ -1393,7 +1401,7 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             var state: [String: JSONValue]
             switch Self.readStateRaw(statePath) {
             case .corrupt:
-                return false                       // fail safe: dormant
+                throw TriggerSchedulerError.invalidRequest("\(statePath.path) is damaged; restore it so the trigger can be claimed")
             case .missing:
                 state = [:]
             case .parsed(let o):
@@ -1418,17 +1426,10 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             await oweTrigger(surface: surface, name: name, occurrence: stamp).value
             return true
         }
-        do {
-            // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-            // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-            // every conformer already has it. The old downcast to
-            // SwiftNativePersistenceCore only had the effect of running this critical
-            // section UNLOCKED for any other conformer.
-            return try await persistence.withFileLock(statePath, work)
-        } catch {
-            Self.logger.error("claim RMW failed for trigger '\(name, privacy: .public)': \(String(describing: error), privacy: .public) — treated as not-claimed (no fire this tick)")
-            return false
-        }
+        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
+        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
+        // every conformer already has it.
+        return try await persistence.withFileLock(statePath, work)
     }
 
     /// Extract an integer config field. Tolerates whole numbers emitted as
@@ -1495,6 +1496,8 @@ public actor SwiftNativeTriggerScheduler: TriggerSchedulerClient {
             "id": .string(id),
             "created_at": .string(createdAt),
             "source": .string("trigger:morning_brief"),
+            "presentation": .object(["icon": .string("sun.horizon.fill"), "badge": .string("MORNING-BRIEF"),
+                                     "words": .string("Your morning brief"), "act_label": .string("Go ahead")]),
             "severity": .string("important"),
             "title": .string(built.title),
             "summary": .string(built.summary),

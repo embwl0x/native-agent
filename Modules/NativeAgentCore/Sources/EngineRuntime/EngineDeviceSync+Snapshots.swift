@@ -100,6 +100,7 @@ extension NAProviderCatalogProvider {
             providerID: provider.provider_id,
             displayName: provider.display_name,
             authState: provider.auth_status.state,
+            eligible: provider.auth_status.eligible,
             authModes: provider.auth_modes,
             models: provider.models.map { model in
                 NAProviderCatalogModel(

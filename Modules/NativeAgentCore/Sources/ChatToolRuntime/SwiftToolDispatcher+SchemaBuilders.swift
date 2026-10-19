@@ -48,8 +48,10 @@ extension SwiftToolDispatcher {
             let paramsData = tool.inputSchema
                 .flatMap { try? $0.serializedData(pretty: false) }
                 ?? fallbackData
+            // The server's own per-tool risk is the class this tool declares.
             return LLMToolSchema(
                 name: tool.bridgedName,
+                toolClass: MCPToolBridge.declaredClass(tool.effectiveRiskClass),
                 description: tool.description ?? "Call MCP tool \(tool.toolName) on server \(tool.serverId).",
                 parametersJSON: paramsData
             )

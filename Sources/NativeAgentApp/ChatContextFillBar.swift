@@ -29,6 +29,11 @@ enum ContextFillPresentation {
         let isOverBudget: Bool
     }
 
+    /// The window's size; 0 is a window no catalog row states, never a size.
+    static func window(_ budget: Int) -> String? {
+        budget > 0 ? NumberFormatter.localizedString(from: NSNumber(value: budget), number: .decimal) : nil
+    }
+
     static func transcriptTokens(_ value: Int?) -> String {
         guard let value else { return "unknown" }
         return NumberFormatter.localizedString(from: NSNumber(value: value), number: .decimal)
@@ -141,18 +146,20 @@ struct ContextFillBar: View {
 
             if let s = status {
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text("\(formatExactTokens(s.used_tokens)) / \(formatExactTokens(s.budget))")
+                    Text("\(formatExactTokens(s.used_tokens)) / \(ContextFillPresentation.window(s.budget) ?? "window unknown")")
                         .font(ShellType.captionCodeSemibold)
                         .foregroundStyle(s.context_loaded == true ? .primary : .secondary)
                         .lineLimit(1)
 
                     HStack(spacing: 5) {
-                        Text(s.context_loaded == true ? formatPercent(pct) : "estimate")
-                            .foregroundStyle(
-                                s.context_loaded == true
-                                    ? fillColor
-                                    : NativeAgentShell.secondary
-                            )
+                        if s.budget > 0 {
+                            Text(s.context_loaded == true ? formatPercent(pct) : "estimate")
+                                .foregroundStyle(
+                                    s.context_loaded == true
+                                        ? fillColor
+                                        : NativeAgentShell.secondary
+                                )
+                        }
                         Text("chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens))")
                             .foregroundStyle(NativeAgentShell.secondary)
                         Image(systemName: "rectangle.compress.vertical")
@@ -278,15 +285,17 @@ struct ContextFillBar: View {
         let deltaDescription = s.turn_delta_tokens.map {
             " Change from the preceding turn's final provider request: \(formatSignedTokens($0)) tokens."
         } ?? ""
+        let window = s.budget > 0 ? "your \(s.budget)-token window" : "a window no catalog states for this model"
         let usageDescription = s.context_loaded == true
-            ? "Exact last provider request: \(s.used_tokens) of \(s.budget) input tokens. Stored transcript estimate: \(transcript); remainder after that estimate: \(prompt).\(deltaDescription)"
-            : "No matching provider receipt yet. Transcript estimate: \(transcript) of your \(s.budget)-token window."
+            ? "Exact last provider request: \(s.used_tokens) input tokens of \(window). Stored transcript estimate: \(transcript); remainder after that estimate: \(prompt).\(deltaDescription)"
+            : "No matching provider receipt yet. Transcript estimate: \(transcript) tokens of \(window)."
         return "\(usageDescription) Mode: \(mode). Compaction is based on reducible transcript growth and becomes available at \(s.auto_compact_threshold) transcript tokens. A lower provider-request count on a later turn does not by itself mean compaction occurred."
     }
 
     private func contextAccessibilityLabel(_ s: SessionContextStatus) -> String {
         let source = s.context_loaded == true ? "exact provider input" : "transcript estimate"
-        return "Context: \(s.used_tokens) of \(s.budget) tokens, \(formatPercent(s.percent)), \(source). Stored chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens)) tokens; automatic compaction at \(s.auto_compact_threshold)."
+        let fill = s.budget > 0 ? "of \(s.budget) tokens, \(formatPercent(s.percent))" : "tokens, window unknown"
+        return "Context: \(s.used_tokens) \(fill), \(source). Stored chat \(ContextFillPresentation.transcriptTokens(s.transcript_tokens)) tokens; automatic compaction at \(s.auto_compact_threshold)."
     }
 
     @MainActor
@@ -382,8 +391,8 @@ struct ComposerContextRing: View {
     private var helpText: String {
         guard let status else { return "Context used this conversation" }
         let used = NumberFormatter.localizedString(from: NSNumber(value: status.used_tokens), number: .decimal)
-        let budget = NumberFormatter.localizedString(from: NSNumber(value: status.budget), number: .decimal)
-        return "Context: \(used) of \(budget) tokens (\(Int(usage.percent.rounded()))%)"
+        guard let window = ContextFillPresentation.window(status.budget) else { return "Context: \(used) tokens; window unknown" }
+        return "Context: \(used) of \(window) tokens (\(Int(usage.percent.rounded()))%)"
     }
 
     var body: some View {
@@ -397,7 +406,7 @@ struct ComposerContextRing: View {
                     .animation(NativeAgentMotion.standard, value: usage.fillFraction)
             }
             .frame(width: 11, height: 11)
-            if status != nil {
+            if let status, status.budget > 0 {
                 Text("\(Int(usage.percent.rounded()))%")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)

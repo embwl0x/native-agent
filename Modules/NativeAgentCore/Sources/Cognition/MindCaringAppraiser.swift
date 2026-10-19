@@ -161,15 +161,22 @@ actor CaringReceiptLog {
 
     private var url: URL { MindCaringAppraiser.receiptURL }
 
+    /// Only an absent log is created; an existing one is appended to or, on
+    /// any failure, left exactly as it was and the failure named.
     func append(_ line: String) {
         let url = self.url
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let bytes = Data((line + "\n").utf8)
-        if let handle = try? FileHandle(forWritingTo: url) {
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                try bytes.write(to: url, options: .withoutOverwriting)
+                return
+            }
+            let handle = try FileHandle(forWritingTo: url)
             defer { try? handle.close() }
-            guard let end = try? handle.seekToEnd() else { return }
-            try? handle.write(contentsOf: bytes)
+            let end = try handle.seekToEnd()
+            try handle.write(contentsOf: bytes)
             // 2026-09-22: rows that never get amended still grow the file;
             // past ~1MB keep the newest 2000 lines (~700KB).
             if end + UInt64(bytes.count) > 1_000_000,
@@ -177,8 +184,8 @@ actor CaringReceiptLog {
                 let kept = text.split(separator: "\n").suffix(2000).joined(separator: "\n") + "\n"
                 replace(with: Data(kept.utf8), at: url)
             }
-        } else {
-            try? bytes.write(to: url, options: .atomic)
+        } catch {
+            nativeLog("caring: receipt not appended to %@: %@", url.path, error.localizedDescription)
         }
     }
 

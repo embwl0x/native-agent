@@ -572,7 +572,7 @@ struct DoctorCheckRow: View {
                 Text(check.title.withoutStaleNextGenPhaseCopy)
                     .font(NativeAgentFont.section)
                 Spacer()
-                StatusBadge(text: check.status == "unmeasured" ? "READING" : check.status.uppercased(), status: check.status)
+                StatusBadge(text: check.status.uppercased(), status: check.status)
             }
             Text(check.detail.withoutStaleNextGenPhaseCopy)
                 .font(NativeAgentFont.body)

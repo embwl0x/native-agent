@@ -334,13 +334,8 @@ final class TurnInspectorStore {
     private(set) var mode: Mode = .live
     /// Newest-turn-first cards for the current mode's events.
     private(set) var cards: [InspectorTurnCard] = []
-    /// Live drop count surfaced from the bus subscription (slow-consumer signal).
-    var liveDropCount: Int {
-        if case .measured(let count) = feed.liveDropCountState { return count }
-        return 0
-    }
-    /// Availability-preserving form of `liveDropCount`. Views must render this
-    /// rather than treating the compatibility integer's zero as a receipt.
+    /// Live drop count from the bus subscription (slow-consumer signal), with
+    /// its availability: an unknown count is never rendered as zero.
     var liveDropCountState: TurnInspectorLiveDropState { feed.liveDropCountState }
     var liveSinkActive: Bool { feed.liveSinkActive }
     /// Replay diagnostics.

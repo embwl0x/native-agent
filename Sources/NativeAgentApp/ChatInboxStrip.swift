@@ -2,7 +2,6 @@ import Cognition
 import EngineRuntime
 import ApprovalTransactions
 import SwiftUI
-import ApprovalTransactions
 import NotificationInbox
 import ApprovalInbox
 import AppKit

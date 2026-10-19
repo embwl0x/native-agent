@@ -1,3 +1,4 @@
+import ApprovalInbox
 import ChatToolParsing
 import CryptoKit
 import Foundation
@@ -22,10 +23,10 @@ extension SwiftNativeTurnEngine {
     struct PreparedToolCall: Sendable {
         let pairedId: String
         /// The spelling the model called, handed to the chain as-is so its
-        /// canonicalizer can carry it to the policy gates (GatedToolNameContext).
+        /// canonicalizer resolves the same tool she named.
         let requestedName: String
         /// Its canonical name (ToolNameAliases): the one name the pill, the
-        /// receipt, the records and every per-tool rule below read.
+        /// receipt and the records below read.
         let internalName: String
         let dispatchInput: [String: JSONValue]
         /// Planning identity; refreshed when execution starts, then carried unchanged.
@@ -88,7 +89,19 @@ extension SwiftNativeTurnEngine {
                     && providerTools.providerName(forInternalName: internalName) == nil
                 return (prepared, call.undeclaredKeys.isEmpty && !folded, call.input, call.undeclaredKeys)
             }
-        let prepared = planned.filter(\.offered).map(\.call)
+        // One execution claim per effect: a call this turn put on an approval
+        // card is that card's to run while it is undecided; after the decision
+        // it answers one re-proposal with the card's receipt, and an identical
+        // call after that is a fresh invocation through the gate.
+        var answered: Set<String> = []
+        let claimed: [String: JSONValue] = planned.reduce(into: [:]) { claims, entry in
+            guard let receipt = cardClaim(on: entry.call, priorDispatches: priorDispatches) else { return }
+            if case .object(let fields) = receipt, fields["decision"] != nil, case .string(let card)? = fields["card"] {
+                guard answered.insert(card).inserted else { return }
+            }
+            claims[entry.call.pairedId] = receipt
+        }
+        let prepared = planned.filter { $0.offered && claimed[$0.call.pairedId] == nil }.map(\.call)
         // Mixed or not is decided on everything the model called in this
         // step, before unoffered calls are dropped, a list's entries each.
         let stepToolNames = planned.flatMap { ToolNameAliases.ranTools($0.call.internalName, input: $0.call.dispatchInput) }
@@ -133,7 +146,10 @@ extension SwiftNativeTurnEngine {
         records.reserveCapacity(planned.count)
         for entry in planned {
             let out: (record: TurnEngineResult.ToolDispatchRecord, block: LLMContentBlock)
-            if entry.offered {
+            if entry.offered, let receipt = claimed[entry.call.pairedId] {
+                out = await Self.makeSlotOutputs(prepared: entry.call, result: receipt, isError: false,
+                    sessionId: sessionId, neutralizingText: neutralizingTextResults, appDoor: appDoor)
+            } else if entry.offered {
                 guard let slot = slotIterator.next() else { continue }
                 images.append(contentsOf: slot.images)
                 out = await Self.makeSlotOutputs(
@@ -164,6 +180,42 @@ extension SwiftNativeTurnEngine {
         // continuation, not the persisted/tool-result text representation.
         blocks.append(contentsOf: images)
         return (blocks, records)
+    }
+
+    /// The receipt of the approval card that still holds this exact call (same
+    /// tool, same arguments), or nil. The claim lives on the call's latest
+    /// record: while that record waits on the card the claim holds; once the
+    /// decided receipt has answered a re-proposal, that record no longer waits,
+    /// so the claim is spent.
+    func cardClaim(on call: PreparedToolCall, priorDispatches: [TurnEngineResult.ToolDispatchRecord]) -> JSONValue? {
+        guard let held = priorDispatches.last(where: {
+            $0.ranCall.tool == call.ranCall.tool && $0.ranCall.input == call.ranCall.input
+        }), ChatToolOutcome.isWaitingApproval(held.result), case .string(let card)? = SessionHistoryPromptRenderer.receiptField("approvalId", in: held.result)
+            ?? SessionHistoryPromptRenderer.receiptField("approval_id", in: held.result) else { return nil }
+        let path = (remPinsDataRoot ?? defaultDataRoot()).appendingPathComponent("workflows/approvals/requests.json")
+        let record: ApprovalRecord
+        do {
+            guard let found = try SwiftNativeApprovalInbox.loadApprovalRowsChecked(at: path)
+                .compactMap(ApprovalRecord.init(json:)).first(where: { $0.id == card }) else { throw CocoaError(.fileReadNoSuchFile) }
+            record = found
+        } catch {
+            return .object(["status": .string("unknown"), "effects": .string("unknown"), "card": .string(card),
+                "not_run_status": .string("claimed_by_card"),
+                "reason": .string("This exact call already waits on card \(card), which could not be read (\(error.localizedDescription)); it was not run again. Check the card before repeating it.")])
+        }
+        guard record.status != "pending" else {
+            guard case .object(var waiting) = held.result else { return held.result }
+            // Its own waiting fields stay as they are, so it still waits on the card.
+            waiting["claimed_by_card"] = .string(card)
+            waiting["detail"] = .string("This exact call already waits on card \(card); answering the card runs it once. It was not run again.")
+            return .object(waiting)
+        }
+        let approved = record.decision == "approved"
+        return .object(["status": .string(approved ? (record.executedAction == nil ? "unknown" : "ok") : "skipped"),
+            "effects": .string(approved ? "unknown" : "none"), "card": .string(card),
+            "decision": .string(record.decision ?? record.status), "receipt": record.executedAction ?? .null,
+            "not_run_status": .string("claimed_by_card"),
+            "detail": .string("This exact call was already decided on card \(card) (\(record.decision ?? record.status)); its receipt is the card's, and it was not run again.")])
     }
 
     /// User, 2026-09-06: Stop must stop the REST of the batch too. Both cancel
@@ -277,12 +329,12 @@ extension SwiftNativeTurnEngine {
         ])
     }
 
-    /// A text-lane block carrying fields its tool does not take is a result
-    /// she wrote, not a call (`TextMarkerCodec.calls`); it ran nothing.
+    /// A text-lane block carrying fields its tool does not take is not a call
+    /// it can run (`TextMarkerCodec.calls`); it ran nothing.
     nonisolated static func undeclaredFieldsResult(_ name: String, keys: [String]) -> JSONValue {
         .object([
             "error": .string("\(name) takes no \(keys.joined(separator: ", ")), so this block was not run. "
-                + "Results come only from tools; never write one. To call \(name), use only its own parameters."),
+                + "To call \(name), use only its own parameters."),
             "status": .string("skipped"),
             "effects": .string("none"),
         ])
@@ -597,9 +649,9 @@ extension SwiftNativeTurnEngine {
         var prepared = prepared
         prepared.ranCall = ToolNameAliases.ranCall(prepared.internalName, input: prepared.dispatchInput)
         let journal = DeskContinuationScope.current
-        let step = Self.checkpointStep(prepared)
+        var step = Self.checkpointStep(prepared)
         do {
-            try await journal?.begin(step, peerSources: PeerDataTaint.current?.checkpointSources ?? [])
+            step = try await journal?.begin(step, peerSources: PeerDataTaint.current?.checkpointSources ?? []) ?? step
         } catch {
             return (prepared, .object(["status": .string("failed"), "effects": .string("none"),
                 "not_run_status": .string("continuation_refused"), "reason": .string(error.localizedDescription)]), true)
@@ -620,7 +672,8 @@ extension SwiftNativeTurnEngine {
         else if ran == "workshop_submit", text("id") != nil,
                 ["queued", "running", "pending"].contains(text("status") ?? "") { owner = "workshop" }
         else { owner = nil }
-        let settled = step.readOnly || ChatToolOutcome.neverRan(outcome.0) || object["effects"] == .string("none")
+        // Settled on the receipt's own evidence, never on how the tool is spelled.
+        let settled = ChatToolOutcome.neverRan(outcome.0) || object["effects"] == .string("none")
             || (owner == nil && !ChatToolOutcome.isWaitingOnPerson(outcome.0)
                 && !DeskContinuation.receiptIsUnresolved(outcome.0)
                 && ![.running, .timedOut, .effectUnconfirmed].contains(MacControlReceiptOutcome.projecting(envelope: outcome.0)))
@@ -641,6 +694,7 @@ extension SwiftNativeTurnEngine {
     /// The checkpoint keeps the same redacted argument summary the transcript
     /// keeps, bounded, plus only the reference a domain verifier needs: a
     /// whole-file write is checked by path and content digest, never content.
+    /// `effect` digests the exact call, so a re-proposed one is the same step.
     nonisolated private static func checkpointStep(_ prepared: PreparedToolCall) -> DeskContinuation.Step {
         let json = (try? JSONValue.object(prepared.dispatchInput).serialize(pretty: false)) ?? ""
         let input = String(SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(
@@ -655,9 +709,9 @@ extension SwiftNativeTurnEngine {
             reference = ["path": .string(path), "bytes": .int(Int64(content.utf8.count)),
                          "sha256": .string(SHA256.hash(data: Data(content.utf8)).map { String(format: "%02x", $0) }.joined())]
         }
-        var step = DeskContinuation.Step(id: UUID().uuidString, tool: ran, input: input, reference: reference)
-        step.readOnly = ParallelToolDispatch.isParallelSafe(internalToolName: ran)
-        return step
+        let exact = (try? JSONValue.object(ranInput).serialize(pretty: false)) ?? json
+        return DeskContinuation.Step(id: UUID().uuidString, tool: ran, input: input, reference: reference,
+            effect: SHA256.hash(data: Data((ran + "\n" + exact).utf8)).map { String(format: "%02x", $0) }.joined())
     }
 
     nonisolated static func runCheckpointedDispatchBody(

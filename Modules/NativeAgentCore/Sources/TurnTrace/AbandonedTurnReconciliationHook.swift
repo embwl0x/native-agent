@@ -63,10 +63,13 @@ public enum AbandonedTurnReconciliationHook {
                 return
             }
             if turnId.isEmpty {
-                let checkpoints = try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
-                for checkpoint in checkpoints {
-                    try await reconcile(dataRoot: dataRoot, sessionId: sessionId, turnId: checkpoint.turnId)
+                // Each checkpoint reconciles on its own; one that fails owes its own
+                // repair and never holds back its siblings.
+                var failed: Error?
+                for turn in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: sessionId) {
+                    do { try await reconcile(dataRoot: dataRoot, sessionId: sessionId, turnId: turn) } catch { failed = error }
                 }
+                if let failed { throw failed }
                 await RepairOwed.settle(dataRoot, operation: AbandonedTurnReconciler.operation(sessionId: sessionId, turnId: turnId),
                     evidence: .init(source: AbandonedTurnReconciler.owner(sessionId: sessionId, turnId: turnId), id: sessionId)).value
                 return
@@ -112,10 +115,9 @@ public enum AbandonedTurnReconciliationHook {
         lastSweepAt = now
         running = true
         let active = inFlight().union(resuming)
+        // Never behind telemetry: only an earlier process's turns are
+        // candidates, and a resuming one is excluded until it confirms.
         Task.detached(priority: .utility) {
-            // Let the finished turn's own terminal row reach disk before the
-            // sweep reads the day files looking for it.
-            await TurnTraceBus.shared.drainForProcessExit()
             let outcome = await AbandonedTurnReconciler().sweep(inFlightTurnIds: active)
             await MainActor.run {
                 running = false

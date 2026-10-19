@@ -441,7 +441,9 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let token = peer.credentialKey == nil ? nil : try AgentPeerCredentials.read(peerID: peer.id)
         if peer.credentialKey != nil && token == nil { throw AgentCommunicationError.invalid("configured peer credential is unavailable") }
         let localRequestID = UUID().uuidString.lowercased()
-        var envelope: [String: JSONValue] = ["agent": .string(agent), "transport": .string(peer.transport.rawValue),
+        // The attested door id rides beside the display name: the taint latch keys trust by it.
+        var envelope: [String: JSONValue] = ["agent": .string(agent), "agent_id": .string("peer:" + peer.id),
+            "transport": .string(peer.transport.rawValue),
             "local_request_id": .string(localRequestID), "automatic_polling": .bool(false)]
         func finished(_ fields: [String: JSONValue]) -> JSONValue {
             var result = fields

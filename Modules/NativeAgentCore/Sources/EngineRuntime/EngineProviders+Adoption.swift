@@ -22,7 +22,7 @@ extension ProvidersFacade {
     ) async -> Bool {
         let available: Set<String> = Set(
             ((try? await list()) ?? [])
-                .filter { $0.auth_status.state == "ready" }
+                .filter { $0.auth_status.eligible }
                 .map { $0.provider_id }
         )
         // Never point surfaces at a provider that isn't actually ready (e.g. a

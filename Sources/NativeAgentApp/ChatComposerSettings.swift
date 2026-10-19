@@ -4,7 +4,6 @@ import MultimodalTTS
 import ChatOrchestration
 import EngineRuntime
 import AppToolRuntime
-import TrustCenter
 import SwiftUI
 import PersistenceCore
 import NativeAgentShared
@@ -706,7 +705,7 @@ final class ComposerShellState {
     /// The receipt, as rows: one per component, then the Assembled line, the
     /// provider's token line and the model-and-when line — the same order and
     /// the same words the card draws, from the same loaded receipt. Nothing
-    /// here is a control, so `activateRow` still refuses the pane.
+    /// here is a control.
     private func contextRows() -> [ComposerShellRow] {
         ComposerContextReceiptPresentation.lines(contextReceipt).map {
             ComposerShellRow(id: $0.id, label: $0.label, isSelected: false)
@@ -719,8 +718,6 @@ final class ComposerShellState {
         }
     }
 
-    var selectedRowID: String? { rows.first(where: \.isSelected)?.id }
-
     /// What the open pane is, in one line, for a page read.
     var paneReadLine: String {
         switch activePane {
@@ -731,53 +728,6 @@ final class ComposerShellState {
         case .think: "Thinking pane is open."
         case .trust: "Trust pane is open."
         case .context: "Context pane is open."
-        }
-    }
-
-    /// Take a row of the active pane by its id. Returns false when the pane
-    /// does not hold that row, so a driver gets a real answer.
-    @discardableResult
-    func activateRow(id: String) -> Bool {
-        guard let reader else { return false }
-        switch activePane {
-        case .none, .context:
-            return false
-        case .model:
-            guard reader.providerGroups.contains(where: { $0.id == id }) else { return false }
-            activePane = .models(id)
-            flyoutIndex = nil
-            return true
-        case .models(let provider):
-            guard rows.contains(where: { $0.id == id }) else { return false }
-            if id == Self.backRowID {
-                activePane = .model
-                flyoutIndex = nil
-                return true
-            }
-            guard let group = reader.providerGroups.first(where: { $0.id == provider }) else { return false }
-            if let vendor = shownVendors(group)?.first(where: { "vendor:" + $0.id == id }) {
-                flyoutVendor = vendor.id
-                flyoutIndex = nil
-                return true
-            }
-            // Only the models in the visible column can be taken.
-            if let model = shownModels(group)?.models.first(where: { $0.id == id }) {
-                reader.select(model: model, provider: provider)
-                dismiss()
-                return true
-            }
-            guard reader.providerGroups.contains(where: { $0.id == id }) else { return false }
-            activePane = .models(id)
-            flyoutIndex = nil
-            return true
-        case .think:
-            guard let index = reader.efforts.firstIndex(where: { $0.id == id }) else { return false }
-            reader.setEffort(index: index)
-            return true
-        case .trust:
-            guard let preset = TrustPolicyPreset.allCases.first(where: { $0.quietID == id }) else { return false }
-            applyTrust(preset, appModel: reader.appModel)
-            return true
         }
     }
 

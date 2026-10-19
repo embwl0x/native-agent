@@ -120,25 +120,13 @@ package final class ChatTurnExecution: @unchecked Sendable {
         pendingNeed = need
     }
 
-    /// The final text of a turn that ended waiting on a card.
-    ///
-    /// Two jobs, and the second one is why this exists at all:
-    ///
-    ///  * The model's own prose is cut at the first protocol marker. The
-    ///    text-compat lane used to hand its RAW accumulation through, so a turn
-    ///    whose model went straight to the tool persisted the literal
-    ///    `<tool_use name="…">{}</tool_use>` as the assistant's reply and the
-    ///    person read the marker as Agent's answer (Agent, 2026-09-13).
-    ///  * On a route that cannot draw the card, the card's own copy is said in
-    ///    prose. Otherwise the turn reaches Telegram, Slack and the bridge as
-    ///    an empty string — which they report as "the reply came back empty"
-    ///    and "stream ended without final reply". The Mac and iPhone say
-    ///    nothing extra here: the card IS the reply there, and repeating it in
-    ///    prose would double it up.
+    /// The final text of a turn that ended waiting on a card: her own words,
+    /// written after she read the card's receipt, and on a route that cannot
+    /// draw the card, the card's own copy said in prose, so Telegram, Slack and
+    /// the bridge never get an empty reply. The Mac and iPhone say nothing extra:
+    /// the card is drawn there, and repeating it in prose would double it up.
     package static func waitingReply(visible: String) -> String {
-        let prose = ToolCallParser.visiblePrefix(
-            in: ToolCallParser.stripToolUseMarkers(visible)
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let prose = visible.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let execution = ChatTurnExecution.current,
               let need = execution.waitingInteraction
         else { return prose }

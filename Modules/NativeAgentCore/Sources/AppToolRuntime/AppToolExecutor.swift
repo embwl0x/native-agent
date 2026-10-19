@@ -16,6 +16,7 @@ import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import ProviderRouting
+import StandingBots
 import ToolRegistry
 import TrustCenter
 import DeviceSync
@@ -33,6 +34,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     public let quietHost: @MainActor @Sendable () -> (any QuietToolHost)?
     public let presentation: any QuietToolPresentationPort
     public let interactions: any ToolInteractionResolving
+    let actionIndex: SwiftNativeMemoryV2
     public let securityCenter: SwiftNativeSecurityCenter
     public let enforceAutonomySecurity: Bool
     public let browserActionRunner: @Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue
@@ -89,6 +91,24 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         self.quietHost = quietHost
         self.presentation = presentation
         self.interactions = interactions
+        let root = securityCenter.dataRoot
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
+        self.actionIndex = memory
+        Task {
+            let paths = ["agents/peers.json", "mcp/servers.json", "mcp/cache/tools.json", "config/embeddings.json", "ui/layout.json"]
+                .map { root.appendingPathComponent($0) }
+                + [defaultPersonaRoot(dataRoot: root).appendingPathComponent("skills/bodies")]
+            await memory.installActionIndex(paths: paths,
+                notifications: [AbilityStore.didChange, BotRunQueue.didChange, UserDefaults.didChangeNotification]) {
+                    let pages = await MainActor.run {
+                        Dictionary(([Self.doorInbox] + presentation.pages).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+                    }
+                    let inventory = try await AppActions.inventory(dataRoot: root)
+                    return try AppActions.actionTexts(inventory.actions, pages: pages,
+                        contacts: AgentPeerStore(dataRoot: root).list().map(\.name),
+                        helpers: BotDefinitionStore(dataRoot: root).list().map(\.name))
+                }
+        }
     }
 
     /// Whether an app call only reads: home, page/item reads, find, a read

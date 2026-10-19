@@ -47,11 +47,11 @@ extension BuiltInToolSchemaFactory {
     func coreSchemas() -> [LLMToolSchema?] {
         let mailReplyFields: [(String, JSONValue)] = [
             ("subject", strSchema("Subject for legacy matching; omit when using the exact message locator.")),
-            ("message_id", intSchema("Exact positive inbox message ID from the latest read.")),
+            ("message_id", intSchema("Exact positive inbox message ID from the latest read.", minimum: 1)),
             ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id.")),
             ("expected_account", strSchema("expected_account from the same row, when it has one.")),
             ("expected_account_id", strSchema("expected_account_id from the same row.")),
-            ("position", intSchema("position from the same row: finds the message fast.")),
+            ("position", intSchema("position from the same row: finds the message fast.", minimum: 1)),
             ("body", strSchema("Reply body (required).")),
             ("sender", strSchema("Optional sender filter — disambiguates when multiple messages share the subject.")),
             ("reply_all", boolSchema("Reply to all recipients. Defaults to false.")),
@@ -1369,12 +1369,12 @@ extension BuiltInToolSchemaFactory {
                         ("unread", boolSchema("true selects unread messages, false selects read messages; omit for both.")),
                         ("sort", enumStringSchema(["newest", "oldest"], "Date order; default newest. Keep unchanged for continuation.")),
                         ("offset", mailOffsetSchema),
-                        ("message_id", intSchema("Exact positive message ID from a prior read in the same scope; returns up to 16000 characters of body.")),
+                        ("message_id", intSchema("Exact positive message ID from a prior read in the same scope; returns up to 16000 characters of body.", minimum: 1)),
                         ("body_offset", intSchema("Exact detail continuation offset from body_end, up to 2000000; omit initially.")),
                         ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id in the prior read.")),
                         ("expected_account", strSchema("expected_account from the same row, when it has one.")),
                         ("expected_account_id", strSchema("expected_account_id from the same row; Mail's index checks the account with it.")),
-                        ("position", intSchema("position from the same row: finds the message fast.")),
+                        ("position", intSchema("position from the same row: finds the message fast.", minimum: 1)),
                     ],
                     required: []
                 )
@@ -1385,13 +1385,13 @@ extension BuiltInToolSchemaFactory {
                 description: "Save one local Apple Mail attachment by index or unique filename using an observed mail.N name or paired message identity from a Mail read. Defaults to ~/Downloads; destination is a folder within the same writable roots as files.write in the current mode. Never overwrites: adds a numbered suffix. Returns path and size in bytes. Requires Mail Read access; no Mail UI or AppleScript is used.",
                 parametersJSON: params(properties: [
                     ("name", strSchema("Observed mail.N workspace name; use instead of exact locator fields.")),
-                    ("message_id", intSchema("Exact positive message ID from the Mail read.")),
+                    ("message_id", intSchema("Exact positive message ID from the Mail read.", minimum: 1)),
                     ("expected_message_id", strSchema("Exact RFC message identifier paired with message_id.")),
                     ("expected_account", strSchema("expected_account from the same row, when present.")),
                     ("expected_account_id", strSchema("expected_account_id from the same row.")),
                     ("scope", enumStringSchema(["inbox", "sent"], "Mailbox scope from the same row; default inbox.")),
-                    ("position", intSchema("position from the same row, when present.")),
-                    ("index", intSchema("1-based attachment index from the Mail read; index or filename is required.")),
+                    ("position", intSchema("position from the same row, when present.", minimum: 1)),
+                    ("index", intSchema("1-based attachment index from the Mail read; index or filename is required.", minimum: 1)),
                     ("filename", strSchema("Exact unique attachment filename; index disambiguates duplicate names.")),
                     ("destination", strSchema("Destination folder; default ~/Downloads."))
                 ], required: [])
@@ -1473,7 +1473,7 @@ extension BuiltInToolSchemaFactory {
                         ("sort", enumStringSchema(["newest", "oldest_unread"], "Thread order; default newest. oldest_unread selects threads with unread incoming messages, earliest first, and includes oldest_unread_message_id, oldest_unread_date, oldest_unread_preview and its availability status. Omit for an exact thread read.")),
                         ("query", strSchema("A person (name, number or email) or words they wrote; lists only matching conversations.")),
                         ("thread_id", strSchema("Exact thread_id returned by this tool, to inspect that conversation.")),
-                        ("before_message_id", intSchema("Older-page cursor returned as older_before_message_id. Requires the same exact thread_id; omit for recent messages.")),
+                        ("before_message_id", intSchema("Older-page cursor returned as older_before_message_id. Requires the same exact thread_id; omit for recent messages.", minimum: 1)),
                     ],
                     required: []
                 )
@@ -1826,10 +1826,10 @@ extension BuiltInToolSchemaFactory {
                 parametersJSON: params(
                     properties: [
                         ("messages", mailBatchItemsSchema(effects: true, markReadOnly: true)),
-                        ("message_id", intSchema("Inbox message_id from mail_list_recent.")),
+                        ("message_id", intSchema("Inbox message_id from mail_list_recent.", minimum: 1)),
                         ("expected_message_id", strSchema("expected_message_id from the same row.")),
                         ("expected_account", strSchema("expected_account from the same row, when it has one.")),
-                        ("position", intSchema("position from the same row: finds the message fast.")),
+                        ("position", intSchema("position from the same row: finds the message fast.", minimum: 1)),
                         ("subject", strSchema("Or the message's subject, when there's no message_id.")),
                         ("sender", strSchema("Optional sender filter with subject.")),
                     ],
@@ -1842,10 +1842,10 @@ extension BuiltInToolSchemaFactory {
                 description: "Archive one inbox message by message_id + expected_message_id from mail_list_recent, or a subject only one message has. Requires Mail → Write permission.",
                 parametersJSON: params(
                     properties: [
-                        ("message_id", intSchema("Inbox message_id from mail_list_recent.")),
+                        ("message_id", intSchema("Inbox message_id from mail_list_recent.", minimum: 1)),
                         ("expected_message_id", strSchema("expected_message_id from the same row.")),
                         ("expected_account", strSchema("expected_account from the same row, when it has one.")),
-                        ("position", intSchema("position from the same row: finds the message fast.")),
+                        ("position", intSchema("position from the same row: finds the message fast.", minimum: 1)),
                         ("subject", strSchema("Or the message's subject, when there's no message_id.")),
                         ("sender", strSchema("Optional sender filter with subject.")),
                     ],
@@ -1858,10 +1858,10 @@ extension BuiltInToolSchemaFactory {
                 description: "Move one message to its account's Trash, including archived mail, by message_id + expected_message_id from a prior read, or a subject only one indexed message has. Rechecks identity in its current mailbox. Never permanently deletes. Requires Mail → Write permission and the existing approval policy.",
                 parametersJSON: params(
                     properties: [
-                        ("message_id", intSchema("Message_id from a prior Mail read; the message may have been archived since that read.")),
+                        ("message_id", intSchema("Message_id from a prior Mail read; the message may have been archived since that read.", minimum: 1)),
                         ("expected_message_id", strSchema("expected_message_id from the same row.")),
                         ("expected_account", strSchema("expected_account from the same row, when it has one.")),
-                        ("position", intSchema("Optional prior position hint; deletion locates the current mailbox by indexed identity.")),
+                        ("position", intSchema("Optional prior position hint; deletion locates the current mailbox by indexed identity.", minimum: 1)),
                         ("subject", strSchema("Or the message's subject, when there's no message_id.")),
                         ("sender", strSchema("Optional sender filter with subject.")),
                     ],

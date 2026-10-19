@@ -22,6 +22,35 @@ public enum NativeAgentMacEventIdentity {
     public static let sourceUserData: Int64 = 0x4E_41_54_49_56_45 // "NATIVE"
 }
 
+/// While her script runs, the input it drives is hers, not the person's. A
+/// script's keystroke and click are posted by System Events (or by our own
+/// osascript child), which cannot carry our event tag, so the attention
+/// monitor knows them by their posting process for the script's lifetime.
+/// Hardware input has no posting process and is always the person's.
+public enum ScriptedInputSources {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var running = 0
+
+    public static func during<T>(_ body: () async throws -> T) async rethrows -> T {
+        lock.withLock { running += 1 }
+        defer { lock.withLock { running -= 1 } }
+        return try await body()
+    }
+
+    #if canImport(AppKit) && os(macOS)
+    static func posted(_ event: CGEvent) -> Bool {
+        guard lock.withLock({ running > 0 }) else { return false }
+        let pid = pid_t(event.getIntegerValueField(.eventSourceUnixProcessID))
+        guard pid > 0, pid != getpid() else { return false }
+        if NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.systemevents" { return true }
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        return sysctl(&mib, 4, &info, &size, nil, 0) == 0 && size > 0 && info.kp_eproc.e_ppid == getpid()
+    }
+    #endif
+}
+
 /// Bounded, process-local provenance for UI changes caused by NativeAgent's
 /// own motor output. ActivityWatch consumes only this timestamp seam; it does
 /// not gain a scheduler, store, or dependency on an attention session.
@@ -267,7 +296,8 @@ public struct SystemMacAttentionEventSource: MacAttentionEventSource {
 
             func activity(from event: NSEvent) -> MacAttentionActivity? {
                 if event.cgEvent?.getIntegerValueField(.eventSourceUserData)
-                    == NativeAgentMacEventIdentity.sourceUserData {
+                    == NativeAgentMacEventIdentity.sourceUserData
+                    || event.cgEvent.map(ScriptedInputSources.posted) == true {
                     return nil
                 }
                 // Shotgun (User, 10-04): while it is up, Stop in it is the only

@@ -230,6 +230,7 @@ struct ShotgunView: View {
         switch phase {
         case .canceled: "Stopped"
         case .failed: "Couldn't finish"
+        case .outcomeUnknown: "Outcome unknown"
         default: "Done"
         }
     }

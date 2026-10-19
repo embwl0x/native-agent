@@ -230,6 +230,8 @@ actor SessionDigestCache {
         return value
     }
 
+    func cached(_ key: String) -> String? { store[key] }
+
     private func set(_ value: String, forKey key: String) {
         if store[key] == nil {
             insertionOrder.append(key)
@@ -295,7 +297,22 @@ public struct SessionDigestProvider: Sendable {
             try await provider.loadOrBuildAndPersist(
                 sessionId: trimmed, model: model, surface: surface, userMessage: userMessage)
         }
-        guard let previous = try Self.priorSessionId(in: value, sessionId: trimmed, dataRoot: dataRoot) else { return nil }
+        return try rendered(value, sessionId: trimmed)
+    }
+
+    /// The handoff as already published for this session, cached or persisted;
+    /// never a build. Nil when none is published; "" when the published one
+    /// carries no thread.
+    public func published(forSessionId sessionId: String) async throws -> String? {
+        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let key = [dataRoot.path, trimmed].joined(separator: "\u{1F}")
+        guard let value = try await SessionDigestCache.shared.cached(key) ?? readPersistedDigest(sessionId: trimmed) else { return nil }
+        return try rendered(value, sessionId: trimmed) ?? ""
+    }
+
+    private func rendered(_ value: String, sessionId: String) throws -> String? {
+        guard let previous = try Self.priorSessionId(in: value, sessionId: sessionId, dataRoot: dataRoot) else { return nil }
         var lines = value.components(separatedBy: "\n")
         guard let index = lines.lastIndex(where: { !$0.isEmpty }) else { return nil }
         lines[index] = Self.pointerSentence(sessionId: previous)

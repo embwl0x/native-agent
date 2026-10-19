@@ -50,10 +50,6 @@ public final class MemoryAtomRecordIndex: @unchecked Sendable {
         return lock.withLock { recordToAtom[normalized] }
     }
 
-    func recordIDs(for atomIDs: [ContextAtomID]) -> [String] {
-        lock.withLock { atomIDs.compactMap { atomToRecord[$0] } }
-    }
-
     func recordMap(for atomIDs: [ContextAtomID], generationID: Int64) -> [ContextAtomID: String] {
         let requested = Set(atomIDs)
         return lock.withLock {
@@ -77,7 +73,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     // v3: creation time is separate from update freshness for memory age tags.
     private static let schemaVersion = "memory-context-projection-v4"
     private let memory: SwiftNativeMemoryV2
-    private let provenanceIndex: MemoryAtomRecordIndex?
+    private let provenanceIndex: MemoryAtomRecordIndex
 
     init(
         memory: SwiftNativeMemoryV2 = SwiftNativeMemoryV2.shared,
@@ -85,7 +81,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         self.memory = memory
-        self.provenanceIndex = provenanceIndex
+        self.provenanceIndex = provenanceIndex ?? MemoryAtomRecordIndex()
         self.dataRoot = dataRoot
         self.invalidationSourceURL = dataRoot.appendingPathComponent("memory/memory.sqlite")
             .standardizedFileURL
@@ -126,6 +122,9 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
             throw NativeMemoryContextProjectionError.invalidModelFingerprint
         }
 
+        // Unchanged words keep their vector; a source whose descriptor moved
+        // (its locator now carries the record id) republishes with that vector.
+        var redescribed: [ContextCompiledSource] = []
         let changed = selected.filter { item in
             guard let previous = previousSources[item.sourceID],
                   previous.sourceHash == item.sourceHash,
@@ -136,6 +135,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
                   embedding.values.allSatisfy(\.isFinite) else {
                 return true
             }
+            if previous.descriptor != item.descriptor { redescribed.append(item.compiledSource(embedding: embedding)) }
             return false
         }
 
@@ -175,10 +175,59 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
             )
         }
         return ContextCompiledProjectionResult(
-            changedSources: changedSources,
+            changedSources: changedSources + redescribed,
             removedSourceIDs: removed,
             atomRecordIDs: atomRecordIDs
         )
+    }
+
+    /// The body never speaks a memory the database says is gone or tightened:
+    /// the chosen atoms' records are read by id, and any retired, newer than
+    /// the version compiled, or not disclosed on this surface is dropped.
+    func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
+                surface: ContextSurface) async -> ContextTurnExclusion {
+        let locators = Dictionary(generation.sources.lazy.filter { $0.descriptor.owner == Self.owner }
+            .map { ($0.descriptor.id, $0.descriptor.canonicalLocator) }, uniquingKeysWith: { first, _ in first })
+        let atoms = chosen.compactMap { atom in
+            locators[atom.draft.sourceID].map { (atom, Self.recordID(inLocator: $0)) }
+        }
+        guard !atoms.isEmpty else { return ContextTurnExclusion() }
+        do {
+            let records = try await memory.memoryRecords(ids: atoms.compactMap(\.1))
+            let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            let dropped = atoms.filter { atom, recordID in
+                !Self.speakable(recordID.flatMap { byID[$0] }, compiledAt: atom.draft.freshness.updatedAt, on: surface)
+            }
+            let pending = dropped.filter { $0.1.flatMap { byID[$0] }.map(Self.pendingAdmission) == true }
+            return ContextTurnExclusion(atomIDs: Set(dropped.map(\.0.draft.id)), unverified: pending.map {
+                ContextDegradedSourceNotice(sourceID: $0.0.draft.sourceID, reason: "saved; its check is pending")
+            })
+        } catch {
+            return ContextTurnExclusion(atomIDs: Set(atoms.map(\.0.draft.id)), unverified: [ContextDegradedSourceNotice(
+                sourceID: ContextStableID.source(owner: Self.owner, locator: "memory-v2"),
+                reason: "memories withheld this turn: the memory store could not confirm them (\(error.localizedDescription))")])
+        }
+    }
+
+    /// Active, recall-eligible, no newer than what was compiled, and disclosed here.
+    static func speakable(_ record: MemoryRecord?, compiledAt: Date, on surface: ContextSurface) -> Bool {
+        guard let record, isActive(record), !pendingAdmission(record), MemoryLifecycle.isRecallEligible(record.lifecycle),
+              let version = parseDate(record.updatedAt) ?? parseDate(record.createdAt),
+              version.timeIntervalSince(compiledAt) <= 0.001,
+              MemoryRecordDisclosurePolicy.classify(record)?.permits(surface: surface.rawValue, personaID: nil) == true
+        else { return false }
+        return true
+    }
+
+    static func pendingAdmission(_ record: MemoryRecord) -> Bool {
+        guard case .object(let extras)? = record.extras else { return false }
+        return extras[MemoryStorage.pendingAdmissionKey] == .bool(true)
+    }
+
+    /// The record id the locator carries; nil for one compiled before it did.
+    static func recordID(inLocator locator: String) -> String? {
+        guard let range = locator.range(of: "/records/id:") else { return nil }
+        return String(locator[range.upperBound...])
     }
 
     func didPublish(
@@ -186,7 +235,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         generation: ContextStoredGeneration,
         retaining generationIDs: Set<Int64>
     ) {
-        provenanceIndex?.publish(
+        provenanceIndex.publish(
             result?.atomRecordIDs,
             generationID: generation.generation.id,
             liveAtomIDs: Set(generation.atoms.lazy
@@ -338,15 +387,11 @@ private extension NativeMemoryContextProjection {
             guard !normalized.isEmpty else { return "shared" }
             return "personas/\(ContextStableID.digest(parts: [normalized]))"
         }()
-        let locator = "memory-v2/\(personaScope)/records/\(locatorDigest)"
-        // Keep record/atom identity stable when disclosure scope changes.
-        // The canonical locator carries persona scope for eligibility, while
-        // the source identity remains the long-standing record-id digest used
-        // by resident attention activation and persisted generations.
-        let sourceID = ContextStableID.source(
-            owner: owner,
-            locator: "memory-v2/records/\(locatorDigest)"
-        )
+        // The record id rides the locator, so a turn can read the record back.
+        let locator = "memory-v2/\(personaScope)/records/id:\(recordID)"
+        // Keep record/atom identity stable when disclosure scope changes:
+        // the locator carries persona scope, the source identity does not.
+        let sourceID = ContextStableID.source(owner: owner, locator: "memory-v2/records/\(locatorDigest)")
         let descriptor = ContextSourceDescriptor(
             id: sourceID,
             owner: owner,

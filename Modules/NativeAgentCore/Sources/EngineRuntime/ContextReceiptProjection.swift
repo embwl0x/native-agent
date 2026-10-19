@@ -93,12 +93,12 @@ public enum ContextReceiptProjection {
         guard case .receipt(var receipt) = loaded else { return loaded }
         let selected = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let windowModel = selected.isEmpty ? (receipt.model ?? "") : selected
-        let native = ProviderRouting.contextLength(forModel: windowModel)
-        // An unknown model: 60% of the gauge default, as the ring reads it.
-        receipt.windowTokens = ContextBudgetPolicy.windowTokens(forModel: windowModel)
-            ?? ChatSessionAutocompactionConfig.productionDefault().effectiveWindowTokens(nativeWindowTokens: native)
-            ?? native
-        receipt.nativeWindowTokens = native
+        // The selected model on the Chat route, as the ring reads it; a window
+        // no catalog row states stays nil, and the card says so.
+        let root = PersistenceCore.defaultDataRoot()
+        let route = await SwiftNativeProviderRouting(dataRoot: root).chatRouteProvider()
+        receipt.windowTokens = ContextBudgetPolicy.windowTokens(forModel: windowModel, providerID: route, dataRoot: root)
+        receipt.nativeWindowTokens = ProviderRouting.verifiedContextLength(forModel: windowModel, providerID: route, dataRoot: root)
         receipt.windowModelName = windowModel.isEmpty
             ? nil
             : FirstPartyModelCatalog.descriptor(for: windowModel)?.name ?? windowModel

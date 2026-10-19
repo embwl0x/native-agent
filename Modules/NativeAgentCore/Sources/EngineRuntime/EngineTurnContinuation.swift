@@ -1,4 +1,5 @@
 import Agents
+import Experiences
 import AttentionRouting
 import BackgroundWork
 import BackgroundLoops
@@ -40,6 +41,18 @@ public struct TurnContinuationRuntime: Sendable {
 
     public func resumeAtLaunch(_ checkpoint: TurnCheckpoint,
         resumeMacTurn: @Sendable (TurnCheckpoint, TurnContinuationRuntime) async throws -> Void) async throws {
+        // A worker's run (its checkpoint owned by the run itself) answers only
+        // its caller, the Workshop step that started it; relaunch interrupted
+        // that step, and its own claim recovery runs it again. The checkpoint
+        // goes back to that caller: its answer is let go as abandoned, never a
+        // chat turn to resume nor a repair owed.
+        if checkpoint.sessionId == "worker-" + checkpoint.runId {
+            try checkpoint.remove(dataRoot: dataRoot)
+            ExperienceStore.record(dataRoot, checkpoint.runId) { store in
+                try await store.append([.letGo(key: "answer", reason: .abandoned)], to: checkpoint.runId)
+            }
+            return
+        }
         if checkpoint.capabilityProfile == "mac", checkpoint.surface == "chat", checkpoint.helperDefinition == nil {
             try await resumeMacTurn(checkpoint, self)
         } else { try await resumeTurn(checkpoint) }
@@ -113,9 +126,7 @@ public struct TurnContinuationRuntime: Sendable {
         switch try await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: sessionId,
                                          responseRunId: runId, route: route, source: surface) {
         case .start, .inProgress:
-            var mirror = response
-            mirror.attachments = []
-            try await lifecycle.cacheResponse(mirror, deliveryId: deliveryId, requestDigest: digest)
+            try await lifecycle.cacheResponse(response, deliveryId: deliveryId, requestDigest: digest)
         case .cached: break
         case .settled, .outcomeUnknown, .conflict: throw CodexCompletionLifecycle.LifecycleError.requestConflict
         }
@@ -141,7 +152,7 @@ public struct TurnContinuationRuntime: Sendable {
             guard let surface = route.sourceKey else { continue }
             let text = "[\(Self.mirrorDoors[surface] ?? surface)]\n" + response.output
             _ = await AgentBridgeCompletionRouter.deliver(deliveryId: row.id, requestDigest: row.digest,
-                text: text, attachments: [], route: route,
+                text: text, attachments: response.attachments ?? [], route: route,
                 sender: makeSender(surface == "app" || surface == "chat", route.correlationId, { config, chatID in
                     TelegramPollLoop.inboundAuthorizationDecision(allowedChatIds: config.allowedChatIds,
                         allowedUserIds: config.allowedUserIds, chatId: chatID, fromUserId: chatID > 0 ? chatID : nil) == .allowed
@@ -255,8 +266,11 @@ public struct TurnContinuationRuntime: Sendable {
         if checkpoint.hasRedeliveryOwner {
             let digest = CodexCompletionTranscriptEvidence.responseDigest(sessionId: checkpoint.sessionId,
                 runId: checkpoint.runId, content: response.output, attachments: response.attachments ?? [])
-            guard try await settleReply(response: response, route: route, envelope: envelope,
-                settlement: .durable(deliveryID: "turn-restart.\(checkpoint.runId)", requestDigest: digest, notifyRequestedResult: false)) == "completed" else { return }
+            let delivery = try await settleReply(response: response, route: route, envelope: envelope,
+                settlement: .durable(deliveryID: "turn-restart.\(checkpoint.runId)", requestDigest: digest, notifyRequestedResult: false))
+            // Any settled outcome is the delivery journal's to keep; resend is
+            // disabled there, so the checkpoint has nothing left to redeliver.
+            guard ["completed", "sent_unconfirmed", "failed_before_answer"].contains(delivery) else { return }
             try checkpoint.remove(dataRoot: dataRoot)
         } else if checkpoint.helperDefinition == nil, let kind = route.kind, kind == .local || kind == .callerResult {
             // The reply is in the conversation: the chat showing it refreshes,
@@ -503,18 +517,18 @@ public struct TurnContinuationRuntime: Sendable {
             case .inProgress:
                 try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
             case .settled(let delivery):
-                return delivery?.status == "sent_unconfirmed" || delivery?.status == "failed_before_answer" ? "completed" : delivery?.status ?? "completed"
+                return delivery?.status ?? "completed"
             case .outcomeUnknown, .conflict: throw CodexCompletionLifecycle.LifecycleError.requestConflict
             }
             let delivery = await AgentBridgeCompletionRouter.deliver(
                 deliveryId: deliveryID, requestDigest: digest, text: response.output,
                 attachments: response.attachments ?? [], route: route, sender: sender, lifecycle: lifecycle,
                 notifyRequestedResult: notifyRequestedResult)
-            return ["sent_unconfirmed", "failed_before_answer"].contains(delivery.status) ? "completed" : delivery.status
+            return delivery.status
         case .approvalClaim:
             let delivery = try await sender.deliverReply(response, deliveryId: response.runId, route: route,
                 priorVerdict: nil, notifyRequestedResult: false)
-            return delivery.status == "sent_unconfirmed" ? "completed" : delivery.status
+            return delivery.status
         }
     }
 }

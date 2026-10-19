@@ -142,11 +142,7 @@ public actor GitHubApprovalEdgeNotifier {
 
     private func save(_ state: State, _ dataRoot: URL) throws {
         let url = stateURL(dataRoot)
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        let data = try JSONEncoder().encode(state)
-        try data.write(to: url, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(state), to: url)
         cached[dataRoot.standardizedFileURL.path] = state
     }
 }

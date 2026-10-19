@@ -66,9 +66,15 @@ extension MacFourVerbs {
         if let part, ["menu", "menus", "menu bar"].contains(Self.normalize(part)) {
             var body: [String: JSONValue] = [:]
             if let app { body["app"] = .string(app) }
-            guard let result = try? await host.dispatch(action: "menu", body: body), result.ok else {
-                return MacFourVerbsReply(ok: false, text: "I couldn't read that app's menu bar.",
-                                         detail: ["error": .string("menu_unavailable")])
+            let result: MacControlResult
+            do { result = try await host.dispatch(action: "menu", body: body) } catch {
+                return MacFourVerbsReply(ok: false, text: "I couldn't read that app's menu bar: \(error).",
+                                         detail: ["error": .string("menu_unavailable"), "message": .string("\(error)")])
+            }
+            guard result.ok else {
+                return MacFourVerbsReply(ok: false, text: "I couldn't read that app's menu bar: "
+                    + (Self.string(Self.object(result.output)["message"]) ?? result.error ?? "the Mac refused the read") + ".",
+                    detail: Self.operationDetail(result).merging(["error": .string("menu_unavailable")]) { current, _ in current })
             }
             let output = Self.object(result.output)
             let rows = Self.array(output["paths"]).compactMap { row -> String? in

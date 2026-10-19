@@ -10,8 +10,9 @@ import Experiences
 /// One backend (Anthropic / OpenAI / Codex CLI). The real client multiplexes
 /// over these by model-id prefix.
 public protocol LLMAdapter: Sendable {
-    static var supportsTools: Bool { get }
-    var supportsTools: Bool { get }
+    /// How this transport carries tools; required, so a new adapter has to say.
+    static var toolWire: ProviderToolWire { get }
+    static var carriesImages: Bool { get }
     var providerId: String { get }
     func complete(prompt: String, system: String?, model: String) async throws -> String
 
@@ -87,8 +88,7 @@ public enum LLMMessagesStreamKind: String, Sendable {
 }
 
 extension LLMAdapter {
-    public static var supportsTools: Bool { false }
-    public var supportsTools: Bool { Self.supportsTools }
+    public static var carriesImages: Bool { true }
 
     public func stream(
         prompt: String,
@@ -266,7 +266,7 @@ public final class SwiftNativeLLMClient: LLMClient {
     /// First-party OAuth-direct providers serve ONE model family each. When a
     /// surface is pinned to one of them and the requested id belongs to no
     /// family we can infer (`llama-3`, `deepseek-chat`, `o3`), the routing
-    /// family-mismatch check above cannot fire — `inferredProviderId` returns
+    /// family-mismatch check above cannot fire — `inferredProviderID` returns
     /// nil — so the raw id used to reach the pinned adapter, which quietly
     /// coerced it to its own default and billed the call. Reject it here,
     /// BEFORE dispatch and before any token spend (NORTHSTAR clause 2). The
@@ -283,7 +283,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         guard Self.firstPartyOAuthDirectProviderIDs.contains(pinned) else { return }
         let requested = resolution.model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !requested.isEmpty else { return }
-        guard inferredProviderId(forModel: requested) == nil else { return }
+        guard SwiftNativeProviderRouting.inferredProviderID(forModel: requested, dataRoot: moonshotCatalogDataRoot) == nil else { return }
         throw LLMError.modelUnavailable(provider: pinned, model: requested)
     }
 
@@ -313,21 +313,6 @@ public final class SwiftNativeLLMClient: LLMClient {
                 model: resolution.model
             )
         }
-    }
-
-    /// M-F3: Moonshot recognition is CATALOG MEMBERSHIP, not just the
-    /// kimi-/moonshot- prefix — the static first-party rows AND the live
-    /// authenticated /v1/models disk cache (account-visible ids need not
-    /// carry the prefix; review round 2 caught the static-only guard missing
-    /// them).
-    private func isMoonshotCatalogModel(_ lowercasedID: String) -> Bool {
-        if FirstPartyModelCatalog.descriptor(for: lowercasedID, providerID: "moonshot") != nil {
-            return true
-        }
-        return MoonshotModelCatalog.isKnownCatalogModelID(
-            lowercasedID,
-            dataRoot: moonshotCatalogDataRoot
-        )
     }
 
     private func providerLifecycleStart(
@@ -393,8 +378,7 @@ public final class SwiftNativeLLMClient: LLMClient {
             dataRoot: moonshotCatalogDataRoot, id: "provider-repair:" + started.id, evidence: [.init(source: "provider", id: started.id)])
         let normalized = ProviderFailure.normalize(error) as? ProviderFailure.Diagnostic
         return ProviderFailure.Diagnostic(cause: ProviderFailure.classify(error) ?? .malformedResponse, detail: detail,
-            deadlineExpired: normalized?.deadlineExpired ?? false, admitted: normalized?.admitted ?? false,
-            liveFirstOutputCut: normalized?.liveFirstOutputCut ?? false, repair: repair)
+            deadlineExpired: normalized?.deadlineExpired ?? false, admitted: normalized?.admitted ?? false, repair: repair)
     }
 
     /// Adapter choice produced by `resolveAdapterAndModel`. Used by
@@ -455,7 +439,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                 unrouted: true
             )
         }
-        if let inferred = inferredProviderId(forModel: model),
+        if let inferred = SwiftNativeProviderRouting.inferredProviderID(forModel: model, dataRoot: moonshotCatalogDataRoot),
            !SwiftNativeProviderRouting.providerCanServeModel(activeProvider, inferredProvider: inferred) {
             // A mismatch used to silently swap in the provider default; since
             // 2026-08-21 (User-directed) it is marked here and
@@ -523,47 +507,40 @@ public final class SwiftNativeLLMClient: LLMClient {
     }
 
     /// The one provider switch all four dispatch paths share, so a guard added
-    /// here cannot be missing from a sibling copy (the F1-M1 guard below once
-    /// lived only in the streaming path). `label` is the stream-guard label.
+    /// here cannot be missing from a sibling copy. `label` is the stream-guard label.
     private func adapter(
         for resolution: AdapterResolution,
         tools: [LLMToolSchema]?
     ) throws -> (adapter: any LLMAdapter, label: String) {
+        let chosen: (adapter: any LLMAdapter, label: String)
         switch resolution.choice {
         case .openRouter:
             guard let openRouter else { throw LLMError.notConfigured(provider: "openrouter") }
-            return (openRouter, "openrouter")
+            chosen = (openRouter, "openrouter")
         case .anthropic:
-            // F1-M1: the native-tools GATE (usesNativeToolLane) and the
-            // resolver decide the provider independently; with
-            // LLMCallContext.providerId nil the gate can admit the native lane
-            // on the model-id backstop while the resolver keeps an anthropic
-            // surface pin. Sending provider-native tools[] on a Claude
-            // subscription connection is the documented invariant this defends
-            // (NativeToolCapability) — kimi-code is the ONLY anthropic-family
-            // adapter probed for the native tools contract. Scoped HERE, not
-            // pre-dispatch: OpenAI-shaped lanes receive tools[] legitimately
-            // (function calling). FAIL LOUD — never silently strip tools.
-            if tools != nil,
-               !NativeToolCapability.providerSupportsNativeTools(resolution.providerId) {
-                throw LLMError.providerError(message:
-                    "native tools[] bound to non-native Anthropic-family adapter "
-                    + "'\(resolution.providerId)' for model "
-                    + "'\(resolution.model)' — "
-                    + "gate/resolver disagreement (F1-M1)")
-            }
-            return (try anthropicAdapter(for: resolution.providerId), resolution.providerId)
+            chosen = (try anthropicAdapter(for: resolution.providerId), resolution.providerId)
         case .openAI:
-            return (try openAIAdapter(for: resolution.providerId), resolution.providerId)
+            chosen = (try openAIAdapter(for: resolution.providerId), resolution.providerId)
         case .xai:
             guard let xaiOAuthDirect else { throw LLMError.notConfigured(provider: "xai_oauth_direct") }
-            return (xaiOAuthDirect, "xai")
+            chosen = (xaiOAuthDirect, "xai")
         case .moonshot:
             guard let moonshot else { throw LLMError.notConfigured(provider: "moonshot") }
-            return (moonshot, "moonshot")
+            chosen = (moonshot, "moonshot")
         case .codex:
-            return (codex, "codex")
+            chosen = (codex, "codex")
         }
+        // A marker transport (the Claude subscription) is never handed a tools
+        // array; reaching here with one is this body's own disagreement, said as such.
+        if tools != nil, type(of: chosen.adapter).toolWire == .textMarkers {
+            let setting = "providers." + (ProviderSurfaceGroups.group(for: LLMCallContext.surface ?? "chat")
+                ?? ProviderSurfaceGroups.chat).id + "_model"
+            throw ToolFailureError(
+                "NativeAgent did not send this call: its dispatch bound a tools array to \(resolution.providerId) · \(resolution.model), whose transport takes tools as text markers. This is a fault in NativeAgent, not the provider; nothing was sent. \(setting) can move this work to another model meanwhile.",
+                effects: .none, owner: "NativeAgent provider dispatch",
+                nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(setting)])]))
+        }
+        return chosen
     }
 
     private func adapterChoice(forProviderId rawProviderId: String) -> AdapterChoice? {
@@ -585,29 +562,6 @@ public final class SwiftNativeLLMClient: LLMClient {
         case "codex": return .codex
         default: return nil
         }
-    }
-
-    private func inferredProviderId(forModel model: String) -> String? {
-        let lower = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if lower.isEmpty { return nil }
-        if lower.contains("/") { return "openrouter" }
-        if lower.hasPrefix("claude")
-            || lower.hasPrefix("sonnet/")
-            || lower.hasPrefix("opus/")
-            || lower.hasPrefix("haiku/") {
-            return "anthropic"
-        }
-        if lower.hasPrefix("gpt") { return "openai" }
-        if lower.hasPrefix("grok") { return "xai" }
-        if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) { return "kimi-code" }
-        if lower.hasPrefix("kimi-") || lower.hasPrefix("moonshot-") { return "moonshot" }
-        // Non-prefixed Moonshot catalog IDs participate in the same provider
-        // compatibility check: a mismatched explicit route must fail before
-        // dispatch. Membership includes static rows and the live disk cache.
-        if isMoonshotCatalogModel(lower) {
-            return "moonshot"
-        }
-        return nil
     }
 
     private func executionControls(
@@ -654,14 +608,10 @@ public final class SwiftNativeLLMClient: LLMClient {
     /// with no error (observed 2026-09-05: an OAuth-direct request open >11 min).
     private func withCompletionWall<T: Sendable>(
         _ label: String,
-        providerId: String,
         _ work: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        // 2026-09-22 WHY: 300s, not the stream's 600s, on the OAuth-direct routes
-        // only. Slowest real non-streaming call there in 14 days was 245s; hung
-        // ones sat the full 600s then passed on retry.
-        let wall = providerId.hasSuffix("_oauth_direct")
-            ? min(streamGuardConfig.wallTimeout, 300) : streamGuardConfig.wallTimeout
+        // One wall for every route: a provider's name never shortens its clock.
+        let wall = streamGuardConfig.wallTimeout
         guard wall > 0 else {
             return try await ProviderStreamContext.$stallOnly.withValue(true) { try await work() }
         }
@@ -788,7 +738,7 @@ public final class SwiftNativeLLMClient: LLMClient {
         let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
         do {
             try validateCatalogAvailability(resolution)
-            let result = try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in
+            let result = try await withCompletionWall("\(resolution.choice)") { [self] in
                     try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
                         try await LLMCallContext.$surface.withValue(surface) {
                             try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {

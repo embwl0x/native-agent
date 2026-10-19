@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import Experiences
 import PersistenceCore
 
 extension CognitiveSubstrate {
@@ -23,7 +24,51 @@ extension CognitiveSubstrate {
 
     public func recordReceipt(kind: String, payload: JSONValue = .object([:])) async {
         guard configuration.enabled, configuration.persistenceEnabled, let store else { return }
-        try? await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now())
+        do { try await store.appendReceipt(kind: kind, payload: payload, at: dependencies.now()) } catch {
+            // A log line has no resident state to reconcile: it stays an owed
+            // repair until its owner lets it go, without blocking health.
+            oweUnsaved("receipt.\(kind)", error, store: store)
+        }
+    }
+
+    /// The writes whose callers do not take the failure. A failure marks
+    /// persistence degraded under its stage and files one repair naming it;
+    /// the next write of that stage persists the current resident state (the
+    /// truth), which settles the repair and clears the stage. No replay.
+    func notingPersistence(_ stage: String, _ write: () async throws -> Void) async {
+        guard let store else { return }
+        do {
+            try await write()
+            guard unsavedStages.remove(stage) != nil else { return }
+            RepairOwed.settle(Self.dataRoot(of: store), operation: "cognition.persist:" + stage,
+                              evidence: .init(source: "cognition/cognition.sqlite", id: stage))
+            guard unsavedStages.isEmpty, persistenceHealth.failureStage == "unsaved", !persistenceWritesBlocked else { return }
+            persistenceHealth = CognitivePersistenceHealth(
+                status: .healthy, writesBlocked: false,
+                lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
+                lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt)
+        } catch {
+            oweUnsaved(stage, error, store: store)
+            guard !stage.hasPrefix("receipt."), !persistenceWritesBlocked else { return }
+            unsavedStages.insert(stage)
+            persistenceHealth = CognitivePersistenceHealth(
+                status: .degraded, writesBlocked: false,
+                lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
+                lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt,
+                failureStage: "unsaved",
+                failureDetail: bounded("unsaved: \(unsavedStages.sorted().joined(separator: ", ")); last cause: \(error)",
+                                       maxCharacters: 320))
+        }
+    }
+
+    private func oweUnsaved(_ stage: String, _ error: Error, store: CognitiveSQLiteStore) {
+        RepairOwed.owe(Self.dataRoot(of: store), id: "cognition-persist:" + UUID().uuidString.lowercased(), kind: .run,
+                       operation: "cognition.persist:" + stage, owner: "cognition",
+                       words: "Her \(stage) was not saved: \(error.localizedDescription)")
+    }
+
+    private static func dataRoot(of store: CognitiveSQLiteStore) -> URL {
+        store.databaseURL.deletingLastPathComponent().deletingLastPathComponent()
     }
 
     /// Observational surfaces preserve unavailable receipt evidence explicitly.
@@ -39,9 +84,9 @@ extension CognitiveSubstrate {
     }
 
     func persistArtifact(kind: String, id: UUID, status: String, score: Double, payload: JSONValue) async {
-        try? await persistArtifactChecked(
-            kind: kind, id: id, status: status, score: score, payload: payload
-        )
+        await notingPersistence("artifact.\(kind).\(id.uuidString)") {
+            try await persistArtifactChecked(kind: kind, id: id, status: status, score: score, payload: payload)
+        }
     }
 
     func persistArtifactChecked(
@@ -168,7 +213,7 @@ extension CognitiveSubstrate {
     /// artifact — the timeline carries the history — so bounded restores and the global
     /// prune can never crowd out live state with retired rows).
     func deleteArtifactRecord(id: UUID) async {
-        try? await deleteArtifactRecordChecked(id: id)
+        await notingPersistence("artifact.delete.\(id.uuidString)") { try await deleteArtifactRecordChecked(id: id) }
     }
 
     /// Same delete, but a caller that has already changed in-memory state on

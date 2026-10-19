@@ -799,19 +799,7 @@ public struct DelegationOutcomeCursor: Sendable, Equatable {
     /// Atomic write — a torn cursor would either re-card everything or skip a
     /// window, and both are user-visible.
     public func write(to url: URL) throws {
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let data = try toJSON().serializedData(pretty: false)
-        let temp = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try data.write(to: temp)
-        // replaceItemAt REQUIRES an existing destination, so the first write
-        // (the seeding tick — the one that matters most) has to move instead.
-        if FileManager.default.fileExists(atPath: url.path) {
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: temp)
-        } else {
-            try FileManager.default.moveItem(at: temp, to: url)
-        }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(toJSON().serializedData(pretty: false), to: url)
     }
 
     /// Both bridge writers emit `new Date().toISOString()`; the no-fraction

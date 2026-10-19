@@ -54,6 +54,8 @@ extension AttentionRouter {
             if !pending, let modified { retained[path] = modified }
         }
         settledResultFiles = retained
+        let confirmed = iCloudBridge.phoneConfirmedEventIDs(dataRoot: dataRoot)
+        Self.settleKnocks(confirmed: confirmed, dataRoot: dataRoot)
         let total = deliveries.count + helpers.count
         guard total > 0 else {
             resultRetryOffset = 0
@@ -70,7 +72,7 @@ extension AttentionRouter {
             do {
                 if index < deliveries.count {
                     let (path, row, intent) = deliveries[index]
-                    if try await deliverRequestedResult(row: row, intent: intent) {
+                    if try await deliverRequestedResult(row: row, intent: intent, confirmed: confirmed) {
                         if let group = acknowledgements.firstIndex(where: { $0.path == path }) {
                             acknowledgements[group].intents.append(intent)
                         } else {
@@ -82,12 +84,14 @@ extension AttentionRouter {
                     guard let title = entry.conditionNotificationTitle else {
                         throw StandingBotsError.corruptStore("condition notification title unavailable")
                     }
+                    let eventID = "bot_condition:\(entry.id.uuidString)"
+                    let userInfo = ["eventId": eventID, "screen": "activity", "source": "bot_condition", "botId": entry.botId.uuidString]
                     let outcome = try await route(
-                        eventId: "bot_condition:\(entry.id.uuidString)", importance: .requestedResult,
+                        eventId: eventID, importance: .requestedResult,
                         title: TurnSecretRedactor.redactDisplayText(String(title.prefix(160))),
                         body: TurnSecretRedactor.redactDisplayText(String(entry.headline.prefix(500))),
-                        userInfo: ["screen": "activity", "source": "bot_condition", "botId": entry.botId.uuidString])
-                    if outcome.deliveryProjection.reachedAChannel || outcome.deliveryProjection == .previouslyHandled {
+                        userInfo: userInfo)
+                    if Self.settled(outcome, confirmed: confirmed) {
                         try shelf.acknowledge(readerId: ShelfStore.conditionNotificationReaderID, entryIds: [entry.id])
                     }
                 }
@@ -120,7 +124,8 @@ extension AttentionRouter {
             guard case .object(let fields) = row, case .object(let metadata)? = fields["metadata"],
                   case .object(let intent)? = metadata["resultDelivery"], intent["eventId"] == .string(eventID) else { continue }
             if intent["state"] == .string("delivered") { return true }
-            guard try await deliverRequestedResult(row: row, intent: intent, opening: opening) else { return false }
+            guard try await deliverRequestedResult(row: row, intent: intent, opening: opening,
+                confirmed: iCloudBridge.phoneConfirmedEventIDs(dataRoot: dataRoot)) else { return false }
             try await Self.acknowledgeResults([intent], at: path)
             return true
         }
@@ -135,7 +140,11 @@ extension AttentionRouter {
         return intent
     }
 
-    private func deliverRequestedResult(row: JSONValue, intent: [String: JSONValue], opening: String? = nil) async throws -> Bool {
+    /// True once the result is delivered: a transport accepted it, or the
+    /// phone signed its arrival. A hand-off the phone has not confirmed stays
+    /// owed; the router's ledger keeps a retry from sending it twice.
+    private func deliverRequestedResult(row: JSONValue, intent: [String: JSONValue], opening: String? = nil,
+                                        confirmed: Set<String>) async throws -> Bool {
         guard case .string(let eventID)? = intent["eventId"],
               case .string(let sessionID)? = intent["sessionId"],
               case .string(let runID)? = intent["runId"],
@@ -148,16 +157,26 @@ extension AttentionRouter {
         if case .string(let text)? = fields["content"] { content = text } else { content = "" }
         let preview = String(TurnSecretRedactor.redactDisplayText(content)
             .trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))
+        let userInfo = ["eventId": eventID, "source": "requested_result", "screen": "chat",
+                        "sessionId": opening ?? sessionID, "correlationId": runID,
+                        "resultCreatedAt": Self.string(fields["createdAt"])]
         let outcome = try await route(
             eventId: eventID, importance: .requestedResult,
             title: "Result ready",
             body: preview.isEmpty ? "Your result is ready." : preview,
             reason: eventID,
-            userInfo: ["eventId": eventID, "source": "requested_result", "screen": "chat",
-                       "sessionId": opening ?? sessionID, "correlationId": runID,
-                       "resultCreatedAt": Self.string(fields["createdAt"])]
+            userInfo: userInfo
         )
-        return outcome.deliveryProjection.reachedAChannel || outcome.deliveryProjection == .previouslyHandled
+        return Self.settled(outcome, confirmed: confirmed)
+    }
+
+    private static func settled(_ outcome: AttentionOutcome, confirmed: Set<String>) -> Bool {
+        switch outcome.deliveryProjection {
+        case .accepted: return true
+        case .queued, .previouslyHandled:
+            return outcome.knock.map(confirmed.contains) ?? false
+        case .noChannel, .deferred, .failed: return false
+        }
     }
 
     private static func string(_ value: JSONValue?) -> String {

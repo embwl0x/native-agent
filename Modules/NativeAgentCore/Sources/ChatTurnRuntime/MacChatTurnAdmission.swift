@@ -283,24 +283,23 @@ public extension MacChatTurnPresentationPort {
                     occurredAt: Date()
                 ))
                 do {
-                    try await macChatTurns.runAdmittedTurn(sessionID: targetSessionId) {
+                    try await macChatTurns.runAdmittedTurn(sessionID: targetSessionId, turnID: activityIdentity.turnId,
+                                                           runID: enqueuedRunID) {
                         await ChatToolSessionContext.$envelope.withValue(envelope) {
-                            await ChatPersistenceContext.$pinnedTurnRunID.withValue(enqueuedRunID) {
-                                // The user row says who sent it, so a reply to the
-                                // agent's own send never mirrors as User's. No origin
-                                // keeps whatever the caller already bound.
-                                await TurnRequest(message: text, sessionID: targetSessionId, surface: "chat",
-                                    origin: .some(origin ?? ChatPersistenceContext.originProvenance)).bind {
-                                    await runMacChatTurnBody(
-                                        text,
-                                        attachments: attachments,
-                                        sessionId: targetSessionId,
-                                        generation: generation,
-                                        ctx: bodyCtx,
-                                        hideUserBubble: hideUserBubble || enqueuedRunID != nil,
-                                        activityIdentity: activityIdentity
-                                    )
-                                }
+                            // The user row says who sent it, so a reply to the
+                            // agent's own send never mirrors as User's. No origin
+                            // keeps whatever the caller already bound.
+                            await TurnRequest(message: text, sessionID: targetSessionId, surface: "chat",
+                                origin: .some(origin ?? ChatPersistenceContext.originProvenance)).bind {
+                                await runMacChatTurnBody(
+                                    text,
+                                    attachments: attachments,
+                                    sessionId: targetSessionId,
+                                    generation: generation,
+                                    ctx: bodyCtx,
+                                    hideUserBubble: hideUserBubble || enqueuedRunID != nil,
+                                    activityIdentity: activityIdentity
+                                )
                             }
                         }
                     }

@@ -138,10 +138,10 @@ struct MobileHelperEditorView: View {
             if edit.modelPinned != false {
             Picker("Provider", selection: $edit.provider) {
                 Text("Choose").tag("")
-                ForEach(sync.providers.filter { $0.auth_status.state == "ready" }, id: \.provider_id) {
+                ForEach(sync.providers.filter { $0.auth_status.eligible }, id: \.provider_id) {
                     Text($0.display_name).tag($0.provider_id)
                 }
-                if !edit.provider.isEmpty, !sync.providers.contains(where: { $0.provider_id == edit.provider && $0.auth_status.state == "ready" }) {
+                if !edit.provider.isEmpty, !sync.providers.contains(where: { $0.provider_id == edit.provider && $0.auth_status.eligible }) {
                     Text(edit.provider + " · unavailable").tag(edit.provider)
                 }
             }.aliveRow().onChange(of: edit.provider) { old, _ in

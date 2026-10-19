@@ -107,11 +107,11 @@ public enum DeskSequencing {
         return until > now
     }
 
-    /// Parse a defer stamp: a bare `yyyy-MM-dd` UTC day (which means the END of
-    /// that day — an item parked "until 2026-08-05" is still parked during the
-    /// 5th) or a full ISO timestamp.
+    /// Parse a defer stamp: a bare `yyyy-MM-dd` day (which means the END of
+    /// that day in the Mac's zone, whatever its length — an item parked "until
+    /// 2026-08-05" is still parked during the 5th) or a full ISO timestamp.
     public static func parseDeferStamp(_ raw: String) -> Date? {
-        if let d = DeskClock.parseDay(raw) { return d.addingTimeInterval(86_400) }
+        if let d = DeskClock.parseDay(raw) { return Calendar.autoupdatingCurrent.date(byAdding: .day, value: 1, to: d) }
         return DeskClock.parseISO(raw)
     }
 

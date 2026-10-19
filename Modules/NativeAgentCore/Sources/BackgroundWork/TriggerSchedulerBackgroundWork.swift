@@ -214,6 +214,6 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
 
         let active = (fires.compactMap(\.name) + dueJobs).sorted()
         guard !active.isEmpty else { return .skipped(reason: "nothing due") }
-        return .completed(result: "settled \(active.count) due item(s)")
+        return .completed(result: "settled \(active.count) due item(s): \(active.joined(separator: ", "))")
     }
 }

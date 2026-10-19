@@ -25,7 +25,7 @@ public enum ProviderRequestAdmission {
 // LLMClient+AnthropicOAuthRequestBody.swift.
 
 public final class AnthropicOAuthDirectAdapter: LLMAdapter {
-    public static let supportsTools = true
+    public static let toolWire = ProviderToolWire.textMarkers
     public let providerId: String = "anthropic_oauth_direct"
 
     public static let productionSession: URLSession = makeProductionSession()

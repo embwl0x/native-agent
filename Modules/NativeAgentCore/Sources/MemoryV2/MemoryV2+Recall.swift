@@ -4,10 +4,10 @@ import PersistenceCore
 
 extension SwiftNativeMemoryV2 {
 
-    /// Restore the canonical semantic corpus before serving recall. Content
-    /// changes invalidate only that snapshot; keep converging until cancellation.
+    /// Restore the canonical semantic corpus. Content changes invalidate only
+    /// that snapshot; keep converging until cancellation.
     @discardableResult
-    public func reconcileMemoryEmbeddingEpoch() async throws -> MemoryEmbeddingEpochActivationReport? {
+    func reconcileMemoryEmbeddingEpoch() async throws -> MemoryEmbeddingEpochActivationReport? {
         try await ensureCanonicalAttachment()
         guard let embedder else { throw MemoryV2Error.storageUnavailable }
         try await warmUpEmbedder()
@@ -22,6 +22,10 @@ extension SwiftNativeMemoryV2 {
             }
         }
     }
+
+    static let recallCorpusConverging = MemoryV2Error.underlying(
+        "Semantic recall is unavailable: saved memories are being re-embedded for the current memory-search model. MemoryV2 finishes this on its own; retry recall after it does."
+    )
 
     /// Access-signal bump for records served OUTSIDE the recall lane (the
     /// fluid-context serve path, task #42). Same storage write as recall's
@@ -68,14 +72,36 @@ extension SwiftNativeMemoryV2 {
         timings["attachment_ms"] = milliseconds(since: recallStarted)
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try Task.checkCancellation()
+        // Recall reads the published vector space and never builds one: what
+        // is missing is named, and its housekeeping flight requested.
         let epochStarted = ProcessInfo.processInfo.systemUptime
-        let reindexed = try await reconcileMemoryEmbeddingEpoch()
+        guard let residentEpoch = residentEmbeddingEpoch() else {
+            requestEmbeddingEpochReconcile()
+            let failed = embeddingRuntimeSnapshot()?.lastLoadError.map { " Its last load failed: \($0)." } ?? ""
+            throw MemoryV2Error.underlying("Semantic recall is unavailable: the memory-search model is not loaded.\(failed) MemoryV2 loads it on its own; retry recall shortly.")
+        }
+        guard try await memoryEmbeddingEpochState().activeEpoch == residentEpoch.rawValue else {
+            requestEmbeddingEpochReconcile()
+            throw Self.recallCorpusConverging
+        }
         timings["epoch_ms"] = milliseconds(since: epochStarted)
-        timings["reindexed"] = reindexed == nil ? 0 : 1
         let embeddingStarted = ProcessInfo.processInfo.systemUptime
-        let queryEmbedding = try await embedOneWithEpoch(query.text)
+        // The same question in the other voice ("me" → the agent's name,
+        // "you" → the user's), asked alongside the original; a row keeps the
+        // better of its two scores. See MemoryRecallQueryExpansion. Both
+        // voices share one embed, so neither can silently go missing.
+        let storeDirectory = await storage.path.deletingLastPathComponent()
+        let rewritten = MemoryRecallQueryExpansion.rewrite(
+            query.text,
+            names: MemoryRecallQueryExpansion.names(storeDirectory: storeDirectory)
+        )
+        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        let embedded = try await embedder.embedWithEpoch([query.text] + (rewritten.map { [$0] } ?? []))
+        guard let qvec = embedded.vectors.first else {
+            throw MemoryV2Error.underlying("embedder returned no vectors")
+        }
+        let queryEmbedding = (vector: qvec, epoch: embedded.epoch)
         try Task.checkCancellation()
-        let qvec = queryEmbedding.vector
         let topK = max(1, query.topK)
         // Explicit recall judges the bounded corpus in one pass rather than
         // paying for a small window and then judging a refill. Other callers
@@ -92,24 +118,8 @@ extension SwiftNativeMemoryV2 {
         // no direction, so cosine recall would return [] just as surely as a
         // thrown error would.
         let hasUsableVector = !qvec.isEmpty && qvec.contains { $0 != 0 && $0.isFinite }
-        // The same question in the other voice ("me" → the agent's name,
-        // "you" → the user's), asked alongside the original; a row keeps the
-        // better of its two scores. See MemoryRecallQueryExpansion.
-        let storeDirectory = await storage.path.deletingLastPathComponent()
-        let rewritten = MemoryRecallQueryExpansion.rewrite(
-            query.text,
-            names: MemoryRecallQueryExpansion.names(storeDirectory: storeDirectory)
-        )
-        // The other voice costs ONE embedder round-trip per recall, not one
-        // per pass (User, 2026-09-06): computing it inside `retrieve` meant the
-        // refill below asked the Neural Engine for the same rewritten question
-        // a second time, on the exact turns where recall was already short.
-        let rewrittenEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
-        if let rewritten, hasUsableVector {
-            rewrittenEmbedding = try? await embedOneWithEpoch(rewritten)
-        } else {
-            rewrittenEmbedding = nil
-        }
+        let rewrittenEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)? = rewritten != nil
+            && embedded.vectors.count > 1 ? (embedded.vectors[1], embedded.epoch) : nil
         timings["embedding_ms"] = milliseconds(since: embeddingStarted)
         try Task.checkCancellation()
         let canonicalStorage = await storage.underlyingStorage()
@@ -126,9 +136,8 @@ extension SwiftNativeMemoryV2 {
                 return try await read(vector, epoch)
             } catch let error as MemoryStorageError {
                 guard case .embeddingEpochMismatch = error else { throw error }
-                try await reconcileMemoryEmbeddingEpoch()
-                let repaired = try await embedOneWithEpoch(text)
-                return try await read(repaired.vector, repaired.epoch)
+                requestEmbeddingEpochReconcile()
+                throw Self.recallCorpusConverging
             }
         }
         func disclosedRows(_ rows: [ScoredMemoryRecord]) -> [ScoredMemoryRecord] {
@@ -220,21 +229,6 @@ extension SwiftNativeMemoryV2 {
         let sorted = Array(disclosed.sorted { $0.score > $1.score }.prefix(max(0, topK)))
         timings["selection_ms"] = milliseconds(since: selectionStarted)
         timings["results"] = Double(sorted.count)
-        // Dead-lane alarm (2026-07-24): `persona` is an exact-equality filter
-        // over RECORD persona ids (configured agent names). A
-        // caller that hands it a persona SLOT id can never match a row, so the
-        // whole recall lane silently returns nothing. Only fires on the zero-hit
-        // path, at most once per (persona, surface), and only after proving the
-        // persona filter — not disclosure, not an empty store — is to blame.
-        if query.persona != nil, (query.requiresRelevance == true ? scored.isEmpty : sorted.isEmpty) {
-            await reportPersonaRecallStarvation(
-                query: query,
-                personaFilteredCandidateCount: scored.count,
-                embedding: qvec,
-                epoch: queryEmbedding.epoch,
-                storage: storage
-            )
-        }
         // Fire-and-forget access bump: record that these memories were used,
         // AFTER we've computed the answer, WITHOUT awaiting — so recall's read
         // latency is unchanged (Agent's zero-read-cost constraint). This is the
@@ -355,96 +349,6 @@ extension SwiftNativeMemoryV2 {
         guard !tombstoned else { return nil }
         try Task.checkCancellation()
         return record
-    }
-
-    /// Zero-hit path: decide whether the PERSONA FILTER specifically emptied
-    /// this recall, and say so at most once per (persona, surface).
-    ///
-    /// The original probe only proved "the unfiltered store has a candidate",
-    /// which is true in two perfectly healthy situations and made the alarm a
-    /// wolf-cry. Both are now ruled out before anything is logged:
-    ///
-    ///   1. SURFACE DISCLOSURE emptied the recall. `scored` is the
-    ///      persona-filtered, pre-disclosure candidate set. If it is NON-empty
-    ///      the persona filter matched rows just fine and disclosure dropped
-    ///      them — a different subsystem, and not a dead lane. Stay quiet.
-    ///   2. NOTHING DISCLOSABLE exists anyway. The unfiltered probe is run
-    ///      through the SAME `MemoryRecordDisclosurePolicy` gate as the real
-    ///      recall. If no probe row would have been disclosable to this
-    ///      surface/persona, the persona filter cost the caller nothing.
-    ///
-    /// What survives both gates is provable: rows exist, they are disclosable
-    /// here, and the persona filter matched none of them. That is the claim the
-    /// message now makes — it names the record persona ids it actually saw and
-    /// offers the slot-id diagnosis as the leading explanation rather than
-    /// asserting it. (A brand-new agent-name persona with no rows yet is
-    /// observationally identical inside one recall; the once-per-signature memo
-    /// keeps that case to a single line instead of a per-call stream.)
-    private func reportPersonaRecallStarvation(
-        query: MemoryV2RecallRequest,
-        personaFilteredCandidateCount: Int,
-        embedding: [Float],
-        epoch: MemoryEmbeddingEpoch?,
-        storage: MemoryStorageBridge
-    ) async {
-        guard let persona = query.persona else { return }
-        // Gate 1 — the persona filter DID match rows; disclosure emptied the
-        // result. Not this diagnostic's business.
-        guard personaFilteredCandidateCount == 0 else { return }
-        // Bound: a tool loop repeating the same starving recall used to print an
-        // error on every call. Same shape as
-        // ContextFlowCoordinator.PrecoverageFailureReporter — one line per
-        // distinct signature, not one per turn.
-        //
-        // HONEST SCOPE (gpt-5.5 review 2026-07-24 LOW): this bounds the LOG, and
-        // it bounds the probe only once a signature has actually REPORTED — the
-        // insert happens after a disclosable probe row is found. A repeat recall
-        // whose probe keeps finding nothing disclosable (e.g. wrong-vocabulary
-        // persona on a surface with no permitted rows) stays correctly silent but
-        // re-pays the probe each call. Left as-is deliberately: post-2026-07-24
-        // policy `memoryRecallPersonaFilter` always returns nil, so reaching here
-        // at all requires a caller that bypasses the helper with a non-nil
-        // persona — rare enough that memoizing a never-reported signature would
-        // trade a real diagnostic for an imaginary saving.
-        let signature = "\(persona)|\(query.surface ?? "nil")"
-        guard !reportedStarvationSignatures.contains(signature) else { return }
-
-        let probe: [ScoredMemoryRecord]
-        do {
-            probe = try await storage.recall(
-                embedding: embedding,
-                embeddingEpoch: epoch,
-                queryText: query.text,
-                topK: personaStarvationProbeTopK,
-                persona: nil
-            )
-        } catch {
-            return
-        }
-        // Gate 2 — the same disclosure gate the real recall applies, asked with
-        // `personaID: nil` on purpose. `permits` enforces persona equality
-        // ITSELF, so passing the queried persona here would fold the very cause
-        // we are trying to isolate back into the test and make the alarm
-        // unreachable. Nil asks the one question that is left: would SURFACE
-        // disclosure have released this row?
-        let disclosable = probe.filter { scoredRecord in
-            guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
-                return false
-            }
-            return classification.permits(surface: query.surface, personaID: nil)
-        }
-        guard !disclosable.isEmpty else { return }
-
-        let observedPersonaIDs = Set(disclosable.map { $0.record.personaId ?? "nil" }).sorted()
-        reportedStarvationSignatures.insert(signature)
-        emitDiagnostic(
-            "[memory-v2] ERROR persona recall starvation: persona filter "
-            + "\"\(persona)\" (surface \(query.surface ?? "nil")) matched 0 records while "
-            + "\(disclosable.count) disclosable row(s) sit in the store under persona id(s) "
-            + "[\(observedPersonaIDs.joined(separator: ", "))]. Disclosure is not the cause — "
-            + "the persona filter is. Record persona ids are agent names; if \"\(persona)\" is "
-            + "a persona SLOT id, this lane can never fill."
-        )
     }
 
 }

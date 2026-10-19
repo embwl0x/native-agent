@@ -660,6 +660,11 @@ extension SwiftToolDispatcher {
             "matched": .int(Int64(result.matchedCount)),
             "has_more": .bool(result.hasMore),
         ]
+        // Matches and counts cover only what was read: holes qualify them.
+        if !result.historyUnreadable.isEmpty {
+            payload["coverage"] = .string("partial")
+            payload["history_unreadable"] = .array(result.historyUnreadable.map(JSONValue.string))
+        }
         // A damaged amendments file means a correction may be missing from any
         // entry above. Say it here too — an entry read as healthy is exactly how
         // a claim she has already corrected comes back as if it still stood.

@@ -218,7 +218,8 @@ extension CognitiveSubstrate {
     func remindedOfMoment(
         for request: CognitiveCapsuleRequest,
         from read: CognitiveFrozenRead,
-        felt: inout (signals: FeltSignals, fingerprint: FeltLineRender?)?
+        felt: inout (signals: FeltSignals, fingerprint: FeltLineRender?)?,
+        unreadable: inout [String]
     ) async -> CognitiveRecalledMoment? {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
@@ -261,8 +262,10 @@ extension CognitiveSubstrate {
         // boundary the store must apply. A record restricted to one surface
         // must never arrive unbidden on another (review, 2026-09-02: the first
         // cut recalled unfiltered, which let every record through).
-        let moments = await dependencies.recallMoments(
+        let recalled = await dependencies.recallMoments(
             fingerprint.text, Self.remindedOfRecallLimit, request.surface)
+        unreadable += recalled.unreadable
+        let moments = recalled.value
         guard !moments.isEmpty else { return nil }
         // Every moment this lookup SAW gets its feeling recorded, not just the
         // one that speaks — the ordinary recall lane may serve any of them into

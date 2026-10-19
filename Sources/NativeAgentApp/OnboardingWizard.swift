@@ -87,7 +87,7 @@ final class OnboardingWizardState {
             guard generation == providerLoadGeneration else { return }
             providers = refreshed
             providerLoadError = nil
-            let ready = refreshed.filter { $0.auth_status.state == "ready" }
+            let ready = refreshed.filter { $0.auth_status.eligible }
             if let pendingConnectedProviderID,
                let connected = ready.first(where: { $0.provider_id == pendingConnectedProviderID }) {
                 self.pendingConnectedProviderID = nil
@@ -381,6 +381,13 @@ struct OnboardingWizard: View {
         }
         state.profileRepairRecheckOffered = false
         state.profileRepairOnly = false
+        // An unreadable profile on a finished install is its own receipt: no reset offered.
+        if disposition == .profileUnreadable {
+            state.pendingRecoveryNeedsReset = false
+            state.errorMessage = resp.profileUnreadable
+            state.step = .error
+            return
+        }
         if disposition == .reset {
             state.pendingRecoveryNeedsReset = true
             state.errorMessage = "Incomplete persona documents were found. Reset will back them up before onboarding starts again."
@@ -831,7 +838,7 @@ private struct ProviderConnectStep: View {
                             ProviderThenModelPicker.Provider(
                                 id: provider.provider_id,
                                 name: ProviderThenModelPicker.plainProviderName(provider.display_name),
-                                ready: provider.auth_status.state == "ready",
+                                ready: provider.auth_status.eligible,
                                 models: provider.models.map { .init(id: $0.id, name: $0.name) }
                             )
                         },
@@ -880,11 +887,6 @@ private struct ProviderConnectStep: View {
         }
         // The chat model can be set from anywhere, not only this sheet's picker.
         .onChange(of: [appModel.chatProvider, appModel.chatModel]) { updateModelReadiness() }
-    }
-
-    private var agentDisplayName: String {
-        let n = state.agentName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return n.isEmpty ? "Your agent" : n
     }
 
     /// Reload the provider list and reflect whether ANY provider is ready.

@@ -19,13 +19,6 @@ public actor SwiftNativeTrustCenter {
     let persistence: any PersistenceCoreProtocol
     let clock: @Sendable () -> Date
 
-    /// Valid autonomy levels for Swift policy evaluation. Exposed so
-    /// consumers do not duplicate the accepted values.
-    public static let unifiedPolicyAutonomyLevels: Set<String> = [
-        "auto", "draft_auto", "send_approval",
-        "confirm", "destructive_strong", "blocked",
-    ]
-
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
@@ -121,48 +114,6 @@ public actor SwiftNativeTrustCenter {
             return merged
         }
         return normalizedTrustPolicy(saved: merged, defaults: defaults)
-    }
-
-    /// Checked compare-and-set used by the human-approved autonomy promotion
-    /// reconciler. Only the named raw override is changed, and only while its
-    /// locked value remains one of the caller's already-reviewed tiers.
-    public func compareAndSetToolAutonomy(
-        tool: String,
-        expectedCurrentTiers: Set<String>,
-        newTier: String
-    ) async throws -> Bool {
-        let cleanTool = tool.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanTool.isEmpty,
-              !expectedCurrentTiers.isEmpty,
-              Self.unifiedPolicyAutonomyLevels.contains(newTier)
-        else {
-            throw TrustCenterError.invalidRequest
-        }
-
-        let path = trustPolicyPath
-        let defaults = defaultTrustPolicy()
-        return try await persistence.withFileLock(path) {
-            var current = WorkshopPolicyBlockVocabulary.foldToWireKey(
-                try Self.loadRawPolicyChecked(at: path))
-            try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
-            var autonomy: [String: JSONValue]
-            if case .object(let value)? = current["toolAutonomy"] {
-                autonomy = value
-            } else {
-                autonomy = [:]
-            }
-            guard case .string(let lockedTier)? = autonomy[cleanTool],
-                  expectedCurrentTiers.contains(lockedTier)
-            else {
-                return false
-            }
-            autonomy[cleanTool] = .string(newTier)
-            current["toolAutonomy"] = .object(autonomy)
-            try Self.validateAuthorityPolicyShape(current)
-            try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
-            try await persistence.writeJSON(.object(current), to: path)
-            return true
-        }
     }
 
     private var trustPolicyPath: URL {

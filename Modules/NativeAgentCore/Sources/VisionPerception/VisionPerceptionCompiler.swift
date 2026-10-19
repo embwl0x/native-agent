@@ -139,7 +139,9 @@ public struct VisionPerceptionCompiler: Sendable {
             if error is CancellationError { throw error }
             try Task.checkCancellation()
             // Saliency is additive: an ordinary failure retains text and
-            // colour evidence, but cancellation must not publish a frame.
+            // colour evidence, but cancellation must not publish a frame. What
+            // it would have added is unobserved, not absent, and the percept says so.
+            notes.append("saliency layer failed (\(error.localizedDescription)); controls only it would find were not looked for")
         }
         candidates = candidates.filter { isVisible($0.rect) }
         let considered = candidates.count

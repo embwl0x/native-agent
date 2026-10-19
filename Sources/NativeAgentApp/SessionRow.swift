@@ -36,11 +36,6 @@ struct ChatRenameStateMachine: Equatable {
         ended = false
     }
 
-    mutating func syncExternalTitle(_ title: String) {
-        guard !isRenaming else { return }
-        draftTitle = title
-    }
-
     mutating func submit(currentTitle: String) -> EndResult {
         let cleaned = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty, cleaned != currentTitle else { return finish(.cancelled) }

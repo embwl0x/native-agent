@@ -153,7 +153,8 @@ extension SwiftNativeMemoryV2 {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         if try await storage.isTombstoned(content: content) { return true }
-        let embedded = try await embedOneWithEpoch(content)
+        // A cold model leaves the paraphrase check to the owed-vector fill.
+        guard let embedded = try await residentWriteEmbedding(content) else { return false }
         return try await storage.matchesTombstone(embedding: embedded.vector, embeddingEpoch: embedded.epoch)
     }
 
@@ -273,33 +274,38 @@ extension SwiftNativeMemoryV2 {
                 record: record, embedding: nil, embeddingEpoch: nil,
                 insertIfMissing: false, preserveID: id != nil
             ) {
-                await flushDerivedMemoryChanges()
                 return existing
             }
         }
         // Embed ONCE; the same vector serves the semantic tombstone gate and
         // the insert. Wave1 T3: a paraphrase of a deleted claim blocks here at
         // write time (the read path never pays); contradictions score below the
-        // high threshold and are admitted as new information.
-        let embedded = try await embedOneWithEpoch(content)
-        if try await storage.matchesTombstone(
+        // high threshold and are admitted as new information. A cold model
+        // owes the vector instead, and the fill applies the same gate.
+        let embedded = try await residentWriteEmbedding(content)
+        if let embedded, try await storage.matchesTombstone(
             embedding: embedded.vector,
             embeddingEpoch: embedded.epoch
         ) {
             throw MemoryV2Error.underlying("tombstoned: content is a paraphrase of a rejected claim")
         }
+        var admitted = record
+        if embedded == nil {
+            // Saved, admitted only when its vector lands and passes the checks
+            // (under its own id when the caller owns it).
+            admitted.extras = MemoryStorage.owingAdmission(record.extras, preservingID: id != nil)
+        }
         let inserted: MemoryRecord
         if !superseding.isEmpty {
-            inserted = try await storage.insert(record: record, embedding: embedded.vector,
-                                              embeddingEpoch: embedded.epoch, superseding: superseding)
+            inserted = try await storage.insert(record: admitted, embedding: embedded?.vector,
+                                              embeddingEpoch: embedded?.epoch, superseding: superseding)
         } else {
-            guard let admitted = try await storage.admit(
-                    record: record, embedding: embedded.vector, embeddingEpoch: embedded.epoch,
+            guard let saved = try await storage.admit(
+                    record: admitted, embedding: embedded?.vector, embeddingEpoch: embedded?.epoch,
                     insertIfMissing: true, preserveID: id != nil) else { throw MemoryV2Error.storageUnavailable }
-            inserted = admitted
+            inserted = saved
         }
-        await flushDerivedMemoryChanges()
-        return inserted
+        return embedded == nil ? owedVector(inserted) : inserted
     }
 
     /// Convenience tombstone check used by upstream filters (e.g. the chat-fact

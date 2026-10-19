@@ -161,11 +161,12 @@ public actor TurnVolatileArchive {
     // MARK: - Reads
 
     /// run id → the messages that turn sent after its user turn, in order.
-    public func load(sessionId: String) async -> [String: [ArchivedVolatileBlock]] {
-        await sweepOrphansIfDue()
+    /// Aging runs on its own; a history read never waits for it. An archive
+    /// that cannot be read throws: the replay says so instead of looking empty.
+    public func load(sessionId: String) async throws -> [String: [ArchivedVolatileBlock]] {
+        Task { await self.sweepOrphansIfDue() }
         guard let path = pathFor(sessionId: sessionId) else { return [:] }
-        let entries = await readLocked(path: path)
-        return Dictionary(grouping: entries, by: \.runId)
+        return Dictionary(grouping: try await readLocked(path: path), by: \.runId)
             .mapValues { $0.sorted { $0.order < $1.order } }
     }
 
@@ -199,7 +200,7 @@ public actor TurnVolatileArchive {
                     at: directory, withIntermediateDirectories: true
                 )
                 try await persistence.withFileLock(path) {
-                    var entries = await self.readLocked(path: path)
+                    var entries = try await self.readLocked(path: path)
                     entries.removeAll { $0.runId == trimmedRun }
                     entries.append(contentsOf: archivable)
                     if entries.count > Self.maxEntries {
@@ -229,14 +230,18 @@ public actor TurnVolatileArchive {
     public func prune(sessionId: String, keeping: Set<String>) async {
         guard let path = pathFor(sessionId: sessionId),
               FileManager.default.fileExists(atPath: path.path) else { return }
-        try? await persistence.withFileLock(path) {
-            let entries = await self.readLocked(path: path)
-            let kept = entries.filter { keeping.contains($0.runId) }
-            // 2026-09-22: batch the rewrite. Stale rows are never replayed (the
-            // projection matches run ids on replayed user rows), so rewriting
-            // the whole file each time one run slides out is pure churn.
-            guard entries.count - kept.count >= Self.pruneBatch else { return }
-            try? await self.writeLocked(kept, path: path)
+        do {
+            try await persistence.withFileLock(path) {
+                let entries = try await self.readLocked(path: path)
+                let kept = entries.filter { keeping.contains($0.runId) }
+                // 2026-09-22: batch the rewrite. Stale rows are never replayed (the
+                // projection matches run ids on replayed user rows), so rewriting
+                // the whole file each time one run slides out is pure churn.
+                guard entries.count - kept.count >= Self.pruneBatch else { return }
+                try await self.writeLocked(kept, path: path)
+            }
+        } catch {
+            FileHandle.standardError.write(Data("TurnVolatileArchive: prune not done for session \(sessionId): \(error)\n".utf8))
         }
     }
 
@@ -296,11 +301,16 @@ public actor TurnVolatileArchive {
 
     // MARK: - Helpers (called while holding the file lock, except the read in load())
 
-    private func readLocked(path: URL) async -> [ArchivedVolatileBlock] {
-        guard let rows = try? await persistence.readJSONL(path) else { return [] }
-        return rows.compactMap { row in
+    /// A file that cannot be read whole throws, a damaged line or row included:
+    /// neither an invented empty archive nor a reduced one may authorize the
+    /// rewrite that would replace it.
+    private func readLocked(path: URL) async throws -> [ArchivedVolatileBlock] {
+        let read = try await persistence.readJSONLReporting(path)
+        let damaged = CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: path.path])
+        guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine else { throw damaged }
+        return try read.rows.map { row in
             guard case .object(let object) = row,
-                  case .string(let runId)? = object["runId"], !runId.isEmpty else { return nil }
+                  case .string(let runId)? = object["runId"], !runId.isEmpty else { throw damaged }
             let text: String = {
                 if case .string(let value)? = object["text"] { return value }
                 return ""
@@ -319,13 +329,13 @@ public actor TurnVolatileArchive {
                     guard case .object(let change) = entry,
                           case .string(let kind)? = change["kind"],
                           case .string(let name)? = change["name"], !name.isEmpty,
-                          let parsed = LLMToolChange.Kind(rawValue: kind) else { continue }
+                          let parsed = LLMToolChange.Kind(rawValue: kind) else { throw damaged }
                     changes.append(LLMToolChange(kind: parsed, name: name))
                 }
             }
-            // A row that reproduces neither kind of message is dropped rather
-            // than replayed as something it was not.
-            guard !text.isEmpty || !changes.isEmpty else { return nil }
+            // A row that reproduces neither kind of message is damage, never
+            // replayed as something it was not.
+            guard !text.isEmpty || !changes.isEmpty else { throw damaged }
             let recordedAt: String = {
                 if case .string(let value)? = object["recordedAt"] { return value }
                 return ""

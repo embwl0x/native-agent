@@ -10,10 +10,8 @@ import TelegramBot
 import TrustCenter
 
 extension QuietProviderAccount {
-    public init(providerID: String, authState: String, models: [ProviderModelInfo], dataRoot: URL) {
-        let failed = authState == "ready"
-            && LLMProviderStatusFeed.failedTest(providerID: providerID, dataRoot: dataRoot) == "key rejected"
-        self.init(id: providerID, authState: failed ? "needs_reconnect" : authState, models: models.map {
+    public init(providerID: String, authState: String, eligible: Bool, models: [ProviderModelInfo]) {
+        self.init(id: providerID, authState: authState, eligible: eligible, models: models.map {
             QuietProviderModel(
                 id: $0.id,
                 defaultEffort: $0.default_reasoning_effort ?? "high",

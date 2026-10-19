@@ -2,6 +2,7 @@ import Context
 import Foundation
 import KnowledgeGraph
 import MemoryV2
+import NativeAgentCore
 import PersistenceCore
 
 /// The knowledge graph, made REACHABLE instead of dark.
@@ -62,6 +63,45 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
         self.sqlite = dataRoot.appendingPathComponent("memory/memory.sqlite").standardizedFileURL
         self.dataRoot = dataRoot
     }
+
+    /// A chosen edge is spoken only while the memory that last asserted it
+    /// is active, unchanged since compile, and disclosed on this surface; the
+    /// supporting records are read by id with the memory atoms' own rule.
+    func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
+                surface: ContextSurface) async -> ContextTurnExclusion {
+        let owned = Set(generation.sources.lazy.filter { $0.descriptor.owner == Self.owner }.map(\.descriptor.id))
+        let relations = chosen.filter { owned.contains($0.draft.sourceID) }
+        // Compiled before relations recorded their support: unknowable here,
+        // so they wait for the rebuild to republish them.
+        let legacy = relations.filter { atom in !atom.draft.entities.contains { $0.kind == Self.supportKind } }
+        var exclusion = ContextTurnExclusion(atomIDs: Set(legacy.map(\.draft.id)), unverified: legacy.isEmpty ? [] : [
+            ContextDegradedSourceNotice(sourceID: ContextStableID.source(owner: Self.owner, locator: "knowledge-graph"),
+                                        reason: "graph relations compiled by an earlier build wait for the graph rebuild")])
+        let supported = relations.compactMap { atom -> (ContextStoredAtom, String, Date)? in
+            guard let support = atom.draft.entities.first(where: { $0.kind == Self.supportKind }),
+                  support.id != "none", let at = support.id.lastIndex(of: "@") else { return nil }
+            return (atom, String(support.id[..<at]),
+                    NativeMemoryContextProjection.parseDate(String(support.id[support.id.index(after: at)...])) ?? .distantPast)
+        }
+        guard !supported.isEmpty else { return exclusion }
+        do {
+            let records = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).memoryRecords(ids: supported.map(\.1))
+            let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            exclusion.atomIDs.formUnion(supported.lazy.filter { _, id, compiled in
+                !NativeMemoryContextProjection.speakable(byID[id], compiledAt: compiled, on: surface)
+            }.map(\.0.draft.id))
+        } catch {
+            exclusion.atomIDs.formUnion(supported.map(\.0.draft.id))
+            exclusion.unverified.append(ContextDegradedSourceNotice(
+                sourceID: ContextStableID.source(owner: Self.owner, locator: "knowledge-graph"),
+                reason: "graph relations withheld this turn: their memories could not be confirmed (\(error.localizedDescription))"))
+        }
+        return exclusion
+    }
+
+    /// The edge's supporting memory, `id@version`, carried in every atom;
+    /// `none` marks a relation no memory asserted.
+    static let supportKind = "supporting_memory"
 
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
@@ -138,7 +178,7 @@ extension NativeKnowledgeGraphContextProjection {
             }
             let sourceHash = ContextStableID.digest(parts: [schemaVersion] + ordered.map {
                 [self.body($0), $0.objectID, String($0.weight.bitPattern),
-                 String($0.mentionCount), $0.lastSeen ?? ""].joined(separator: "\u{1f}")
+                 String($0.mentionCount), $0.lastSeen ?? "", Self.support($0)].joined(separator: "\u{1f}")
             })
             let descriptor = ContextSourceDescriptor(
                 id: sourceID,
@@ -197,7 +237,7 @@ extension NativeKnowledgeGraphContextProjection {
         // predicate is what the atom SAYS, never how it is found: admitting it
         // here (or as a trigger) would let a generic "who owns what?" pull
         // unrelated edges, which is prompt mass wearing reach's name.
-        let entities = [
+        let entities = [ContextEntity(kind: supportKind, id: Self.support(relation), label: "")] + [
             ContextEntity(
                 kind: ContextCorrectionScope.relationshipEntityKind,
                 id: relation.subjectID,
@@ -231,6 +271,10 @@ extension NativeKnowledgeGraphContextProjection {
             decayState: 1,
             embedding: nil
         )
+    }
+
+    static func support(_ relation: KnowledgeGraphContextRelation) -> String {
+        relation.memoryID.map { $0 + "@" + (relation.memoryVersion ?? "") } ?? "none"
     }
 
     /// Endpoint names only — see the note on `entities`. The predicate is

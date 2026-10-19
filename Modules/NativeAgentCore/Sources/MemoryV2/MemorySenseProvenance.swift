@@ -74,6 +74,5 @@ extension MemoryStorage: SenseMemoryProvenanceSink {
         }
         invalidateRecallCache()
         try await refreshProjectionHooks(ids: changed.map(\.id))
-        await DerivedStateInvalidationCenter.shared.flush()
     }
 }

@@ -185,15 +185,21 @@ public enum MacCrossAppDrag {
 
     public static func isSecureKind(_ kind: String) -> Bool { kind == secureKind }
 
-    public static func destinationIsSecureWords(destination: String) -> String {
-        "\(destination) is a password field. I don't drop anything into a credential box — that one "
-            + "is yours to fill. I haven't raised anything or sent input."
+    /// What this refusal already did, said as it is: a raise that happened
+    /// is never denied.
+    static func effectsSoFar(raised app: String?) -> String {
+        app.map { "I brought \($0) to the front; I sent no input." } ?? "I haven't raised anything or sent input."
     }
 
-    public static func pathCrossesSecureWords(destinationApp: String) -> String {
+    public static func destinationIsSecureWords(destination: String, raised: String? = nil) -> String {
+        "\(destination) is a password field. I don't drop anything into a credential box — that one "
+            + "is yours to fill. " + effectsSoFar(raised: raised)
+    }
+
+    public static func pathCrossesSecureWords(destinationApp: String, raised: String? = nil) -> String {
         "The straight line this drag would travel passes over a password field on the way to "
             + "\(destinationApp), and a drag that crosses one can spring it open or drop into it. "
-            + "I haven't raised anything or sent input. Move the windows apart, or close that "
+            + effectsSoFar(raised: raised) + " Move the windows apart, or close that "
             + "field, and ask me again."
     }
 

@@ -120,7 +120,7 @@ public enum MacControlActionRoutes {
                     switch mcErr {
                     case .unknownAction: return 404
                     case .missingField: return 400
-                    case .sensitivePathDenied, .shellNotWhitelisted: return 403
+                    case .sensitivePathDenied: return 403
                     case .malformedResponse, .ioFailure,
                          .notificationFailed, .applescriptFailed, .appControlFailed,
                          .operation:

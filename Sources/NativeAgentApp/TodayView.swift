@@ -95,14 +95,6 @@ enum TodayPalette {
             ? NSColor(white: 1, alpha: 0.12)
             : NSColor(white: 0, alpha: 0.06)
     })
-    /// 2026-09-12 (User's eye, Agent's read): the waiting card was a third
-    /// surface — a translucent green-grey that let the ground through while
-    /// every other card was opaque slate. One family of surfaces: it wears the
-    /// card's own fill and stroke, and its priority is carried by the teal
-    /// heading (`accent`) and the action beside the line, not by the ground
-    /// under it.
-    static let waitingFill = cardFill
-    static let waitingStroke = cardStroke
     static let hairline = Color.primary.opacity(0.08)
 }
 
@@ -113,7 +105,6 @@ enum TodayMetrics {
     /// at 12pt and a gap before the ring: a folded row says its span, and the
     /// mockup's 64pt only held a single clock.
     static let timeColumnWidth: CGFloat = 122
-    static let rowSpacing: CGFloat = 10
     static let sectionSpacing: CGFloat = 20
     static let topPadding = NativeAgentSpacing.pageTop
     /// EVERY ROW THE SAME HEIGHT. User, 2026-09-02: the column read ragged

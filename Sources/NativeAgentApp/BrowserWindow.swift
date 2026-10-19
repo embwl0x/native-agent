@@ -227,11 +227,11 @@ final class BrowserWindowController: NSObject, ObservableObject {
         if browserOwnerID == runID { browserOwnerID = nil }
     }
 
-    func navigate(_ url: URL, runID: String, ownerID: String? = nil) async throws -> NavResult {
+    func navigate(_ url: URL, runID: String, ownerID: String) async throws -> NavResult {
         ensureWindow()
         guard let webView else { throw BrowserError.notReady }
 
-        // Ownership spans navigation and captures; IPC calls have no owner.
+        // Ownership spans navigation and captures; every navigation has an owner.
         if navDelegate.onFinish != nil || browserOwnerID != ownerID {
             throw BrowserError.busy
         }
@@ -374,10 +374,6 @@ extension BrowserActionRoutes {
 
 private struct AppBrowserRouteEffects: BrowserIPCWindowEffects {
     @MainActor var navigationInProgress: Bool { BrowserWindowController.shared.navigationInProgress }
-    @MainActor func navigateFromIPC(_ url: URL, runID: String) async throws -> BrowserNavigationResult {
-        let result = try await BrowserWindowController.shared.navigate(url, runID: runID)
-        return BrowserNavigationResult(url: result.url, title: result.title, httpStatus: result.httpStatus)
-    }
     @MainActor func click(selector: String) async throws { try await BrowserWindowController.shared.click(selector: selector) }
     @MainActor func fill(selector: String, text: String) async throws { try await BrowserWindowController.shared.fill(selector: selector, text: text) }
     @MainActor func showWindow() { BrowserWindowController.shared.showWindow() }

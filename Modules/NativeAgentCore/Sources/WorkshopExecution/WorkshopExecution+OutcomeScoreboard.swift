@@ -142,15 +142,10 @@ public enum WorkshopOutcomeScoreboard {
     public static let terminalStatuses: Set<String> =
         completedStatuses.union(failedStatuses).union(cancelledStatuses).union(unverifiedStatuses)
 
-    /// UTC ISO-8601 calendar — deterministic week bucketing regardless of host
-    /// timezone (the host TZ must NOT shift which week a Workshop execution lands in).
-    static var isoCalendar: Calendar {
-        var c = Calendar(identifier: .iso8601)
-        c.timeZone = TimeZone(identifier: "UTC")!
-        return c
-    }
+    /// ISO-8601 weeks in the Mac's current zone, the week the person lives in.
+    static var isoCalendar: Calendar { Calendar(identifier: .iso8601) }
 
-    /// Start of the ISO week (Monday 00:00 UTC) containing `date`.
+    /// Start of the ISO week (Monday 00:00 on the Mac's clock) containing `date`.
     public static func weekStart(of date: Date) -> Date {
         let cal = isoCalendar
         let comps = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
@@ -326,7 +321,6 @@ extension WorkshopOutcomeScoreboard {
         let recent = Array(weeks.suffix(window))
         let df = DateFormatter()
         df.calendar = isoCalendar
-        df.timeZone = TimeZone(identifier: "UTC")!
         df.locale = Locale(identifier: "en_US_POSIX")
         df.dateFormat = "yyyy-MM-dd"
 

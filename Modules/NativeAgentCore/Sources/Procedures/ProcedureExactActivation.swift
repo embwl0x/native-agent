@@ -303,6 +303,7 @@ package struct ProcedureExactActivationStatus: Sendable, Equatable {
     let activationArtifactCount: Int
     let corruptActivationArtifactCount: Int
     let activeAutomaticProcedureCount: Int
+    let unreadable: [String]
 }
 
 extension ProcedureArtifactStore {
@@ -421,12 +422,10 @@ extension ProcedureArtifactStore {
     }
 
     package func exactActivationStatusSnapshot() async -> ProcedureExactActivationStatus {
-        let activationsDirectory = root.appendingPathComponent("activations", isDirectory: true)
-        let activationURLs = ((try? FileManager.default.contentsOfDirectory(
-            at: activationsDirectory,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []).filter { $0.pathExtension == "json" }.prefix(1_024)
+        var unreadable: [String] = []
+        let activationURLs = Self.statusListing(
+            root.appendingPathComponent("activations", isDirectory: true), unreadable: &unreadable
+        ).prefix(1_024)
         var validActivations = 0
         var corruptActivations = 0
         for url in activationURLs {
@@ -442,12 +441,9 @@ extension ProcedureArtifactStore {
             validActivations += 1
         }
 
-        let activeDirectory = root.appendingPathComponent("active", isDirectory: true)
-        let activeURLs = ((try? FileManager.default.contentsOfDirectory(
-            at: activeDirectory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )) ?? []).filter { $0.pathExtension == "json" }.prefix(128)
+        let activeURLs = Self.statusListing(
+            root.appendingPathComponent("active", isDirectory: true), unreadable: &unreadable
+        ).prefix(128)
         var active = 0
         for url in activeURLs {
             guard let data = Self.checkedRegularFile(url, maximumBytes: 64 * 1_024),
@@ -455,17 +451,25 @@ extension ProcedureArtifactStore {
                     ProcedureExactActivationPointer.self,
                     from: data
                   ), pointer.validates,
-                  url.deletingPathExtension().lastPathComponent == pointer.procedureID,
-                  (try? await loadActiveExactProcedure(
+                  url.deletingPathExtension().lastPathComponent == pointer.procedureID else {
+                unreadable.append("active/\(url.lastPathComponent): unreadable or invalid pointer")
+                continue
+            }
+            do {
+                _ = try await loadActiveExactProcedure(
                     procedureID: pointer.procedureID,
                     implementationIdentity: pointer.implementationIdentity
-                  )) != nil else { continue }
-            active += 1
+                )
+                active += 1
+            } catch {
+                unreadable.append("active/\(url.lastPathComponent): \(error)")
+            }
         }
         return ProcedureExactActivationStatus(
             activationArtifactCount: validActivations,
             corruptActivationArtifactCount: corruptActivations,
-            activeAutomaticProcedureCount: active
+            activeAutomaticProcedureCount: active,
+            unreadable: unreadable
         )
     }
 

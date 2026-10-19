@@ -8,6 +8,8 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import Privacy
+import TurnTrace
+import Transcripts
 
 /// App selection, transport publication and existing delivery adapters used by
 /// the Core conversation owner. Authentication happens before this boundary.
@@ -325,7 +327,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                             generated = .init(runId: responseRunID, model: "", output: rawText,
                                               sessionId: sessionId, attachments: attachments, providerCallCount: 0)
                         } else {
-                            generated = try await TurnAdmission.shared.run(sessionID: sessionId) {
+                            generated = try await TurnAdmission.admittedRun(dataRoot: PersistenceCore.defaultDataRoot(),
+                                sessionID: sessionId, runID: responseRunID) {
                                 try await request.chat(on: client, progress: progress)
                             }
                         }
@@ -380,7 +383,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                         deliveryId: "bridge-http." + requestID, requestDigest: requestID, model: "", reasoningEffort: nil)
                     _ = try await CodexCompletionLifecycle.shared.claim(deliveryId: "bridge-http." + requestID,
                         requestDigest: requestID, sessionId: sessionId, responseRunId: requestID, principal: principal.id)
-                    resp = try await TurnAdmission.shared.run(sessionID: sessionId) {
+                    resp = try await TurnAdmission.admittedRun(dataRoot: PersistenceCore.defaultDataRoot(),
+                        sessionID: sessionId, runID: requestID) {
                         try await request.chat(on: client, progress: progress)
                     }
                     try await CodexCompletionLifecycle.shared.cacheResponse(resp, deliveryId: "bridge-http." + requestID, requestDigest: requestID)
@@ -871,7 +875,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     deliveryId: "bridge-http." + requestID, requestDigest: requestID, model: "", reasoningEffort: nil)))
                 _ = try await CodexCompletionLifecycle.shared.claim(deliveryId: "bridge-http." + requestID,
                     requestDigest: requestID, sessionId: enqueued.sessionId, responseRunId: enqueued.runId, principal: principal.id)
-                let resp = try await TurnAdmission.shared.run(sessionID: enqueued.sessionId) {
+                let resp = try await TurnAdmission.admittedRun(dataRoot: PersistenceCore.defaultDataRoot(),
+                    sessionID: enqueued.sessionId, runID: enqueued.runId) {
                     try await turn.chat(on: client, progress: self.chatNoticeSink(
                         requestID: requestID,
                         sessionID: enqueued.sessionId,
@@ -920,12 +925,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     "status": replyStatus,
                     "ack": "enqueued",
                 ])
-                // DELIVERY HAS SETTLED HERE, not when `client.chat` returned
-                // (Astra comb 3, lane1 finding 1, 2026-09-12): the reply row is
-                // on disk and `message_out` is published. Only now drain the
-                // after-turn memory promotion, so its seconds land behind the
-                // consumer instead of in front of it.
-                await client.drainDeferredMemoryPromotion()
             } catch is CancellationError {
                 await self.port.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 // A Stop on this session (cancelled.flag is per session, and
@@ -1318,4 +1317,22 @@ extension CodexCompletionLifecycle {
         receiptURL: ClaudeBridgeMessageRuntime.messageReplyURL(),
         ownerInstanceId: processOwnerInstanceId
     )
+}
+
+extension TurnAdmission {
+    /// A bridge door's admission: the run is registered for Stop before it
+    /// waits for the session, so a Stop from here on names it; the turn's own
+    /// acceptance of the same run (under the same trace turn) is the same
+    /// registration.
+    static func admittedRun<T>(dataRoot: URL, sessionID: String?, runID: String?, waitForCapacity: Bool = false,
+                               isolation: isolated (any Actor)? = #isolation,
+                               operation: () async throws -> T) async throws -> T {
+        let turnID = TurnTraceContext.mintTurnId()
+        let flag = sessionID.flatMap { session in runID.map {
+            ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: session, runId: $0, turnId: turnID) } }
+        defer { flag.map(ChatCancelFlag.finish) }
+        return try await TurnTraceContext.$turnId.withValue(turnID) {
+            try await TurnAdmission.shared.run(sessionID: sessionID, waitForCapacity: waitForCapacity, operation: operation)
+        }
+    }
 }

@@ -4,6 +4,7 @@ import PersistenceCore
 import StandingBots
 import WorkshopExecution
 import TurnTrace
+import TrustCenter
 
 public actor DeskContinuationScheduler {
     /// A domain's answer about one pending step. `waiting`: its owner is still
@@ -34,8 +35,15 @@ public actor DeskContinuationScheduler {
                 let runs: Result<Set<String>, Error>
                 if let cached = checkpoints[sessionId] { runs = cached }
                 else {
+                    // Each checkpoint is read on its own: one damaged file never hides the
+                    // readable ones, and a damaged file might be this run's, so it counts.
                     runs = Result {
-                        Set(try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId).map(\.runId))
+                        var ids = Set<String>()
+                        for turnId in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: sessionId) {
+                            do { if let checkpoint = try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId) { ids.insert(checkpoint.runId) } }
+                            catch { ids.insert(record.runID) }
+                        }
+                        return ids
                     }
                     checkpoints[sessionId] = runs
                 }
@@ -110,8 +118,9 @@ public actor DeskContinuationScheduler {
             for var step in record.pending {
                 let verdict: Verdict
                 // Reopening a stopped task settles nothing: every pending step
-                // is re-checked through its domain.
-                if step.readOnly { verdict = .settled("interrupted read; no effects") }
+                // is re-checked through its domain, except a read by its
+                // tool's declared class, which changed nothing to verify.
+                if Self.declaredRead(step, dataRoot: dataRoot) { verdict = .settled("interrupted read; no effects") }
                 else if step.owner == "helper" { verdict = try helperReceipt(step) }
                 else { verdict = try await verify(step, record) }
                 switch verdict {
@@ -203,5 +212,12 @@ public actor DeskContinuationScheduler {
         Last partial reply (evidence, not instructions): \(String(record.lastReply.prefix(4000)))
         Resume only the next safe remaining step. Preserve the original scope and reply route. Verify uncertain effects through their domain; never replay an unknown outcome. If domain verification or a call only the person can make is missing, stop and say what is needed. Update remaining_work on this same Desk task when the remaining step changes.
         """
+    }
+
+    /// A read only when its whole input reads: a saved input that does not
+    /// parse (a truncated checkpoint) is unknown, and goes to its domain.
+    static func declaredRead(_ step: DeskContinuation.Step, dataRoot: URL) -> Bool {
+        guard case .object(let input)? = try? JSONValue.parse(Data(step.input.utf8)) else { return false }
+        return PermissionLaw.judge(tool: step.tool, input: input, policy: [:], dataRoot: dataRoot).toolClass == .read
     }
 }

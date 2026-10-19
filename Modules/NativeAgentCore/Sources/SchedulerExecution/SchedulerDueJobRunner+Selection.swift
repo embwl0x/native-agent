@@ -13,8 +13,8 @@ extension SchedulerDueJobRunner {
     /// until the slow integrity sweep. Startup and source-change reconciliation
     /// still run immediately through BackgroundLoopsManager.
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
-        let rows = try? await schedulerJobs.jobRows()
-        guard let rows else { return nil }
+        // An unreadable inventory has no known crossing; the pass reports it.
+        guard let rows = try? await schedulerJobs.jobRows() else { return nil }
         let nowEpoch = now.timeIntervalSince1970
         var earliestFuture: Double?
         var hasOverdue = false
@@ -205,7 +205,8 @@ extension SchedulerDueJobRunner {
             severity: "important",
             jobId: "nativeagent-nightly-dream",
             itemId: itemId,
-            relatedPaths: paths
+            relatedPaths: paths,
+            presentation: Self.dreamCardPresentation
         )
         _ = try await archiveOlderDreamInboxItems(keeping: itemId)
         _ = await postCycleNotification(

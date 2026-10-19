@@ -42,7 +42,10 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
-        switch await pump.tick() {
+        let pass = await pump.tick()
+        let unknown = pass.unknownTiming.isEmpty ? "" : "; timing unknown for "
+            + pass.unknownTiming.joined(separator: ", ") + " (its next-refresh time is unreadable; set the item's cadence again)"
+        switch pass.outcome {
         case .disabled:
             return .off("Desk autonomy disabled")
         case .organismUnavailable:
@@ -52,7 +55,7 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
         case .resourcePressure:
             return .skipped(reason: "resource pressure")
         case .quiet:
-            return .skipped(reason: "nothing due")
+            return unknown.isEmpty ? .skipped(reason: "nothing due") : .failed(error: "nothing else due" + unknown)
         case .unavailable(let cause):
             return .failed(error: "Workshop storage unavailable: \(cause)")
         case .leaseHeld:
@@ -62,7 +65,7 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
             // lane is broken, not idle. Doctor must see it (GPT-5.6, 2026-09-10).
             return .failed(error: "Desk reservation refused: the attempt could not be persisted")
         case .ran(let status):
-            return .completed(result: "Desk work session \(status.rawValue)")
+            return .completed(result: "Desk work session \(status.rawValue)" + unknown)
         }
     }
 }

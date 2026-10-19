@@ -606,14 +606,6 @@ extension MemoryStatusProjection {
         return EmbeddingsToggleResult(ok: true, error: nil, detail: detail, status: embeddingsStatus(from: result.runtime))
     }
 
-    // DAEMON-DEAD PORT (2026-06-02): configure the managed Swift embedding
-    // runtime's idle-retention mode and return current status.
-    public static func setEmbeddingsMemoryMode(_ mode: String, dataRoot: URL) async throws -> EmbeddingsToggleResult {
-        try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).configureEmbeddingMemoryMode(mode)
-        let status = try await embeddingsStatus(dataRoot: dataRoot)
-        return EmbeddingsToggleResult(ok: true, error: nil, detail: nil, status: status)
-    }
-
 }
 
 public enum EmbeddingPlainCopy {

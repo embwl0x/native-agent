@@ -43,16 +43,26 @@ public struct MakeStudio: Sendable {
         !ref.isEmpty && ref.count <= 40 && ref.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" }
     }
 
-    public func meta(_ ref: String) -> Meta? {
-        guard Self.isRef(ref),
-              let data = try? Data(contentsOf: folder(ref).appendingPathComponent("meta.json")) else { return nil }
-        return try? JSONDecoder().decode(Meta.self, from: data)
+    /// Nil only when the ref has no meta.json; unreadable or damaged meta throws.
+    public func readMeta(_ ref: String) throws -> Meta? {
+        guard Self.isRef(ref) else { return nil }
+        let data: Data
+        do {
+            data = try Data(contentsOf: folder(ref).appendingPathComponent("meta.json"))
+        } catch CocoaError.fileReadNoSuchFile {
+            return nil
+        }
+        return try JSONDecoder().decode(Meta.self, from: data)
     }
 
-    /// The ref with the newest version.
-    public func newestRef() -> String? {
-        let refs = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
-        return refs.compactMap(meta).max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") }?.ref
+    /// The ref with the newest version; nil only when Make holds nothing. An
+    /// unreadable folder or meta throws rather than reading as empty.
+    public func newestRef() throws -> String? {
+        let refs: [String]
+        do { refs = try FileManager.default.contentsOfDirectory(atPath: root.path) }
+        catch CocoaError.fileReadNoSuchFile { return nil }
+        return try refs.filter(Self.isRef).compactMap(readMeta)
+            .max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") }?.ref
     }
 
     /// Copies `file` in as the next version of `ref`, or of a new ref when nil.
@@ -64,7 +74,7 @@ public struct MakeStudio: Sendable {
             if ref.isEmpty {
                 meta = Meta(ref: String(UUID().uuidString.lowercased().prefix(8)), versions: [])
             } else {
-                guard let found = self.meta(ref) else {
+                guard let found = try self.readMeta(ref) else {
                     throw Refusal(reason: "unknown_ref", message: "No Make ref is called \(ref). Leave ref out to start a new one.")
                 }
                 meta = found
@@ -79,26 +89,31 @@ public struct MakeStudio: Sendable {
             meta.versions.append(version)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(meta).write(to: dir.appendingPathComponent("meta.json"), options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(meta), to: dir.appendingPathComponent("meta.json"))
             return (meta.ref, version)
         }
     }
 
-    /// image.generate's images, as versions of `ref` (a new ref when nil or
-    /// unknown). The envelope gains `make_ref`; a failed copy leaves it as it was.
+    /// image.generate's images, as versions of `ref` (a new ref when nil).
+    /// The envelope gains `make_ref` for what landed and `make_failed` for each
+    /// image that did not, with why; a requested ref is never swapped for a new one.
     public static func registerGenerated(_ result: JSONValue, prompt: String, ref: String?, dataRoot: URL) -> JSONValue {
         guard case .object(var response) = result, response["status"] == .string("ok"),
               case .array(let images)? = response["images"] else { return result }
         let studio = MakeStudio(dataRoot: dataRoot)
-        var ref = ref.flatMap { studio.meta($0) == nil ? nil : $0 }
+        var ref = ref, landed = false, failed: [JSONValue] = []
         let model: String? = if case .string(let name)? = response["model"] { name } else { nil }
         for image in images {
-            guard case .object(let row) = image, case .string(let path)? = row["path"],
-                  let added = try? studio.add(URL(fileURLWithPath: path), ref: ref, prompt: prompt, model: model)
-            else { continue }
-            ref = added.ref
+            guard case .object(let row) = image, case .string(let path)? = row["path"] else { continue }
+            do {
+                ref = try studio.add(URL(fileURLWithPath: path), ref: ref, prompt: prompt, model: model).ref
+                landed = true
+            } catch {
+                failed.append(.object(["path": .string(path), "error": .string(error.localizedDescription)]))
+            }
         }
-        if let ref { response["make_ref"] = .string(ref) }
+        if landed, let ref { response["make_ref"] = .string(ref) }
+        if !failed.isEmpty { response["make_failed"] = .array(failed) }
         return .object(response)
     }
 }
@@ -160,6 +175,9 @@ extension MakeStudio {
         private var refs: [String] = []
         public private(set) var newest: MakeStudio.Meta?
         public private(set) var loaded = false
+        /// Why the shelf shows less than the disk holds; the last good
+        /// membership and metadata stand meanwhile, never an empty shelf.
+        public private(set) var fault: String?
         private var studio: MakeStudio?
         private var watcher: FileChangeWatcher?
         private var armed: [URL] = []
@@ -194,22 +212,30 @@ extension MakeStudio {
                     let previous = metadata
                     let previousRefs = refs
                     let fresh = await Task.detached(priority: .utility) {
-                        var refs = previousRefs
+                        var refs = previousRefs, faults: [String] = []
                         if changes.contains(studio.root) {
-                            try? FileManager.default.createDirectory(at: studio.root, withIntermediateDirectories: true)
-                            refs = ((try? FileManager.default.contentsOfDirectory(atPath: studio.root.path)) ?? []).filter(MakeStudio.isRef)
+                            do {
+                                try FileManager.default.createDirectory(at: studio.root, withIntermediateDirectories: true)
+                                refs = try FileManager.default.contentsOfDirectory(atPath: studio.root.path).filter(MakeStudio.isRef)
+                            } catch {
+                                faults.append("\(studio.root.path) could not be read: \(error.localizedDescription)")
+                            }
                         }
                         let membership = Set(refs)
                         var result = previous.filter { membership.contains($0.key) }
                         for ref in refs where result[ref] == nil || changes.contains(studio.folder(ref).appendingPathComponent("meta.json")) {
-                            result[ref] = studio.meta(ref)
+                            do { result[ref] = try studio.readMeta(ref) } catch {
+                                faults.append("\(ref)/meta.json could not be read: \(error.localizedDescription)")
+                            }
                         }
-                        return (result, refs, refs.compactMap { result[$0] }.max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") })
+                        return (result, refs, refs.compactMap { result[$0] }.max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") },
+                                faults.isEmpty ? nil : faults.joined(separator: "; "))
                     }.value
                     guard self.studio?.dataRoot == studio.dataRoot else { continue }
                     if fresh.0 != metadata { metadata = fresh.0 }
                     refs = fresh.1
                     if newest != fresh.2 { newest = fresh.2 }
+                    fault = fresh.3
                     loaded = true
                     rearm(studio)
                 }

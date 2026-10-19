@@ -249,7 +249,7 @@ public struct MaintenanceBackgroundWork: Sendable {
             // A code finding needs a code change: the harness queue holds it
             // for the builder, once per finding, with this pass's digest.
             fileCodeFinding: { proposal in
-                let digest = dataRoot.appendingPathComponent("self_improvement/digests/\(NativeTimestampFormat.utcDay(Date())).md")
+                let digest = dataRoot.appendingPathComponent("self_improvement/digests/\(NativeTimestampFormat.calendarDay(Date())).md")
                 try await HarnessQueue.file(HarnessFinding(
                     key: proposal.findingId, title: proposal.title,
                     summary: proposal.proposedChange + "\nEvidence: " + proposal.evidence,
@@ -781,12 +781,18 @@ private struct OffDiskBackupRunner: LoopRunner {
             return .skipped(reason: "alternate data root")
         }
         let parent = port.offDiskBackupParent()
-        guard FileManager.default.fileExists(atPath: parent.deletingLastPathComponent().path) else {
-            return .skipped(reason: port.unavailableSkipPrefix + "iCloud Drive is off — no off-disk backup")
-        }
+        let port = port
         do {
+            // iCloud Drive reads block on dataless folders: off the pool.
+            let drive = try await VolumeIO.run { () -> (available: Bool, newest: Date?) in
+                guard FileManager.default.fileExists(atPath: parent.deletingLastPathComponent().path) else { return (false, nil) }
+                return (true, try port.offDiskAutomaticBackups(in: parent).first?.date)
+            }
+            guard drive.available else {
+                return .skipped(reason: port.unavailableSkipPrefix + "iCloud Drive is off — no off-disk backup")
+            }
             let now = Date()
-            let newest = try port.offDiskAutomaticBackups(in: parent).first?.date
+            let newest = drive.newest
             let trigger: String
             // Below the daily check interval, so a once-a-day tick never skips a day.
             if let newest, now.timeIntervalSince(newest) < 20 * 60 * 60 {
@@ -1562,7 +1568,7 @@ public struct WeeklySelfImprovementLoop: LoopRunner {
     }
 
     static func todayString(_ date: Date) -> String {
-        NativeTimestampFormat.utcDay(date)
+        NativeTimestampFormat.calendarDay(date)
     }
 }
 
@@ -2024,10 +2030,10 @@ public struct DataRootDiskHygieneCheck: LoopRunner {
         self.fileNotice = fileNotice
     }
 
-    /// Day bucket (UTC yyyy-MM-dd) used as the reservation key so the scan runs
+    /// Day bucket (yyyy-MM-dd) used as the reservation key so the scan runs
     /// at most once per calendar day across every driver.
     static func dayKey(_ date: Date) -> String {
-        NativeTimestampFormat.utcDay(date)
+        NativeTimestampFormat.calendarDay(date)
     }
 
     public func tickOutcome() async -> LoopTickOutcome {

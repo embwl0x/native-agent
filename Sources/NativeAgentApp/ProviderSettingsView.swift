@@ -2,6 +2,7 @@
 // PATCH-2026-05-07: leftover-2 per-surface active provider picker (Mac side)
 import SwiftUI
 import Foundation
+import NativeAgentShared
 import ProviderRouting
 import PersistenceCore
 
@@ -229,7 +230,6 @@ struct ProviderSettingsView: View {
     private static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
     @Environment(AppModel.self) private var appModel
     @State private var providers: [ProviderInfo] = []
-    @State private var failedTests: [String: String] = [:]
     @State private var isLoading = false
     /// A reload asked for while another was in flight. The `isLoading`
     /// guard drops the second call; this makes it run once afterwards so a
@@ -336,7 +336,7 @@ struct ProviderSettingsView: View {
                     // collapsed disclosure, and a chevron labelled "Reconnect"
                     // reads as a heading, not a control. The button shows.
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(provider.auth_status.state == "ready" ? "Reconnect ChatGPT account" : "Sign in with ChatGPT")
+                        Text(provider.auth_status.eligible ? "Reconnect ChatGPT account" : "Sign in with ChatGPT")
                             .font(ShellType.bodySemibold)
                             .foregroundStyle(NativeAgentShell.text)
                         OAuthSignInButton(provider: .chatgpt) {
@@ -360,15 +360,22 @@ struct ProviderSettingsView: View {
 
     @ViewBuilder
     private func accountRow(_ provider: ProviderInfo) -> some View {
-        if provider.auth_status.state != "ready" {
+        if !provider.auth_status.eligible {
             Button {
                 configureSheet = provider
             } label: {
                 HStack {
-                    Text(provider.display_name)
-                        .font(ShellType.rowTitle)
-                        .foregroundStyle(NativeAgentShell.text)
-                        .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(provider.display_name)
+                            .font(ShellType.rowTitle)
+                            .foregroundStyle(NativeAgentShell.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let line = ProviderAccountStateLinePresentation.line(provider.auth_status) {
+                            Text(line)
+                                .font(ShellType.rowDetail).foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
                     Spacer(minLength: 4)
                     Text(provider.auth_modes.contains("api_key") ? "API key" : "Sign in")
                         .font(ShellType.rowDetail)
@@ -389,10 +396,7 @@ struct ProviderSettingsView: View {
                         .font(ShellType.rowTitle)
                         .foregroundStyle(NativeAgentShell.text)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(ProviderAccountStateLinePresentation.line(
-                        state: provider.auth_status.state,
-                        detail: provider.auth_status.detail,
-                        failedTest: failedTests[provider.provider_id]))
+                    Text(ProviderAccountStateLinePresentation.line(provider.auth_status) ?? "")
                         .font(ShellType.rowDetail).foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(provider.auth_modes.map { mode in
@@ -406,11 +410,11 @@ struct ProviderSettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 8)
-                Button(provider.auth_status.state == "ready" ? "Manage" : "Set up") {
+                Button("Manage") {
                     configureSheet = provider
                 }
                 .buttonStyle(.bordered).controlSize(.small)
-                .accessibilityLabel("\(provider.auth_status.state == "ready" ? "Manage" : "Set up") \(provider.display_name)")
+                .accessibilityLabel("Manage \(provider.display_name)")
             }
         }
     }
@@ -463,7 +467,7 @@ struct ProviderSettingsView: View {
                         } else {
                             // One group card, a row per account, hairlines between.
                             AliveGroupCard {
-                                ForEach(providers.sorted { ($0.auth_status.state == "ready" ? 0 : 1, $0.display_name) < ($1.auth_status.state == "ready" ? 0 : 1, $1.display_name) }) { provider in
+                                ForEach(providers.sorted { ($0.auth_status.eligible ? 0 : 1, $0.display_name) < ($1.auth_status.eligible ? 0 : 1, $1.display_name) }) { provider in
                                     accountRow(provider)
                                 }
                             }
@@ -675,7 +679,7 @@ struct ProviderSettingsView: View {
 
             ModelChoiceRow {
             Menu {
-                ForEach(pickerProviders.filter { $0.auth_status.state == "ready" }) { provider in
+                ForEach(pickerProviders.filter { $0.auth_status.eligible }) { provider in
                     // One name per account, page-wide: the Accounts list's own
                     // display name, never a second alias for the same row.
                     Button(provider.display_name) {
@@ -686,7 +690,7 @@ struct ProviderSettingsView: View {
                 let id = activeSurface[lead] ?? "codex"
                 let account = providers.first { $0.provider_id == id }
                 let name = account?.display_name ?? (id.isEmpty ? "Choose an account" : id)
-                let suffix = id.isEmpty || account?.auth_status.state == "ready" ? "" : " · not connected"
+                let suffix = id.isEmpty || account?.auth_status.eligible == true ? "" : " · not connected"
                 Text(name + suffix)
                     .lineLimit(1)
                     .help(name + suffix)
@@ -859,7 +863,6 @@ struct ProviderSettingsView: View {
                 overrideReadFailed = false
             }
             providers = snapshot.providers
-            failedTests = snapshot.failedTests
             rowSet = snapshot.rowSet
             if let catalog = snapshot.catalog {
                 catalogModels = catalog.models
@@ -1220,28 +1223,11 @@ enum ProviderTelegramSettingsButtonPresentation: Equatable {
     }
 }
 
-/// The one line under a configured provider's name.
-///
-/// `auth_status.state == "ready"` means "eligible to dispatch", which is NOT
-/// the same claim as "connected". The oauth-direct readers deliberately return
-/// ready for an access token that has already expired as long as a refresh
-/// token is on file — the refresh itself is unproven until a chat uses it. That
-/// detail is already in the row's own model, so the line states it instead of
-/// replacing it with "Connected · account available".
+/// The one line under an account's name: the row's own words for how far
+/// it is proven (checked, saved and not yet proven, could not check, rejected).
+/// An account nobody has set up has no line, only Set up.
 enum ProviderAccountStateLinePresentation {
-    static func line(state: String, detail: String, failedTest: String? = nil) -> String {
-        guard ProvidersFacade.accountIsReady(state) else { return "Not connected" }
-        if let failedTest { return failedTestLine(failedTest) }
-        // An expired access token with a refresh token on file is normal: it
-        // renews on the next chat. Saying "expired" here sent User to sign in
-        // three times (10-03); a real refresh failure arrives as failedTest.
-        return "Connected · account available"
+    static func line(_ status: ProviderAuthStatus) -> String? {
+        status.eligible || status.state == "rejected" ? status.detail : nil
     }
-
-    /// A signed-in account whose last test failed (`LLMProviderStatusFeed.failedTest`):
-    /// ready to dispatch is not working. Reconnecting is User's, in Manage.
-    static func failedTestLine(_ failure: String) -> String {
-        failure == "key rejected" ? "Key rejected — reconnect" : "Connected · last test failed: \(failure)"
-    }
-
 }

@@ -23,6 +23,19 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
         return MacControlGate.policyForAdmittedFullMac(policy, admitted: authority.admitted)
     }
 
+    /// Raw doors (the phone remote, a bridge) meet the permission law
+    /// here. The person's own Mac workbench is his decision.
+    public func authorize(tool: String, input: [String: JSONValue]) async -> (level: String, reason: String, remedy: JSONValue?)? {
+        guard operatorOrigin == nil else { return nil }
+        do {
+            let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
+            let answer = PermissionLaw.answer(tool: tool, input: input, policy: snapshot.policy, dataRoot: dataRoot)
+            return (answer.level, answer.reason, answer.remedy)
+        } catch {
+            return ("blocked", "trust/policy.json could not be read, so \(tool) cannot be judged: \(error.localizedDescription)", nil)
+        }
+    }
+
 }
 
 extension SystemProcessAdapter {

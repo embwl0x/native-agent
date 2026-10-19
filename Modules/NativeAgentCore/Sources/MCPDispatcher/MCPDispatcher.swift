@@ -5,16 +5,15 @@ import PersistenceCore
 
 // MARK: - Records
 //
-// Subsystem #3 — READ-ONLY MCP query surface + consent ledger storage IO.
+// Subsystem #3 — READ-ONLY MCP query surface.
 //
-// This file owns persisted MCP server/cache/consent records. Live stdio
+// This file owns persisted MCP server and cache records. Live stdio
 // subprocess lifecycle and tool calls are implemented in MCPSubprocess+Process
 // and MCPSubprocess+LiveCache.
 //
 // Storage layout:
 //   <root>/mcp/servers.json            — list of server records
 //   <root>/mcp/cache/tools.json        — dict[server_id, {createdAt, tools:[...]}]
-//   <root>/mcp/consent/ledger.json     — list of consent records
 //
 // JSONValue? carries lossy-extras for fields older/newer records may extend.
 
@@ -83,14 +82,14 @@ public struct MCPServer: Sendable, Equatable {
 }
 
 extension MCPServer {
-    /// Bind consent to execution configuration, executable contents and local
+    /// The server's execution configuration, executable contents and local
     /// interpreter inputs. Display/health updates are not identity.
     public func executionIdentity() throws -> String {
         try executionBinding().identity
     }
 
-    /// The same resolved binding used by stored consent, for per-call Full Mac
-    /// admission which must not create a new standing high-risk grant.
+    /// The pinned binding a call's admission checks, so the call runs what
+    /// was configured.
     public func pinnedExecutionIdentity() throws -> String? {
         let binding = try executionBinding()
         return binding.unpinned ? nil : binding.identity
@@ -402,173 +401,11 @@ extension MCPTool {
     ]
 }
 
-/// One row in the consent ledger. Mirrors `grant_mcp_consent`'s output
-/// shape exactly (id is "<serverId>:<toolName>"; permissions is a sorted
-/// list of permission tokens).
-public struct MCPConsent: Sendable, Equatable {
-    /// Populated by the checked ledger reader, never trusted from disk.
-    var validatedServerIdentity: String?
-    public var id: String                 // "<serverId>:<toolName>"
-    public var serverId: String
-    public var toolName: String
-    public var scope: String              // "server_tool"
-    public var risk: String               // mirrors server.riskClass at grant time
-    public var status: String             // "granted" | "revoked"
-    public var permissions: [String]      // sorted, de-duped at grant time
-    public var argumentSummary: String
-    public var grantedAt: String          // ISO-8601
-    public var updatedAt: String          // ISO-8601
-    public var revokedAt: String?         // ISO-8601 or nil
-    /// True when the grant could not bind every npm package to an offline version.
-    /// Legacy rows without this metadata conservatively decode as unpinned.
-    public var unpinned: Bool
-    public var extras: JSONValue?
-
-    public init(
-        id: String,
-        serverId: String,
-        toolName: String,
-        scope: String = "server_tool",
-        risk: String,
-        status: String,
-        permissions: [String] = [],
-        argumentSummary: String = "",
-        grantedAt: String,
-        updatedAt: String,
-        revokedAt: String? = nil,
-        unpinned: Bool = true,
-        extras: JSONValue? = nil
-    ) {
-        self.id = id
-        self.serverId = serverId
-        self.toolName = toolName
-        self.scope = scope
-        self.risk = risk
-        self.status = status
-        self.permissions = permissions
-        self.argumentSummary = argumentSummary
-        self.grantedAt = grantedAt
-        self.updatedAt = updatedAt
-        self.revokedAt = revokedAt
-        self.unpinned = unpinned
-        self.extras = extras
-    }
-}
-
-extension MCPConsent {
-    static let knownKeys: Set<String> = [
-        "id", "serverId", "toolName", "scope", "risk", "status",
-        "permissions", "argumentSummary", "grantedAt", "updatedAt",
-        "revokedAt", "unpinned",
-    ]
-
-    public init?(json: JSONValue) {
-        guard case .object(let obj) = json else { return nil }
-        func str(_ k: String) -> String {
-            if case .string(let s) = obj[k] ?? .null { return s }
-            return ""
-        }
-        func optStr(_ k: String) -> String? {
-            if case .string(let s) = obj[k] ?? .null { return s }
-            return nil
-        }
-        let idStr = str("id")
-        if idStr.isEmpty { return nil }
-        self.id = idStr
-        self.serverId = str("serverId")
-        self.toolName = str("toolName")
-        self.scope = {
-            let s = str("scope")
-            return s.isEmpty ? "server_tool" : s
-        }()
-        self.risk = str("risk")
-        self.status = str("status")
-        var perms: [String] = []
-        if case .array(let arr) = obj["permissions"] ?? .null {
-            for v in arr {
-                if case .string(let s) = v { perms.append(s) }
-            }
-        }
-        self.permissions = perms
-        self.argumentSummary = str("argumentSummary")
-        self.grantedAt = str("grantedAt")
-        self.updatedAt = str("updatedAt")
-        self.revokedAt = optStr("revokedAt")
-        if let value = obj["unpinned"] {
-            guard case .bool(let flag) = value else { return nil }
-            self.unpinned = flag
-        } else {
-            self.unpinned = true
-        }
-        var extra: [String: JSONValue] = [:]
-        for (k, v) in obj where !MCPConsent.knownKeys.contains(k) {
-            extra[k] = v
-        }
-        self.extras = extra.isEmpty ? nil : .object(extra)
-    }
-
-    /// Serialize to JSONValue matching the legacy grant_mcp_consent
-    /// shape: `permissions` always present (possibly empty), `revokedAt`
-    /// always present (explicit null when nil — Python writes None on grant).
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "serverId": .string(serverId),
-            "toolName": .string(toolName),
-            "scope": .string(scope),
-            "risk": .string(risk),
-            "status": .string(status),
-            "permissions": .array(permissions.map(JSONValue.string)),
-            "argumentSummary": .string(argumentSummary),
-            "grantedAt": .string(grantedAt),
-            "updatedAt": .string(updatedAt),
-            "unpinned": .bool(unpinned),
-        ]
-        obj["revokedAt"] = revokedAt.map(JSONValue.string) ?? .null
-        if case .object(let extra)? = extras {
-            for (k, v) in extra where !MCPConsent.knownKeys.contains(k) {
-                obj[k] = v
-            }
-        }
-        return .object(obj)
-    }
-}
-
-/// Input for `grantConsent` — the subset of fields a caller specifies. The
-/// implementation fills in `grantedAt`, `updatedAt`, derives `id` from
-/// `(serverId, toolName)`, and sorts/dedupes permissions.
-public struct MCPConsentGrant: Sendable, Equatable {
-    public var serverId: String
-    public var toolName: String
-    public var scope: String
-    public var risk: String
-    public var permissions: [String]
-    public var argumentSummary: String
-
-    public init(
-        serverId: String,
-        toolName: String,
-        scope: String = "server_tool",
-        risk: String,
-        permissions: [String] = [],
-        argumentSummary: String = "Consent granted from NativeAgent UI/API."
-    ) {
-        self.serverId = serverId
-        self.toolName = toolName
-        self.scope = scope
-        self.risk = risk
-        self.permissions = permissions
-        self.argumentSummary = argumentSummary
-    }
-}
-
 // MARK: - Errors
 
 public enum MCPDispatcherError: Error, Equatable {
     /// Server id was not found.
     case serverNotFound(String)
-    /// Consent record not found for revocation.
-    case consentNotFound(String)
     /// Caller supplied malformed input.
     case invalidRequest(String)
     /// Storage layer rejected a write or returned a malformed shape.
@@ -589,17 +426,9 @@ public enum MCPDispatcherError: Error, Equatable {
 ///     Swift would race the daemon's defaults-merge logic. Swift's read
 ///     view is just whatever's on disk now.)
 ///   - `<root>/mcp/cache/tools.json` (READ ONLY)
-///   - `<root>/mcp/consent/ledger.json` (READ + WRITE — grant/revoke)
-///
-/// Actor-isolated to serialize concurrent grant/revoke R-M-W against the
-/// same on-disk ledger. Mirrors ApprovalInbox's reentrancy gate.
 public actor SwiftNativeMCPDispatcher {
     let root: URL
     let persistence: any PersistenceCoreProtocol
-    /// Serializes mutating ledger ops (grant/revoke) — see ApprovalInbox
-    /// for the pattern's rationale.
-    private var mutationTail: Task<Void, Never>? = nil
-    var consentServerIdentities: [String: String]?
 
     /// Share server-list reads within the in-actor TTL window.
     private struct _ServersCacheRow: Sendable {
@@ -644,20 +473,6 @@ public actor SwiftNativeMCPDispatcher {
             .appendingPathComponent("mcp", isDirectory: true)
             .appendingPathComponent("cache", isDirectory: true)
             .appendingPathComponent("tools.json")
-    }
-
-    public var consentLedgerPath: URL {
-        root
-            .appendingPathComponent("mcp", isDirectory: true)
-            .appendingPathComponent("consent", isDirectory: true)
-            .appendingPathComponent("ledger.json")
-    }
-
-    /// Successful consent grants and revocations emit events to this trace ledger.
-    public var tracesPath: URL {
-        root
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
     }
 
     // MARK: Read paths
@@ -843,13 +658,16 @@ public actor SwiftNativeMCPDispatcher {
 
     public func listTools(forServer serverId: String) async throws -> [MCPTool] {
         let raw = try await persistence.readJSON(toolsCachePath, ifMissing: .object([:]))
-        guard case .object(let dict) = raw else { return [] }
-        guard case .object(let entry) = dict[serverId] ?? .null else { return [] }
+        // No entry is no tools yet; a cache of the wrong shape is a failed read.
+        let damaged = CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: toolsCachePath.path])
+        guard case .object(let dict) = raw else { throw damaged }
+        guard let row = dict[serverId] else { return [] }
+        guard case .object(let entry) = row else { throw damaged }
         let cachedAt: String? = {
             if case .string(let s) = entry["createdAt"] ?? .null { return s }
             return nil
         }()
-        guard case .array(let tools) = entry["tools"] ?? .null else { return [] }
+        guard case .array(let tools) = entry["tools"] ?? .null else { throw damaged }
         var out: [MCPTool] = []
         out.reserveCapacity(tools.count)
         for t in tools {
@@ -889,370 +707,18 @@ public actor SwiftNativeMCPDispatcher {
         return out.sorted { $0.name < $1.name }
     }
 
-    public func listConsents(forServer serverId: String? = nil) async throws -> [MCPConsent] {
-        var records = try Self.readConsentLedgerChecked(at: consentLedgerPath)
-        if let serverId { records.removeAll { $0.serverId != serverId } }
-        let servers = try await _readServersUncached()
-        var identities: [String: String] = [:]
-        for server in servers where serverId == nil || server.id == serverId {
-            identities[server.id] = try? server.executionIdentity()
-        }
-        consentServerIdentities = identities
-        for index in records.indices {
-            records[index].validatedServerIdentity = identities[records[index].serverId]
-        }
-        // Match list_mcp_consent: sorted by updatedAt DESC (fallback grantedAt).
-        return records.sorted { lhs, rhs in
-            let lkey = lhs.updatedAt.isEmpty ? lhs.grantedAt : lhs.updatedAt
-            let rkey = rhs.updatedAt.isEmpty ? rhs.grantedAt : rhs.updatedAt
-            return lkey > rkey
-        }
-    }
-
     public enum ToolAdmission: Sendable {
         case allowed(risk: String)
-        case revoked
-        case unpinned
-        case requiresApproval(risk: String)
         case pinRequired
-        case unpinnedGrant
     }
 
-    /// Own consent mechanics here; each surface keeps its refusal and cards.
-    public func toolAdmission(
-        server: MCPServer, toolName: String, surface: String, presentsApproval: Bool,
-        fullMacYoloAdmitted: @Sendable (String, String) async -> Bool
-    ) async throws -> ToolAdmission {
-        let consents = try await listConsents(forServer: server.id)
-        let unpinnedGrant = consents.first {
-            $0.toolName == toolName && $0.unpinned
-                && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "granted"
-        }
-        let revoked = consents.contains {
-            $0.toolName == toolName
-                && $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "revoked"
-        }
-        // Chat refuses revocation immediately. UI preserves legacy-grant
-        // refusal ordering before returning its blocked card.
-        if !presentsApproval, revoked { return .revoked }
-        let risk = MCPToolBridge.effectiveRiskClass(
-            serverId: server.id, toolName: toolName,
-            serverRiskClass: server.riskClass, dataRoot: root
-        )
-        if consents.contains(where: {
-            $0.toolName == toolName && MCPToolBridge.consent($0, matchesCurrentEffectiveRisk: risk)
-        }) { return .allowed(risk: risk) }
-        let yoloAdmitted = await fullMacYoloAdmitted("mcp__\(server.id)__\(toolName)", surface)
-        let requiresApproval = MCPToolBridge.riskRequiresApproval(risk)
-        if unpinnedGrant != nil, !yoloAdmitted, requiresApproval { return .unpinned }
-        if revoked { return .revoked }
-        if requiresApproval, !yoloAdmitted { return .requiresApproval(risk: risk) }
-        if yoloAdmitted, try server.pinnedExecutionIdentity() == nil { return .pinRequired }
-        if !requiresApproval || (yoloAdmitted && unpinnedGrant != nil) {
-            let grant = try await grantConsent(MCPConsentGrant(
-                serverId: server.id,
-                toolName: toolName,
-                scope: unpinnedGrant?.scope ?? "server_tool",
-                risk: risk,
-                permissions: unpinnedGrant?.permissions ?? [],
-                argumentSummary: unpinnedGrant != nil && yoloAdmitted
-                    ? "Renewed legacy MCP consent under admitted Full Mac authority using the current resolved implementation."
-                    : (presentsApproval ? "Auto-granted low-risk local Swift MCP call." : "Auto-granted low-risk Swift chat MCP call.")
-            ))
-            if grant.unpinned { return .unpinnedGrant }
-        }
-        return .allowed(risk: risk)
-    }
-
-    // MARK: Mutating paths
-
-    private func runSerialized<T: Sendable>(
-        _ body: @Sendable @escaping () async throws -> T
-    ) async throws -> T {
-        let prior = mutationTail
-        let task = Task<T, Error> {
-            _ = await prior?.value
-            return try await body()
-        }
-        mutationTail = Task { _ = try? await task.value }
-        return try await task.value
-    }
-
-    @discardableResult
-    public func grantConsent(_ grant: MCPConsentGrant) async throws -> MCPConsent {
-        let servers = try await _readServersUncached()
-        guard let server = servers.first(where: { $0.id == grant.serverId }) else {
-            throw MCPDispatcherError.serverNotFound(grant.serverId)
-        }
-        let binding = try server.executionBinding()
-        let serverIdentity = binding.identity
-        let record = try await runSerialized { [persistence, consentLedgerPath, clock] in
-            try await Self._grantImpl(
-                grant: grant,
-                persistence: persistence,
-                ledgerPath: consentLedgerPath,
-                serverIdentity: serverIdentity,
-                unpinned: binding.unpinned,
-                now: Date()
-            )
-        }
-        // Trace parity with the daemon's record_trace,
-        // emitted AFTER the locked ledger write — same ordering as Python.
-        // Best-effort: a trace-append failure must NOT fail the grant (the
-        // daemon's append_jsonl is likewise non-fatal). Mirrors the daemon's
-        // payload exactly: {serverId, toolName, status, permissions}.
-        await emitConsentTrace(
-            kind: "mcp.consent.grant",
-            title: "\(grant.serverId):\(grant.toolName)",
-            payload: [
-                "serverId": .string(grant.serverId),
-                "toolName": .string(grant.toolName),
-                "status": .string("granted"),
-                "permissions": .array(record.permissions.map(JSONValue.string)),
-            ],
-            now: Date()
-        )
-        return record
-    }
-
-    private static func _grantImpl(
-        grant: MCPConsentGrant,
-        persistence: any PersistenceCoreProtocol,
-        ledgerPath: URL,
-        serverIdentity: String,
-        unpinned: Bool,
-        now: Date
-    ) async throws -> MCPConsent {
-        // One path lock spans the ledger transaction across processes and
-        // dispatcher instances; mutationTail only serializes this instance.
-        let work: @Sendable () async throws -> MCPConsent = {
-            let key = "\(grant.serverId):\(grant.toolName)"
-            // Authority data is never tolerant: only an absent ledger means
-            // empty. Corrupt, malformed, or duplicate rows block the mutation
-            // and remain byte-for-byte untouched.
-            let records = try Self.readConsentLedgerChecked(at: ledgerPath)
-            // 2026-09-06: delimiter-bearing IDs can share a legacy display key.
-            // Never replace another server/tool pair's grant to make room.
-            guard !records.contains(where: {
-                $0.id == key && ($0.serverId != grant.serverId || $0.toolName != grant.toolName)
-            }) else {
-                throw MCPDispatcherError.malformedResponse("MCP consent key collides with another server/tool pair")
-            }
-            guard records.contains(where: { $0.id == key }) || records.count < 300 else {
-                throw MCPDispatcherError.malformedResponse("MCP consent ledger is full (300 records); new grants cannot be saved")
-            }
-            let kept = records
-                .filter { $0.id != key }
-                .map { $0.toJSON() }
-            let stamp = isoTimestamp(now)
-            let perms = Array(Set(grant.permissions)).sorted()
-            let summary = String(grant.argumentSummary.prefix(500))
-            var record = MCPConsent(
-                id: key,
-                serverId: grant.serverId,
-                toolName: grant.toolName,
-                scope: grant.scope.isEmpty ? "server_tool" : grant.scope,
-                risk: grant.risk,
-                status: "granted",
-                permissions: perms,
-                argumentSummary: summary,
-                grantedAt: stamp,
-                updatedAt: stamp,
-                revokedAt: nil,
-                unpinned: unpinned,
-                extras: .object(["serverIdentity": .string(serverIdentity)])
-            )
-            record.validatedServerIdentity = serverIdentity
-            var out: [JSONValue] = [record.toJSON()]
-            out.append(contentsOf: kept)
-            try await persistence.writeJSON(.array(out), to: ledgerPath)
-            return record
-        }
-        // withFileLock is available to every persistence conformer.
-        return try await persistence.withFileLock(ledgerPath, work)
-    }
-
-    public func revokeConsent(serverId: String, toolName: String) async throws {
-        try await runSerialized { [persistence, consentLedgerPath, clock] in
-            try await Self._revokeImpl(
-                serverId: serverId,
-                toolName: toolName,
-                persistence: persistence,
-                ledgerPath: consentLedgerPath,
-                now: Date()
-            )
-        }
-        // Trace parity with the daemon's record_trace,
-        // emitted only AFTER a SUCCESSFUL revoke (a .consentNotFound throw above
-        // skips this — matching Python, which raises before record_trace).
-        // Daemon payload: {consentId: key, status: "revoked"}.
-        let key = "\(serverId):\(toolName)"
-        await emitConsentTrace(
-            kind: "mcp.consent.revoke",
-            title: key,
-            payload: [
-                "consentId": .string(key),
-                "status": .string("revoked"),
-            ],
-            now: Date()
-        )
-    }
-
-    /// Append an `mcp.consent.*` event to `<root>/traces/events.jsonl` in the
-    /// daemon's record_trace envelope shape ({id, kind, title, status, payload,
-    /// createdAt}, the retired daemon). Best-effort: never throws — a trace
-    /// write failure must not fail the consent operation (the daemon's
-    /// append_jsonl is non-fatal too). One-sided flock around the append as a
-    /// cross-process precaution (matches DispatchLedger.append); Python's
-    /// append_jsonl is unlocked and relies on POSIX O_APPEND atomicity.
-    private func emitConsentTrace(
-        kind: String,
-        title: String,
-        payload: [String: JSONValue],
-        now: Date
-    ) async {
-        // The envelope-level `status` mirrors the daemon's record_trace, which
-        // pulls `status` out of the payload (defaulting to "ok").
-        var statusStr = "ok"
-        if case .string(let s)? = payload["status"] { statusStr = s }
-        let event: JSONValue = .object([
-            "id": .string(UUID().uuidString),
-            "kind": .string(kind),
-            "title": .string(title),
-            "status": .string(statusStr),
-            "payload": .object(payload),
-            "createdAt": .string(Self.isoTimestamp(now)),
-        ])
-        let tracesURL = tracesPath
-        do {
-            try await appendPathOwnedJSONL(
-                event,
-                to: tracesURL,
-                using: persistence,
-                logLabel: "MCPDispatcher.trace"
-            )
-        } catch {
-            nativeLog("%@",
-                "MCPDispatcher: best-effort consent trace append failed (\(kind) \(title)): \(error)"
-            )
-        }
-    }
-
-    private static func _revokeImpl(
-        serverId: String,
-        toolName: String,
-        persistence: any PersistenceCoreProtocol,
-        ledgerPath: URL,
-        now: Date
-    ) async throws -> Void {
-        // Hold one cross-process lock across the full consent read/mutate/write.
-        let work: @Sendable () async throws -> Void = {
-            let records = try Self.readConsentLedgerChecked(at: ledgerPath)
-            let items = records.map { $0.toJSON() }
-            let key = "\(serverId):\(toolName)"
-            var mutated: [JSONValue] = items
-            var found = false
-            let stamp = isoTimestamp(now)
-            for (idx, item) in items.enumerated() {
-                guard case .object(var obj) = item else { continue }
-                if case .string(let id) = obj["id"] ?? .null, id == key,
-                   obj["serverId"] == .string(serverId),
-                   obj["toolName"] == .string(toolName) {
-                    obj["status"] = .string("revoked")
-                    obj["revokedAt"] = .string(stamp)
-                    obj["updatedAt"] = .string(stamp)
-                    mutated[idx] = .object(obj)
-                    found = true
-                    break
-                }
-            }
-            if !found {
-                throw MCPDispatcherError.consentNotFound(key)
-            }
-            try await persistence.writeJSON(.array(mutated), to: ledgerPath)
-        }
-        // Uniform locking (L7, 2026-08-01): `withFileLock` is a
-        // PersistenceCoreProtocol EXTENSION (PersistenceCore+FileLock.swift:4), so
-        // every conformer already has it. The old downcast to
-        // SwiftNativePersistenceCore only had the effect of running this critical
-        // section UNLOCKED for any other conformer.
-        try await persistence.withFileLock(ledgerPath, work)
-    }
-
-    /// Checked authority-store read. General persistence reads intentionally
-    /// tolerate missing/corrupt informational projections, but consent is an
-    /// authorization ledger: treating unreadable authority as an empty list
-    /// would silently change the meaning of the store.
-    nonisolated static func readConsentLedgerChecked(at path: URL) throws -> [MCPConsent] {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: path.path) else { return [] }
-        let data: Data
-        do {
-            data = try Data(contentsOf: path)
-        } catch {
-            throw MCPDispatcherError.unavailable(
-                underlying: "MCP consent ledger is unreadable: \(error.localizedDescription)"
-            )
-        }
-        let raw: JSONValue
-        do {
-            raw = try JSONValue.parse(data)
-        } catch {
-            throw MCPDispatcherError.malformedResponse("MCP consent ledger contains invalid JSON")
-        }
-        guard case .array(let items) = raw else {
-            throw MCPDispatcherError.malformedResponse("MCP consent ledger must be a JSON array")
-        }
-        guard items.count <= 300 else {
-            throw MCPDispatcherError.malformedResponse("MCP consent ledger exceeds 300 records")
-        }
-
-        var records: [MCPConsent] = []
-        records.reserveCapacity(items.count)
-        var seen = Set<String>()
-        for (index, item) in items.enumerated() {
-            guard let record = strictConsent(item), seen.insert(record.id).inserted else {
-                throw MCPDispatcherError.malformedResponse(
-                    "MCP consent ledger has malformed or duplicate row at index \(index)"
-                )
-            }
-            records.append(record)
-        }
-        return records
-    }
-
-    private nonisolated static func strictConsent(_ json: JSONValue) -> MCPConsent? {
-        guard case .object(let object) = json,
-              let record = MCPConsent(json: json),
-              !record.serverId.isEmpty,
-              !record.toolName.isEmpty,
-              record.id == "\(record.serverId):\(record.toolName)",
-              !record.scope.isEmpty,
-              !record.risk.isEmpty,
-              ["granted", "revoked"].contains(record.status),
-              !record.grantedAt.isEmpty,
-              !record.updatedAt.isEmpty,
-              case .string? = object["argumentSummary"],
-              case .string? = object["scope"],
-              case .string? = object["risk"],
-              case .string? = object["status"],
-              case .string? = object["grantedAt"],
-              case .string? = object["updatedAt"] else { return nil }
-        // Pre-Swift consent rows may omit `permissions`, whose established
-        // decode meaning is the safe empty list. If present, the field must be
-        // a string array; malformed authority is never compact-mapped away.
-        if let permissions = object["permissions"] {
-            guard case .array(let values) = permissions,
-                  values.allSatisfy({ if case .string = $0 { return true }; return false })
-            else { return nil }
-        }
-        if let revokedAt = object["revokedAt"] {
-            switch revokedAt {
-            case .null, .string: break
-            default: return nil
-            }
-        }
-        return record
+    /// Whether this server's implementation is pinned, so the call runs what
+    /// was configured. Authority is the turn's gate (posture x the tool's
+    /// declared class); no consent record or risk spelling decides here.
+    public func toolAdmission(server: MCPServer, toolName: String) throws -> ToolAdmission {
+        guard try server.pinnedExecutionIdentity() != nil else { return .pinRequired }
+        return .allowed(risk: MCPToolBridge.effectiveRiskClass(
+            serverId: server.id, toolName: toolName, serverRiskClass: server.riskClass, dataRoot: root))
     }
 
     // MARK: Helpers
@@ -1260,13 +726,7 @@ public actor SwiftNativeMCPDispatcher {
     /// Match Python's `now_iso()`: ISO-8601 with fractional seconds, `+00:00`
     /// suffix (not `Z`). Shared with ApprovalInbox's stamp format.
     nonisolated static func isoTimestamp(_ date: Date) -> String {
-        let fmt = ISO8601DateFormatter()
-        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let zulu = fmt.string(from: date)
-        if zulu.hasSuffix("Z") {
-            return String(zulu.dropLast()) + "+00:00"
-        }
-        return zulu
+        NativeTimestampFormat.fractionalUTCOffset(date)
     }
 
     // MARK: Data root resolution (delegated to PersistenceCore)

@@ -146,18 +146,6 @@ struct TextMarkerCodec: Sendable {
             in: text, toolNames: catalogNames.union(turnActiveTools), parseInvoke: true)
     }
 
-    /// A call-free round that is in-progress-shaped ("reading the README
-    /// now") or names a call it never made (`**Tool: desk_read**` as the whole
-    /// reply). Only a turn with tools can break that promise.
-    func promisesUnfulfilledWork(_ text: String) -> Bool {
-        !catalogNames.isEmpty
-            && (ToolCallParser.looksLikeUnfulfilledActionPromise(text)
-                || ToolCallParser.looksLikeNarratedToolInvocation(
-                    text,
-                    knownToolNames: catalogNames.union(turnActiveTools)
-                ))
-    }
-
     // MARK: - Catalog carrier
 
     /// Places the lazy tool contract ahead of volatile recall/history so the

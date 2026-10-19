@@ -91,6 +91,19 @@ extension SwiftToolDispatcher {
         default:
             throw ContextExpansionError.invalidCharacterOffset
         }
+        // Expansion re-checks the one atom it opens, as the choice did: an atom
+        // its owner retired or narrowed since the turn began is not opened.
+        let withheld = await prepared.verify(pointer)
+        if !withheld.atomIDs.isEmpty {
+            let why = withheld.unverified.map(\.reason).joined(separator: "; ")
+            return .object([
+                "status": .string("failed"),
+                "reason": .string("context_atom_withheld"),
+                "message": .string(why.isEmpty
+                    ? "This item is no longer available to this turn: its owner retired or narrowed it since the turn began."
+                    : why),
+            ])
+        }
         let result = try ContextExpander().expand(
             pointer,
             for: prepared.need,

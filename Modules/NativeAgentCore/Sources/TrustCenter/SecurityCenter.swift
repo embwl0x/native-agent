@@ -87,13 +87,15 @@ public actor SwiftNativeSecurityCenter {
     }
 
     public func status(limit: Int = 8) async throws -> SecurityCenterStatus {
+        // The history is the audit's evidence: "ready" only when it reads.
+        let history: Result<[JSONValue], any Error>
+        do { history = .success(try await persistence.tailJSONL(auditReceiptsPath, limit: limit, maxBytes: 512 * 1024)) }
+        catch { history = .failure(error) }
+        let recent = ((try? history.get()) ?? []).compactMap(Self.receiptSummary)
         let policy: [String: JSONValue]
         do {
             policy = try await trustCenter.loadTrustPolicyChecked()
         } catch {
-            let receipts = (try? await persistence.tailJSONL(
-                auditReceiptsPath, limit: limit, maxBytes: 512 * 1024
-            )) ?? []
             return SecurityCenterStatus(
                 status: "blocked",
                 mode: "unavailable",
@@ -108,25 +110,20 @@ public actor SwiftNativeSecurityCenter {
                     status: "blocked",
                     detail: "Saved authority state is unavailable: \(error.localizedDescription)",
                     enabled: false
-                )],
-                recentReceipts: receipts.compactMap(Self.receiptSummary)
+                ), Self.auditFlag(enabled: true, history: history)],
+                recentReceipts: recent
             )
         }
         let security = Self.object(policy["securityPolicy"])
         let permission = Self.string(policy["permissionLevel"]) ?? "balanced"
         let developerMode = Self.bool(policy["developerMode"], default: false)
         let fullMac = Self.fullMacActive(policy: policy)
-        let receipts = (try? await persistence.tailJSONL(auditReceiptsPath, limit: limit, maxBytes: 512 * 1024)) ?? []
-        let recent = receipts.compactMap(Self.receiptSummary)
         let trustedOrigins = try await trustedOriginCount()
         let killSwitch = Self.bool(security["killSwitchEnabled"], default: false)
-        let auditEnabled = Self.bool(security["auditReceiptsEnabled"], default: true)
         let flags = [
             SecurityStatusFlag(
                 // What this row reads is `killSwitchEnabled`, so it is named
-                // and switched by that. (It was titled "Security Center" and
-                // claimed the per-action check, which `capability_policy`
-                // below also claims.)
+                // and switched by that.
                 id: "security_center",
                 title: "Kill Switch",
                 status: killSwitch ? "blocked" : "off",
@@ -134,77 +131,20 @@ public actor SwiftNativeSecurityCenter {
                 enabled: true
             ),
             SecurityStatusFlag(
-                id: "capability_policy",
-                title: "Capability Policy",
-                status: "ready",
-                detail: "I check how risky each action is before it runs.",
-                enabled: Self.bool(security["capabilityPolicyEnabled"], default: true)
-            ),
-            SecurityStatusFlag(
                 id: "origin_trust",
                 title: "Origin Trust",
                 status: trustedOrigins > 0 ? "ready" : "limited",
-                detail: trustedOrigins > 0 ? "\(trustedOrigins) approved remote trust \(trustedOrigins == 1 ? "entry" : "entries") across Telegram, Slack, and paired phones. Each request still needs origin verification." : "No approved remote trust entries. Remote requests need origin verification before risky actions run.",
-                enabled: Self.bool(security["originTrustEnabled"], default: true)
+                detail: trustedOrigins > 0 ? "\(trustedOrigins) approved remote trust \(trustedOrigins == 1 ? "entry" : "entries") across Telegram, Slack, and paired phones. Each request still needs origin verification." : "No approved remote trust entries. A remote request nobody verified can read; anything else it asks for waits for you.",
+                enabled: true
             ),
             SecurityStatusFlag(
                 id: "signed_remote_commands",
                 title: "Signed Remote Commands",
                 status: "ready",
-                detail: "Anything risky sent from your iPhone must carry a signature only your paired devices can produce.",
+                detail: "With strict signing on, a trusted remote request also needs a signature only your paired devices can produce before it changes anything; otherwise it waits for you.",
                 enabled: Self.bool(security["signedRemoteCommandsRequired"], default: true)
             ),
-            SecurityStatusFlag(
-                id: "prompt_injection_shield",
-                title: "Prompt-Injection Shield",
-                status: "ready",
-                detail: "Text I read from files, pages, and messages is checked for hidden instructions trying to redirect me.",
-                enabled: Self.bool(security["promptInjectionShieldEnabled"], default: true)
-            ),
-            SecurityStatusFlag(
-                id: "danger_gates",
-                title: "Danger Gates",
-                status: (developerMode || fullMac) ? "armed" : "ready",
-                detail: developerMode
-                    ? "Developer Mode is on, so I am allowed to take destructive actions on this Mac."
-                    : (fullMac
-                        ? "Full Mac allows file and app access, shell commands, moving files to the Trash, "
-                          + "and system control until you turn it off. Trust origin checks and macOS permissions still apply."
-                        : "Destructive actions on this Mac are blocked."),
-                enabled: Self.bool(security["dangerGatesEnabled"], default: true)
-            ),
-            SecurityStatusFlag(
-                id: "rollback_by_default",
-                title: "Rollback By Default",
-                status: "ready",
-                detail: "Anything that writes or deletes is expected to leave a restore point first.",
-                enabled: Self.bool(security["rollbackByDefault"], default: true)
-            ),
-            SecurityStatusFlag(
-                id: "secret_firewall",
-                title: "Secret Firewall",
-                status: "ready",
-                detail: "Passwords and keys are hidden from the activity log and blocked from leaving your Mac.",
-                enabled: Self.bool(security["secretFirewallEnabled"], default: true)
-            ),
-            SecurityStatusFlag(
-                id: "skill_tool_signing",
-                title: "Skill/Tool Signing",
-                status: "ready",
-                detail: "Tools are signed; an unsigned tool that could do damage is not allowed to run.",
-                enabled: Self.bool(security["toolSigningRequired"], default: true)
-            ),
-            SecurityStatusFlag(
-                id: "audit_receipts",
-                title: "Audit Receipts",
-                status: auditEnabled ? "ready" : "off",
-                // Sweep R4 C9: was the raw filesystem path, which the panel
-                // already renders on its own line directly below the flags.
-                detail: auditEnabled
-                    ? "A record of every gated action is kept on this Mac so you can check what ran."
-                    : "Recording is off, so gated actions are not being logged.",
-                enabled: auditEnabled
-            ),
+            Self.auditFlag(enabled: Self.bool(security["auditReceiptsEnabled"], default: true), history: history),
         ]
         return SecurityCenterStatus(
             status: killSwitch ? "blocked" : "ready",
@@ -217,6 +157,20 @@ public actor SwiftNativeSecurityCenter {
             flags: flags,
             recentReceipts: recent
         )
+    }
+
+    private static func auditFlag(enabled: Bool, history: Result<[JSONValue], any Error>) -> SecurityStatusFlag {
+        let detail: String
+        let status: String
+        switch (enabled, history) {
+        case (false, _):
+            (status, detail) = ("off", "Recording is off, so gated actions are not being logged.")
+        case (true, .failure(let error)):
+            (status, detail) = ("failed", "security/audit.jsonl did not read (\(error.localizedDescription)), so I cannot show what was recorded.")
+        case (true, .success):
+            (status, detail) = ("ready", "The record of gated actions on this Mac reads back, so you can check what ran.")
+        }
+        return SecurityStatusFlag(id: "audit_receipts", title: "Audit Receipts", status: status, detail: detail, enabled: enabled)
     }
 
     public func evaluateTool(
@@ -257,14 +211,11 @@ public actor SwiftNativeSecurityCenter {
     ) async throws -> SecurityToolEnvelope {
         let policy = snapshot.policy
         let security = Self.object(policy["securityPolicy"])
-        let developerMode = Self.bool(policy["developerMode"], default: false)
-        let filePolicy = Self.object(policy["filePolicy"])
-        let connectorPolicy = Self.object(policy["connectorPolicy"])
         let fullMac = Self.fullMacActive(policy: policy)
         let canonicalTool = Self.policyToolName(tool)
         let trustedRoots = Self.trustedWorkspaceRoots(
             policy: policy,
-            filePolicy: filePolicy,
+            filePolicy: Self.object(policy["filePolicy"]),
             dataRoot: dataRoot
         )
         let profile = Self.profile(
@@ -279,31 +230,20 @@ public actor SwiftNativeSecurityCenter {
         // trust from generation B, authorizing a combination that never
         // existed. Connector-owned Telegram/Slack allowlists remain live reads
         // from their own authority domains.
-        let originAssessment = try await assessOrigin(origin, policy: policy)
+        var originAssessment = try await assessOrigin(origin, policy: policy)
+        // A bridge turn from a peer the person trusts is authenticated by that
+        // trust: no untrusted peer among the turn's sources, verified identity bound.
+        if PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface), origin.userId != nil,
+           CapabilityLifecycle.turnWriteCheck()() == nil {
+            originAssessment = OriginAssessment(trusted: true, reason: "a peer the person trusts", isRemote: true)
+        }
         let fullMacYoloAuthority = Self.fullMacYoloAuthority(
-            tool: tool,
-            surface: origin.surface,
             originAssessment: originAssessment,
             snapshot: snapshot
         )
-        let trustedLocalAgentBridge =
-            Self.localAgentBridgeToolNames.contains(canonicalTool)
-            && (!originAssessment.isRemote || originAssessment.trusted)
-        // ACCEPTED RISK (2026-07-21 audit, LOW): the trusted-remote half of
-        // this carve means an allowlisted Telegram GROUP member's injected
-        // text, relayed by Agent into an invoke payload, skips the injection
-        // shield. Kept deliberately: the waiver is pinned behavior
-        // (SecurityCenter_allows_trustedTelegramCodexMessageWithPATTaskSpec)
-        // for the operator's DM-only surface, the shield still fires on
-        // flagged payloads from UNtrusted origins, and post-2026-07-21 a
-        // security .ask routes to a real approval instead of a dead deny —
-        // so flipping this to local-only is a one-line change if group
-        // surfaces ever join the allowlist.
-        let (toolClass, law, autonomyLevel, autonomyReason, autonomyRemedy) = PermissionLaw.answer(
-            tool: tool, input: input, policy: policy, saved: snapshot.userConfiguredAutonomyOverrides,
-            dataRoot: dataRoot, roots: trustedRoots, capabilities: profile.capabilities)
-        let promptInjectionKeys = Self.promptInjectionKeys(in: .object(input))
-        let secretKeys = Self.secretKeys(in: .object(input))
+        // The one decision: User's posture and the class the call declares.
+        let (toolClass, autonomyLevel, autonomyReason, autonomyRemedy) = PermissionLaw.answer(
+            tool: tool, input: input, policy: policy, dataRoot: dataRoot, roots: trustedRoots, capabilities: profile.capabilities)
         // W2/W3-FIX-R2 2 — `redactedInputPreview` is PERSISTED to
         // security/audit.jsonl by `record`, and this class's own redactor only
         // catches secret-NAMED keys and secret-SHAPED strings. The literal
@@ -316,10 +256,6 @@ public actor SwiftNativeSecurityCenter {
         let redacted = Self.redactValue(
             .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
         )
-        let signedToolKnown = try isSignedOrBuiltinTool(canonicalTool)
-        let rollbackRequired = profile.capabilities.contains("filesystem_write")
-            || profile.capabilities.contains("filesystem_delete")
-            || profile.capabilities.contains("destructive")
         let auditEnabled = Self.bool(security["auditReceiptsEnabled"], default: true)
 
         var decision = SecurityToolDecision.allow
@@ -329,262 +265,37 @@ public actor SwiftNativeSecurityCenter {
         if !originAssessment.trusted {
             reasons.append(.init(.origin, originAssessment.reason))
         }
-        if rollbackRequired && Self.bool(security["rollbackByDefault"], default: true) {
-            reasons.append(.init(.note, "A restore point is required before changing or deleting files."))
-        }
-        // USER 2026-08-12 — YOLO: an unknown/unsigned tool signature is recorded
-        // as a NOTE, not a block. It was denying her own built-in Mac tools
-        // (legacy app focus tool) on his machine. Trust Center categories + Full Mac +
-        // the macOS TCC grant remain the real gates.
-        if !signedToolKnown {
-            reasons.append(.init(.note, "This tool’s signature is unknown; it can still run."))
-        }
-        if !promptInjectionKeys.isEmpty {
-            reasons.append(.init(.note, "Possible hidden instructions were found in \(promptInjectionKeys.joined(separator: ", "))."))
-        }
-        if !secretKeys.isEmpty {
-            reasons.append(.init(.note, "Possible passwords or keys were hidden in \(secretKeys.joined(separator: ", "))."))
-        }
 
-        if Self.bool(security["killSwitchEnabled"], default: false),
-           !Self.catalogToolNames.contains(canonicalTool) {
+        if Self.bool(security["killSwitchEnabled"], default: false) {
             decision = .block
             reasons.append(.init(.cause, "trust/policy.json securityPolicy.killSwitchEnabled=true stops this action."))
             remedy = Repair.why(owner: "trust/policy.json securityPolicy.killSwitchEnabled", tap: "Trust > Access > Security Center > Pause everything")
         }
 
         // Safe changes nothing on User's side of the line (the law).
-        if decision != .block, law == "blocked" {
+        if decision != .block, autonomyLevel == "blocked" {
             decision = .block
             reasons.append(.init(.cause, autonomyReason))
         }
 
-        if enforceAutonomy, decision != .block {
-            switch autonomyLevel {
-            case "blocked":
-                decision = .block
-                reasons.append(.init(.cause, autonomyReason))
-            case "send_approval", "confirm", "destructive_strong":
-                if !Self.notificationToolNames.contains(canonicalTool),
-                   !Self.catalogToolNames.contains(canonicalTool),
-                   !profile.capabilities.contains("approval_stage") {
-                    decision = Self.maxDecision(decision, .ask)
-                    reasons.append(.init(.cause, autonomyReason))
-                }
-            default:
-                break
-            }
-        }
-
-        // A raw user `blocked` override is a hard authority decision, not an
-        // autonomy ask. Keep it effective even when a composed caller asks
-        // SecurityCenter to leave ordinary autonomy resolution to an outer
-        // gate (`enforceAutonomy == false`).
-        if decision != .block,
-           fullMacYoloAuthority.state == .explicitlyBlocked || profile.capabilities.contains(where: {
-               SwiftNativeTrustCenter.hasExplicitBlockOverride($0, overrides: snapshot.userConfiguredAutonomyOverrides)
-           }) {
-            decision = .block
-            let names = [canonicalTool, tool] + Array(profile.capabilities) + [GatedToolNameContext.rawSpelling(of: tool)].compactMap { $0 }
-            let entries = snapshot.userConfiguredAutonomyOverrides.keys.filter { key in
-                key != "default" && snapshot.userConfiguredAutonomyOverrides[key] == .string("blocked")
-                    && names.contains { SwiftNativeTrustCenter.fnmatch(name: $0, pattern: key) }
-            }.sorted()
-            let owner = "trust/policy.json " + entries.map { "toolAutonomy[\($0)]=blocked" }.joined(separator: ", ")
-            reasons.append(.init(.cause, owner + " stops this action."))
-            remedy = Repair.why(owner: owner,
-                tap: entries.map { "Trust > Access and policy > Saved tool permissions > \($0) > Use posture" }.joined(separator: "; "))
+        if enforceAutonomy, decision != .block, ["send_approval", "confirm", "destructive_strong"].contains(autonomyLevel) {
+            decision = .ask
+            reasons.append(.init(.cause, autonomyReason))
         }
 
         // Full Mac is authority selected by the trusted operator; it is not an
-        // authentication mechanism for an inbound sender. An origin that the
-        // canonical surface owner did not admit must never inherit that local
-        // authority, even when the requested tool is classified below high
-        // risk. Authenticated/allowlisted remote origins remain fully open
-        // inside Full Mac because their assessment is trusted.
-        // THE PEER BRIDGE ASKS; IT DOES NOT BLOCK (User, 2026-09-15).
-        //
-        // `agent-bridge` is always assessed as an untrusted remote, so the
-        // three ordinary origin gates below fired as hard `.block` — which
-        // meant that under Full Mac a peer turn could not even READ, and every
-        // high-risk effect died here before `PeerTurnEffectPolicy` could file
-        // the person's card. A peer gets the whole Agent: her reads are never
-        // blocked, and her effects become the card.
-        //
-        // This relaxes ONLY these ordinary origin/risk gates. The hard denies
-        // keep their `.block` and are untouched: an explicitly user-blocked
-        // tool, the secret firewall, and the kill switch.
-        let peerBridgeOrigin = PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface)
-        let peerBridgeEffect = peerBridgeOrigin && PeerTurnEffectPolicy.requiresPeerApproval(
-            tool, capabilities: Array(profile.capabilities), input: input,
-            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot), fullMac: fullMac)
-        // A read on the peer bridge skips these gates entirely; an effect
-        // downgrades to `.ask` so it reaches the approval card.
-        func originGateDecision() -> SecurityToolDecision? {
-            guard peerBridgeOrigin else { return .block }
-            return peerBridgeEffect ? .ask : nil
-        }
-
-        if decision != .block,
-           fullMac,
-           originAssessment.isRemote,
-           !originAssessment.trusted,
-           let gated = originGateDecision() {
-            decision = Self.maxDecision(decision, gated)
-            reasons.append(.init(.cause, peerBridgeOrigin
-                ? "a peer asked for this; Full Mac authority needs the person"
-                : "This remote sender is not trusted to use Full Mac access."))
-        }
-
-        if decision != .block,
-           profile.risk >= .high,
-           originAssessment.isRemote,
-           !originAssessment.trusted,
-           Self.bool(security["originTrustEnabled"], default: true),
-           let gated = originGateDecision() {
-            decision = Self.maxDecision(decision, gated)
-            reasons.append(.init(.cause, peerBridgeOrigin
-                ? "a peer asked for this high-risk tool; it needs the person"
-                : "This remote sender is not trusted for high-risk actions."))
-        }
-
-        // Uniform cross-surface access (the user, 2026-06-09): a TRUSTED remote origin
-        // (allowlisted Telegram / paired iOS) has already proven provenance via the
-        // allowlist/pairing — the same trust root that lets the local Mac surface run
-        // high-risk tools. For such origins the signed-command requirement is redundant,
-        // so waive it and let trusted remote surfaces behave like the Mac (e.g.
-        // invoke_codex works in Telegram, not just Mac chat). Gate 1 above still
-        // hard-blocks any UNTRUSTED remote origin, so this never elevates a stranger.
-        // the user can restore strict signing by setting trustedRemoteHighRiskAllowed=false.
-        let trustedRemoteWaiver = originAssessment.trusted
-            && Self.bool(security["trustedRemoteHighRiskAllowed"], default: true)
-        if decision != .block,
-           profile.risk >= .high,
-           originAssessment.isRemote,
-           !trustedRemoteWaiver,
-           Self.bool(security["signedRemoteCommandsRequired"], default: true),
-           origin.commandSignatureVerified != true,
-           let gated = originGateDecision() {
-            decision = Self.maxDecision(decision, gated)
-            reasons.append(.init(.cause, peerBridgeOrigin
-                ? "a peer's request is unsigned, so it needs the person"
-                : "This high-risk remote request has no verified signature."))
-        }
-
-        // the user 2026-06-13 ("yolo IS dev mode — she can do everything on yolo"):
-        // an ACTIVE Full Mac (yolo) window satisfies the Developer-Mode
-        // requirement for critical actions (the builder tools shell/git/
-        // apply_patch profile as .critical) — but with hard
-        // limits:
-        //   1. Remote origins must be authenticated by their canonical surface
-        //      owner (Telegram allowlist, paired iOS identity, verified Slack).
-        //      A surface label alone never receives Full Mac authority.
-        let yoloSatisfiesDevMode = fullMacYoloAuthority.admitted
-        if decision != .block,
-           profile.risk == .critical,
-           // USER 2026-08-12 YOLO: critical actions no longer require Developer
-           // Mode on his machine (default flipped false).
-           Self.bool(security["criticalRequiresDeveloperMode"], default: false),
-           !developerMode,
-           !yoloSatisfiesDevMode {
-            decision = .block
-            reasons.append(.init(.cause, "critical action requires Developer Mode"))
-            remedy = Repair.why(owner: "trust/policy.json securityPolicy.criticalRequiresDeveloperMode and developerMode",
-                tap: "Trust > Access and policy > Access > Full Mac > Enable Full Mac")
-        }
-
-        if decision != .block,
-           profile.capabilities.contains("other_app_settings_write"),
-           !fullMac {
-            decision = Self.maxDecision(decision, .ask)
-            // First, so the card names the cause rather than a recorded note.
-            reasons.append(.init(.cause, "writing into another app's settings needs your go-ahead"))
-        }
-
-        // A reply turn from an authenticated contact gets the same answer as the
-        // person's own turn: under Full Mac her sends pass this ask (flattened
-        // below), so do a reply turn's messages and reads — to that contact or
-        // any other saved agent (User, 2026-09-25; widened 2026-09-27: "open it
-        // up on full mac"). claude/codex/omp_message are not in this list: they
-        // wake coding agents with local authority and keep their own ask.
-        let replyingContact = origin.userId.map { "peer:" + $0 }
-        let peerContinuation = peerBridgeOrigin && fullMac && !peerBridgeEffect
-            && ["agent_message", "agent_read"].contains(PeerTurnEffectPolicy.normalized(tool))
-            && replyingContact != nil
-        if decision != .block,
-           profile.capabilities.contains("external_send"),
-           !peerContinuation,
-           !profile.capabilities.contains("notification"),
-           !profile.capabilities.contains("approval_stage"),
-           Self.bool(connectorPolicy["sendExternalMessagesRequiresApproval"], default: true) {
-            decision = Self.maxDecision(decision, .ask)
-            reasons.append(.init(.cause, "external send requires approval"))
-        }
-
-        if decision != .block,
-           !secretKeys.isEmpty,
-           Self.bool(security["secretFirewallEnabled"], default: true),
-           !profile.capabilities.contains("notification"),
-           (profile.capabilities.contains("external_send")
-            || profile.capabilities.contains("network_write")
-            || profile.capabilities.contains("shell")) {
-            decision = .block
-            reasons.append(.init(.cause, "trust/policy.json securityPolicy.secretFirewallEnabled blocks secret egress from input: \(secretKeys.sorted().joined(separator: ", ")). Remove the secret values from those fields before submitting this action."))
-            remedy = nil
-        }
-
-        if decision != .block,
-           !promptInjectionKeys.isEmpty,
-           Self.bool(security["promptInjectionShieldEnabled"], default: true),
-           (profile.risk >= .high || profile.capabilities.contains("external_send") || !secretKeys.isEmpty) {
-            if fullMac {
-                // USER 2026-08-13 — "yolo means yolo, nothing gated, end of
-                // story." An ACTIVE Full Mac (YOLO) window is a blanket
-                // operator grant, so the prompt-injection shield does not
-                // escalate to approval — it only NOTES the markers so the
-                // audit trail keeps the signal. Turn YOLO off (Full Mac
-                // window lapses) and the shield gates again exactly as before.
-                reasons.append(.init(.note, "Possible hidden instructions were noted; Full Mac allows this action."))
-            } else if trustedLocalAgentBridge {
-                reasons.append(.init(.note, "A trusted agent can receive this task."))
-            } else {
-                decision = Self.maxDecision(decision, .ask)
-                reasons.append(.init(.cause, "Possible hidden instructions need your review."))
-            }
-        }
-
-        // USER 2026-08-12 — YOLO: an unsigned high-risk tool is no longer blocked
-        // on his machine. This was denying her own built-in Mac tools
-        // (legacy app focus tool) because they are not in the signature registry.
-        // `toolSigningRequired` now defaults FALSE; set it true in security
-        // policy to restore the block.
-        if decision != .block,
-           !signedToolKnown,
-           profile.risk >= .high,
-           Self.bool(security["toolSigningRequired"], default: false) {
-            decision = .block
-            reasons.append(.init(.cause, "unsigned high-risk tool is blocked"))
-            remedy = nil
-        }
-
-        if decision == .ask,
-           Self.notificationToolNames.contains(canonicalTool),
-           Self.bool(security["allowAppNotifications"], default: true),
-           secretKeys.isEmpty,
-           promptInjectionKeys.isEmpty {
-            decision = .allow
-            reasons.append(.init(.note, "Security policy allows app notifications."))
-        }
-
-        // An admitted Full Mac YOLO grant is the operator's answer to ordinary
-        // per-call ask/confirm policy. Flatten asks here, after every security
-        // rule has had a chance to produce a hard `.block`, so direct/raw
-        // SecurityCenter clients and composed chat clients see the same
-        // decision. This never upgrades a block. Destructive (a delete for
-        // good, a macOS permission reset) still asks User, even under Full Mac.
-        if decision == .ask, fullMacYoloAuthority.admitted, toolClass != .destructive {
-            decision = .allow
-            reasons.append(.init(.note, "Full Mac allows this action without asking again."))
+        // authentication mechanism for an inbound sender. One rule for a remote
+        // origin nobody authenticated (an untrusted peer, a stranger, an
+        // unsigned request where signing is required): it reads, and anything
+        // else it asks for, on either side of the line, is the person's card.
+        // Trusted origins are judged exactly like the Mac. The kill switch stays a hard deny.
+        let signatureMissing = !(originAssessment.trusted && Self.bool(security["trustedRemoteHighRiskAllowed"], default: true))
+            && Self.bool(security["signedRemoteCommandsRequired"], default: true) && origin.commandSignatureVerified != true
+        if decision != .block, originAssessment.isRemote, !originAssessment.trusted || signatureMissing, toolClass != .read {
+            decision = .ask
+            reasons.append(.init(.cause, originAssessment.trusted
+                ? "This remote request has no verified signature, so it needs the person."
+                : "\(originAssessment.reason): this request is not authenticated, so it needs the person."))
         }
 
         let now = Self.isoTimestamp(evaluatedAt)
@@ -600,13 +311,10 @@ public actor SwiftNativeSecurityCenter {
             risk: profile.risk.rawValue,
             autonomyLevel: autonomyLevel,
             fullMacYoloAuthority: fullMacYoloAuthority.state,
-            signedToolKnown: signedToolKnown,
-            rollbackRequired: rollbackRequired,
             decision: decision,
             allowed: decision == .allow,
             requiresApproval: decision == .ask,
             reasons: reasons,
-            untrustedInputKeys: Array(Set(promptInjectionKeys)).sorted(),
             redactedInputPreview: redacted,
             auditReceiptsEnabled: auditEnabled,
             autonomyReason: autonomyReason,
@@ -634,15 +342,10 @@ public actor SwiftNativeSecurityCenter {
             risk: SecurityRisk.critical.rawValue,
             autonomyLevel: "blocked",
             fullMacYoloAuthority: .unavailable,
-            signedToolKnown: false,
-            rollbackRequired: true,
             decision: .block,
             allowed: false,
             requiresApproval: false,
             reasons: [.init(.cause, "\(dataRoot.appendingPathComponent("trust/policy.json").path) could not authorize \(canonicalTool): \(error.localizedDescription)")],
-            untrustedInputKeys: Array(
-                Set(Self.promptInjectionKeys(in: .object(input)))
-            ).sorted(),
             redactedInputPreview: Self.redactValue(
                 .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
             ),
@@ -946,21 +649,5 @@ public actor SwiftNativeSecurityCenter {
             chatIds: Self.stringSet(obj["allowed_chat_ids"]).union(Self.stringSet(obj["allowedChatIds"])),
             userIds: Self.stringSet(obj["allowed_user_ids"]).union(Self.stringSet(obj["allowedUserIds"]))
         )
-    }
-
-    private func isSignedOrBuiltinTool(_ tool: String) throws -> Bool {
-        if AuthoredToolEffects.primitiveCapabilities[tool] != nil || tool.hasPrefix("fetch.")
-            || AppActionBinding.builtInToolName(tool)
-            || Self.connectorActionIDs.contains(where: { $0.value == tool && AppActionBinding.builtInToolName($0.key) })
-            || Self.notificationToolNames.contains(tool)
-            || Self.catalogToolNames.contains(tool) {
-            return true
-        }
-        return try ToolRegistryActions.entries(dataRoot: dataRoot).contains { value in
-            guard case .object(let row) = value,
-                  (Self.string(row["name"]) ?? Self.string(row["id"])) == tool else { return false }
-            return !(Self.string(row["manifestSignature"]) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
     }
 }

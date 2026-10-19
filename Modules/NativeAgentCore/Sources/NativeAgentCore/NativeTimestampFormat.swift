@@ -14,11 +14,12 @@ public enum NativeTimestampFormat {
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
-    private static let utcDayFormatter: DateFormatter = {
+    // Calendar days are the Mac's current zone's days unless an item sets one.
+    private static let calendarDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.timeZone = .autoupdatingCurrent
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter
     }()
@@ -32,11 +33,20 @@ public enum NativeTimestampFormat {
 
     /// UTC offset wire format with floored microseconds, omitted at whole seconds.
     public static func flooredOptionalMicrosecondUTCOffset(_ date: Date) -> String {
+        microsecondUTCOffset(date, rounding: .down)
+    }
+
+    /// The one microsecond `+00:00` builder. `rounding` turns the instant into
+    /// whole microseconds (`.down` truncates like Python's isoformat of a
+    /// datetime; `.toNearestOrEven` is `fromtimestamp`'s rounding), carrying
+    /// into the second; a zero fraction is omitted unless `alwaysFraction`.
+    public static func microsecondUTCOffset(
+        _ date: Date, rounding: FloatingPointRoundingRule, alwaysFraction: Bool = false
+    ) -> String {
         let interval = date.timeIntervalSince1970
-        // Floor to integer microseconds (Python truncates, never rounds up). The
-        // whole-second component and the micros are derived from ONE floored
-        // value so they can never disagree at a boundary.
-        let totalMicros = Int64((interval * 1_000_000).rounded(.down))
+        // The whole-second component and the micros are derived from ONE
+        // rounded value so they can never disagree at a boundary.
+        let totalMicros = Int64((interval * 1_000_000).rounded(rounding))
         // 2026-09-07: Swift's / and % truncate toward zero, so a pre-epoch
         // instant produced a negative fraction; floor so the remainder is 0..<1e6.
         var wholeSeconds = totalMicros / 1_000_000
@@ -56,14 +66,14 @@ public enum NativeTimestampFormat {
             c.year ?? 0, c.month ?? 0, c.day ?? 0,
             c.hour ?? 0, c.minute ?? 0, c.second ?? 0
         )
-        if micros == 0 {
+        if micros == 0, !alwaysFraction {
             return base + "+00:00"  // timespec='auto' omits the fraction
         }
         return base + String(format: ".%06d+00:00", micros)
     }
 
-    public static func utcDay(_ date: Date) -> String {
-        lock.withLock { utcDayFormatter.string(from: date) }
+    public static func calendarDay(_ date: Date) -> String {
+        lock.withLock { calendarDayFormatter.string(from: date) }
     }
 
     /// Preserve the loops' default-format-first, fractional-format-second order.

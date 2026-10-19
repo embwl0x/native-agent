@@ -83,7 +83,7 @@ extension SwiftNativePersonaEngine {
             return backup
         }
 
-        await flushDerivedPersonaChange(target, reason: "persona_tool_write")
+        await publishDerivedPersonaChange(target, reason: "persona_tool_write")
 
         return PersonaToolWriteResult(
             kind: canon,
@@ -136,7 +136,7 @@ extension SwiftNativePersonaEngine {
             return backup
         }
 
-        await flushDerivedPersonaChange(target, reason: "persona_section_appended")
+        await publishDerivedPersonaChange(target, reason: "persona_section_appended")
 
         return PersonaToolWriteResult(
             kind: canon,
@@ -169,7 +169,7 @@ extension SwiftNativePersonaEngine {
         }
     }
 
-    func flushDerivedPersonaChange(_ target: URL, reason: String) async {
+    func publishDerivedPersonaChange(_ target: URL, reason: String) async {
         await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
             namespace: "persona",
             stableID: target.lastPathComponent,
@@ -177,7 +177,6 @@ extension SwiftNativePersonaEngine {
             canonicalLocator: target.path,
             reason: reason
         ))
-        await DerivedStateInvalidationCenter.shared.flush()
     }
 
     /// `existing.rstrip()` -- Python strips trailing Unicode whitespace only.

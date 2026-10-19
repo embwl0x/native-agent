@@ -39,9 +39,10 @@ public actor SchedulerDueJobRunner {
     let persistence = SwiftNativePersistenceCore()
     let schedulerJobs: SwiftNativeTriggerScheduler
     let cycleNotificationDelivery: CycleNotificationDelivery
-    /// The loop owner reads this after a tick and publishes a failed loop
-    /// receipt. Activity evidence is not best-effort: if it cannot be written,
-    /// subsequent scheduled effects stop rather than becoming unaccountable.
+    /// The pass's first fault: unwritable activity evidence, unreadable or
+    /// unrepairable job state, or a result that could not be settled. The loop
+    /// owner reads it after a pass and publishes a failed loop receipt, so an
+    /// unknown inventory never reads as "nothing due". Only a new pass clears it.
     public internal(set) var activityFeedError: String?
     var running = false
     /// Bodies that crossed their caller-facing deadline but have not actually
@@ -126,8 +127,8 @@ public actor SchedulerDueJobRunner {
                 )
             }
         } catch {
-            // appendActivity records its own durable-evidence failure. Either
-            // way, a failed scheduler-state repair is not safe to continue.
+            // A failed scheduler-state repair is not safe to continue.
+            noteFault("Scheduled job state could not be repaired: \(error.localizedDescription)")
             do {
                 try await appendActivity(
                     jobId: nil,
@@ -141,7 +142,7 @@ public actor SchedulerDueJobRunner {
             return []
         }
 
-        var completedNames: [String] = []
+        var settled: [String] = []
         // 2026-09-06: rows this pass cannot make progress on — a recovered
         // claim whose notice would not write, or whose release failed. They are
         // excluded from selection so the pass keeps reaching the other due jobs
@@ -155,6 +156,7 @@ public actor SchedulerDueJobRunner {
             do {
                 claimed = try await claimDueJob(now: now, excludingJobIds: deferredJobIds)
             } catch {
+                noteFault("Scheduled jobs could not be read: \(error.localizedDescription)")
                 do {
                     try await appendActivity(
                         jobId: nil,
@@ -165,7 +167,7 @@ public actor SchedulerDueJobRunner {
                         payload: .object([:])
                     )
                 } catch { }
-                return completedNames
+                return settled
             }
 
             // A durable claim left by a prior process means the effect may
@@ -179,10 +181,8 @@ public actor SchedulerDueJobRunner {
                 do {
                     try await schedulerJobs.settleUnknownOccurrence(recovery, now: now)
                 } catch {
-                    if activityFeedError == nil {
-                        activityFeedError = "Scheduler reconciliation could not release occurrence "
-                            + "\(recovery.occurrenceKey): \(error.localizedDescription)"
-                    }
+                    noteFault("Scheduler reconciliation could not release occurrence "
+                        + "\(recovery.occurrenceKey): \(error.localizedDescription)")
                     deferredJobIds.insert(recovery.jobId)
                     continue
                 }
@@ -216,10 +216,11 @@ public actor SchedulerDueJobRunner {
                         "output": NativeAppSecretRedactor.redactValue(result.output),
                     ])
                 )
-                if result.status == "completed" || result.status == "warn" {
-                    completedNames.append(job.name)
-                }
+                // Every settled occurrence is work this pass did, whatever its
+                // outcome; a failed job is never "nothing due".
+                settled.append("\(job.name) (\(result.status))")
             } catch {
+                noteFault("\(job.name) ran (\(result.status)) but its result could not be settled: \(error.localizedDescription)")
                 do {
                     try await appendActivity(
                         jobId: job.id,
@@ -230,7 +231,7 @@ public actor SchedulerDueJobRunner {
                         payload: .object(["jobId": .string(job.id)])
                     )
                 } catch {
-                    return completedNames
+                    return settled
                 }
             }
             // Parent-cancel propagation (W3b Finding 2): if the scheduler loop was
@@ -247,7 +248,11 @@ public actor SchedulerDueJobRunner {
                 break
             }
         }
-        return completedNames
+        return settled
+    }
+
+    func noteFault(_ fault: String) {
+        if activityFeedError == nil { activityFeedError = fault }
     }
 
     private func recordUnknownOccurrence(_ recovery: SwiftNativeTriggerScheduler.OccurrenceRecovery) async -> Bool {
@@ -273,9 +278,7 @@ public actor SchedulerDueJobRunner {
             )
             return true
         } catch {
-            if activityFeedError == nil {
-                activityFeedError = "Scheduler reconciliation evidence could not be written: \(error.localizedDescription)"
-            }
+            noteFault("Scheduler reconciliation evidence could not be written: \(error.localizedDescription)")
             return false
         }
     }

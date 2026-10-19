@@ -20,11 +20,13 @@ struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
     let read_at: String?
     /// The conversation a card raised elsewhere was mirrored into for User.
     var chat_session_id: String? = nil
+    /// What the source means, as the Mac says it; nil from a Mac too old to say.
+    var presentation: InboxPresentation? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, created_at, source, severity, title, summary, detail
         case relatedWorkshopExecutionId = "related_mission_id" // compatibility wire ID
-        case related_approval_id, related_paths, related_groups, actions, status, read_at, chat_session_id
+        case related_approval_id, related_paths, related_groups, actions, status, read_at, chat_session_id, presentation
     }
 
     /// Wave 4 (phase A) read-both: accept the FUTURE `related_execution_id`
@@ -68,6 +70,7 @@ extension InboxItemRecord {
         status = try c.decode(String.self, forKey: .status)
         read_at = try c.decodeIfPresent(String.self, forKey: .read_at)
         chat_session_id = try c.decodeIfPresent(String.self, forKey: .chat_session_id)
+        presentation = try? c.decodeIfPresent(InboxPresentation.self, forKey: .presentation)
     }
 
     var isUnread: Bool { status == "unread" }
@@ -90,40 +93,14 @@ extension InboxItemRecord {
         }
     }
 
-    var sourceIcon: String {
-        if hasLinkedApproval { return "checkmark.shield.fill" }
-        if source.hasPrefix("proactive_autonomy") { return "lightbulb.fill" }
-        if source.hasPrefix("harness_learning") { return "wand.and.stars" }
-        if source == "dream_cycle"               { return "moon.stars.fill" }
-        if source == "rem_cycle"                 { return "sparkles" }
-        if source.hasPrefix("trigger:file_watch") { return "doc.text.magnifyingglass" }
-        // P2-4: `execution_complete:<id>` is the canonical source; historical
-        // cards synced from the Mac still say `mission_complete:<id>`.
-        if source.hasPrefix("execution_complete") || source.hasPrefix("mission_complete") {
-            return "checkmark.circle.fill"
-        }
-        if source == "idle_checkin"               { return "clock.fill" }
-        if source.hasPrefix("trigger:morning_brief") { return "sun.horizon.fill" }
-        if source.hasPrefix("trigger:stuck_pattern") { return "arrow.trianglehead.2.clockwise" }
-        if source == "self_test"                  { return "testtube.2" }
-        return "bell.fill"
-    }
+    /// The Mac's one reading of the source; a card from a Mac too old to
+    /// send it is shown as unclassified, never reclassified here.
+    var sourceIcon: String { presentation?.icon ?? "bell.fill" }
 
-    var sourceBadgeLabel: String {
-        if hasLinkedApproval { return "APPROVAL" }
-        if source.hasPrefix("proactive_autonomy") { return "IDEA" }
-        if source.hasPrefix("harness_learning") { return "LEARNING" }
-        if source == "dream_cycle" { return "DREAM" }
-        if source == "rem_cycle" { return "REM" }
-        if source.hasPrefix("trigger:file_watch")    { return "FILE-WATCH" }
-        if source.hasPrefix("trigger:morning_brief") { return "MORNING-BRIEF" }
-        if source.hasPrefix("trigger:stuck_pattern") { return "STUCK-PATTERNS" }
-        if source == "idle_checkin"                  { return "IDLE-CHECKIN" }
-        if source.hasPrefix("execution_complete") || source.hasPrefix("mission_complete") {
-            return "WORKSHOP"
-        }
-        return source.uppercased().prefix(14).description
-    }
+    var sourceBadgeLabel: String { presentation?.badge ?? source.uppercased().prefix(14).description }
+
+    /// Where a card came from, in plain words (the badge label is plumbing).
+    var sourceWords: String { presentation?.words ?? "A note from me" }
 
     var createdDate: Date? {
         ISO8601DateFormatter().date(from: created_at)
@@ -155,9 +132,19 @@ extension InboxItemRecord {
             actions: actions,
             status: nextStatus,
             read_at: readAt ?? read_at,
-            chat_session_id: chat_session_id
+            chat_session_id: chat_session_id,
+            presentation: presentation
         )
     }
+}
+
+/// The Mac's `InboxSourcePresentation`, as the snapshot carries it.
+struct InboxPresentation: Codable, Hashable, Sendable {
+    let icon: String
+    let badge: String
+    let words: String
+    /// Nil: the card's own action label says it.
+    let act_label: String?
 }
 
 typealias InboxRelatedGroup = NativeAgentShared.InboxRelatedGroup

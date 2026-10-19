@@ -13,6 +13,10 @@ public enum CodexAccountModelCatalog {
         guard isAccountBackedProvider(providerID) else {
             return []
         }
+        // The account's models see images; whether this route's transport
+        // carries them is the adapter's declaration (the Codex CLI does not).
+        let vision = ProviderToolCapability.carriesImages(
+            providerID: providerID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
         return load(
             providerID: providerID,
             cacheURL: cacheURL,
@@ -23,7 +27,7 @@ public enum CodexAccountModelCatalog {
                 name: $0.displayName,
                 context_length: $0.contextWindow,
                 supports_streaming: true,
-                supports_vision: true,
+                supports_vision: vision,
                 supports_tools: true,
                 supports_json_mode: true,
                 default_reasoning_effort: $0.defaultReasoningEffort,
@@ -55,9 +59,8 @@ public enum CodexAccountModelCatalog {
 
         init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
-            // Matching accepts any JSON object; malformed model rows still
-            // leave the shipped projection, as an unsuccessful load did.
-            models = (try? fields.decode([Record].self, forKey: .models)) ?? []
+            // An unreadable model array is an unreadable list, never an empty one.
+            models = try fields.decode([Record].self, forKey: .models)
             accountID = try? fields.decode(String.self, forKey: .accountID)
         }
     }
@@ -164,7 +167,8 @@ public enum CodexAccountModelCatalog {
                     supportedReasoningEfforts: efforts,
                     supportsFast: hasFastTier,
                     priority: record.priority ?? 1_000,
-                    contextWindow: record.contextWindow ?? 400_000
+                    // The record's window, else the shipped row's for this id, else unknown (0).
+                    contextWindow: record.contextWindow ?? byID[id]?.contextWindow ?? 0
                 )
             }
         }
@@ -219,15 +223,31 @@ public enum CodexAccountModelCatalog {
         })
     }
 
+    /// The account's own list is there but unreadable (the CLI's shared one
+    /// only when the account has none beside its sign-in): its models and
+    /// windows are unknown, never the shipped rows.
+    public static func cacheFault(
+        dataRoot: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> String? {
+        let (authURL, canonical) = authPath(dataRoot: dataRoot, environment: environment)
+        let sibling = authURL.deletingLastPathComponent().appendingPathComponent("models_cache.json")
+        let url = FileManager.default.fileExists(atPath: sibling.path) || !canonical ? sibling : cacheCandidate(environment: environment)
+        return modelCatalogFault(at: url, read: readCache(at: url) != nil, owner: "this ChatGPT account")
+    }
+
+    private static func authPath(dataRoot: URL, environment: [String: String]) -> (url: URL, canonical: Bool) {
+        let canonical = dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
+        return (canonical
+            ? OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot, environment: environment)
+            : OpenAIOAuthDirectAdapter.boundRootReadAuthPath(dataRoot: dataRoot), canonical)
+    }
+
     private static func chatGPTOAuthCache(
         dataRoot: URL,
         environment: [String: String]
     ) -> (url: URL, cache: Cache)? {
-        let usesCanonicalBody = dataRoot.standardizedFileURL
-            == PersistenceCore.defaultDataRoot().standardizedFileURL
-        let authURL = usesCanonicalBody
-            ? OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot, environment: environment)
-            : OpenAIOAuthDirectAdapter.boundRootReadAuthPath(dataRoot: dataRoot)
+        let (authURL, usesCanonicalBody) = authPath(dataRoot: dataRoot, environment: environment)
         if !usesCanonicalBody {
             let sibling = authURL.deletingLastPathComponent()
                 .appendingPathComponent("models_cache.json")

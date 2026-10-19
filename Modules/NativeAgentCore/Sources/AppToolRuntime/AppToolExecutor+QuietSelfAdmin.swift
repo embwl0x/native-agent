@@ -72,29 +72,16 @@ extension AppToolExecutor {
     /// catalog's `writable` and the set's refusal cannot drift apart.
     public static let fullMacModeName = "Full Mac"
 
-    /// A posture the saved policy actually spells out, or nothing.
-    ///
-    /// Nothing is a refusal, never a default: a level this does not recognise
-    /// (an older spelling, a hand-edited file) used to fall through to the
-    /// outside-workspace axis and read as Builder, which is the permissive
-    /// answer — exactly the wrong way for an unknown to fail.
-    public static func quietPosture(permissionLevel: String, outsideWorkspaceDefault: String) -> QuietPosture? {
-        switch permissionLevel.trimmingCharacters(in: .whitespaces).lowercased() {
-        case "strict", "locked_down":
-            return QuietPosture(name: "Safe", changesAllowed: false)
-        case "full_mac_os", "wide_open_receipts":
-            return QuietPosture(name: "Full Mac", changesAllowed: true)
-        case "balanced":
-            switch outsideWorkspaceDefault.trimmingCharacters(in: .whitespaces).lowercased() {
-            case "ask", "allow":
-                return QuietPosture(name: "Builder", changesAllowed: true)
-            case "deny":
-                return QuietPosture(name: "Work mode", changesAllowed: true)
-            default:
-                return nil
-            }
-        default:
-            return nil
+    /// The saved posture, as `PermissionLaw.posture` reads it for every gate,
+    /// named for the person. Work with outside-workspace writes on ask is
+    /// the Builder preset.
+    public static func quietPosture(_ policy: [String: JSONValue]) -> QuietPosture {
+        switch PermissionLaw.posture(policy) {
+        case .fullMac: return QuietPosture(name: fullMacModeName, changesAllowed: true)
+        case .readOnly: return QuietPosture(name: "Safe", changesAllowed: false)
+        case .work:
+            let outside: JSONValue? = if case .object(let file)? = policy["filePolicy"] { file["outsideWorkspaceDefault"] } else { nil }
+            return QuietPosture(name: outside == .string("ask") ? "Builder" : "Work mode", changesAllowed: true)
         }
     }
 
@@ -111,13 +98,7 @@ extension AppToolExecutor {
     ) async -> QuietPosture? {
         guard let policy = try? await SwiftNativeTrustCenter(dataRoot: dataRoot)
             .loadTrustPolicyChecked() else { return nil }
-        guard case .string(let level)? = policy["permissionLevel"] else { return nil }
-        var outside = ""
-        if case .object(let filePolicy)? = policy["filePolicy"],
-           case .string(let raw)? = filePolicy["outsideWorkspaceDefault"] {
-            outside = raw
-        }
-        return quietPosture(permissionLevel: level, outsideWorkspaceDefault: outside)
+        return quietPosture(policy)
     }
 
     /// Full Mac as ONE locked authority generation spells it.
@@ -125,17 +106,9 @@ extension AppToolExecutor {
     /// `freshQuietPosture` answers for the moment it is called; a write that
     /// carries Full Mac authority re-asks this question inside the transaction
     /// that writes, against the generation it is merging into
-    /// (`applyPolicyPatchChecked(_:guardedByLockedPolicy:)`). Anything the saved
-    /// policy does not plainly say is not Full Mac.
+    /// (`applyPolicyPatchChecked(_:guardedByLockedPolicy:)`).
     public static func lockedPolicyIsFullMac(_ policy: [String: JSONValue]) -> Bool {
-        guard case .string(let level)? = policy["permissionLevel"] else { return false }
-        var outside = ""
-        if case .object(let filePolicy)? = policy["filePolicy"],
-           case .string(let raw)? = filePolicy["outsideWorkspaceDefault"] {
-            outside = raw
-        }
-        return quietPosture(permissionLevel: level, outsideWorkspaceDefault: outside)?.name
-            == fullMacModeName
+        PermissionLaw.posture(policy) == .fullMac
     }
 
     static func unreadablePostureFailure(extra: [String: JSONValue] = [:]) -> JSONValue {

@@ -152,12 +152,6 @@ extension AppModel {
         }
     }
 
-    /// chat-smoothness phase 1 (the user, 2026-06-12): word-by-word flow, coalesced.
-    /// ONE tunable knob for the Mac streaming cadence — raise for calmer
-    /// ripple, lower for snappier. 70ms ≈ word-arrival rhythm at typical
-    /// model token rates without hammering the renderer.
-    static let chatStreamCoalesceSeconds = ChatStreamAccumulator.publishInterval
-
     /// Fluid glass A1: the streamed reply learns where its working notes end
     /// as soon as the core's final result says, so a reply that has already
     /// settled folds them in one animated swap, and the row the disk refresh

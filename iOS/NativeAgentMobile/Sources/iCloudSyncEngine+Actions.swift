@@ -1173,18 +1173,6 @@ extension iCloudSyncEngine {
     }
 
     @discardableResult
-    func approvePromotion(candidateId: String) async throws -> [String: String]? {
-        let action = InboxAction.make(action: "approvePromotion", payload: ["candidateId": candidateId])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
-    }
-
-    @discardableResult
-    func rejectPromotion(candidateId: String) async throws -> [String: String]? {
-        let action = InboxAction.make(action: "rejectPromotion", payload: ["candidateId": candidateId])
-        return try requireSuccessfulActionResponse(await sendDecisionActionWithSignatureRetry(action))
-    }
-
-    @discardableResult
     func inboxAction(itemId: String, actionId: String) async throws -> [String: String]? {
         let action = InboxAction.make(action: "inboxAction", payload: [
             "itemId": itemId,
@@ -1666,6 +1654,17 @@ extension iCloudSyncEngine {
             )
         )
         return result["status"] ?? result["result"] ?? ""
+    }
+
+    /// The phone's Steer, on the Mac's control lane. True when the turn
+    /// working in that chat took it; the Mac then says how it ended.
+    func steerChat(sessionId: String, runId: String, text: String) async throws -> Bool {
+        let action = InboxAction.make(action: "steerChat", payload: [
+            "sessionId": sessionId, "runId": runId, "text": text, "routeKey": ChatRuntimeControls.deviceSourceKey,
+        ])
+        let result = try requireSuccessfulActionResponse(
+            await sendActionWithSignatureRetry(action, pollTimeoutSeconds: 8, pollIntervalSeconds: 0.35))
+        return result["steered"] == "true"
     }
 
     /// Remove a tab through the signed Mac-owned pin mutation seam. This does

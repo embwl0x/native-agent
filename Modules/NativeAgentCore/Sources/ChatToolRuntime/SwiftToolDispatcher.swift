@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import Experiences
 import Foundation
 import StandingBots
 import Research
@@ -383,8 +384,14 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         return names
     }
 
-    func registryToolRecord(_ tool: String) -> [String: JSONValue]? {
-        guard case .array(let rows)? = try? AbilityStore(dataRoot: dataRoot).registry(kind: .tool) else { return nil }
+    func registryToolRecord(_ tool: String) throws -> [String: JSONValue]? {
+        let rows: [JSONValue]
+        switch Self.authoredRegistry(dataRoot: dataRoot) {
+        case .success(let read): rows = read
+        case .failure(let error):
+            throw ToolFailureError("Her tool registry did not read (\(error.localizedDescription)), so '\(tool)' could not be looked up. Nothing ran.",
+                                   effects: .none, owner: "abilities")
+        }
         for case .object(let row) in rows {
             let name: JSONValue? = if case .string? = row["id"] { row["id"] } else { row["name"] }
             if name == .string(tool) { return row }
@@ -395,9 +402,25 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     private func readRegistryRecords() -> [JSONRow] { Self.readRegistryRecords(dataRoot: dataRoot) }
 
     private static func readRegistryRecords(dataRoot: URL) -> [JSONRow] {
-        guard case .array(let rows)? = try? AbilityStore(dataRoot: dataRoot).registry(kind: .tool) else { return [] }
+        guard case .success(let rows) = authoredRegistry(dataRoot: dataRoot) else { return [] }
         let records = rows.compactMap { try? JSONRow($0) }
         return records.count == rows.count ? records : []
+    }
+
+    /// Her authored tool registry, or the fault that kept it from reading.
+    /// A fault is never an empty registry: the catalog offers none of her
+    /// tools while it lasts, and her home owes the repair until a read works.
+    static func authoredRegistry(dataRoot: URL) -> Result<[JSONValue], any Error> {
+        do {
+            let registry = try AbilityStore(dataRoot: dataRoot).registry(kind: .tool)
+            guard case .array(let rows) = registry else { throw CocoaError(.fileReadCorruptFile) }
+            RepairOwed.settle(dataRoot, operation: "abilities.tool_registry", evidence: .init(source: "abilities", id: UUID().uuidString))
+            return .success(rows)
+        } catch {
+            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act, operation: "abilities.tool_registry", owner: "abilities",
+                           words: "Her tool registry did not read (\(error.localizedDescription)); her own tools are not offered until it reads again.")
+            return .failure(error)
+        }
     }
 
     /// R9 (review finding 2): the FULL built-in dispatch namespace — every
@@ -440,10 +463,15 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     /// A failed read is not memoized; the key is read before the catalog walk.
     package static func authoredTools(dataRoot: URL) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
         AbilityStore.withLock {
-            guard let revision = try? AbilityStore(dataRoot: dataRoot).revision() else { return [] }
+            let revision: [String]
+            do { revision = try AbilityStore(dataRoot: dataRoot).revision() } catch {
+                RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act, operation: "abilities.tool_registry", owner: "abilities",
+                               words: "Her tool registry's revision did not read (\(error.localizedDescription)); her own tools are not offered until it reads again.")
+                return []
+            }
             let key = (dataRoot.path, revision, AppActionBinding.registeredToolCount)
             if let memo = authoredToolsMemo, memo.key == key { return memo.tools }
-            guard case .array(let rows)? = try? AbilityStore(dataRoot: dataRoot).registry(kind: .tool) else { return [] }
+            guard case .success(let rows) = authoredRegistry(dataRoot: dataRoot) else { return [] }
             let records = rows.compactMap { try? JSONRow($0) }
             guard records.count == rows.count else { return [] }
             let tools = authoredTools(records: records)

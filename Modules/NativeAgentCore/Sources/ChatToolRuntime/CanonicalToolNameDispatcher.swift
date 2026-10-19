@@ -322,42 +322,10 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
                     : "app {action:\"agent.message\",args:{agent:\"<contact>\",text:\"<message>\"}}; options.timeout_seconds is OMP only", effects: .none)
         }
         if let route {
-            let alias = GatedToolNameAlias(raw: tool, canonical: route.tool)
-            return try await GatedToolNameContext.$alias.withValue(alias) {
-                let result = try await inner.dispatch(tool: route.tool, input: route.input, surface: surface)
-                return AgentConversationRouting.wrap(result: result, route: route, input: input)
-            }
+            let result = try await inner.dispatch(tool: route.tool, input: route.input, surface: surface)
+            return AgentConversationRouting.wrap(result: result, route: route, input: input)
         }
-        let canonical = Self.canonical(tool)
-        // 2026-09-06: canonicalizing before the gates threw away the spelling
-        // the caller used, and the Trust Center matches override/block keys
-        // against the name it is given — so a user's `"save.skill": "blocked"`
-        // stopped applying. Carry the raw spelling down the chain so the policy
-        // gates can judge both and keep the stricter answer. Bound even when
-        // nothing was rewritten (as nil) so a nested dispatch cannot inherit a
-        // stale alias.
-        //
-        // 2026-09-06: except when the alias already describes THIS dispatch.
-        // The bridge wraps a gated client that begins with a canonicalizer of
-        // its own, so the inner one is handed the canonical name, rewrites
-        // nothing, and used to bind nil — erasing the raw spelling the outer
-        // wrapper captured before the gates in between could read it. An
-        // inherited alias whose canonical name is exactly the name we were
-        // handed is this call's own alias; carry it through. Anything else is
-        // a stale alias from an enclosing dispatch and still clears.
-        let alias: GatedToolNameAlias?
-        if canonical != tool {
-            alias = GatedToolNameAlias(raw: tool, canonical: canonical)
-        } else if let inherited = GatedToolNameContext.alias,
-                  inherited.canonical.trimmingCharacters(in: .whitespaces)
-                      == canonical.trimmingCharacters(in: .whitespaces) {
-            alias = inherited
-        } else {
-            alias = nil
-        }
-        return try await GatedToolNameContext.$alias.withValue(alias) {
-            try await inner.dispatch(tool: canonical, input: input, surface: surface)
-        }
+        return try await inner.dispatch(tool: Self.canonical(tool), input: input, surface: surface)
     }
 
     public func listAvailableTools() async throws -> [String] {

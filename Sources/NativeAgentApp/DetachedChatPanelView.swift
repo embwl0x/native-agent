@@ -43,7 +43,7 @@ struct DetachedChatPanelView: View {
     // Render-cost audit F1 — streaming-delta scroll throttle.
     //
     // `.onChange(of: messages.last?.content)` fires on every coalesced delta
-    // (~14 Hz for the whole turn, `chatStreamCoalesceSeconds = 0.07`), and each
+    // (~14 Hz for the whole turn, `ChatStreamAccumulator.publishInterval = 0.07`), and each
     // one forced a LazyVStack realization/measurement pass toward the bottom
     // anchor. The main window has solved this since chat-smoothness phase 1;
     // the panel just never got the coordinator. Same type, same call shape as

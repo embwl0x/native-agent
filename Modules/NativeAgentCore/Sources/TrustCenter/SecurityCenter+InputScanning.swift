@@ -2,68 +2,6 @@ import Foundation
 import PersistenceCore
 
 extension SwiftNativeSecurityCenter {
-    static func promptInjectionKeys(in value: JSONValue) -> [String] {
-        let needles = [
-            "ignore previous",
-            "ignore all previous",
-            "system prompt",
-            "developer message",
-            "reveal secrets",
-            "show secrets",
-            "api key",
-            "access token",
-            "disable safety",
-            "bypass policy",
-            "run shell",
-            "sudo ",
-        ]
-        var hits: [String] = []
-        func walk(_ v: JSONValue, keyPath: String) {
-            switch v {
-            case .string(let s):
-                let lower = s.lowercased()
-                if needles.contains(where: { lower.contains($0) }) {
-                    hits.append(keyPath.isEmpty ? "input" : keyPath)
-                }
-            case .array(let arr):
-                for (idx, item) in arr.enumerated() { walk(item, keyPath: "\(keyPath)[\(idx)]") }
-            case .object(let obj):
-                for (k, item) in obj { walk(item, keyPath: keyPath.isEmpty ? k : "\(keyPath).\(k)") }
-            default:
-                break
-            }
-        }
-        walk(value, keyPath: "")
-        return hits
-    }
-
-    static func secretKeys(in value: JSONValue) -> [String] {
-        var hits: [String] = []
-        func walk(_ v: JSONValue, keyPath: String) {
-            let key = keyPath.lowercased()
-            switch v {
-            case .string(let s):
-                if !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   isSecretKey(key) || looksLikeSecret(s) {
-                    hits.append(keyPath.isEmpty ? "input" : keyPath)
-                }
-            case .array(let arr):
-                for (idx, item) in arr.enumerated() { walk(item, keyPath: "\(keyPath)[\(idx)]") }
-            case .object(let obj):
-                for (k, item) in obj { walk(item, keyPath: keyPath.isEmpty ? k : "\(keyPath).\(k)") }
-            case .null:
-                // A null optional field is absent, not a secret.
-                break
-            default:
-                if isSecretKey(key) {
-                    hits.append(keyPath)
-                }
-            }
-        }
-        walk(value, keyPath: "")
-        return Array(Set(hits)).sorted()
-    }
-
     static func redactValue(_ value: JSONValue, keyPath: String = "") -> JSONValue {
         let key = keyPath.lowercased()
         if isSecretKey(key) {

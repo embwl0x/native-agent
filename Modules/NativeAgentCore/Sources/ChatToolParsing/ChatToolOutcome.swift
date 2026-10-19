@@ -233,10 +233,10 @@ public enum ChatToolOutcome {
         return ExactResultClass(rawValue: original)
     }
 
-    /// Exact machine-envelope classification for evidence and resident
-    /// consequence paths. Unlike `outputLooksSuccessful`, this never treats a
-    /// missing status as success. Pending transport, approval, partial, and
-    /// ambiguous envelopes stay unknown.
+    /// Exact machine-envelope classification: the one outcome algebra every
+    /// projection reads (`outputLooksSuccessful` is its "did not fail"). It
+    /// never treats a missing status as success. Pending transport, approval,
+    /// partial, and ambiguous envelopes stay unknown.
     public static func exactResultClass(_ output: JSONValue) -> ExactResultClass {
         if MCPInvocationOutcome.classify(response: output).providerToolResultIsError {
             return .failed

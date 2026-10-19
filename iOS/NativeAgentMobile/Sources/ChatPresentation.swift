@@ -41,28 +41,12 @@ enum ChatRuntimeControlPresentation {
         model: String,
         providers: [ProviderInfo]
     ) -> String {
-        let ready = providers.filter { $0.auth_status.state == "ready" }
+        let ready = providers.filter { $0.auth_status.eligible }
         if ready.contains(where: { $0.provider_id == selectedProviderID }) { return selectedProviderID }
         if let activeProviderID, ready.contains(where: { $0.provider_id == activeProviderID }) { return activeProviderID }
         return ready.first(where: { provider in
             provider.models.contains(where: { $0.id == model })
         })?.provider_id ?? ""
-    }
-
-    static func reconciled(
-        model: String,
-        provider: ProviderInfo?,
-        selectedEffort: String,
-        selectedFastMode: Bool
-    ) -> (model: String, effort: String, fastMode: Bool) {
-        let modelInfo = provider?.models.first(where: { $0.id == model })
-        let allowed = modelInfo?.supported_reasoning_efforts?.filter { !$0.isEmpty }
-            ?? ["none", "low", "medium", "high"]
-        let preferred = modelInfo?.default_reasoning_effort ?? "high"
-        let effort = allowed.contains(selectedEffort)
-            ? selectedEffort
-            : (allowed.contains(preferred) ? preferred : (allowed.first ?? "high"))
-        return (model, effort, modelInfo?.supports_fast == true ? selectedFastMode : false)
     }
 
     static func shouldRollback(selectionGeneration: Int, requestGeneration: Int) -> Bool {

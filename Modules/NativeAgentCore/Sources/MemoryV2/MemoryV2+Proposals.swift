@@ -232,11 +232,9 @@ extension SwiftNativeMemoryV2 {
                 )
             }
             let accepted = try await acceptSuperseding(id: id, superseding: superseding)
-            await flushDerivedMemoryChanges()
             return accepted
         }
         let accepted = try await storage.acceptProposal(id: id)
-        await flushDerivedMemoryChanges()
         return accepted
     }
 
@@ -291,7 +289,6 @@ extension SwiftNativeMemoryV2 {
             expectedContent: proposal.content, content: content,
             embedding: embedded.vector, embeddingEpoch: embedded.epoch.rawValue
         ))
-        await flushDerivedMemoryChanges()
         return accepted
     }
 

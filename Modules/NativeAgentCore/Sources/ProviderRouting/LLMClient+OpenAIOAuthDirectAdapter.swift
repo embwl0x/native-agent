@@ -70,7 +70,7 @@ actor AsyncSerialQueue {
 }
 
 public final class OpenAIOAuthDirectAdapter: LLMAdapter {
-    public static let supportsTools = true
+    public static let toolWire = ProviderToolWire.native
     public let providerId: String = "openai_oauth_direct"
 
     public static let productionSession: URLSession = makeProductionSession()
@@ -316,9 +316,11 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
                         catch { throw LLMError.notConfigured(provider: "openai_oauth_direct") }
                         var req = try responsesRequest(accessToken: access)
 
+                        let accountRow = accountModel(coercedModel)
                         let bodyDict = Self.buildResponsesBodyFromMessages(
                             model: coercedModel, messages: messages, system: system, tools: tools,
-                            supportedEfforts: accountSupportedEfforts(model: coercedModel)
+                            supportedEfforts: accountRow?.supportedReasoningEfforts,
+                            supportsFast: accountRow?.supportsFast
                         )
                         do {
                             req.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [.sortedKeys])
@@ -420,7 +422,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
         system: String?,
         tools: [LLMToolSchema]?,
         transport: OpenAIExecutionControls.Transport = .chatGPTOAuth,
-        supportedEfforts: [String]? = nil
+        supportedEfforts: [String]? = nil,
+        supportsFast: Bool? = nil
     ) -> [String: Any] {
         var inputItems: [[String: Any]] = []
         for m in messages {
@@ -507,7 +510,8 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
             to: &body,
             model: model,
             transport: transport,
-            supportedEfforts: supportedEfforts
+            supportedEfforts: supportedEfforts,
+            supportsFast: supportsFast
         )
         // U1 step 4: stable per-session prompt-cache routing. Absent when no
         // session id is bound (byte-identical body to pre-U1).
@@ -716,12 +720,12 @@ public final class OpenAIOAuthDirectAdapter: LLMAdapter {
     /// Explicit injection wins; otherwise use the shared credential discovery
     /// and CLI-adoption consent rules in OpenAIOAuthCredentials.
     /// Effort levels the signed-in account's discovered catalog lists for `model`.
-    func accountSupportedEfforts(model: String) -> [String]? {
+    func accountModel(_ model: String) -> CodexAccountModelCatalog.Model? {
         CodexAccountModelCatalog.matchingModels(
             providerID: "openai_oauth_direct",
             oauthAuthURL: resolveAuthPath(),
             fallbackCacheURL: CodexAccountModelCatalog.cacheCandidate()
-        ).first { $0.id == model }?.supportedReasoningEfforts
+        ).first { $0.id == model }
     }
 
     func resolveAuthPath() -> URL {

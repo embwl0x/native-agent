@@ -71,13 +71,17 @@ public enum IntraTurnContextCompaction {
 
     /// What one compaction pass actually did. `mode` is the closed vocabulary
     /// the trace and the reactive caller both read: "none" means there was
-    /// nothing left to trim, so the turn finishes with its retained answer.
-    struct Receipt: Sendable, Equatable {
+    /// nothing left to trim, so the provider's refusal is her part's input.
+    struct Receipt: Sendable {
         let charsBefore: Int
         let charsAfter: Int
-        /// "stub" | "fold_llm" | "none"
+        /// "stub" | "fold_llm" | "cap" | "none"
         let mode: String
+        /// Why no working notes were written, when they were needed and are not.
+        var failure: ToolFailureError?
     }
+    /// Working notes, or the receipt of why there are none.
+    typealias Distill = @Sendable (String) async throws -> Result<String, ToolFailureError>
 
     // MARK: - Measurement
 
@@ -163,19 +167,18 @@ public enum IntraTurnContextCompaction {
     static let noteCapChars = 12_000
 
     /// Measure and trim before the next provider call, publishing changed receipts.
-    /// Returns whether pressure was exceeded, even for mode "none", so callers
-    /// recheck their wall-clock budget after compaction and the awaited notice.
+    /// Returns the pass's receipt when pressure was exceeded, nil when not.
     static func compactProactivelyIfNeeded(
         conversation: inout [LLMMessage],
         turnStartIndex: Int,
         windowTokens: Int?,
-        distill: (String) async throws -> String?,
+        distill: Distill,
         surface: String,
         turnRecoveries: Int,
         progress: ChatOrchestrationProgressHandler?
-    ) async throws -> Bool {
+    ) async throws -> Receipt? {
         guard estimatedChars(conversation) > pressureChars(windowTokens: windowTokens) else {
-            return false
+            return nil
         }
         let receipt = try await IntraTurnContextCompaction.compact(
             conversation: &conversation,
@@ -196,7 +199,7 @@ public enum IntraTurnContextCompaction {
                 text: IntraTurnContextCompaction.noticeText
             ))
         }
-        return true
+        return receipt
     }
 
     static func compact(
@@ -205,7 +208,7 @@ public enum IntraTurnContextCompaction {
         windowTokens: Int?,
         keepRecentRounds: Int = 5,
         pressure: Pressure = .proactive,
-        distill: (String) async throws -> String?
+        distill: Distill
     ) async throws -> Receipt {
         let charsBefore = estimatedChars(conversation)
         // A confirmed overflow means the estimate already missed (dense
@@ -316,9 +319,18 @@ public enum IntraTurnContextCompaction {
         }
         let pinned = priorNote.isEmpty ? "" : "[My earlier working notes — carry everything in them forward]\n" + String(priorNote.prefix(noteCapChars)) + "\n\n[Steps since then]\n"
         let room = max(1_000, distillInputMaxChars - pinned.count)
-        guard let note = try await distill(pinned + String(rendered.suffix(room))),
-              !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw ToolFailureError("Working recollection returned no text; the saved turn remains available for repair.", effects: .none)
+        // No notes: the span stays as it was and the receipt says why; nothing
+        // else is trimmed in their place.
+        let note: String
+        switch try await distill(pinned + String(rendered.suffix(room))) {
+        case .success(let text) where !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+            note = text
+        case .success:
+            return Receipt(charsBefore: charsBefore, charsAfter: estimatedChars(conversation), mode: stubbed ? "stub" : "none",
+                           failure: ToolFailureError("The working-notes model returned no text.", effects: .none))
+        case .failure(let failure):
+            return Receipt(charsBefore: charsBefore, charsAfter: estimatedChars(conversation), mode: stubbed ? "stub" : "none",
+                           failure: failure)
         }
         let mode = "fold_llm"
         let body = String(note.prefix(noteCapChars))
@@ -357,7 +369,7 @@ public enum IntraTurnContextCompaction {
         windowTokens: Int?,
         keepRecentRounds: Int,
         pressure: Pressure,
-        distill: (String) async throws -> String?
+        distill: Distill
     ) async throws -> Receipt {
         let after = estimatedChars(conversation)
         guard pressure == .overflow, after > target else {
@@ -373,7 +385,7 @@ public enum IntraTurnContextCompaction {
                 distill: distill
             )
             return Receipt(charsBefore: charsBefore, charsAfter: inner.charsAfter,
-                           mode: inner.mode == "none" ? mode : inner.mode)
+                           mode: inner.mode == "none" ? mode : inner.mode, failure: inner.failure)
         }
         var capped = false
         for idx in conversation.indices where idx >= foldStart && conversation[idx].role == .user {
@@ -419,7 +431,7 @@ public enum IntraTurnContextCompaction {
         return lines.joined(separator: "\n")
     }
 
-    private static let renderToolInputChars = 400
+    static let renderToolInputChars = 400
     private static let renderToolResultChars = 600
 
     // MARK: - Working-notes voice
@@ -473,6 +485,7 @@ public enum IntraTurnContextCompaction {
     ) -> JSONValue {
         .object([
             "mode": .string(receipt.mode),
+            "notesFailure": receipt.failure.map { .string($0.message) } ?? .null,
             "trigger": .string(trigger),
             "charsBefore": .int(Int64(receipt.charsBefore)),
             "charsAfter": .int(Int64(receipt.charsAfter)),

@@ -170,22 +170,6 @@ extension AppQuietToolHost {
             } catch {
                 return ChatToolOutcome.failure(error: error, tool: "app")
             }
-        case "mcp_revoke_consent":
-            // Connectors → MCP → Revoke, on a granted consent.
-            appModel.mcpConsent = (try? await appModel.engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent))
-                ?? appModel.mcpConsent
-            let granted = appModel.mcpConsent.filter { $0.status == "granted" }
-            guard let consent = granted.first(where: { $0.id == text("id") }) else {
-                return AppToolExecutor.failure("unknown_consent",
-                    "No granted MCP consent has that id. Pass id, one of the consents below.",
-                    extra: ["consents": .array(granted.map {
-                        .object(["id": .string($0.id), "server_id": .string($0.serverId ?? ""), "tool": .string($0.toolName ?? "")])
-                    })])
-            }
-            await appModel.revokeMCPConsent(consent)
-            let result = outcome(appModel.statusForAgent, ["id": .string(consent.id)])
-            if case .object(let body) = result, body["status"] == .string("ok") { decided("mcp.revoke_consent \(consent.id)") }
-            return result
         case "telegram_repair":
             do {
                 return try await TelegramUpdateInbox.repair(dataRoot: appModel.engine.dataRoot, inbox: text("inbox"))

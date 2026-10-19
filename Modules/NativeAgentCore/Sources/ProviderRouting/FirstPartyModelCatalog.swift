@@ -43,6 +43,19 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
     /// they are separate betas and may diverge; like `…ClearAt` it can never
     /// be claimed without the base capability.
     public let supportsMidConversationToolChanges: Bool
+    /// Anthropic adaptive thinking; the pinned 4.5 rows predate it.
+    public let adaptiveThinking: Bool
+    /// The public OpenAI API serves this model through Responses, not Chat Completions.
+    public let usesResponses: Bool
+    /// How a request carries the chosen effort.
+    public let reasoningWire: ReasoningWire
+
+    public enum ReasoningWire: Sendable, Equatable {
+        /// The effort itself, when it is not "none".
+        case effort
+        /// Only on or off: thinking is disabled at "none" and enabled otherwise.
+        case thinkingSwitch
+    }
 
     public init(
         id: String,
@@ -57,7 +70,10 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
         supportsFast: Bool = false,
         supportsMidConversationSystem: Bool = false,
         supportsMidConversationSystemClearAt: Bool = false,
-        supportsMidConversationToolChanges: Bool = false
+        supportsMidConversationToolChanges: Bool = false,
+        adaptiveThinking: Bool = true,
+        usesResponses: Bool = false,
+        reasoningWire: ReasoningWire = .effort
     ) {
         self.id = id
         self.name = name
@@ -79,6 +95,9 @@ public struct FirstPartyModelDescriptor: Sendable, Equatable {
         // the base capability.
         self.supportsMidConversationToolChanges =
             supportsMidConversationSystem && supportsMidConversationToolChanges
+        self.adaptiveThinking = adaptiveThinking
+        self.usesResponses = usesResponses
+        self.reasoningWire = reasoningWire
     }
 
     public func providerJSON() -> [String: JSONValue] {
@@ -111,15 +130,15 @@ public enum FirstPartyModelCatalog {
     public static let claude46Efforts = ["low", "medium", "high", "max"]
     public static let grok45Efforts = ["low", "medium", "high"]
 
-    /// Public OpenAI API catalog. GPT-6 tool calls use Responses.
+    /// Public OpenAI API catalog. GPT-6 rows are served through Responses.
     public static let publicOpenAIModels: [FirstPartyModelDescriptor] = [
         .init(id: "gpt-5.6", name: "GPT-5.6 (Sol alias)", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
         .init(id: "gpt-5.6-sol", name: "GPT-5.6 Sol", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
         .init(id: "gpt-5.6-terra", name: "GPT-5.6 Terra", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
         .init(id: "gpt-5.6-luna", name: "GPT-5.6 Luna", contextLength: 400_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
-        .init(id: "gpt-6.1-sol", name: "GPT-6.1-Sol", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true),
-        .init(id: "gpt-6-sol", name: "GPT-6-Sol", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true),
-        .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true),
+        .init(id: "gpt-6.1-sol", name: "GPT-6.1-Sol", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true, usesResponses: true),
+        .init(id: "gpt-6-sol", name: "GPT-6-Sol", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT56Efforts, supportsFast: true, usesResponses: true),
+        .init(id: gpt6AstraModelID, name: "GPT-6-Astra", contextLength: 1_050_000, supportsJSONMode: true, defaultReasoningEffort: "medium", supportedReasoningEfforts: publicGPT6AstraEfforts, supportsFast: true, usesResponses: true),
     ]
 
     /// Subscription-backed ChatGPT/Codex fallback. A signed models cache
@@ -166,9 +185,9 @@ public enum FirstPartyModelCatalog {
         .init(id: "claude-opus-4-7", name: "Claude Opus 4.7", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: fullClaudeEfforts),
         .init(id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: claude46Efforts),
         .init(id: "claude-opus-4-6", name: "Claude Opus 4.6", contextLength: 1_000_000, defaultReasoningEffort: "high", supportedReasoningEfforts: claude46Efforts),
-        .init(id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5", contextLength: 200_000, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high"]),
-        .init(id: "claude-haiku-4-5", name: "Claude Haiku 4.5", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
-        .init(id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"]),
+        .init(id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5", contextLength: 200_000, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high"], adaptiveThinking: false),
+        .init(id: "claude-haiku-4-5", name: "Claude Haiku 4.5", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"], adaptiveThinking: false),
+        .init(id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5", contextLength: 200_000, defaultReasoningEffort: "none", supportedReasoningEfforts: ["none"], adaptiveThinking: false),
     ]
 
     /// xAI text models retained by NativeAgent plus the current Grok 4.5
@@ -193,7 +212,7 @@ public enum FirstPartyModelCatalog {
         .init(id: "kimi-k3", name: "Kimi K3", contextLength: 1_048_576, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["max"]),
         .init(id: "kimi-k2.7-code-highspeed", name: "Kimi K2.7 Code Highspeed", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["max"]),
         .init(id: "kimi-k2.7-code", name: "Kimi K2.7 Code", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "max", supportedReasoningEfforts: ["max"]),
-        .init(id: "kimi-k2.6", name: "Kimi K2.6", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["none", "high"]),
+        .init(id: "kimi-k2.6", name: "Kimi K2.6", contextLength: 262_144, supportsJSONMode: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["none", "high"], reasoningWire: .thinkingSwitch),
     ]
 
     /// Kimi Code SUBSCRIPTION catalog (provider id "kimi-code"). Distinct from
@@ -437,9 +456,7 @@ public enum FirstPartyExecutionControls {
     }
 
     public static func applyAnthropicControls(to body: inout [String: Any], model: String) {
-        // The catalog's pinned 4.5 models predate adaptive thinking.
-        if let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: model),
-           !descriptor.id.contains("-4-5") {
+        if FirstPartyModelCatalog.anthropicDescriptor(for: model)?.adaptiveThinking == true {
             body["thinking"] = ["type": "adaptive", "display": "summarized"]
         }
         guard let effort = anthropicEffort(model: model, requested: LLMCallContext.reasoningEffort) else {

@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 
 /// Durable receipt for Workshop storage repair passes.
 ///
@@ -294,7 +295,7 @@ public enum WorkshopStorageMigrator {
                 withJSONObject: object,
                 options: [.prettyPrinted, .sortedKeys]
             )
-            try normalized.write(to: record, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(normalized, to: record)
             repaired.append("\(relativePath(record, under: dataRoot)) receipts_dir -> \(canonical)")
         }
         return repaired
@@ -331,7 +332,7 @@ public enum WorkshopStorageMigrator {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(report).write(to: receipt, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(report), to: receipt)
         return report
     }
 

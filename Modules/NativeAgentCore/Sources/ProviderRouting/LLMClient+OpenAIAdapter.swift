@@ -4,7 +4,7 @@ import PersistenceCore
 
 /// OpenAI API-key adapter: GPT-6 uses Responses; older models use Chat Completions.
 public final class OpenAIAdapter: LLMAdapter {
-    public static let supportsTools = true
+    public static let toolWire = ProviderToolWire.native
     public let providerId: String = "openai"
     /// Request timeout for the API-key lane. Same resolved value the OAuth
     /// direct adapters use (240s), so both lanes fail a stalled request the

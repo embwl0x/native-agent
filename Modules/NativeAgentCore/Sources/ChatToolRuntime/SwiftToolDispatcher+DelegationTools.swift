@@ -132,11 +132,13 @@ extension SwiftToolDispatcher {
             "legacy_or_other_build_count": .int(Int64(legacyOrOther.count)),
             "legacy_or_other_build_delivery_unknown_count": .int(Int64(legacyOrOther.filter { $0.deliveryOutcome == "unknown" }.count)),
             "jobs": .array(jobs.map { job in
+                // The contact first: its attested id carries the person's grant; the lane name never does.
+                let who = peers.first(where: { ($0.handles ?? []).contains(job.agent) })
                 let value = PeerDataTaintDispatcher.labelled(
                     fullDetail ? job.toJSON(includeReplyText: messageID != nil) : job.toCompactJSON(),
-                    agent: job.agent, dataRoot: dataRoot)
+                    agent: who.map { "peer:" + $0.id } ?? job.agent, dataRoot: dataRoot)
                 guard case .object(var object) = value else { return value }
-                if let who = peers.first(where: { ($0.handles ?? []).contains(job.agent) }) {
+                if let who {
                     object["door"] = .string(job.agent)
                     object["agent"] = .string("peer:" + who.id)
                     object["agent_name"] = .string(who.name)

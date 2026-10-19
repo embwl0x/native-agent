@@ -1,52 +1,17 @@
 import Foundation
 import PersistenceCore
 
-// MARK: - The first conversation's one write is not confirm-tier
+// MARK: - The first conversation's one documented write
 //
-// User's decision, 2026-09-15 (mockups/onboarding/NOTE.md §4.2 put the question
-// to him): when the agent opens the first conversation and asks the person what
-// they want it to be, the single line it writes down is NOT held behind an
-// approval card.
-//
-// WHY THE GUARD IS WRONG HERE, SPECIFICALLY. `PersonaWriteGuard` exists because
-// a permissive Trust posture would otherwise let the agent silently rewrite its
-// own identity documents. That is a real hazard and the guard keeps it for every
-// other persona write. But on this one turn the person has just said, in their
-// own words, who they want the agent to be — and the receipt under the answer
-// shows the exact sentence and the exact document it went into. Asking a
-// stranger to authorize writing down the thing they just typed is not a
-// confirmation, it is a form.
-//
-// WHAT KEEPS THIS HONEST — rewritten 2026-09-15 after Sol's review (P0-1/2/3).
-// The first version was a re-evaluatable predicate over loose facts: any
-// dispatcher could ask it, a prefix match let a changed suffix re-open it, and
-// the "already written?" read raced the append. It is now a ONE-SHOT BEARER
-// TOKEN with an atomic consume:
-//
-//   * The token is armed by the app ONLY after the opener actually lands, and
-//     carries the chat session id it was armed for and the EXACT section title
-//     that write must use (derived from the profile, not from the model).
-//   * A dispatch is exempt only when it is `persona_append_section`, kind
-//     `soul`, on that session, with that exact single-line title, single-line
-//     content, into a SOUL.md that carries no "Who I am to …" section yet.
-//   * Granting it arms ONE more token of the same shape (User, 2026-09-25):
-//     kind `voice`, title "How I talk with …", into a VOICE.md without that
-//     section — the answer to "how would you like me to sound".
-//   * Granting it RENAMES the token. Rename is atomic on POSIX, so of any
-//     number of concurrent or repeated dispatches exactly one can ever win —
-//     which is what closes the check-then-append race (P0-3) without reaching
-//     into the persona engine's flock. A second write is simply not exempt and
-//     meets the ordinary confirm card.
-//
-// The token is consumed on GRANT, not on success, so a write that is admitted
-// and then fails does not leave a live exemption behind. That fails closed: the
-// person's next attempt gets the ordinary approval card rather than a second
-// silent write.
-//
-// Everything else about the write is unchanged: the engine still backs the
-// document up, still refuses `kind: "user"`, and SecurityCenter still records
-// the dispatch. The exemption is audited at its use site rather than being
-// silent (see `ChatOrchestrationClient+DispatchWrappers`).
+// When the agent opens the first conversation and asks the person who they
+// want it to be, the single line it writes down is a one-shot bearer token the
+// app arms after the opener lands (User, 2026-09-15; hardened after Sol's
+// P0-1/2/3): `persona_append_section`, kind `soul`, on that session, with the
+// exact single-line title, into a SOUL.md without a "Who I am to …" section.
+// Spending it RENAMES the token (atomic on POSIX, so exactly one dispatch can
+// win) and arms one more of the same shape for VOICE.md, "How I talk with …"
+// (User, 2026-09-25). The token authorizes nothing: posture decides the write
+// like any other. Spending it is what moves the first conversation on.
 public enum FirstConversationPersonaExemption {
 
     /// The section-title prefix the flow writes under. Used ONLY to detect that

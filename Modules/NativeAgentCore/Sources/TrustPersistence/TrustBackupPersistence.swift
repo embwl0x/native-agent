@@ -25,7 +25,7 @@ private actor NativeBackupRestoreCoordinator {
 
 private let nativeBackupRestoreCoordinator = NativeBackupRestoreCoordinator()
 
-private struct NativeBackupIntegrityFile: Codable, Equatable {
+private struct NativeBackupIntegrityFile: Codable, Equatable, Sendable {
     let path: String
     let sizeBytes: Int64
     let sha256: String
@@ -393,7 +393,8 @@ public enum TrustBackupPersistence {
     /// staged in a local temp directory (SQLite copies leave WAL mode there),
     /// copied into `parent/auto-<UTC time>`, re-verified against its manifest
     /// where it landed, then automatic folders beyond the newest
-    /// `offDiskBackupKeepCount` are pruned.
+    /// `offDiskBackupKeepCount` are pruned. Every step that touches iCloud
+    /// Drive runs on VolumeIO, never on the cooperative pool.
     public static func createOffDiskBackup(
         reason: String,
         dataRoot root: URL,
@@ -403,16 +404,18 @@ public enum TrustBackupPersistence {
     ) async throws -> URL {
         let fm = FileManager.default
         let iCloudDrive = parent.deletingLastPathComponent()
-        guard Self.pathEntryExists(iCloudDrive) else {
-            throw Self.backupError(code: 503, "iCloud Drive is not available at \(iCloudDrive.path); no off-disk backup was written.")
-        }
-        if !Self.pathEntryExists(parent) {
-            try fm.createDirectory(at: parent, withIntermediateDirectories: false)
-        }
         let name = "auto-" + Self.offDiskBackupFolderFormatter().string(from: now)
         let destination = parent.appendingPathComponent(name, isDirectory: true)
-        guard !Self.pathEntryExists(destination) else {
-            throw Self.backupError(code: 409, "Off-disk backup \(name) already exists.")
+        try await VolumeIO.run {
+            guard Self.pathEntryExists(iCloudDrive) else {
+                throw Self.backupError(code: 503, "iCloud Drive is not available at \(iCloudDrive.path); no off-disk backup was written.")
+            }
+            if !Self.pathEntryExists(parent) {
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+            }
+            guard !Self.pathEntryExists(destination) else {
+                throw Self.backupError(code: 409, "Off-disk backup \(name) already exists.")
+            }
         }
         let staging = fm.temporaryDirectory
             .appendingPathComponent("NativeAgent-offdisk-\(UUID().uuidString.lowercased())", isDirectory: true)
@@ -428,17 +431,21 @@ public enum TrustBackupPersistence {
                 offDisk: true,
                 host: host
             ).files
-            try fm.copyItem(at: staging, to: partial)
-            guard try Self.backupIntegrityFiles(in: partial.appendingPathComponent("data", isDirectory: true)) == files else {
-                throw Self.backupError(code: 500, "Off-disk backup copy does not match its manifest.")
+            try await VolumeIO.run {
+                try FileManager.default.copyItem(at: staging, to: partial)
+                guard try Self.backupIntegrityFiles(in: partial.appendingPathComponent("data", isDirectory: true)) == files else {
+                    throw Self.backupError(code: 500, "Off-disk backup copy does not match its manifest.")
+                }
+                try FileManager.default.moveItem(at: partial, to: destination)
             }
-            try fm.moveItem(at: partial, to: destination)
         } catch {
-            try? fm.removeItem(at: partial)
+            _ = try? await VolumeIO.run { try FileManager.default.removeItem(at: partial) }
             throw error
         }
-        for stale in try Self.offDiskAutomaticBackups(in: parent).dropFirst(Self.offDiskBackupKeepCount) {
-            try fm.removeItem(at: stale.url)
+        try await VolumeIO.run {
+            for stale in try Self.offDiskAutomaticBackups(in: parent).dropFirst(Self.offDiskBackupKeepCount) {
+                try FileManager.default.removeItem(at: stale.url)
+            }
         }
         return destination
     }

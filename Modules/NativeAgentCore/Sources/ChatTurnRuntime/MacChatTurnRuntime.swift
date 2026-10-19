@@ -13,8 +13,20 @@ public final class MacChatTurnRuntime {
     /// Ordinary sends, retries and receipt follow-ups share this runtime's
     /// session slot through transcript settlement, including detached chat
     /// and local bridge turns that also carry the chat surface.
-    public func runAdmittedTurn<T>(sessionID: String, operation: () async throws -> T) async throws -> T {
-        try await TurnAdmission.shared.run(sessionID: sessionID, operation: operation)
+    ///
+    /// The one place a Mac turn's run is registered for Stop: synchronously,
+    /// before any await, so a Stop from here on names the live run, and one
+    /// that came before (cancelling the task) ends it here. The run is pinned
+    /// so the turn's own acceptance is this same registration.
+    public func runAdmittedTurn<T>(sessionID: String, turnID: String, runID: String? = nil,
+                                   operation: () async throws -> T) async throws -> T {
+        let runID = runID ?? UUID().uuidString
+        let stop = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: sessionID, runId: runID, turnId: turnID)
+        defer { ChatCancelFlag.finish(stop) }
+        try Task.checkCancellation()
+        return try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runID) {
+            try await TurnAdmission.shared.run(sessionID: sessionID, operation: operation)
+        }
     }
 
     public nonisolated static let streamProgressCoalesceSeconds: TimeInterval = 1.0

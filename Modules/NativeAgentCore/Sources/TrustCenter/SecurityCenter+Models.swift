@@ -63,14 +63,14 @@ public enum SecurityToolDecision: String, Codable, Sendable, Equatable {
 ///
 /// `.admitted` is deliberately narrow: the saved Full Mac grant is active,
 /// the concrete conversation origin is local or has been authenticated by its
-/// canonical remote surface, and the user has not explicitly blocked this
-/// tool. Callers may use that state to flatten per-call ask/confirm policy into
-/// allow. It never authorizes a SecurityCenter `.block` or a domain-owned
-/// boundary such as protected roots, disabled integrations, secret egress, or
-/// macOS TCC.
+/// canonical remote surface. Callers may use that state to flatten per-call
+/// ask/confirm policy into allow. It never authorizes a SecurityCenter
+/// `.block` or a domain-owned boundary such as protected roots, disabled
+/// integrations, or macOS TCC.
 public enum FullMacYoloAuthorityState: String, Codable, Sendable, Equatable {
     case admitted
     case inactive
+    /// Older audit receipts carry it; no saved per-tool entry decides now.
     case explicitlyBlocked = "explicitly_blocked"
     case untrustedOrigin = "untrusted_origin"
     case unavailable
@@ -223,14 +223,11 @@ public struct SecurityToolEnvelope: Codable, Sendable, Equatable, Identifiable {
     public var risk: String
     public var autonomyLevel: String
     public var fullMacYoloAuthority: FullMacYoloAuthorityState
-    public var signedToolKnown: Bool
-    public var rollbackRequired: Bool
     public var decision: SecurityToolDecision
     public var allowed: Bool
     public var requiresApproval: Bool
     public var reasons: [SecurityReason]
     public var primaryReason: String { SecurityReason.firstCause(in: reasons) }
-    public var untrustedInputKeys: [String]
     public var redactedInputPreview: JSONValue
     public var auditReceiptsEnabled: Bool
     public var autonomyReason: String? = nil

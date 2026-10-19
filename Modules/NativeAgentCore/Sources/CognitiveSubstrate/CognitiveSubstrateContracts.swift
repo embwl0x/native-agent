@@ -34,18 +34,17 @@ public struct CognitiveSubstrateDependencies: Sendable {
     /// surface; the wiring must hand it to the store's disclosure policy rather
     /// than recalling unfiltered.
     ///
-    /// Default is silence, and silence is the honest degraded state: a cold or
-    /// unavailable memory store simply means she is not reminded of anything
-    /// this turn. It must never cost a provider call.
+    /// An unreadable store is not silence: it is named in `unreadable` and
+    /// becomes her receipt line. It must never cost a provider call.
     public var recallMoments: @Sendable (
         _ feltLine: String, _ k: Int, _ surface: String
-    ) async -> [CognitiveRecalledMoment]
+    ) async -> CognitiveCueRead<[CognitiveRecalledMoment]>
     /// Phase 5 B1. Last night's dream residue phrases (her diary's own words,
     /// embedded on device) scored against this message; [] when there is no
     /// living residue. Phrases in `spent` already surfaced and are skipped
     /// (all spent → no lookup at all). Local only, warm embedder only, never a
     /// provider call, never memory.
-    public var dreamThemes: @Sendable (_ message: String, _ spent: Set<String>) async -> [CognitiveDreamTheme]
+    public var dreamThemes: @Sendable (_ message: String, _ spent: Set<String>) async -> CognitiveCueRead<[CognitiveDreamTheme]>
     /// Phase 5 D1: the local embedder, for the background reflection step
     /// only (paraphrase recurrence). Nil when it cannot embed; the lexical
     /// match still runs.
@@ -56,7 +55,7 @@ public struct CognitiveSubstrateDependencies: Sendable {
     /// Phase 5 B2. What actually happened between User's last turn and this
     /// one — a few short items with real content, [] when nothing did. Local
     /// reads only; the surface is the disclosure boundary for moments.
-    public var sinceGap: @Sendable (_ from: Date, _ to: Date, _ surface: String) async -> [String]
+    public var sinceGap: @Sendable (_ from: Date, _ to: Date, _ surface: String) async -> CognitiveCueRead<[String]>
     /// Phase 5 E3: a human cause for the body's feelings — an interest she
     /// came back to (curiosity), an opinion revised on evidence (coherence).
     public var feltCause: @Sendable (_ curiosity: Double, _ coherence: Double) async -> Void
@@ -67,12 +66,14 @@ public struct CognitiveSubstrateDependencies: Sendable {
         userName: @escaping @Sendable () -> String = { "" },
         attentionProjectionSink: @escaping @Sendable (CognitiveAttentionSignals?, Date) -> Void = { _, _ in },
         dynamics: @escaping @Sendable () -> PersonalityDynamicsConfiguration = { .default },
-        recallMoments: @escaping @Sendable (String, Int, String) async -> [CognitiveRecalledMoment]
-            = { _, _, _ in [] },
-        dreamThemes: @escaping @Sendable (String, Set<String>) async -> [CognitiveDreamTheme] = { _, _ in [] },
+        recallMoments: @escaping @Sendable (String, Int, String) async -> CognitiveCueRead<[CognitiveRecalledMoment]>
+            = { _, _, _ in CognitiveCueRead([]) },
+        dreamThemes: @escaping @Sendable (String, Set<String>) async -> CognitiveCueRead<[CognitiveDreamTheme]>
+            = { _, _ in CognitiveCueRead([]) },
         embedTexts: @escaping @Sendable ([String]) async -> [[Float]]? = { _ in nil },
         peerTrusted: @escaping @Sendable (String) -> Bool = { _ in false },
-        sinceGap: @escaping @Sendable (Date, Date, String) async -> [String] = { _, _, _ in [] },
+        sinceGap: @escaping @Sendable (Date, Date, String) async -> CognitiveCueRead<[String]>
+            = { _, _, _ in CognitiveCueRead([]) },
         feltCause: @escaping @Sendable (Double, Double) async -> Void = { _, _ in },
         decisions: @escaping @Sendable () async -> [String: Experience] = { [:] }
     ) {
@@ -91,6 +92,18 @@ public struct CognitiveSubstrateDependencies: Sendable {
     }
 
     public static let live = CognitiveSubstrateDependencies()
+}
+
+/// What a continuity source read, and each source it could not read with its
+/// cause: unreadable is never folded into "nothing came to mind".
+public struct CognitiveCueRead<Value: Sendable>: Sendable {
+    public var value: Value
+    public var unreadable: [String]
+
+    public init(_ value: Value, unreadable: [String] = []) {
+        self.value = value
+        self.unreadable = unreadable
+    }
 }
 
 /// Receipt history is observational evidence, not an empty-by-default metric.

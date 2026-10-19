@@ -353,10 +353,9 @@ extension SwiftNativeChatOrchestrationClient {
                         }
                 }
             }
+            // A consumer that stops listening only detaches: the accepted turn
+            // runs on until it ends or its Stop is raised.
             control.install(task)
-            continuation.onTermination = { termination in
-                if case .cancelled = termination { control.cancel() }
-            }
         }
         return ChatStreamExecution(events: events, control: control)
     }

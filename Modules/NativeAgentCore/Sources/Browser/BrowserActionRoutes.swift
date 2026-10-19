@@ -150,6 +150,9 @@ public struct BrowserActionRoutes: Sendable {
             if let chars = result.textChars {
                 sourceReceipt["textChars"] = .int(Int64(chars))
             }
+            if !result.readFailures.isEmpty {
+                sourceReceipt["readFailures"] = .object(result.readFailures.mapValues(JSONValue.string))
+            }
             if captureSource, let text = result.text {
                 try Task.checkCancellation()
                 let persisted = try await persistBrowserTextCapture(
@@ -202,6 +205,61 @@ public struct BrowserActionRoutes: Sendable {
         }
         // The Core reducer makes terminal state absorbing, so an explicit
         // cancel committed during WebKit/capture always defeats late success.
+        await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
+        return committed
+    }
+
+    /// A page effect that is not a navigation (a click, a fill) under the one
+    /// operation owner. The window is owned before the first suspension and
+    /// the run is cancellable before its start is persisted; after the start,
+    /// the canonical state is read again and the page must still be the one
+    /// it started on, so a cancel committed meanwhile, or a replacement page,
+    /// gets no input. The completion says what it did.
+    @MainActor
+    public func executePageEffect(
+        _ name: String, detail: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        _ effect: @escaping @MainActor () async throws -> Void
+    ) async throws -> JSONValue {
+        let page = effects.currentURL() ?? ""
+        let parsed = try validBrowserURL(page)
+        let runID = "page-\(UUID().uuidString.lowercased())"
+        try effects.acquireBrowser(runID: runID)
+        defer { effects.releaseBrowser(runID: runID) }
+        let latch = BrowserRunCancellationLatch()
+        let token = BrowserActiveRunRegistry.shared.register(runID: runID) { latch.cancel() }
+        defer { BrowserActiveRunRegistry.shared.unregister(runID: runID, token: token) }
+        let start = BrowserOperationStart(id: runID, url: parsed.url.absoluteString, domain: parsed.domain, initialState: .running)
+        let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
+        _ = try await browser.executeBrowserOperation(.start(start))
+        let phase = try await browser.motorActionReadModel(actionId: runID)?.phase
+        var receipt = detail
+        receipt["action"] = .string(name)
+        var state = BrowserOperationTerminalState.succeeded
+        let task = Task { @MainActor in
+            guard phase == .running else { throw CancellationError() }
+            guard effects.currentURL() == page else {
+                throw NSError(domain: "NativeAgentBrowser", code: 409, userInfo: [
+                    NSLocalizedDescriptionKey: "The page changed before the \(name) could land; nothing was sent to it."
+                ])
+            }
+            try Task.checkCancellation()
+            try await effect()
+        }
+        latch.install { task.cancel() }
+        // The caller's cancel reaches the effect the way navigation's does.
+        do {
+            try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+        } catch is CancellationError { state = .canceled } catch {
+            state = .failed
+            receipt["error"] = .string(error.localizedDescription)
+        }
+        guard let committed = try await browser.executeBrowserOperation(.complete(BrowserOperationCompletion(
+            id: runID, requestDigest: SwiftNativeBrowserClient.browserRequestDigest(for: start),
+            state: state, opened: false, sourceReceipt: .object(receipt)))).run else {
+            throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
+                NSLocalizedDescriptionKey: "Browser canonical completion returned no run"
+            ])
+        }
         await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
         return committed
     }
@@ -349,13 +407,15 @@ public struct BrowserActionRoutes: Sendable {
         try Task.checkCancellation()
         let text = captureSource ? (try await effects.readText()) : nil
         try Task.checkCancellation()
-        let links = captureSource ? (try? await effects.readLinks()) : nil
+        var readFailures: [String: String] = [:]
+        var links: [BrowserLink]?
+        if captureSource {
+            do { links = try await effects.readLinks() } catch { readFailures["links"] = error.localizedDescription }
+        }
         try Task.checkCancellation()
-        let textChars: Int?
-        if let text {
-            textChars = text.count
-        } else {
-            textChars = try? await effects.readText().count
+        var textChars = text?.count
+        if text == nil {
+            do { textChars = try await effects.readText().count } catch { readFailures["textChars"] = error.localizedDescription }
         }
         let screenshot = captureScreenshot ? (try await effects.screenshot()) : nil
         try Task.checkCancellation()
@@ -365,7 +425,8 @@ public struct BrowserActionRoutes: Sendable {
             text: text,
             textChars: textChars,
             links: links,
-            screenshot: screenshot
+            screenshot: screenshot,
+            readFailures: readFailures
         )
     }
 

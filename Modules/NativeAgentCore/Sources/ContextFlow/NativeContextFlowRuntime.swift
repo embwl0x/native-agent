@@ -335,6 +335,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// lends its priority to the launch's utility-priority startup instead of
     /// parking behind it on a busy Mac (a continuation lends nothing).
     private var startup: Task<Void, Never>?
+    private var personaPickerReconcile: Task<Void, Never>?
     private var semanticQueryCache: [String: ContextQueryEmbeddingValue] = [:]
     private var semanticQueryCacheOrder: [String] = []
     static let maximumConcurrentSemanticQueries = 8
@@ -502,10 +503,18 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     /// Eagerly rebuild after the Mac picker changes. `prepareContextTurn` also
-    /// calls this fence, so an unstructured UI notification can never let the
-    /// next real chat turn consume the prior persona generation.
+    /// requests it, without waiting: a turn whose kernel predates the selection
+    /// gets the persona receipt, never the prior persona.
     public func personaPickerDidChange() async {
         await reconcilePersonaPickerIfNeeded()
+    }
+
+    private func requestPersonaPickerReconcile() {
+        guard personaPickerReconcile == nil else { return }
+        personaPickerReconcile = Task {
+            await reconcilePersonaPickerIfNeeded()
+            personaPickerReconcile = nil
+        }
     }
 
     private func normalizedPersonaOverride() -> String? {
@@ -577,7 +586,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
               runtime.effectiveBackend != ManagedEmbeddingProvider.failClosedBackend,
               runtime.coreMLLoaded
                 || runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend else {
-            return nil
+            return ContextQueryEmbeddingTicket(unavailable: "the memory-search model is not loaded")
         }
         // Backend inspection suspends. A stop/reload during that await must
         // not admit a task against the retired runtime after its drain.
@@ -603,7 +612,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         // The runtime snapshot already carries the exact usable vector-space
         // identity. A second MemoryV2 getter would make ManagedEmbeddingProvider
         // reread the same backend/mode JSON files on every active turn.
-        guard let embeddingEpoch = runtime.embeddingEpoch else { return nil }
+        guard let embeddingEpoch = runtime.embeddingEpoch else {
+            return ContextQueryEmbeddingTicket(unavailable: "the memory-search model named no vector space")
+        }
         let key = ContextStableID.digest(parts: [
             "semantic-query-v2",
             embeddingEpoch,
@@ -626,25 +637,26 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         // Semantic query vectors are optional. Keep a wedged provider or burst
         // of turns from building an unbounded task/ticket backlog; overflow
         // follows the existing lexical-only path without delaying the turn.
-        guard semanticQueryTickets.count < Self.maximumConcurrentSemanticQueries else { return nil }
+        guard semanticQueryTickets.count < Self.maximumConcurrentSemanticQueries else {
+            return ContextQueryEmbeddingTicket(unavailable: "\(Self.maximumConcurrentSemanticQueries) query embeddings are already in flight")
+        }
         let ticket = ContextQueryEmbeddingTicket()
         semanticQueryTickets[key] = ticket
         let modelID = runtime.modelId
         semanticQueryTasks[key] = Task(priority: .utility) { [weak self, memory] in
-            let value: ContextQueryEmbeddingValue?
+            let value: Result<ContextQueryEmbeddingValue, Error>
             do {
                 let texts = alternateQuery.map { [query, $0] } ?? [query]
                 let batch = try await memory.embedForDerivedContextWithEpoch(texts)
-                value = batch.vectors.first.map {
-                    ContextQueryEmbeddingValue(
-                        values: $0,
-                        alternateValues: batch.vectors.count > 1 ? batch.vectors[1] : nil,
-                        modelFingerprint: batch.epoch.rawValue,
-                        modelID: modelID
-                    )
-                }
+                guard let first = batch.vectors.first else { throw MemoryV2Error.underlying("embedder returned no vectors") }
+                value = .success(ContextQueryEmbeddingValue(
+                    values: first,
+                    alternateValues: batch.vectors.count > 1 ? batch.vectors[1] : nil,
+                    modelFingerprint: batch.epoch.rawValue,
+                    modelID: modelID
+                ))
             } catch {
-                value = nil
+                value = .failure(error)
             }
             await self?.completeSemanticQuery(
                 key: key, epoch: epoch, expectedEmbeddingEpoch: embeddingEpoch, value: value
@@ -657,20 +669,32 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         key: String,
         epoch: UInt64,
         expectedEmbeddingEpoch: String,
-        value: ContextQueryEmbeddingValue?
+        value result: Result<ContextQueryEmbeddingValue, Error>
     ) {
         guard epoch == semanticQueryEpoch else { return }
         semanticQueryTasks[key] = nil
         let ticket = semanticQueryTickets.removeValue(forKey: key)
-        guard let value,
-              !value.values.isEmpty,
-              value.values.allSatisfy(\.isFinite),
-              value.modelFingerprint == expectedEmbeddingEpoch else { return }
+        let value: ContextQueryEmbeddingValue
+        switch result {
+        case .failure(let error):
+            ticket?.fail("query embedding failed: \(error.localizedDescription)")
+            return
+        case .success(let embedded):
+            value = embedded
+        }
+        guard !value.values.isEmpty, value.values.allSatisfy(\.isFinite) else {
+            ticket?.fail("the memory-search model returned an unusable query vector")
+            return
+        }
+        guard value.modelFingerprint == expectedEmbeddingEpoch else {
+            ticket?.fail("the memory-search model changed while the query embedded")
+            return
+        }
         // The embedder can change while prediction is suspended. Never bind
         // a vector from the new space to the old snapshot's cache key: after
         // a switch back, that poisoned hit would keep disabling semantic
-        // relevance for this query. Failure retains the bounded nil fallback;
-        // removing the in-flight ticket above permits a fresh exact-epoch retry.
+        // relevance for this query. Removing the in-flight ticket above
+        // permits a fresh exact-epoch retry.
         semanticQueryCache[key] = value
         touchSemanticQueryCacheKey(key)
         while semanticQueryCacheOrder.count > 32 {
@@ -697,7 +721,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
 
     public func prepareContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn {
         await start()
-        await reconcilePersonaPickerIfNeeded()
+        // The person's selection is applied by the build; the turn never
+        // waits on it, and an unpublished selection is the persona receipt below.
+        requestPersonaPickerReconcile()
         guard let coordinator else {
             if let startupFailure { throw NativeContextFlowStartupError(detail: startupFailure) }
             throw ContextTurnPreparationError.coordinatorNotStarted

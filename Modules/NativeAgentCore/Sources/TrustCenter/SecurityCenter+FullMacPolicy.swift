@@ -31,8 +31,6 @@ extension SwiftNativeSecurityCenter {
             }
             let originAssessment = try await assessOrigin(origin, policy: checkedSnapshot.policy)
             return Self.fullMacYoloAuthority(
-                tool: tool,
-                surface: origin.surface,
                 originAssessment: originAssessment,
                 snapshot: checkedSnapshot
             )
@@ -47,7 +45,7 @@ extension SwiftNativeSecurityCenter {
     /// THE launch decision for an agent NativeAgent drives, for the request's
     /// real origin: admitted Full Mac runs it with full access, a lower Trust
     /// or an origin not admitted for Full Mac runs it restricted, and an
-    /// explicit block or an unreadable policy launches nothing.
+    /// unreadable policy launches nothing.
     public func drivenAgentLaunchPermission(
         tool: String,
         origin: SecurityOriginContext
@@ -62,12 +60,8 @@ extension SwiftNativeSecurityCenter {
 
     /// Shared pure evaluator for owners that already hold one checked
     /// authorization generation. This is the single YOLO vocabulary: there is
-    /// intentionally no tool exclusion list. Explicit `blocked` is the only
-    /// per-tool posture that outranks an admitted grant; hard SecurityCenter
-    /// and domain decisions remain blocks rather than ask/confirm policy.
+    /// intentionally no tool exclusion list and no saved per-tool entry.
     static func fullMacYoloAuthority(
-        tool: String,
-        surface: String,
         originAssessment: OriginAssessment,
         snapshot: TrustPolicyAuthorizationSnapshot
     ) -> FullMacYoloAuthorityAssessment {
@@ -77,35 +71,11 @@ extension SwiftNativeSecurityCenter {
                 reason: "Full Mac is not turned on"
             )
         }
-        let canonicalTool = Self.policyToolName(tool)
-        if SwiftNativeTrustCenter.hasExplicitBlockOverride(
-            tool,
-            overrides: snapshot.userConfiguredAutonomyOverrides
-        ) || (canonicalTool != tool && SwiftNativeTrustCenter.hasExplicitBlockOverride(
-            canonicalTool,
-            overrides: snapshot.userConfiguredAutonomyOverrides
-        )) {
-            return FullMacYoloAuthorityAssessment(
-                state: .explicitlyBlocked,
-                reason: "tool is explicitly blocked by the user"
-            )
-        }
-
-        let normalizedSurface = surface
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        if originAssessment.isRemote {
-            guard originAssessment.trusted,
-                  fullMacYoloTrustedRemoteSurfaces.contains(normalizedSurface) else {
-                return FullMacYoloAuthorityAssessment(
-                    state: .untrustedOrigin,
-                    reason: originAssessment.reason
-                )
-            }
-        } else if !fullMacYoloLocalSurfaces.contains(normalizedSurface) {
+        // The authenticated origin carries the authority, whatever its door.
+        if originAssessment.isRemote, !originAssessment.trusted {
             return FullMacYoloAuthorityAssessment(
                 state: .untrustedOrigin,
-                reason: "surface is not an admitted Full Mac operator surface"
+                reason: originAssessment.reason
             )
         }
         return FullMacYoloAuthorityAssessment(
@@ -124,8 +94,6 @@ extension SwiftNativeSecurityCenter {
     ) -> FullMacYoloAuthorityAssessment {
         let remote = ConversationSurfaceProfile(surface).isRemote
         return fullMacYoloAuthority(
-            tool: tool,
-            surface: surface,
             originAssessment: OriginAssessment(
                 trusted: remote ? originTrusted : true,
                 reason: remote
@@ -136,38 +104,4 @@ extension SwiftNativeSecurityCenter {
             snapshot: snapshot
         )
     }
-
-    /// P2-3: `workshop` is the canonical Workshop surface; `mission`/`missions`
-    /// stay for turns that still arrive on the 0.3.x spelling. Dropping either
-    /// makes full-mac yolo quietly stop elevating Workshop builder steps.
-    ///
-    /// Wave 5b: the Workshop spellings come from
-    /// `WorkshopSurfaceVocabulary.gateSpellings` rather than being open-coded
-    /// here, per this vocabulary's own rule (no caller may hand-write an
-    /// `== "missions"` check). Same three strings, same membership.
-    // "app" is the name the Mac chat saves its own turns under; a turn
-    // resumed from one of her cards replays under that saved envelope, and it
-    // is still the person's own Mac chat (User 09-27: "she's on full mac there
-    // should be none of that"). A peer's card saves as "agent-bridge". "bot"
-    // is her own helper: it inherits her posture exactly (User 10-17).
-    static let fullMacYoloLocalSurfaces: Set<String> = Set(
-        [
-            "chat", "app", "bot", "desk",
-            "connector_action", "nextgen_action", "native_actions", "mcp_ui",
-        ]
-            + WorkshopSurfaceVocabulary.gateSpellings
-    )
-
-    static let fullMacYoloTrustedRemoteSurfaces: Set<String> = [
-        "telegram",
-        "slack",
-        "ios",
-        "icloud",
-        "iphone",
-        "ipad",
-        "mobile",
-        "watch",
-        "remote",
-    ]
-
 }

@@ -211,7 +211,7 @@ let extraDeps: [String: [String]] = [
     // instance and hands it the root's mind; what it reads from the app's
     // mirrors comes through DeviceSyncHost. Nothing imports it back.
     "DeviceSync": ["Experiences", "MacControl", "PersistenceCore", "CognitiveSubstrate", "Cognition", "ChatOrchestration", "KnowledgeGraph", "MemoryV2", "ApprovalInbox", "NotificationInbox", "ProviderRouting", "MacIntegration", "TrustCenter", "WorkshopExecution", "PersonaEngine", "Transcripts", "Desk", "Privacy", "DeviceSyncState", "TriggerScheduler", "AgentConversations", "TurnTrace"],
-    "AttentionRouting": ["Privacy", "PersistenceCore", "FeedPolicy", "ChatOrchestration", "DeviceSync", "TelegramBot", "Desk", "TriggerScheduler", "NotificationInbox", "ApprovalInbox", "StandingBots"],
+    "AttentionRouting": ["Experiences", "Privacy", "PersistenceCore", "FeedPolicy", "ChatOrchestration", "DeviceSync", "TelegramBot", "Desk", "TriggerScheduler", "NotificationInbox", "ApprovalInbox", "StandingBots"],
     "ProviderRouting": ["Experiences", "PersistenceCore", "TurnTrace", "FeedPolicy"],
     "BackgroundLoops": ["PersistenceCore", "FeedPolicy"],
     // Cross-domain runner bodies sit above their domain owners; the scheduler
@@ -223,7 +223,7 @@ let extraDeps: [String: [String]] = [
     // Due-job execution composes owners that already depend on TriggerScheduler.
     "SchedulerExecution": ["Experiences", "AuthoredCapabilities", "PersistenceCore", "TriggerScheduler", "AttentionRouting", "DeviceSync", "DreamREMCycle", "TelegramBot", "NotificationInbox", "Privacy", "BackgroundWork", "AppToolRuntime"],
     "SystemOps": ["PersistenceCore", "TrustCenter"],
-    "Dispatcher": ["AuthoredCapabilities", "Senses", "PersistenceCore", "MacControl", "Skills"],
+    "Dispatcher": ["Experiences", "AuthoredCapabilities", "Senses", "PersistenceCore", "MacControl", "Skills"],
     // TrustCenter owns the Mac Control gate and injection vocabulary (S9);
     // MacControl reads them. No cycle — TrustCenter imports no executor.
     "MacControl": ["Experiences", "Senses", "PersistenceCore", "TrustCenter", "FeedPolicy"],
@@ -240,7 +240,7 @@ let extraDeps: [String: [String]] = [
     "Skills": ["AuthoredCapabilities", "Senses", "PersistenceCore", "Privacy"],
     "NotificationInbox": ["PersistenceCore", "FeedPolicy", "ApprovalInbox", "Desk"],
     "Connectors": ["AuthoredCapabilities", "PersistenceCore", "Privacy", "FeedPolicy", "MacIntegration", "ProviderRouting", "XConnector", "GitHubConnector", "TrustCenter", "ApprovalInbox", "ApprovalTransactions", "ChatOrchestration", "SlackConnector", "TriggerScheduler", "MacControl", "AppToolRuntime", "DeviceSync", "AttentionRouting", "MacAssistantStatus", "TelegramBot"],
-    "SwarmRuns": ["PersistenceCore", "TurnTrace"],
+    "SwarmRuns": ["Experiences", "PersistenceCore", "TurnTrace"],
     "Browser": ["PersistenceCore", "FeedPolicy", "Privacy", "ApprovalInbox"],
     "Context": ["PersistenceCore", "TrustCenter", "PersonaEngine"],
     // The live ContextFlow owner: turn preparation, settled-tool prewarm,

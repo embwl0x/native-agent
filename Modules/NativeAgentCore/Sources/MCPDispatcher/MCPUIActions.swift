@@ -18,13 +18,6 @@ public struct MCPUIActionAuthority: Sendable {
 }
 
 public enum MCPUIActions {
-    public static func consentRisk(server: MCPServer, toolName: String, dataRoot: URL) -> String {
-        MCPToolBridge.effectiveRiskClass(
-            serverId: server.id, toolName: toolName,
-            serverRiskClass: server.riskClass, dataRoot: dataRoot
-        )
-    }
-
     public static func evaluateMCPUIAdmission(
         serverId: String, toolName: String, arguments: [String: JSONValue], dataRoot: URL
     ) async -> SecurityToolEnvelope {
@@ -51,36 +44,8 @@ public enum MCPUIActions {
         let parsed = try JSONValue.parse(JSONEncoder().encode(input))
         let args: [String: JSONValue]
         if case .object(let object) = parsed { args = object } else { args = [:] }
-        let admission = try await dispatcher.toolAdmission(
-            server: server, toolName: toolName, surface: "mcp_ui", presentsApproval: true,
-            fullMacYoloAdmitted: authority.fullMacYoloAdmitted
-        )
-        switch admission {
-        case .allowed:
-            break
-        case .unpinned:
-            throw authority.deniedError(
-                "MCP tool '\(serverId)/\(toolName)' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
-            )
-        case .revoked, .requiresApproval:
-            let explicitlyRevoked: Bool
-            if case .revoked = admission { explicitlyRevoked = true } else { explicitlyRevoked = false }
-            let approvalID = explicitlyRevoked ? nil : try await authority.fileApprovalRequest(
-                "mcp__\(serverId)__\(toolName)", "mcp_ui", .object(args),
-                "This MCP tool requires approval."
-            )
-            return MCPCallResult(
-                id: callID,
-                serverId: serverId,
-                toolName: toolName,
-                status: explicitlyRevoked ? "blocked" : "needs_approval",
-                approvalId: approvalID,
-                durationSeconds: Date().timeIntervalSince(started),
-                createdAt: createdAt,
-                evidenceStatus: "not_required"
-            )
-        case .pinRequired, .unpinnedGrant:
-            throw authority.deniedError("MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again")
+        guard case .allowed = try await dispatcher.toolAdmission(server: server, toolName: toolName) else {
+            throw authority.deniedError("MCP server '\(serverId)' could not be pinned; resolve its implementation first")
         }
 
         let envelope = await Self.evaluateMCPUIAdmission(

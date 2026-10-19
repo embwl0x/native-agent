@@ -997,7 +997,8 @@ extension SwiftNativeChatOrchestrationClient {
             throw ChatOrchestrationError.emptyMessage
         }
         let resolvedSession = try Self.resolveSessionId(sessionId)
-        let runId = UUID().uuidString
+        // A door that registered its run for Stop at admission pinned it; the row is that run.
+        let runId = ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString
         try await appendMessage(
             sessionId: resolvedSession,
             role: "user",
@@ -1842,7 +1843,7 @@ extension SwiftNativeChatOrchestrationClient {
                 )
                 try Task.checkCancellation()
                 guard ready else {
-                    throw ToolFailureError("Recollection is unavailable; original turns are retained. Repair this compaction before continuing.",
+                    throw ToolFailureError("Recollection is unavailable; the original turns are retained in the compaction backup.",
                         effects: .none, owner: "chat/messages/\(sessionId).jsonl; providers.memory_and_mind_model",
                         nextCall: ToolFailureError.call("app", ["action": .string("chat.compact"),
                             "args": .object(["session_id": .string(sessionId)])]))

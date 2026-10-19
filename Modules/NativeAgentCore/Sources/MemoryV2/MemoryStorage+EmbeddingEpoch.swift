@@ -130,13 +130,16 @@ extension MemoryStorage {
             canonicalLocator: path.standardizedFileURL.path,
             reason: "embedding_epoch_activated"
         ))
-        await DerivedStateInvalidationCenter.shared.flush()
         return report
     }
 
     private static func embeddingCorpus(in db: Database) throws -> [MemoryEmbeddingCorpusRow] {
         var result: [MemoryEmbeddingCorpusRow] = []
-        result += try Row.fetchAll(db, sql: "SELECT id, content FROM memories ORDER BY id").map {
+        // An active row whose vector is owed is the fill's: it lands through
+        // the write's own checks, so activation leaves it for the fill.
+        result += try Row.fetchAll(db, sql: """
+            SELECT id, content FROM memories WHERE embedding IS NOT NULL OR status <> 'active' ORDER BY id
+            """).map {
             MemoryEmbeddingCorpusRow(kind: .memory, id: $0["id"], content: $0["content"])
         }
         result += try Row.fetchAll(db, sql: "SELECT id, content FROM proposals ORDER BY id").map {

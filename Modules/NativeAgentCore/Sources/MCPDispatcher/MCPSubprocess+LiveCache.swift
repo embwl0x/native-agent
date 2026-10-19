@@ -400,7 +400,7 @@ extension SwiftNativeMCPDispatcher {
     /// IMPORTANT — this is a GATE-FREE transport primitive only. It deliberately
     /// does NOT replicate the execution gate (risk-class branching, approval
     /// request creation for external_write/external_send servers, pending-action
-    /// replay registration, or low-risk consent auto-grant). That gate must be
+    /// replay registration). That gate must be
     /// applied in Swift before calling this primitive. NEVER cached: tool
     /// execution is side-effecting and must run every call.
     public func callToolLive(
@@ -409,16 +409,9 @@ extension SwiftNativeMCPDispatcher {
         arguments: JSONValue = .object([:]),
         pool: MCPSubprocessPool? = nil
     ) async throws -> JSONValue {
-        let authorizedIdentities = consentServerIdentities
         let servers = try await _readServersUncached()
         guard let server = servers.first(where: { $0.id == serverId }) else {
             throw MCPDispatcherError.serverNotFound(serverId)
-        }
-        if let authorizedIdentities {
-            guard let expected = authorizedIdentities[serverId],
-                  try server.executionIdentity() == expected else {
-                throw MCPDispatcherError.malformedResponse("MCP server changed after consent validation; review consent again")
-            }
         }
         switch server.transport {
         case "stdio":
@@ -440,13 +433,6 @@ extension SwiftNativeMCPDispatcher {
         if let p = pool { activePool = p }
         else { activePool = await Self.ensurePool(for: servers, root: root) }
         let proc = try await activePool.get(serverId: serverId)
-        if let authorizedIdentities {
-            guard let expected = authorizedIdentities[serverId],
-                  proc.executionIdentity == expected,
-                  try server.executionIdentity() == expected else {
-                throw MCPDispatcherError.malformedResponse("MCP executable changed before dispatch; review consent again")
-            }
-        }
         return try await proc.request(
             method: "tools/call",
             params: .object(["name": .string(toolName), "arguments": arguments])

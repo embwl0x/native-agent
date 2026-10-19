@@ -134,7 +134,7 @@ public enum ConnectorRegistryActions {
             let row = try JSONSerialization.jsonObject(with: rowData, options: []) as? [String: Any] ?? [:]
             rows.append(row)
             let out = try JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys, .prettyPrinted])
-            try out.write(to: wsPath, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(out, to: wsPath)
             return record
         }
         let refreshed = try await listWorkspaces(root: root)
@@ -171,6 +171,8 @@ public struct WorkspaceSearchResult: Identifiable, Codable, Hashable, Sendable {
 public struct WorkspaceSearchResponse: Codable, Hashable, Sendable {
     public var query: String
     public var results: [WorkspaceSearchResult]
+    /// Scope the search could not examine, "path: why"; absent when it saw all of it.
+    public var unexamined: [String]?
 }
 
 public struct WorkspaceRecord: Identifiable, Codable, Hashable, Sendable {

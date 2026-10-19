@@ -31,17 +31,7 @@ import Research
 public enum ToolArguments {
     @TaskLocal static var current: (tool: String, input: [String: JSONValue])?
 
-    /// 1-based ids, positions and cursors whose schema states no minimum: 0
-    /// names nothing, so it is absent too. Kept here, not in the schema JSON
-    /// the model reads.
-    static let positiveOnly: [String: Set<String>] = [
-        "mail_list_recent": ["message_id", "position"], "mail_mark_read": ["message_id", "position"],
-        "mail_save_attachment": ["message_id", "position", "index"],
-        "mail_archive": ["message_id", "position"], "mail_delete": ["message_id", "position"],
-        "mail_reply": ["message_id", "position"], "mail_draft": ["message_id", "position"], "messages_recent_threads": ["before_message_id"],
-    ]
-
-    public static func normalized(_ input: [String: JSONValue], schema: JSONValue, positiveOnly: Set<String> = [], preserving: Set<String> = []) -> [String: JSONValue] {
+    public static func normalized(_ input: [String: JSONValue], schema: JSONValue, preserving: Set<String> = []) -> [String: JSONValue] {
         guard case .object(let schema) = schema,
               case .object(let properties)? = schema["properties"] else { return input }
         let required: [JSONValue]
@@ -50,14 +40,13 @@ public enum ToolArguments {
         // 09-26: some models also fill every unused optional with a blank
         // default ("" / 0; mail_list_recent's message_id 0 turned a list into
         // a message read). An optional "" is absent, and so is an optional 0
-        // the schema's own minimum (or positiveOnly) rules out. false and a
-        // valid 0 stay.
+        // the schema's own minimum rules out. false and a valid 0 stay.
         for (key, value) in input {
             guard let field = properties[key] else { continue }
             if preserving.contains(key), case .object(let shape) = field, shape["type"] == nil { continue }
             let normalized = normalizedValue(value, schema: field)
             if !required.contains(.string(key)), value == .null || value == .string("")
-            || ((normalized == .int(0) || normalized == .double(0)) && (positiveOnly.contains(key) || positiveMinimum(field))) {
+            || ((normalized == .int(0) || normalized == .double(0)) && positiveMinimum(field)) {
                 result.removeValue(forKey: key)
             } else {
                 result[key] = normalized
@@ -150,7 +139,7 @@ public extension ToolDispatchClient {
         let schema = schemas.first { $0.name == canonical || $0.name.replacingOccurrences(of: ".", with: "_") == canonical }
         let authoring = ["save_skill", "sense_make"].contains(canonical) || (canonical == "skill_manage" && input["verb"] == .string("tool_propose"))
         let normalized = schema.flatMap { try? JSONValue.parse($0.parametersJSON) }
-            .map { ToolArguments.normalized(input, schema: $0, positiveOnly: ToolArguments.positiveOnly[canonical] ?? [], preserving: authoring ? ["learned", "choices"] : []) } ?? input
+            .map { ToolArguments.normalized(input, schema: $0, preserving: authoring ? ["learned", "choices"] : []) } ?? input
         return try await ToolArguments.$current.withValue((identity, normalized)) { try await body(normalized) }
     }
 }
@@ -222,7 +211,6 @@ extension SwiftToolDispatcher {
             input["__session_id"] = .string(taskSession)
         }
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        if let refusal = sendInstructionRefusal(tool: tool, input: input) { return refusal }
         if ToolCallParser.isIgnorableToolName(tool) {
             return .object([
                 "status": .string("ignored"),
@@ -531,18 +519,8 @@ extension SwiftToolDispatcher {
         case "x_status":      return try await XConnectorActions.status(input: input)
         case "x_me":          return try await XConnectorActions.me(input: input)
         case "x_search":      return try await XConnectorActions.searchRecent(input: input)
-        case "x_timeline":
-            return try await xConnectorWithOAuthFallback(
-                input: input,
-                primary: { try await XConnectorActions.timelineHome(input: $0) },
-                fallback: { try await XConnectorActions.timelineHomeV1(input: $0) }
-            )
-        case "x_user_tweets":
-            return try await xConnectorWithOAuthFallback(
-                input: input,
-                primary: { try await XConnectorActions.userTweets(input: $0) },
-                fallback: { try await XConnectorActions.userTweetsV1(input: $0) }
-            )
+        case "x_timeline", "x_user_tweets":
+            return try await xDeclaredRoute(tool: tool, input: input)
         case "gmail_status":
             return await impl_gmail_status(input: input)
         case "gmail_search":
@@ -1177,7 +1155,7 @@ extension SwiftToolDispatcher {
             // undispatchable (the custom-tool activation gap).
             // Reserved built-in names never reach here (the switch matches
             // them first), so this route only ever executes genuine customs.
-            if let record = registryToolRecord(tool) {
+            if let record = try registryToolRecord(tool) {
                 // Review finding 3 fix: runTool only VERIFIES a fingerprint
                 // when one exists. The chat lane fails closed on unsigned
                 // tools rather than silently weakening the invariant.
@@ -1221,7 +1199,6 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
             .first { !$0.isEmpty }
         if let taskSession { input["__session_id"] = .string(taskSession) }
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        if let refusal = sendInstructionRefusal(tool: tool, input: input) { return refusal }
         if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
         if ["studio_canon_resolve", "hold_view", "release_view"].contains(tool),
            case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
@@ -1367,5 +1344,29 @@ extension SwiftToolDispatcher {
             wrote(URL(fileURLWithPath: NSString(string: path).expandingTildeInPath))
         }
         return result
+    }
+}
+
+extension SwiftToolDispatcher {
+    /// X reads run the route the connector's saved configuration declares;
+    /// a sign-in refusal is the receipt, naming that route and its lever.
+    func xDeclaredRoute(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
+        let config = XConnectorActions.authRouteConfigPath(dataRoot: dataRoot).path
+        let lever = "Set auth_route to oauth1 or oauth2 in \(config), or sign in to X again on Connectors."
+        let route: String
+        do { route = try XConnectorActions.declaredAuthRoute(dataRoot: dataRoot) } catch {
+            return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string("invalid_auth_route"),
+                            "detail": .string("\(error.localizedDescription) Nothing was read. " + lever)])
+        }
+        let result: JSONValue = switch (tool, route) {
+        case ("x_timeline", "oauth1"): try await XConnectorActions.timelineHomeV1(input: input)
+        case ("x_timeline", _): try await XConnectorActions.timelineHome(input: input)
+        case (_, "oauth1"): try await XConnectorActions.userTweetsV1(input: input)
+        default: try await XConnectorActions.userTweets(input: input)
+        }
+        guard case .object(var fields) = result, case .int(let code)? = fields["statusCode"], code == 401 || code == 403 else { return result }
+        fields["auth_route"] = .string(route)
+        fields["remedy"] = Repair.why(owner: "X connector, \(route) route (\(config) auth_route)", tap: lever)
+        return .object(fields)
     }
 }

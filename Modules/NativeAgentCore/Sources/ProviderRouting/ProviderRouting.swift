@@ -1058,6 +1058,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             if Self.connectableProviderIds.contains(id) || extras["auth_modes"] == nil {
                 extras["auth_modes"] = .array(authModes(for: id).map { .string($0) })
             }
+            // The wire's existing why-the-list-is-missing slot carries an unreadable account list.
+            if codexCacheURL == nil, CodexAccountModelCatalog.isAccountBackedProvider(id),
+               let fault = CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment) {
+                extras["models_note"] = .string(fault)
+            }
             row.extras = .object(extras)
             byId[id] = providerWithReadiness(row, cache: cache, authEnvironment: authEnvironment)
         }
@@ -1074,10 +1079,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         row.active = readiness.ready
         row.oauthStatus = .object([
             "provider_id": .string(row.id),
-            "state": .string(readiness.ready ? "ready" : readiness.state),
+            "state": .string(readiness.state),
             "detail": .string(readiness.detail),
         ])
-        row.lastError = readiness.ready ? nil : readiness.detail
+        // A failed or unreadable receipt stays the row's error while the key stays eligible.
+        row.lastError = readiness.ready && readiness.state != "failed" ? nil : readiness.detail
         var extras: [String: JSONValue] = [:]
         if case .object(let saved)? = row.extras { extras = saved }
         let config = cache.reads[row.id]?.object ?? [:]
@@ -1097,9 +1103,10 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     /// reads its own file exactly as before.
     /// The body reads the same credential admission as provider routing, without catalog discovery.
     public nonisolated func hasUsableCredentials() -> Bool {
-        ["anthropic_oauth_direct", "anthropic", "openai_oauth_direct", "openai",
-         "openrouter", "moonshot", "kimi-code", "xai_oauth_direct"].contains {
-            providerReadiness(id: $0).ready
+        let receipts = ProviderConfigCache(receipts: LLMProviderStatusFeed.receipts(dataRoot: dataRoot))
+        return ["anthropic_oauth_direct", "anthropic", "openai_oauth_direct", "openai",
+                "openrouter", "moonshot", "kimi-code", "xai_oauth_direct"].contains {
+            providerReadiness(id: $0, cache: receipts).ready
         }
     }
 
@@ -1109,16 +1116,46 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> (ready: Bool, state: String, detail: String) {
         if let readiness = cache?.readiness[id] { return readiness }
-        /// API-key presence for `id`, reading the provider config from the
-        /// snapshot's read when there is one.
-        func keyReady() -> Bool {
-            if let read = cache?.reads[id] {
-                return LLMCredentialResolver.resolveAPIKey(providerConfigObject: read.object) != nil
+        /// A present credential, a key or a sign-in, is eligible to dispatch
+        /// (dispatch is its proof) and read by its own last check for exactly
+        /// that credential: rejected is not ready; a failed or unreadable check
+        /// stays eligible and says so; otherwise `standing` answers, given the
+        /// date a check proved it, if one did.
+        func receiptReadiness(_ credential: String, holding: String, rejected: String,
+                              standing: (Date?) -> (ready: Bool, state: String, detail: String))
+            -> (ready: Bool, state: String, detail: String) {
+            let receipts = cache?.receipts ?? LLMProviderStatusFeed.receipts(dataRoot: dataRoot)
+            if let unreadable = receipts.unreadable {
+                return (true, "failed", "\(holding); its checks are unreadable (\(unreadable)).")
             }
-            return LLMCredentialResolver.resolveAPIKey(
-                providerConfigFile: "\(id).json",
-                dataRoot: dataRoot
-            ) != nil
+            switch receipts.verdict(providerID: id, key: credential) {
+            case .rejected: return (false, "rejected", rejected)
+            case .failed(let why): return (true, "failed", "\(holding); its last check failed: \(why)")
+            case .proven(let checkedAt): return standing(checkedAt)
+            case .unchecked: return standing(nil)
+            }
+        }
+        /// needs_key is absent; rejected is refused at its last check; saved is present and unproven; ready is proven.
+        func keyReadiness(_ name: String) -> (ready: Bool, state: String, detail: String) {
+            let key = if let read = cache?.reads[id] {
+                LLMCredentialResolver.resolveAPIKey(providerConfigObject: read.object)
+            } else {
+                LLMCredentialResolver.resolveAPIKey(providerConfigFile: "\(id).json", dataRoot: dataRoot)
+            }
+            guard let key else { return (false, "needs_key", "No \(name) API key configured") }
+            return receiptReadiness(key, holding: "\(name) API key saved",
+                                    rejected: "\(name) rejected this API key at its last check; paste a new key.") {
+                $0.map { (true, "ready", "\(name) API key checked \($0.formatted(.iso8601))") }
+                    ?? (true, "saved", "\(name) API key saved, not yet proven by a check")
+            }
+        }
+        /// A sign-in the validator judged usable keeps its own words unless its check says otherwise.
+        func signInReadiness(_ judged: (Bool, String, String?)) -> (ready: Bool, state: String, detail: String) {
+            guard judged.0, let token = judged.2 else { return (judged.0, "needs_oauth", judged.1) }
+            return receiptReadiness(token, holding: "Signed in",
+                                    rejected: "This sign-in was rejected at its last check; sign in again in Providers.") { _ in
+                (true, "needs_oauth", judged.1)
+            }
         }
         switch id {
         case "openai_oauth_direct", "codex":
@@ -1132,35 +1169,16 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             // Reads codex_home/auth.json and the OAuth candidate paths, not
             // `providers/<id>.json` — nothing in the model lane touches those,
             // so there is no shared read to make.
-            let result = Self.validateOpenAIOAuthDirect(dataRoot: dataRoot, environment: authEnvironment)
-            return (result.0, "needs_oauth", result.1)
+            return signInReadiness(Self.validateOpenAIOAuthDirect(dataRoot: dataRoot, environment: authEnvironment))
         case "anthropic_oauth_direct":
-            let result = Self.validateAnthropicOAuthDirect(
-                providersDir: providersDir,
-                preRead: cache?.reads[id]
-            )
-            return (result.0, "needs_oauth", result.1)
+            return signInReadiness(Self.validateAnthropicOAuthDirect(providersDir: providersDir, preRead: cache?.reads[id]))
         case "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
-            let result = Self.validateXAIOAuthDirect(
-                providersDir: providersDir,
-                preRead: cache?.reads[id]
-            )
-            return (result.0, "needs_oauth", result.1)
-        case "openai":
-            let ready = keyReady()
-            return (ready, "needs_key", ready ? "API key available" : "No OpenAI API key configured")
-        case "anthropic":
-            let ready = keyReady()
-            return (ready, "needs_key", ready ? "API key available" : "No Anthropic API key configured")
-        case "openrouter":
-            let ready = keyReady()
-            return (ready, "needs_key", ready ? "API key available" : "No OpenRouter API key configured")
-        case "moonshot":
-            let ready = keyReady()
-            return (ready, "needs_key", ready ? "Moonshot API key available" : "No Moonshot API key configured")
-        case "kimi-code":
-            let ready = keyReady()
-            return (ready, "needs_key", ready ? "Kimi Code API key available" : "No Kimi Code API key configured")
+            return signInReadiness(Self.validateXAIOAuthDirect(providersDir: providersDir, preRead: cache?.reads[id]))
+        case "openai": return keyReadiness("OpenAI")
+        case "anthropic": return keyReadiness("Anthropic")
+        case "openrouter": return keyReadiness("OpenRouter")
+        case "moonshot": return keyReadiness("Moonshot")
+        case "kimi-code": return keyReadiness("Kimi Code")
         default:
             // The cached read has already resolved any Keychain reference.
             // Bookkeeping alone (auth mode/default model) is not a credential.
@@ -1279,6 +1297,9 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         switch id {
         case "openai": return openai
         case "openai_oauth_direct", "codex":
+            if codexCacheURL == nil, CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot, environment: authEnvironment) != nil {
+                return []
+            }
             let cacheURL = codexCacheURL ?? CodexAccountModelCatalog.chatGPTOAuthCacheCandidate(
                 dataRoot: dataRoot, environment: authEnvironment
             )
@@ -1304,7 +1325,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         case "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth":
             return xai
         case "openrouter": return openrouter
-        case "moonshot": return moonshot
+        case "moonshot", "kimi": return moonshot
         case "kimi-code": return FirstPartyModelCatalog.kimiCodeModels.map { $0.providerJSON() }
         default: return openai + anthropic + xai + openrouter + moonshot
         }
@@ -1775,21 +1796,17 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return prefs[surface]!
     }
 
-    /// SWIFT-NATIVE PHASE B CORRECTION of `_provider_hint_for_model_id`:
-    /// the daemon's Python helper folds OpenRouter's `anthropic/claude-...`
-    /// into `anthropic_oauth_direct` and only avoids the mis-routing via the
-    /// `inferProvider=false` body flag on the picker save. The Swift path
-    /// reads the namespace literally:
-    ///   - `anthropic/...`  -> openrouter   (OpenRouter namespace)
-    ///   - `openai/...`     -> openrouter
-    ///   - bare `claude-...` / `sonnet/`+`opus/`+`haiku/` -> anthropic_oauth_direct
-    ///   - bare `gpt-...`   -> openai_oauth_direct
-    ///   - bare `grok-...`  -> xai_oauth_direct
-    ///   - everything else  -> nil
-    /// Returning nil (rather than "") lets the caller decide whether to fall
-    /// through to the persisted active provider.
+    /// Chat's chosen route, for sizing a window on the selected model; nil
+    /// when routing cannot be read, and the window then stays unknown.
+    public func chatRouteProvider() async -> String? {
+        (try? await checkedRoutingSnapshot()).flatMap { ProviderRoutingSurfaceLookup.value($0.activeProviders, "chat") }
+    }
+
+    /// The provider a model id names, or nil when its spelling names none (the
+    /// caller then keeps the explicit route). Routing, the picker and dispatch
+    /// all read this one answer.
     public nonisolated func inferProviderForModel(_ modelId: String) -> String? {
-        Self.inferredProviderID(forModel: modelId)
+        Self.inferredProviderID(forModel: modelId, dataRoot: dataRoot)
     }
 
     /// Size background evidence from the selected route's catalog without a
@@ -1800,41 +1817,55 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         -> (contextLength: Int?, catalogFailure: String?) {
         let openRouter = providerID == "openrouter"
             ? await OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot) : nil
-        let moonshot = providerID == "moonshot"
-            ? MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() } : nil
-        let rows = modelsForProvider(providerID,
-            openRouterModels: openRouter?.models.map { $0.providerJSON() }, moonshotModels: moonshot)
-        guard let row = rows.first(where: {
-            guard case .string(let id) = $0["id"] else { return false }
-            return id.lowercased() == modelID.lowercased()
-        }),
-              case .int(let length) = row["context_length"], length > 0 else { return (nil, openRouter?.failure) }
-        return (Int(exactly: length), nil)
+        let catalog = catalogRows(providerID, openRouterModels: openRouter?.models)
+        let length = Self.contextLength(of: modelID, in: catalog.rows)
+        return (length, length == nil ? catalog.fault ?? openRouter?.failure : nil)
     }
 
-    public nonisolated static func inferredProviderID(forModel modelId: String) -> String? {
+    /// A route's catalog rows as its picker shows them: the account or
+    /// provider cache under this root, else the rows this build ships when
+    /// none is saved. A saved list that cannot be read gives no rows and its fault.
+    nonisolated func catalogRows(_ providerID: String, openRouterModels: [ProviderModelDescriptor]? = nil)
+        -> (rows: [[String: JSONValue]], fault: String?) {
+        let fault = switch providerID {
+        case "openrouter" where openRouterModels == nil: OpenRouterModelCatalog.cacheFault(dataRoot: dataRoot)
+        case "moonshot": MoonshotModelCatalog.cacheFault(dataRoot: dataRoot)
+        case "openai_oauth_direct", "codex": CodexAccountModelCatalog.cacheFault(dataRoot: dataRoot)
+        default: String?.none
+        }
+        if let fault { return ([], fault) }
+        let openRouter = providerID == "openrouter"
+            ? openRouterModels ?? OpenRouterModelCatalog.readCache(dataRoot: dataRoot) : nil
+        let moonshot = providerID == "moonshot" ? MoonshotModelCatalog.readCache(dataRoot: dataRoot) : nil
+        return (modelsForProvider(providerID, openRouterModels: openRouter?.map { $0.providerJSON() },
+                                  moonshotModels: moonshot?.map { $0.providerJSON() }), nil)
+    }
+
+    /// The window a catalog row states for `modelID`; nil when no row states one.
+    nonisolated static func contextLength(of modelID: String, in rows: [[String: JSONValue]]) -> Int? {
+        let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let row = rows.first(where: {
+            guard case .string(let rowID)? = $0["id"] else { return false }
+            return rowID.lowercased() == id
+        }), case .int(let length)? = row["context_length"], length > 0 else { return nil }
+        return Int(exactly: length)
+    }
+
+    /// `dataRoot` adds the live Moonshot catalog's ids, which need not carry
+    /// its prefix; without one only shipped rows answer.
+    public nonisolated static func inferredProviderID(forModel modelId: String, dataRoot: URL? = nil) -> String? {
         let lower = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if lower.isEmpty { return nil }
-        // Slash-namespaced id => an OpenRouter / aggregator model id.
-        if lower.hasPrefix("anthropic/") || lower.hasPrefix("openai/") {
-            return "openrouter"
-        }
-        if lower.hasPrefix("claude-")
-            || lower.hasPrefix("sonnet/") || lower.hasPrefix("opus/") || lower.hasPrefix("haiku/") {
-            return "anthropic_oauth_direct"
-        }
-        if lower.hasPrefix("gpt-") {
-            return "openai_oauth_direct"
-        }
-        if lower.hasPrefix("grok-") {
-            return "xai_oauth_direct"
-        }
-        // Kimi Code SUBSCRIPTION ids (kimi-for-coding[-highspeed], bare k3)
-        // resolve to "kimi-code" ahead of the moonshot prefix branch below.
-        if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) {
-            return "kimi-code"
-        }
-        if lower.hasPrefix("kimi-") || lower.hasPrefix("moonshot-") {
+        // A vendor/model id is the OpenRouter namespace.
+        if lower.contains("/") { return "openrouter" }
+        if lower.hasPrefix("claude") { return "anthropic_oauth_direct" }
+        if lower.hasPrefix("gpt") { return "openai_oauth_direct" }
+        if lower.hasPrefix("grok") { return "xai_oauth_direct" }
+        // Kimi Code SUBSCRIPTION ids (kimi-for-coding[-highspeed], bare k3).
+        if FirstPartyModelCatalog.kimiCodeModelIDSet.contains(lower) { return "kimi-code" }
+        // Moonshot by declared id: its shipped rows and its live catalog, never a prefix.
+        if FirstPartyModelCatalog.descriptor(for: lower, providerID: "moonshot") != nil
+            || dataRoot.map({ MoonshotModelCatalog.isKnownCatalogModelID(lower, dataRoot: $0) }) == true {
             return "moonshot"
         }
         return nil
@@ -1936,6 +1967,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     struct ProviderConfigCache {
         var reads: [String: ProviderConfigRead] = [:]
         var readiness: [String: (ready: Bool, state: String, detail: String)] = [:]
+        /// The snapshot's one read of the provider checks.
+        var receipts: LLMProviderStatusFeed.Receipts?
     }
 
     private nonisolated func readProviderConfig(_ providerId: String) -> ProviderConfigRead {
@@ -1994,7 +2027,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         for providerIds: Set<String>,
         authEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> ProviderConfigCache {
-        var cache = ProviderConfigCache()
+        var cache = ProviderConfigCache(receipts: LLMProviderStatusFeed.receipts(dataRoot: dataRoot))
         for id in providerIds {
             let trimmedId = id.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedId.isEmpty, !trimmedId.contains("/") else { continue }
@@ -2206,43 +2239,15 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard REASONING_EFFORT_OPTIONS.contains(normalized) else { return fallback }
         let lowerModel = model?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        var supported: Set<String>
-        switch lowerModel {
-        case let model where model.hasPrefix("kimi-") || model.hasPrefix("moonshot-"):
-            supported = Set(MoonshotModelCatalog.supportedReasoningEfforts(for: model))
-        case "gpt-6-sol" where providerID?.lowercased() == "openai":
-            supported = Set(FirstPartyModelCatalog.publicGPT56Efforts)
-        case FirstPartyModelCatalog.gpt6AstraModelID, "gpt-6.1-sol", "gpt-6-sol":
-            supported = providerID?.lowercased() == "openai"
-                ? Set(FirstPartyModelCatalog.publicGPT6AstraEfforts)
-                : Set(FirstPartyModelCatalog.accountGPT6AstraEfforts)
-        case "gpt-6-luna":
-            supported = Set(FirstPartyModelCatalog.accountGPT56LunaEfforts)
-        case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra":
-            supported = providerID?.lowercased() == "openai"
-                ? Set(FirstPartyModelCatalog.publicGPT56Efforts)
-                : Set(FirstPartyModelCatalog.accountGPT56SolTerraEfforts)
-        case "gpt-5.6-luna":
-            supported = providerID?.lowercased() == "openai"
-                ? Set(FirstPartyModelCatalog.publicGPT56Efforts)
-                : Set(FirstPartyModelCatalog.accountGPT56LunaEfforts)
-        default:
-            let bareAnthropic = lowerModel.hasPrefix("anthropic/")
-                ? String(lowerModel.dropFirst("anthropic/".count))
-                : lowerModel
-            if let descriptor = FirstPartyModelCatalog.anthropicDescriptor(for: bareAnthropic) {
-                supported = Set(descriptor.supportedReasoningEfforts)
-            } else if let descriptor = FirstPartyModelCatalog.xAIDescriptor(for: lowerModel) {
-                supported = Set(descriptor.supportedReasoningEfforts)
-            } else if lowerModel.hasPrefix("claude-") || lowerModel.hasPrefix("anthropic/claude-") {
-                supported = ["low", "medium", "high"]
-            } else {
-                supported = ["low", "medium", "high", "xhigh"]
-            }
-        }
-        if let supportedReasoningEfforts {
-            supported = Set(supportedReasoningEfforts)
-        }
+        let route = providerID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        // The model's row declares its efforts, never its spelling: the
+        // account's own row when the caller has it, else the route's shipped
+        // row (Moonshot's live-only ids from its catalog), else any shipped row.
+        let supported = Set(supportedReasoningEfforts
+            ?? FirstPartyModelCatalog.routeSupportedEfforts(lowerModel, providerID: route)
+            ?? (route == "moonshot" ? MoonshotModelCatalog.supportedReasoningEfforts(for: lowerModel) : nil)
+            ?? FirstPartyModelCatalog.descriptor(for: lowerModel)?.supportedReasoningEfforts
+            ?? ["low", "medium", "high", "xhigh"])
         guard supported.contains(normalized) else {
             let cleanFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if supported.contains(cleanFallback) { return cleanFallback }
@@ -2334,9 +2339,21 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         return nil
     }
 
+    /// The access token a sign-in's readiness judged; a provider check binds
+    /// its receipt to it, so a new sign-in is never read by the old one's check.
+    public nonisolated static func signedInAccessToken(providerID: String, dataRoot: URL) -> String? {
+        let providersDir = dataRoot.appendingPathComponent("providers", isDirectory: true)
+        return switch providerID {
+        case "openai_oauth_direct": validateOpenAIOAuthDirect(dataRoot: dataRoot).2
+        case "anthropic_oauth_direct": validateAnthropicOAuthDirect(providersDir: providersDir).2
+        case "xai_oauth_direct": validateXAIOAuthDirect(providersDir: providersDir).2
+        default: nil
+        }
+    }
+
     private nonisolated static func validateOpenAIOAuthDirect(
         dataRoot: URL, environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> (Bool, String) {
+    ) -> (Bool, String, String?) {
         let paths = openAIOAuthCandidatePaths(dataRoot: dataRoot, environment: environment)
         var sawAuth = false
         for path in paths {
@@ -2353,19 +2370,19 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 ?? parseAuthExpiresAt(obj["expires_at"])
                 ?? jwtExpiry(access) {
                 if expDate > Date() {
-                    return (true, "Signed in")
+                    return (true, "Signed in", access)
                 }
                 if !refresh.isEmpty && OAuthRefreshBinding.permitsRefresh(obj, provider: "openai_oauth_direct") {
-                    return (true, "Signed in. Your session will renew on your next chat.")
+                    return (true, "Signed in. Your session will renew on your next chat.", access)
                 }
                 continue
             }
-            return (true, "Signed in")
+            return (true, "Signed in", access)
         }
         if sawAuth {
-            return (false, "Reconnect your ChatGPT account in Providers.")
+            return (false, "Reconnect your ChatGPT account in Providers.", nil)
         }
-        return (false, "Sign in to your ChatGPT account in Providers.")
+        return (false, "Sign in to your ChatGPT account in Providers.", nil)
     }
 
     /// Production keeps the intentional shared-Codex compatibility search.
@@ -2394,7 +2411,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     private nonisolated static func validateAnthropicOAuthDirect(
         providersDir: URL,
         preRead: ProviderConfigRead? = nil
-    ) -> (Bool, String) {
+    ) -> (Bool, String, String?) {
         let path = providersDir.appendingPathComponent("anthropic_oauth_direct.json")
         let parsed: [String: Any]?
         if let preRead {
@@ -2406,7 +2423,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         }
         // The adapter that serves the calls decides (see credentialStatus).
         let status = AnthropicOAuthDirectAdapter.credentialStatus(parsed)
-        return (status.usable, status.detail)
+        let access = parsed.flatMap { OAuthRefreshBinding.tokenSet($0, provider: "anthropic_oauth_direct")["access_token"] as? String }
+        return (status.usable, status.detail, access?.isEmpty == false ? access : nil)
     }
 
     /// `preRead` is the routing snapshot's single locked read of this file; nil
@@ -2414,17 +2432,17 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
     private nonisolated static func validateXAIOAuthDirect(
         providersDir: URL,
         preRead: ProviderConfigRead? = nil
-    ) -> (Bool, String) {
+    ) -> (Bool, String, String?) {
         let path = providersDir.appendingPathComponent("xai_oauth_direct.json")
         let parsed: [String: Any]?
         if let preRead {
             parsed = preRead.object
         } else {
             do { parsed = try XAIOAuthCredentialStore.read(at: path) }
-            catch { return (false, "xAI Keychain credentials are unavailable. Reconnect in Providers.") }
+            catch { return (false, "xAI Keychain credentials are unavailable. Reconnect in Providers.", nil) }
         }
         guard let obj = parsed, !obj.isEmpty else {
-            return (false, "Sign in to your xAI account in Providers.")
+            return (false, "Sign in to your xAI account in Providers.", nil)
         }
         let tokens = OAuthRefreshBinding.tokenSet(obj, provider: "xai_oauth_direct")
         let access = ((tokens["access_token"] as? String) ?? "")
@@ -2432,18 +2450,18 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         let refresh = ((tokens["refresh_token"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !access.isEmpty, !refresh.isEmpty else {
-            return (false, "Reconnect your xAI account in Providers.")
+            return (false, "Reconnect your xAI account in Providers.", nil)
         }
         if let expDate = parseAuthExpiresAt(obj["expires_at"]) ?? jwtExpiry(access) {
             if expDate > Date() {
-                return (true, "Signed in")
+                return (true, "Signed in", access)
             }
             if !refresh.isEmpty && OAuthRefreshBinding.permitsRefresh(obj, provider: "xai_oauth_direct") {
-                return (true, "Signed in. Your session will renew on your next chat.")
+                return (true, "Signed in. Your session will renew on your next chat.", access)
             }
-            return (false, "Reconnect your xAI account in Providers.")
+            return (false, "Reconnect your xAI account in Providers.", nil)
         }
-        return (true, "Signed in")
+        return (true, "Signed in", access)
     }
 
     /// Decodes persisted OAuth expiry values in the shared app/routing compatibility order.
@@ -2476,10 +2494,11 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
 
 // MARK: - Public model lookup
 
-/// Verified context window for the exact admitted provider/model tuple.
-/// Returns nil when this build has no evidence for that tuple; callers that
-/// size prompt material must use their conservative floor rather than treating
-/// the UI gauge's unknown-model fallback as a measured capability.
+/// The one context window for an admitted provider/model tuple: the row that
+/// route's catalog states (its account or provider cache under `dataRoot`,
+/// else the rows this build ships), the same row its picker shows. Nil when no
+/// row states one: callers keep unknown as unknown. Without a provider, the
+/// smallest window this build ships for the id.
 public func verifiedContextLength(
     forModel modelId: String,
     providerID: String?,
@@ -2487,67 +2506,14 @@ public func verifiedContextLength(
 ) -> Int? {
     let model = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     guard !model.isEmpty else { return nil }
-    guard let rawProvider = providerID?.trimmingCharacters(in: .whitespacesAndNewlines),
-          !rawProvider.isEmpty else {
+    guard let provider = providerID?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+          !provider.isEmpty else {
         return FirstPartyModelCatalog.descriptor(for: model)?.contextLength
-            ?? verifiedOpenRouterContextLength(forModel: model)
     }
-    let provider = rawProvider.lowercased()
-    if provider == "openrouter" {
-        return dataRoot.flatMap {
-            OpenRouterModelCatalog.cachedDescriptor(for: model, dataRoot: $0)?.contextLength
-        } ?? verifiedOpenRouterContextLength(forModel: model)
-    }
-    let firstPartyProviders: Set<String> = [
-        "openai", "codex", "openai_oauth_direct",
-        "anthropic", "anthropic_oauth_direct", "anthropic_mcp",
-        "xai", "xai_oauth_direct", "xai-oauth", "grok-oauth", "x-ai-oauth", "xai-grok-oauth",
-        "moonshot", "kimi", "kimi-code",
-    ]
-    guard firstPartyProviders.contains(provider) else { return nil }
-    return FirstPartyModelCatalog.descriptor(for: model, providerID: provider)?.contextLength
+    // A route with neither a shipped nor a fetched catalog carries no evidence.
+    guard provider == "openrouter" || !FirstPartyModelCatalog.models(forProviderID: provider).isEmpty else { return nil }
+    let rows = dataRoot.map { SwiftNativeProviderRouting(dataRoot: $0).catalogRows(provider).rows }
+        ?? FirstPartyModelCatalog.models(forProviderID: provider).map { $0.providerJSON() }
+    return SwiftNativeProviderRouting.contextLength(of: model, in: rows)
 }
 
-private func verifiedOpenRouterContextLength(forModel modelId: String) -> Int? {
-    switch modelId {
-    case "meta-llama/llama-3.3-70b-instruct": return 131_072
-    case "anthropic/claude-sonnet-5": return 1_000_000
-    default: return nil
-    }
-}
-
-/// Context-window budget (input-token cap) for a known model id. Single
-/// source of truth used by the chat-context status bar. Returns 200_000 for
-/// any unknown id so the UI shows the safer of the two values rather than 0.
-///
-/// 2026-06-07: lifted out of the private `modelsForProvider` table so the
-/// Mac UI's getSessionContext can derive the budget directly from
-/// `appModel.chatModel` without going through the async provider catalog.
-public func contextLength(forModel modelId: String) -> Int {
-    let id = modelId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if let descriptor = FirstPartyModelCatalog.descriptor(for: id) {
-        return descriptor.contextLength
-    }
-    switch id {
-    // Every first-party id is answered by the catalog lookup above, so the rows
-    // that used to repeat those windows here were dead and could drift from it
-    // (2026-09-13). What remains is ids no shipped catalog carries.
-    // OpenRouter passthroughs (live rows 2026-08-07; the delisted
-    // anthropic/claude-3.5-sonnet entry was retired with them).
-    // Non-gauge consumer note: ChatSessionAutocompactor reads this length
-    // directly, so the 1M row lets a Sonnet-5-via-OpenRouter session keep the
-    // user-configured compaction ceiling instead of clamping to a 200k
-    // window's 40% — correct for a genuinely 1M-window model.
-    case "meta-llama/llama-3.3-70b-instruct": return 131_072
-    case "anthropic/claude-sonnet-5": return 1_000_000
-    default:
-        // gpt-5.5 review #4 (NEEDS_FIX): unknown-model fallback was 200_000
-        // which is optimistic — a 128k-window model would then read percent
-        // below 100 even when it had blown its real budget and stopped
-        // accepting input. Default to 128_000 so the gauge errs toward
-        // pessimism (the user sees pressure sooner) and only widen for ids that
-        // self-identify as long-context. opus/sonnet/gpt-5.5 family ids
-        // already hit explicit cases above.
-        return 128_000
-    }
-}

@@ -60,12 +60,16 @@ extension SchedulerDueJobRunner {
                 event, to: activityPath, using: persistence,
                 logLabel: "SchedulerDueJobRunner"
             )
-            activityFeedError = nil
         } catch {
-            activityFeedError = "Scheduler activity evidence could not be written: \(error.localizedDescription)"
+            noteFault("Scheduler activity evidence could not be written: \(error.localizedDescription)")
             throw error
         }
     }
+
+    static let dreamCardPresentation: JSONValue = .object(["icon": .string("moon.stars.fill"), "badge": .string("DREAM"),
+                                                           "words": .string("A dream"), "act_label": .string("Go ahead")])
+    static let remCardPresentation: JSONValue = .object(["icon": .string("sparkles"), "badge": .string("REM"),
+                                                         "words": .string("From my rest"), "act_label": .string("Go ahead")])
 
     func appendNotificationInbox(
         title: String,
@@ -78,9 +82,11 @@ extension SchedulerDueJobRunner {
         relatedGroups: [JSONValue] = [],
         detail: String? = nil,
         actions: [JSONValue] = [],
-        notifyPhone: Bool = false
+        notifyPhone: Bool = false,
+        presentation: JSONValue = .null
     ) async throws {
         let now = Self.iso(Date())
+        // The producer declares what its card means (the inbox's `presentation`).
         let row: JSONValue = .object([
             "id": .string(itemId),
             "created_at": .string(now),
@@ -97,6 +103,7 @@ extension SchedulerDueJobRunner {
             "status": .string("unread"),
             "read_at": .null,
             "schedulerJobId": .string(jobId),
+            "presentation": presentation,
         ])
         // 2026-08-31: through the feed's owner, not a raw capped append. The
         // shared cap trims by keeping a suffix, which HARD-DELETES the oldest

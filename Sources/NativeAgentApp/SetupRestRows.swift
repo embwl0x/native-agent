@@ -13,7 +13,7 @@ import AppToolRuntime
 // NOTHING IS FORKED. Every card here reads and writes the SAME storage, the
 // SAME controller and the SAME presentation types the Form rows used, so the
 // two surfaces can never disagree:
-//   Global shortcut   → HotkeyControlView          (SlimSettingsView.swift:325)
+//   Global shortcut   → globalHotkeyEnabled + GlobalHotkeyManager
 //   Context window    → nativeagent.contextWindowMode + nativeagent.compactionThresholdTokens
 //                                                  (SlimSettingsView.swift:330-359)
 //   Updates           → UpdateController.shared + SoftwareUpdateRowPresentation
@@ -101,8 +101,7 @@ struct SetupRestRows: View {
     // MARK: Global shortcut
 
     /// A switch in the card's own format. The default and the manager call
-    /// are the same pair HotkeyControlView owns (MenuBarController.swift),
-    /// kept together here so the switch never drifts from the installed key.
+    /// are kept together here so the switch never drifts from the installed key.
     @AppStorage("globalHotkeyEnabled") private var hotkeyEnabled: Bool = true
 
     private var shortcutRow: some View {

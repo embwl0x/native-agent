@@ -7,12 +7,10 @@ import PersistenceCore
 // MARK: - Native tool-use lane for the Anthropic-wire api-key adapter
 //
 // docs/build_plans/kimi-native-tools.md, P1; extended by
-// docs/build_plans/fable51-sweep-2026-09-01.md item 34. Gated on
-// NativeToolCapability.providerSupportsNativeTools(providerId) — kimi-code AND
-// the Anthropic API-KEY provider id. The Claude OAUTH-direct adapter is a
-// different type entirely (AnthropicOAuthDirectAdapter) and is unreachable
-// from this file; the predicate additionally refuses its provider id so the
-// two can never be confused at the routing seam.
+// docs/build_plans/fable51-sweep-2026-09-01.md item 34. This adapter declares
+// `toolWire = .native` (kimi-code and the Anthropic API key). The Claude
+// OAUTH-direct adapter is a different type (AnthropicOAuthDirectAdapter) that
+// declares `.textMarkers`, and dispatch refuses a tools array bound to it.
 //
 // FABLE 5.1 CONTRACT (Anthropic docs, 2026-09-01) — what this lane must and
 // must not put on the wire:
@@ -205,8 +203,7 @@ extension AnthropicAdapter {
     /// model would never see its own tool results. `nil` (what every non-native
     /// caller passes) remains the byte-identical legacy path.
     func usesNativeToolLane(_ tools: [LLMToolSchema]?) -> Bool {
-        guard NativeToolCapability.providerSupportsNativeTools(providerId) else { return false }
-        return tools != nil
+        tools != nil
     }
 
     // MARK: - Request encoding

@@ -919,7 +919,7 @@ public enum InlineInteractionResolver {
             guard let first = rows.first else {
                 return .failure("No provider named \(interaction.target).")
             }
-            guard let provider = rows.first(where: { $0.authState.lowercased() == "ready" }) else {
+            guard let provider = rows.first(where: \.eligible) else {
                 return .failure("\(first.displayName) still isn't ready.")
             }
             let model = provider.defaultModel ?? provider.firstModel

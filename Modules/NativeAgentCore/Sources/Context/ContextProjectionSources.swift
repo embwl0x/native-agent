@@ -4,6 +4,18 @@ import NativeAgentCore
 /// Incremental output from a rebuildable non-file Context source projection.
 /// Providers compare their current source of truth with `previousSources` and
 /// return only changed sources plus sources that must leave the next generation.
+/// The chosen atoms a provider drops, and the degraded-source receipts for
+/// what it could not verify (dropped too).
+public struct ContextTurnExclusion: Sendable {
+    public var atomIDs: Set<ContextAtomID>
+    public var unverified: [ContextDegradedSourceNotice]
+
+    public init(atomIDs: Set<ContextAtomID> = [], unverified: [ContextDegradedSourceNotice] = []) {
+        self.atomIDs = atomIDs
+        self.unverified = unverified
+    }
+}
+
 public struct ContextCompiledProjectionResult: Sendable, Equatable {
     public let changedSources: [ContextCompiledSource]
     public let removedSourceIDs: Set<ContextSourceID>
@@ -46,10 +58,12 @@ public protocol ContextCompiledProjectionProvider: Sendable {
     /// Point-of-use policy exclusions, including sources in retained generations.
     var excludedSourceOwners: Set<String> { get }
 
-    /// Ephemeral sources must be reconciled at the turn boundary as well as
-    /// by push invalidation (expiry and registration/notification races).
-    var refreshesBeforeTurn: Bool { get }
-    func excludedAtomIDs(in generation: ContextStoredGeneration) async -> Set<ContextAtomID>
+    /// Checked when the turn's atoms are chosen, and again at expansion: the
+    /// provider drops any chosen atom its owner no longer stands behind
+    /// (aged out, retired, changed, or not disclosed on this surface), naming
+    /// what it could not verify. Rebuilds only refresh what is published.
+    func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
+                surface: ContextSurface) async -> ContextTurnExclusion
     func didDeliver(_ items: [ContextPacketItem]) async
 
     func isInvalidated(by change: DerivedSourceChange) -> Bool
@@ -72,8 +86,8 @@ public extension ContextCompiledProjectionProvider {
     var invalidationNamespaces: Set<String> { [] }
     var invalidationSourceURL: URL? { nil }
     var excludedSourceOwners: Set<String> { [] }
-    var refreshesBeforeTurn: Bool { false }
-    func excludedAtomIDs(in generation: ContextStoredGeneration) async -> Set<ContextAtomID> { [] }
+    func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
+                surface: ContextSurface) async -> ContextTurnExclusion { ContextTurnExclusion() }
     func didDeliver(_ items: [ContextPacketItem]) async {}
 
     func didPublish(

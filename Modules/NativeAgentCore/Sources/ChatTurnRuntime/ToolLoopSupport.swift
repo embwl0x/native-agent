@@ -72,7 +72,6 @@ extension TurnEngineResult.LoopCounters {
             "roundsAfterToolFailureCount": .int(Int64(roundsAfterToolFailureCount)),
             "protocolViolationRoundCount": .int(Int64(protocolViolationRoundCount)),
             "emptyReplyRoundCount": .int(Int64(emptyReplyRoundCount)),
-            "unfulfilledPromiseRoundCount": .int(Int64(unfulfilledPromiseRoundCount)),
         ]
     }
 }
@@ -341,7 +340,8 @@ enum ProviderToolResultProjection {
 /// Detects a provider repeatedly issuing the exact same tool batch and
 /// receiving the exact same results. Changed arguments or changed output
 /// always reset the streak, preserving legitimate polling, paging, retries,
-/// and iterative work.
+/// and iterative work. What it sees is her input each round the streak holds;
+/// whether to go on is hers.
 struct ToolLoopNoProgressGuard {
     enum Action: Equatable {
         case none
@@ -350,7 +350,6 @@ struct ToolLoopNoProgressGuard {
         /// thing to say is "fix your arguments" - that is the agent's job, not
         /// the reader's (2026-09-13, first-failure pass).
         case warn(model: String, person: String?)
-        case wait(rounds: Int)
     }
 
     private var previous: [TurnEngineResult.ToolDispatchRecord]?
@@ -377,18 +376,15 @@ struct ToolLoopNoProgressGuard {
                 previousFailure = failure
                 sameFailureRoundCount = 1
             }
-            if sameFailureRoundCount == 4 {
+            if sameFailureRoundCount >= 4 {
                 return .warn(
-                    model: "No progress detected: \(failure.name) has failed with the same error four rounds in a row (\(failure.error)). Change the call or stop calling it; rewording the arguments does not change the outcome.",
+                    model: "No progress detected: \(failure.name) has failed with the same error \(sameFailureRoundCount) rounds in a row (\(failure.error)). Change the call or stop calling it; rewording the arguments does not change the outcome.",
                     // Only an evidenced standing blocker is the reader's to
-                    // resolve. Everything else is the agent repairing its own
-                    // call, and narrating that to the person just asks them to
-                    // debug a tool they never wrote.
-                    person: Self.standingBlocker(failure)
+                    // resolve, once. Everything else is the agent repairing its
+                    // own call, and narrating that to the person just asks them
+                    // to debug a tool they never wrote.
+                    person: sameFailureRoundCount == 4 ? Self.standingBlocker(failure) : nil
                 )
-            }
-            if sameFailureRoundCount >= 8 {
-                return .wait(rounds: sameFailureRoundCount)
             }
         } else {
             previousFailure = nil
@@ -401,14 +397,11 @@ struct ToolLoopNoProgressGuard {
             identicalRoundCount = 1
         }
 
-        if identicalRoundCount == 8 {
+        if identicalRoundCount >= 8 {
             return .warn(
-                model: "No progress detected: this exact tool batch has returned the same result eight rounds in a row. Change the arguments, use a narrower query or a different tool, or answer from the results already available.",
+                model: "No progress detected: this exact tool batch has returned the same result \(identicalRoundCount) rounds in a row. Change the arguments, use a narrower query or a different tool, or answer from the results already available.",
                 person: nil
             )
-        }
-        if identicalRoundCount >= 16 {
-            return .wait(rounds: identicalRoundCount)
         }
         return .none
     }
@@ -518,25 +511,5 @@ struct ToolLoopNoProgressGuard {
               case .object(var object) = result else { return result }
         object["approvalId"] = nil
         return .object(object)
-    }
-}
-
-/// Shared retry receipt; callers retain their distinct replay and cancellation behavior.
-enum ProviderRetryTrace {
-    static func emit(
-        error: Error, attempt: Int, delaySeconds: TimeInterval,
-        mode: String, turnRecoveries: Int, surface: String
-    ) {
-        TurnTraceBus.fireFromContext(
-            kind: TurnLifecycleMilestone.providerRetry.rawValue,
-            surface: surface,
-            payload: .object([
-                "attempt": .int(Int64(attempt)),
-                "delaySeconds": .double(delaySeconds),
-                "reason": .string(String(ProviderRecoveryPolicy.describe(error).prefix(200))),
-                "mode": .string(mode),
-                "turnRecoveries": .int(Int64(turnRecoveries)),
-            ])
-        )
     }
 }

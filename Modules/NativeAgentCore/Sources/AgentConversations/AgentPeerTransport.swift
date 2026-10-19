@@ -121,6 +121,43 @@ public enum AgentPeerCredentials {
         }
         guard status == errSecSuccess else { throw CredentialError.unavailable }
     }
+    /// A peer's other secrets (a callback's credentials) live in this same
+    /// dedicated store, each under its own account, never in a data file.
+    public static func writeSecret(_ data: Data, account: String) throws {
+        let query = secretQuery(account)
+        var status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var item = query
+            item[kSecUseAuthenticationUI as String] = nil
+            item[kSecValueData as String] = data
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            status = SecItemAdd(item as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw CredentialError.unavailable }
+    }
+
+    public static func readSecret(account: String) throws -> Data? {
+        var query = secretQuery(account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = item as? Data else { throw CredentialError.unavailable }
+        return data
+    }
+
+    public static func deleteSecret(account: String) throws {
+        let status = SecItemDelete(secretQuery(account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw CredentialError.unavailable }
+    }
+
+    private static func secretQuery(_ account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+         kSecAttrAccount as String: "secret:" + account,
+         kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail]
+    }
+
     public static func delete(peerID: String) throws {
         defer { cache.forget(peerID) }
         try revoke(service: service) { service in

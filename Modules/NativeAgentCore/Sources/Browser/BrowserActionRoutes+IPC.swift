@@ -1,8 +1,8 @@
 import Foundation
+import PersistenceCore
 
 public protocol BrowserIPCWindowEffects: BrowserRouteEffects {
     @MainActor var navigationInProgress: Bool { get }
-    @MainActor func navigateFromIPC(_ url: URL, runID: String) async throws -> BrowserNavigationResult
     @MainActor func click(selector: String) async throws
     @MainActor func fill(selector: String, text: String) async throws
     @MainActor func showWindow()
@@ -26,10 +26,34 @@ extension BrowserActionRoutes {
         }
     }
 
-    private static func currentPageSchemeAllowed(_ currentURL: String?) -> Bool {
-        guard let currentURL else { return true }
-        let scheme = URL(string: currentURL)?.scheme?.lowercased() ?? ""
-        return scheme == "http" || scheme == "https"
+    /// Every IPC page effect enters the browser the way a run does: it owns
+    /// the window for its duration (so it cannot touch a page another run is
+    /// capturing) and acts only on an http(s) page (N8: a JS redirect to
+    /// file:// after a validated navigate must not open local files).
+    @MainActor private static func owningPage(
+        _ effects: any BrowserIPCWindowEffects, _ body: () async throws -> [String: Any]
+    ) async throws -> [String: Any] {
+        if let current = effects.currentURL(), !["http", "https"].contains(URL(string: current)?.scheme?.lowercased() ?? "") {
+            let cur = URL(string: current)?.scheme ?? "unknown"
+            return ["ok": false, "error": "url_scheme_not_allowed",
+                    "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
+        }
+        let owner = "ipc-\(UUID().uuidString.lowercased())"
+        try effects.acquireBrowser(runID: owner)
+        defer { effects.releaseBrowser(runID: owner) }
+        return try await body()
+    }
+
+    /// A click or fill is a run like a navigation: the one operation owner
+    /// persists its start and completion and can cancel or recover it.
+    @MainActor private static func pageEffect(
+        _ effects: any BrowserIPCWindowEffects, _ name: String, _ detail: [String: JSONValue],
+        _ effect: @escaping @MainActor () async throws -> Void
+    ) async throws -> [String: Any] {
+        let run = try BrowserRun(row: try await BrowserActionRoutes(effects: effects).executePageEffect(name, detail: detail, effect))
+        let receipt = (run.sourceReceipt.flatMap { try? $0.serializedData(pretty: false) })
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        return ["ok": run.status == "succeeded", "runId": run.id, "status": run.status, "error": receipt["error"] ?? NSNull()]
     }
 
     @MainActor public static func handleIPCRoute(method: String, path: String, body: Data, effects: any BrowserIPCWindowEffects) async throws -> [String: Any] {
@@ -57,69 +81,40 @@ extension BrowserActionRoutes {
             let runID = requestedRunID?.isEmpty == false
                 ? requestedRunID!
                 : "ipc-\(UUID().uuidString.lowercased())"
-            let result = try await effects.navigateFromIPC(url, runID: runID)
-            // httpStatus is Optional after the real-status fix — a bare
-            // `as Any` wraps .none, which JSONSerialization rejects and the
-            // whole response drops exactly on the nil-status path (gpt-5.5
-            // review blocker). NSNull is the JSON-safe absent marker.
-            return ["ok": true, "url": result.url, "title": result.title,
-                    "httpStatus": result.httpStatus.map { $0 as Any } ?? NSNull()]
+            // The same operation owner as every other navigation: a persisted
+            // run with its ownership, cancellation and recovery.
+            let routes = BrowserActionRoutes(effects: effects)
+            let run = try BrowserRun(row: try await routes.executeVisibleBrowserRun(
+                parsed: try routes.validBrowserURL(urlStr), runID: runID, approvalId: nil,
+                captureSource: false, captureScreenshot: false))
+            let receipt = (run.sourceReceipt.flatMap { try? $0.serializedData(pretty: false) })
+                .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            return ["ok": run.status == "succeeded", "runId": run.id, "status": run.status,
+                    "url": receipt["ipcUrl"] ?? NSNull(), "title": receipt["ipcTitle"] ?? NSNull(),
+                    "httpStatus": receipt["httpStatus"] ?? NSNull(), "error": receipt["openError"] ?? NSNull()]
 
         case "/browser/screenshot":
-            // N8 fix: check current page scheme before operating — a JS redirect to
-            // file:// after a validated navigate would otherwise let read/screenshot
-            // exfiltrate local files.
-            if !currentPageSchemeAllowed(effects.currentURL()) {
-                let cur = effects.currentURL().flatMap { URL(string: $0)?.scheme } ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
+            return try await owningPage(effects) {
+                ["ok": true, "png_base64": try await effects.screenshot().base64EncodedString()]
             }
-            let png = try await effects.screenshot()
-            return ["ok": true, "png_base64": png.base64EncodedString()]
 
         case "/browser/click":
             guard let sel = json["selector"] as? String else { throw BrowserError.badRequest("selector required") }
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed(effects.currentURL()) {
-                let cur = effects.currentURL().flatMap { URL(string: $0)?.scheme } ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            try await effects.click(selector: sel)
-            return ["ok": true]
+            return try await pageEffect(effects, "click", ["selector": .string(sel)]) { try await effects.click(selector: sel) }
 
         case "/browser/fill":
             guard let sel = json["selector"] as? String,
                   let text = json["text"] as? String else { throw BrowserError.badRequest("selector and text required") }
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed(effects.currentURL()) {
-                let cur = effects.currentURL().flatMap { URL(string: $0)?.scheme } ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            try await effects.fill(selector: sel, text: text)
-            return ["ok": true]
+            return try await pageEffect(effects, "fill", ["selector": .string(sel)]) { try await effects.fill(selector: sel, text: text) }
 
         case "/browser/read_text":
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed(effects.currentURL()) {
-                let cur = effects.currentURL().flatMap { URL(string: $0)?.scheme } ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
-            }
-            let text = try await effects.readText()
-            return ["ok": true, "text": text]
+            return try await owningPage(effects) { ["ok": true, "text": try await effects.readText()] }
 
         case "/browser/read_links":
-            // N8 fix: scheme check before operating
-            if !currentPageSchemeAllowed(effects.currentURL()) {
-                let cur = effects.currentURL().flatMap { URL(string: $0)?.scheme } ?? "unknown"
-                return ["ok": false, "error": "url_scheme_not_allowed",
-                        "detail": "Current page scheme '\(cur)' is not allowed; only http/https are permitted"]
+            return try await owningPage(effects) {
+                let links = try await effects.readLinks()
+                return ["ok": true, "links": try JSONSerialization.jsonObject(with: JSONEncoder().encode(links))]
             }
-            let links = try await effects.readLinks()
-            let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(links))
-            return ["ok": true, "links": encoded]
 
         case "/browser/show":
             effects.showWindow()

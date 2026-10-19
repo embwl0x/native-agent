@@ -638,8 +638,8 @@ extension CognitiveSubstrate {
             // purpose; it's her Observatory timeline.
             let formatter = DateFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.timeZone = TimeZone(identifier: "UTC")
-            formatter.dateFormat = "yyyy-MM-dd HH:mm 'UTC'"
+            formatter.timeZone = .current
+            formatter.dateFormat = "yyyy-MM-dd HH:mm zzz"
             let event = recordTimelineEventInMemory(
                 kind: .replayRun,
                 title: "Overnight emotional consolidation",

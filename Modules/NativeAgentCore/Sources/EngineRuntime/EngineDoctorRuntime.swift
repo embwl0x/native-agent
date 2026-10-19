@@ -82,9 +82,9 @@ extension EngineDoctorRuntime {
         await DoctorEmbeddingDownloadCheck.read(dataRoot: dataRoot)
     }
 
-    public func doctorProviderAuthStates() async throws -> [String] {
+    public func doctorProviderAuthStates() async throws -> [(state: String, eligible: Bool)] {
         try await ProvidersFacade(dataRoot: dataRoot)
-            .list().map { $0.auth_status.state }
+            .list().map { ($0.auth_status.state, $0.auth_status.eligible) }
     }
 
     public func doctorProviderRuntimeReading() async -> DoctorProviderRuntimeReading {

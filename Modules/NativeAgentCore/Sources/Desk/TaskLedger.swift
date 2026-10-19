@@ -527,16 +527,8 @@ public struct SwiftNativeTaskLedger: Sendable {
         return now.timeIntervalSince(updated) < terminalTaskRetention
     }
 
-    /// Read all events in the FILE (no lock, no base). Post-compaction this is
-    /// only the tail (the newest `compactionKeepTail`, plus a stale prefix in the crash
-    /// window) — identical to the window the old newest-N cap left behind, so
-    /// callers reading raw events see the same recent slice they always did.
-    /// Use `readFeedUnlocked` / `listTasks` for the base-folded authoritative view.
-    public func readEventsUnlocked() async throws -> [TaskLedgerEvent] {
-        try await readEventsWithIntegrityUnlocked().events
-    }
-
-    /// `readEventsUnlocked` plus the accounting of what the scan threw away.
+    /// All events in the FILE (no lock, no base), plus the accounting of what
+    /// the scan threw away.
     /// `TaskLedgerEvent.fromJSON` returns nil for an unknown `kind` — tolerant
     /// on read, but the count must reach `compactIfNeededUnlocked` so the fold
     /// cannot delete rows it never folded.

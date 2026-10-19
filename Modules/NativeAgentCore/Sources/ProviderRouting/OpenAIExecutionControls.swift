@@ -10,14 +10,18 @@ public enum OpenAIExecutionControls {
         case publicAPI
         case chatGPTOAuth
         case codexCLI
+
+        /// The route whose catalog rows declare what this transport accepts.
+        var route: String {
+            switch self {
+            case .publicAPI: "openai"
+            case .chatGPTOAuth: "openai_oauth_direct"
+            case .codexCLI: "codex"
+            }
+        }
     }
 
     private static let standardEfforts: Set<String> = ["low", "medium", "high", "xhigh"]
-    private static let publicGPT6AstraEfforts = Set(FirstPartyModelCatalog.publicGPT6AstraEfforts)
-    private static let accountGPT6AstraEfforts = Set(FirstPartyModelCatalog.accountGPT6AstraEfforts)
-    private static let publicGPT56Efforts: Set<String> = ["none", "low", "medium", "high", "xhigh", "max"]
-    private static let accountSolTerraEfforts: Set<String> = ["low", "medium", "high", "xhigh", "max", "ultra"]
-    private static let accountLunaEfforts: Set<String> = ["low", "medium", "high", "xhigh", "max"]
 
     /// Models intentionally exposed by the model-facing Codex bridge tools.
     /// The parser remains open to account-discovered models for compatibility;
@@ -32,37 +36,17 @@ public enum OpenAIExecutionControls {
         "gpt-6-luna",
     ]
 
+    /// The efforts the transport's catalog row declares for the model; a model
+    /// no row carries takes the standard set, whatever its spelling.
     public static func supportedReasoningEfforts(
         model: String,
         transport: Transport = .publicAPI
     ) -> Set<String> {
-        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch transport {
-        case .publicAPI:
-            if normalizedModel == "gpt-6-sol" || normalizedModel.hasPrefix("gpt-6-sol-")
-                || normalizedModel == "gpt-6-luna" || normalizedModel.hasPrefix("gpt-6-luna-") {
-                return publicGPT56Efforts
-            }
-            if normalizedModel.hasPrefix("gpt-6-") || normalizedModel.hasPrefix("gpt-6.") {
-                return publicGPT6AstraEfforts
-            }
-            if normalizedModel == "gpt-5.6" || normalizedModel.hasPrefix("gpt-5.6-") {
-                return publicGPT56Efforts
-            }
-            return standardEfforts
-        case .chatGPTOAuth, .codexCLI:
-            switch normalizedModel {
-            case FirstPartyModelCatalog.gpt6AstraModelID, "gpt-6.1-sol", "gpt-6-sol": return accountGPT6AstraEfforts
-            case "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra": return accountSolTerraEfforts
-            case "gpt-5.6-luna", "gpt-6-luna": return accountLunaEfforts
-            default: return standardEfforts
-            }
-        }
+        FirstPartyModelCatalog.routeSupportedEfforts(model, providerID: transport.route).map(Set.init) ?? standardEfforts
     }
 
     static func usesResponses(model: String) -> Bool {
-        let normalized = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalized.hasPrefix("gpt-6-") || normalized.hasPrefix("gpt-6.")
+        FirstPartyModelCatalog.descriptor(for: model, providerID: Transport.publicAPI.route)?.usesResponses == true
     }
 
     public static func reasoningEffort(
@@ -105,17 +89,18 @@ public enum OpenAIExecutionControls {
         return selected
     }
 
+    /// Priority only where the model's row declares Fast: the account's own
+    /// row when the caller has it, else the transport's shipped row.
     public static func serviceTier(
         model: String,
         requested: String?,
-        transport: Transport = .publicAPI
+        transport: Transport = .publicAPI,
+        supportsFast: Bool? = nil
     ) -> String? {
-        guard model.trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased().hasPrefix("gpt-") else { return nil }
+        guard supportsFast ?? FirstPartyModelCatalog.descriptor(
+            for: model, providerID: transport.route)?.supportsFast == true else { return nil }
         let normalized = requested?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard normalized == "priority" || normalized == "fast" else { return nil }
-        // The `gpt-5.4-mini` carve-out here (no Fast on the account transports)
-        // went with the model itself on 2026-09-13.
         return "priority"
     }
 
@@ -123,7 +108,8 @@ public enum OpenAIExecutionControls {
         to body: inout [String: Any],
         model: String,
         transport: Transport = .publicAPI,
-        supportedEfforts: [String]? = nil
+        supportedEfforts: [String]? = nil,
+        supportsFast: Bool? = nil
     ) {
         if let effort = wireReasoningEffort(
             model: model,
@@ -143,7 +129,8 @@ public enum OpenAIExecutionControls {
         if let tier = serviceTier(
             model: model,
             requested: LLMCallContext.serviceTier,
-            transport: transport
+            transport: transport,
+            supportsFast: supportsFast
         ) {
             body["service_tier"] = tier
         }

@@ -50,13 +50,17 @@ public protocol AppToolTelegramDiagnosticStatus {
     var voiceTranscription: Voice? { get }
 }
 
+/// One account as ProviderRouting publishes it: the receipt's state word and
+/// whether it may dispatch.
 public struct AppToolProviderHealth: Sendable {
     public let providerID: String
     public let authState: String
+    public let eligible: Bool
 
-    public init(providerID: String, authState: String) {
+    public init(providerID: String, authState: String, eligible: Bool) {
         self.providerID = providerID
         self.authState = authState
+        self.eligible = eligible
     }
 }
 
@@ -80,15 +84,13 @@ extension AppToolExecutor {
         let activeProviderID = ChatTurnRuntimeContext.current?.providerID
             ?? configuredProviderID.flatMap { ProviderRoutingSurfaceLookup.value($0, surface) }
         let providers = try? await providerHealth(dataRoot)
-        let activeProviderReady = activeProviderID.flatMap { providerID in
-            providers?
-                .first(where: { $0.providerID == providerID })
-                .map { $0.authState.lowercased() == "ready" }
+        let activeProvider = activeProviderID.flatMap { providerID in
+            providers?.first(where: { $0.providerID == providerID })
         }
         return doctorStatusEnvelope(
             report: report,
             activeProviderID: activeProviderID,
-            activeProviderReady: activeProviderReady
+            activeProvider: activeProvider
         )
     }
 
@@ -114,7 +116,7 @@ extension AppToolExecutor {
     public static func doctorStatusEnvelope(
         report: some AppToolDoctorReport,
         activeProviderID: String?,
-        activeProviderReady: Bool?
+        activeProvider: AppToolProviderHealth?
     ) -> JSONValue {
         let executableRepairs = DoctorSafeRepairPolicy.executableCoreIDs(for: report.checks)
         let checks = report.checks.map { check in
@@ -147,7 +149,7 @@ extension AppToolExecutor {
             return JSONValue.object(row)
         }
         let maintenanceIDs = Set(["oauth_token_expiry"])
-        let activeProviderIsReady = activeProviderReady == true
+        let activeProviderIsReady = activeProvider?.eligible == true
         let maintenanceChecks = report.checks.filter { check in
             if maintenanceIDs.contains(check.checkID) { return true }
             return check.checkID == "live.providers"
@@ -158,17 +160,13 @@ extension AppToolExecutor {
         let activeChecks = report.checks.filter { !maintenanceCheckIDs.contains($0.id) }
         let activePathStatus = doctorRollup(activeChecks.map(\.status))
         let maintenanceStatus = doctorRollup(maintenanceChecks.map(\.status))
-        let providerStatus: String = switch activeProviderReady {
-        case true: "ready"
-        case false: "not_ready"
-        case nil: "unknown"
-        }
         var envelope: [String: JSONValue] = [
             "status": .string(report.status),
             "active_path_status": .string(activePathStatus),
             "maintenance_status": .string(maintenanceStatus),
             "active_provider_id": activeProviderID.map(JSONValue.string) ?? .null,
-            "active_provider_status": .string(providerStatus),
+            // The receipt's own word (ready, saved, failed, rejected, needs_*).
+            "active_provider_status": .string(activeProvider?.authState ?? "unknown"),
             "status_scope_note": .string("status is the global Doctor rollup; active_path_status is the independently classified path serving this surface; maintenance warnings remain visible in checks"),
             "repaired": .bool(report.repaired),
             "check_count": .int(Int64(checks.count)),
@@ -177,7 +175,7 @@ extension AppToolExecutor {
             "maintenance_check_ids": .array(maintenanceChecks.map { .string($0.id) }),
             "checks": .array(checks),
         ]
-        if activeProviderReady == false, let activeProviderID {
+        if activeProvider?.eligible == false, let activeProviderID {
             let target = InlineInteractionRegistry.canonicalProviderID(activeProviderID)
             envelope["next"] = .string("raise request_interaction kind=api_key target=\(target)")
         }

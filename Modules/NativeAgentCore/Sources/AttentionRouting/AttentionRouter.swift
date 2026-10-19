@@ -9,6 +9,7 @@ import NotificationInbox
 import PersistenceCore
 import TelegramBot
 import DeviceSync
+import Experiences
 
 // MARK: - Attention router (sweep item 26, 2026-09-01)
 //
@@ -174,27 +175,22 @@ public struct AttentionOutcome: Sendable {
     /// than merely documented: the ledger was left UNTOUCHED, so the same fact
     /// can still reach him once the window closes.
     public let deferredForQuietHours: Bool
-    /// True when the routing said knock, the transport was TRIED and failed,
-    /// and no other way out was open. A failed transport is not suppression:
-    /// nothing reached him and nothing was deduped, so a caller must be able to
-    /// tell this apart from "already delivered". The ledger is left
-    /// untouched so the next pass can still deliver the fact.
-    public let deliveryFailed: Bool
     /// Her resident wake's knock in quiet hours: kept in the inbox, sent when they end.
     public var heldForResidentWake = false
+    /// The knock's own identity (its event and the reason that made it a
+    /// distinct knock): the event id the phone signs its receipt with.
+    public internal(set) var knock: String?
 
     init(
         delivery: AttentionDelivery,
         receipt: MobileNotificationDeliveryReceipt?,
         suppressed: Bool,
-        deferredForQuietHours: Bool = false,
-        deliveryFailed: Bool = false
+        deferredForQuietHours: Bool = false
     ) {
         self.delivery = delivery
         self.receipt = receipt
         self.suppressed = suppressed
         self.deferredForQuietHours = deferredForQuietHours
-        self.deliveryFailed = deliveryFailed
     }
 
     static let routineSuccess = AttentionOutcome(delivery: .none, receipt: nil, suppressed: false)
@@ -230,7 +226,6 @@ public struct AttentionOutcome: Sendable {
     }
 
     public var deliveryProjection: Delivery {
-        if deliveryFailed { return .failed }
         if deferredForQuietHours { return .deferred }
         if suppressed { return .previouslyHandled }
         guard delivery != .none else { return .noChannel }
@@ -526,12 +521,14 @@ public actor AttentionRouter {
 
     /// What the ledger says was delivered, event id → reason digest. The `app`
     /// door diffs it around one action to report the knocks that action set off.
-    public static func deliveredKnocks(dataRoot: URL) -> [String: String] {
+    /// Delivered knocks by key: none when the ledger was never written; a
+    /// ledger that does not read or decode throws, never reads as none.
+    public static func deliveredKnocks(dataRoot: URL) throws -> [String: String] {
         let url = dataRoot.appendingPathComponent("notify", isDirectory: true)
             .appendingPathComponent("attention_router.json")
-        guard let data = try? Data(contentsOf: url),
-              let state = try? JSONDecoder().decode(State.self, from: data) else { return [:] }
-        return state.reasons
+        let data: Data
+        do { data = try Data(contentsOf: url) } catch CocoaError.fileReadNoSuchFile { return [:] }
+        return try JSONDecoder().decode(State.self, from: data).reasons
     }
 
     /// Well above any live burst; the ledger is a dedupe window, not history.
@@ -662,9 +659,14 @@ public actor AttentionRouter {
             userInfo: userInfo, fallback: eventId
         )
         let digest = Self.stableDigest(reason ?? body)
-        let state = await load()
-        if pinnedTo == nil, state.reasons[ledgerKey] == digest {
-            return AttentionOutcome(delivery: delivery, receipt: nil, suppressed: true)
+        // One knock's identity: its event plus the reason that made it a new
+        // knock (a pinned call is its own each time). It rides the envelope
+        // as the device event id, so the phone's receipt names exactly it.
+        let knockID = Self.knockIdentity(ledgerKey, pinnedTo == nil ? digest : UUID().uuidString.lowercased())
+        if pinnedTo == nil, try await load().reasons[ledgerKey] == digest {
+            var handled = AttentionOutcome(delivery: delivery, receipt: nil, suppressed: true)
+            handled.knock = knockID
+            return handled
         }
         let reservation = "\(ledgerKey):\(digest)"
         if pinnedTo == nil, let existing = inFlight[reservation] {
@@ -673,6 +675,7 @@ public actor AttentionRouter {
 
         let send = Task<AttentionOutcome, Error> {
             var enriched = userInfo
+            enriched["eventId"] = knockID
             enriched["importance"] = importance.rawValue
             enriched["routedTo"] = delivery.rawValue
             // Honest urgency, PROJECTED from the class instead of asserted by
@@ -693,74 +696,71 @@ public actor AttentionRouter {
                 if let sessionId = origin.sessionId { enriched["originSessionId"] = sessionId }
             }
 
+            // The knock is owed to him before any door is tried and stays
+            // owed, with each failure's cause, until its destination takes it:
+            // a caller that only logs the throw can no longer drop it. The
+            // chosen door's failure is never a quiet trip through another one,
+            // and a throw leaves the ledger untouched.
+            let owed = "knock:" + knockID
+            Self.owe(dataRoot, owed, door: delivery, event: knockID, words: title + "\n" + body)
             var receipt: MobileNotificationDeliveryReceipt?
-            var landedOn = delivery
-            if delivery == .conversation, let origin {
-                do {
-                    try await conversationSender(
-                        origin, Self.telegramText(title: title, body: body))
-                } catch {
-                    // Same contract the Telegram exit has kept: a conversation
-                    // that cannot be reached must not swallow the fact.
-                    nativeLog("attention_router: conversation send failed, falling back to phone: %@",
-                          error.localizedDescription)
-                    guard NotificationChannelPreference.push() else {
-                        nativeLog("attention_router: delivery failed with no channel left, event=%@: %@",
-                                  ledgerKey, error.localizedDescription)
-                        return AttentionOutcome(
-                            delivery: .none, receipt: nil, suppressed: false, deliveryFailed: true)
-                    }
-                    enriched["routedTo"] = AttentionDelivery.phone.rawValue
-                    enriched["conversationFallback"] = "1"
-                    receipt = try await phoneSender(title, body, enriched)
-                    landedOn = .phone
-                }
-            } else if delivery == .telegram {
-                do {
+            do {
+                if delivery == .conversation, let origin {
+                    try await conversationSender(origin, Self.telegramText(title: title, body: body))
+                } else if delivery == .telegram {
                     try await telegramSender(Self.telegramText(title: title, body: body))
-                } catch {
-                    // The phone is the fallback, and it is the whole point of
-                    // having one: a Telegram outage must not swallow an
-                    // owner-waiting fact. Let a phone failure propagate.
-                    nativeLog("attention_router: telegram send failed, falling back to phone: %@",
-                          error.localizedDescription)
-                    // ...unless the phone is a channel the person switched off,
-                    // in which case there is no fallback to take.
-                    guard NotificationChannelPreference.push() else {
-                        // Telegram failed and the phone is switched off, so the
-                        // fact reached nobody. Returning `suppressed` here told
-                        // callers it was handled and left no trace at all; a
-                        // failed transport is never suppression.
-                        nativeLog("attention_router: delivery failed with no channel left, event=%@: %@",
-                                  ledgerKey, error.localizedDescription)
-                        return AttentionOutcome(
-                            delivery: .none, receipt: nil, suppressed: false, deliveryFailed: true)
-                    }
-                    enriched["routedTo"] = AttentionDelivery.phone.rawValue
-                    enriched["telegramFallback"] = "1"
+                } else {
                     receipt = try await phoneSender(title, body, enriched)
-                    landedOn = .phone
                 }
-            } else {
-                receipt = try await phoneSender(title, body, enriched)
+            } catch {
+                Self.knock(dataRoot, owed, [.claim(.init(claim: "failed: " + delivery.rawValue + " did not take it: " + error.localizedDescription, evidence: []))])
+                throw error
             }
+            // A chat's send returning is that chat holding it; a phone knock
+            // settles on the phone's own signed receipt (`settleKnocks`).
+            if delivery != .phone { Self.knock(dataRoot, owed, [.obligation(key: "deliver", phase: .accepted)]) }
 
             // Delivery is the commit point. A throw above leaves the ledger
             // untouched so the next pass retries rather than losing the knock.
             if pinnedTo == nil {
                 // Other deliveries can finish while this one awaits a sender.
                 // Merge into their latest committed ledger, not the old snapshot.
-                var state = await load()
+                var state = try await load()
                 state.remember(eventId: ledgerKey, digest: digest, limit: Self.ledgerLimit)
                 try persist(state)
             }
-            return AttentionOutcome(delivery: landedOn, receipt: receipt, suppressed: false)
+            var sent = AttentionOutcome(delivery: delivery, receipt: receipt, suppressed: false)
+            sent.knock = knockID
+            return sent
         }
         if pinnedTo == nil { inFlight[reservation] = send }
         defer {
             if pinnedTo == nil { inFlight[reservation] = nil }
         }
         return try await send.value
+    }
+
+    private static func owe(_ dataRoot: URL, _ id: String, door: AttentionDelivery, event: String, words: String) {
+        let knock = Experience(id: id, kind: .message, face: .init(words: words, artifacts: []), addressedTo: ["person"],
+            owes: ["deliver": .init(to: "person")],
+            claims: ["door: " + door.rawValue, "event: " + event].map { .init(claim: $0, evidence: []) })
+        ExperienceStore.record(dataRoot, id) { store in _ = try await store.begin(knock) }
+    }
+
+    private static func knock(_ dataRoot: URL, _ id: String, _ changes: [ExperienceStore.Change]) {
+        ExperienceStore.record(dataRoot, id) { store in try await store.append(changes, to: id) }
+    }
+
+    /// Every owed knock whose event the phone has signed as arrived is settled.
+    static func settleKnocks(confirmed: Set<String>, dataRoot: URL) {
+        guard !confirmed.isEmpty else { return }
+        ExperienceStore.record(dataRoot, "knock-receipts") { store in
+            for owed in try await store.open() where owed.id.hasPrefix("knock:")
+                && owed.owes["deliver"]?.phase.isSettled == false
+                && owed.claims.contains(where: { $0.claim.hasPrefix("event: ") && confirmed.contains(String($0.claim.dropFirst(7))) }) {
+                try await store.append([.obligation(key: "deliver", phase: .accepted)], to: owed.id)
+            }
+        }
     }
 
     /// Owner alerts require the configured single owner's bound private chat.
@@ -852,6 +852,11 @@ public actor AttentionRouter {
         return "\(head)\n\n\(tail)"
     }
 
+    /// A canonical device event id, so the relay and the phone carry it as is.
+    static func knockIdentity(_ event: String, _ version: String) -> String {
+        SHA256.hash(data: Data((event + ":" + version).utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     public nonisolated static func stableDigest(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8))
             .prefix(12)
@@ -859,23 +864,21 @@ public actor AttentionRouter {
             .joined()
     }
 
-    /// CHECKED decode (2026-09-01 review, MEDIUM). This used to be a `try?`
-    /// pair, so a corrupt ledger silently became `.empty` and the very next
-    /// delivery OVERWROTE it — the dedupe state was reset without a trace and
-    /// every previously-delivered event could knock again, with the evidence of
-    /// what was already sent destroyed. Now the damaged bytes are renamed
-    /// aside, never deleted, a log records the loss, and the fresh
-    /// ledger starts from a known-empty state.
-    private func load() async -> State {
+    /// CHECKED read. A missing ledger is the only empty one. An unreadable
+    /// or damaged ledger is not "nothing was delivered": routing throws its
+    /// cause, so no event knocks again on invented history. Damaged bytes are
+    /// renamed aside, never deleted; once they are, the ledger is known-empty.
+    private func load() async throws -> State {
         if let cached { return cached }
-        guard let data = try? Data(contentsOf: stateURL) else { return .empty }
+        let data: Data
+        do { data = try Data(contentsOf: stateURL) }
+        catch where MacSyncEngine.isNoSuchFileError(error) { return .empty }
         do {
             let state = try JSONDecoder().decode(State.self, from: data)
             cached = state
             return state
         } catch {
-            quarantineDamagedLedger()
-            return .empty
+            throw quarantineDamagedLedger(error)
         }
     }
 
@@ -885,7 +888,7 @@ public actor AttentionRouter {
     /// recoverable is still on disk, and a human can read
     /// `attention_router.json.quarantined-<ts>` to see exactly which events had
     /// already been delivered.
-    private func quarantineDamagedLedger() {
+    private func quarantineDamagedLedger(_ damage: Error) -> Error {
         let fileManager = FileManager.default
         let stamp = String(Int(Date().timeIntervalSince1970))
         var aside = stateURL.appendingPathExtension("quarantined-\(stamp)")
@@ -894,18 +897,16 @@ public actor AttentionRouter {
             aside = stateURL.appendingPathExtension("quarantined-\(stamp)-\(collision)")
             collision += 1
         }
+        let preserved: String
         do {
             try fileManager.moveItem(at: stateURL, to: aside)
+            preserved = "its bytes are preserved at \(aside.lastPathComponent) and the next knock starts a fresh ledger"
         } catch {
-            // The bytes stayed put. The atomic write that follows runs in the
-            // same directory, so it will fail for the same reason rather than
-            // clobbering them — but say so out loud either way.
-            nativeLog("attention_router: damaged ledger could not be preserved aside: %@",
-                  error.localizedDescription)
-            return
+            preserved = "its bytes could not be moved aside (\(error.localizedDescription)); they stay in place"
         }
-        nativeLog("attention_router: damaged ledger self-healed; bytes preserved at %@",
-              aside.lastPathComponent)
+        nativeLog("attention_router: damaged ledger (%@); %@", damage.localizedDescription, preserved)
+        return NSError(domain: "AttentionRouter", code: -2, userInfo: [NSLocalizedDescriptionKey:
+            "The notification ledger is damaged (\(damage.localizedDescription)); \(preserved). Nothing was sent."])
     }
 
     /// Encode under BOTH budgets: `ledgerLimit` has already bounded the entry

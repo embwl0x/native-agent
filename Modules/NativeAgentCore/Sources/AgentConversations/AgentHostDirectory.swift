@@ -167,7 +167,6 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     }
 
     public var isInstalled: Bool { !installation.evidence.isEmpty }
-    public var installationEvidence: [String] { installation.evidence }
 
     private static func isInstalledProgram(_ path: String) -> Bool {
         let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()

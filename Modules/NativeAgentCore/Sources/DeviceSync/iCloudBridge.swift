@@ -438,8 +438,9 @@ public final class iCloudBridge: ObservableObject {
         // setup falls through to the complete legacy path unchanged.
         if deviceTransport != nil {
             setupTask = Task {
-                await sync.engine.startCloudKitSnapshotProjection()
+                let failure = await sync.engine.startCloudKitSnapshotProjection()
                 guard generation == setupGeneration, isSetUp, !Task.isCancelled else { return }
+                if let failure { syncStatus = failure }
                 NotificationCenter.default.addObserver(
                     self,
                     selector: #selector(kvsDidChange(_:)),
@@ -451,8 +452,6 @@ public final class iCloudBridge: ObservableObject {
                         NSUbiquitousKeyValueStore.default.synchronize()
                     }
                 }
-                available = true
-                syncStatus = "CloudKit ready"
             }
             return
         }
@@ -533,12 +532,12 @@ public final class iCloudBridge: ObservableObject {
         trimSeenMessageIDsIfNeeded()
 
         // PATCH-2026-05-07: ios-parity start snapshot writer + inbox watcher
-        await sync.engine.start(docsURL: docsURL)
+        let failure = await sync.engine.start(docsURL: docsURL)
         guard generation == setupGeneration, isSetUp else { return }
 
-        available = true
-        syncStatus = "iCloud ready"
-        doctorTransportHealth = .available
+        available = failure == nil
+        syncStatus = failure ?? "iCloud ready"
+        doctorTransportHealth = failure.map { .unavailable($0) } ?? .available
 
         // Start KVS change observation
         NotificationCenter.default.addObserver(
@@ -553,6 +552,17 @@ public final class iCloudBridge: ObservableObject {
 
         // Start NSMetadataQuery watching iOS outbox folder
         startMetadataQuery(docsURL: docsURL)
+    }
+
+    /// CloudKit is ready when a full publication was accepted; a
+    /// refused group keeps its cause as the status, and with no phone
+    /// listening nothing was published, so nothing is claimed.
+    func notePublication(_ failures: [NAMobileSnapshotGroup: DeviceSyncError]?) {
+        guard accountFailure == nil, !phonePairedElsewhere else { return }
+        guard let failures else { syncStatus = "CloudKit started; no phone is listening yet"; return }
+        syncStatus = failures.min(by: { $0.key.rawValue < $1.key.rawValue }).map {
+            "CloudKit did not accept the phone's \($0.key.rawValue) snapshot: \($0.value.localizedDescription)"
+        } ?? "CloudKit ready"
     }
 
     /// Starts the checked CloudKit transport without depending on iCloud Drive.
@@ -840,7 +850,6 @@ public final class iCloudBridge: ObservableObject {
         if wasElsewhere {
             // The drain and the presence republish below record their own pulses.
             doctorTransportHealth = .unmeasured
-            syncStatus = "CloudKit ready"
         }
         Task.detached(priority: .utility) { await PairingSecretManager.publishMaterialToKVS() }
         Task {
@@ -1449,31 +1458,6 @@ public final class iCloudBridge: ObservableObject {
         }
     }
 
-    // MARK: - Status pings (KVS only — fast)
-
-    func sendShortStatus(key: String, value: String) {
-        // CK-3b: route status through the CloudKit transport when active.
-        if let ck = deviceTransport {
-            guard speaksToPhone else { return }
-            Task {
-                do {
-                    try await ck.setStatus(key: key, value: value)
-                    await recordSendResult(operation: key)
-                } catch {
-                    await recordSendResult(operation: key, error: error)
-                }
-            }
-            return
-        }
-        Task.detached(priority: .utility) {
-            _ = await withCKTimeout("iCloudBridge.sendShortStatus.\(key)", seconds: 3) {
-                let kvs = NSUbiquitousKeyValueStore.default
-                kvs.set(value, forKey: key)
-                return kvs.synchronize()
-            }
-        }
-    }
-
     /// Publish the Mac-owned provider/model catalog to the paired phone without
     /// copying credentials or requiring the legacy iCloud Drive snapshot lane.
     /// The status record is a bounded LWW projection; the Mac remains the only
@@ -1775,7 +1759,7 @@ public final class iCloudBridge: ObservableObject {
               message.metadata?["kind"] == "icloud_action",
               let data = message.text.data(using: .utf8),
               let action = try? JSONDecoder().decode(InboxAction.self, from: data),
-              action.action == "cancelChat",
+              ["cancelChat", "steerChat"].contains(action.action),
               let ids = InboxActionFileBoundary.validatedIDs(for: action),
               ids.messageID == message.metadata?["actionId"],
               let signature = action.signature,

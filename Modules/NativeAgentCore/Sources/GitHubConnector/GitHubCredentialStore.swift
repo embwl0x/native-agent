@@ -450,7 +450,15 @@ public actor GitHubCredentialStore {
                 throw GitHubCredentialVaultError.accountChanged
             } catch {
                 // Transient (offline, 5xx): the old token may still have minutes left.
-                if let expiresAt = oauth.expiresAt, expiresAt > Date() { return oauth.accessToken }
+                // It serves, and the failed refresh goes on the connection record
+                // (a transport failure already did) instead of vanishing.
+                if let expiresAt = oauth.expiresAt, expiresAt > Date() {
+                    if case GitHubOAuthDeviceFlow.FlowError.transport = error {} else {
+                        await GitHubConnectorActions.recordConnectionProof(
+                            statusCode: nil, error: "refresh_failed: \(error.localizedDescription)", dataRoot: dataRoot)
+                    }
+                    return oauth.accessToken
+                }
                 throw error
             }
             return nil

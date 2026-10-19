@@ -15,10 +15,13 @@ public enum TurnCheckpointScope {
 }
 
 /// Serialized with receipts so a checkpoint never claims an unrecorded effect finished.
+/// A write that fails is the turn's receipt, never its end: it owes repair for
+/// that session's checkpoints and the turn goes on; the next write that lands settles it.
 actor TurnCheckpointWriter {
     private var record: TurnCheckpoint
     private let dataRoot: URL
     private var pendingCalls = 0
+    private var owesSettle = true
 
     init(record: TurnCheckpoint, dataRoot: URL) {
         self.record = record
@@ -27,7 +30,7 @@ actor TurnCheckpointWriter {
     }
 
     func capture(prose: String, commentaryCharacters: Int, conversation: [LLMMessage], log: [JSONValue],
-                 startingCalls: Int = 0) throws {
+                 startingCalls: Int = 0) {
         record.log = log
         record.keptProse = prose
         record.workingCommentaryCharacters = commentaryCharacters
@@ -39,14 +42,41 @@ actor TurnCheckpointWriter {
         pendingCalls += startingCalls
         record.runningStep = pendingCalls > 0 ? 1 : nil
         record.peerSources = PeerDataTaint.current?.checkpointSources ?? record.peerSources
-        try record.write(dataRoot: dataRoot)
+        persist()
     }
 
-    func receiptWritten() throws {
+    func receiptWritten() {
         pendingCalls = max(0, pendingCalls - 1)
         record.runningStep = pendingCalls > 0 ? 1 : nil
         record.peerSources = PeerDataTaint.current?.checkpointSources ?? record.peerSources
-        try record.write(dataRoot: dataRoot)
+        persist()
+    }
+
+    private func persist() {
+        if Self.persist(record, dataRoot: dataRoot) != nil { owesSettle = true; return }
+        if owesSettle {
+            RepairOwed.settle(dataRoot, operation: Self.operation(record),
+                              evidence: .init(source: "chat/session_state", id: record.turnId))
+            owesSettle = false
+        }
+    }
+
+    private static func operation(_ record: TurnCheckpoint) -> String { "turn.checkpoint:" + record.sessionId }
+
+    /// The one write of a turn's checkpoint. A failure owes repair naming the
+    /// checkpoint and its cause, and returns those words for the turn to read.
+    static func persist(_ record: TurnCheckpoint, dataRoot: URL) -> String? {
+        do {
+            try record.write(dataRoot: dataRoot)
+            return nil
+        } catch {
+            let owner = "chat/session_state/\(record.sessionId)/turn-\(record.turnId).json"
+            let words = "This turn's checkpoint was not written to \(owner): \(error.localizedDescription). "
+                + "The turn runs; a relaunch before it finishes will not resume it."
+            RepairOwed.owe(dataRoot, id: "turn-checkpoint:" + record.turnId, kind: .run,
+                operation: operation(record), owner: owner, words: words)
+            return words
+        }
     }
 }
 
@@ -87,8 +117,8 @@ extension SwiftNativeChatOrchestrationClient {
     /// the door's own ledger, which never resends. A write that fails is logged
     /// and never holds the checkpoint.
     public static func settleReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String, verdict: String) async throws {
-        for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
-            where checkpoint.runId == runId && checkpoint.deliveryPending {
+        for checkpoint in try replyCheckpoints(dataRoot: dataRoot, sessionId: sessionId, runId: runId).matching
+            where checkpoint.deliveryPending {
             if let key = checkpoint.owedDelivery(status: "completed")?.key {
                 let settle: ExperienceStore.Change? = switch verdict {
                 case "completed": .obligation(key: key, phase: .accepted)
@@ -104,14 +134,34 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
+    /// A damaged file may be this run's: its answer stays owed.
     public static func hasReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws -> Bool {
-        try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId).contains { $0.runId == runId }
+        let found = try replyCheckpoints(dataRoot: dataRoot, sessionId: sessionId, runId: runId)
+        return !found.matching.isEmpty || !found.damaged.isEmpty
     }
 
     public static func removeReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws {
-        for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId) where checkpoint.runId == runId {
+        for checkpoint in try replyCheckpoints(dataRoot: dataRoot, sessionId: sessionId, runId: runId).matching {
             try checkpoint.remove(dataRoot: dataRoot)
         }
+    }
+
+    /// This run's checkpoints, each file read on its own. A damaged file may be
+    /// this run's, so it is kept and named, never settled or removed.
+    static func replyCheckpoints(dataRoot: URL, sessionId: String, runId: String) throws
+        -> (matching: [TurnCheckpoint], damaged: [String]) {
+        var found: (matching: [TurnCheckpoint], damaged: [String]) = ([], [])
+        for turnId in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: sessionId) {
+            do {
+                if let checkpoint = try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId),
+                   checkpoint.runId == runId { found.matching.append(checkpoint) }
+            } catch {
+                found.damaged.append(turnId)
+                nativeLog("Turn checkpoint %@ is unreadable and may be run %@; its answer stays owed: %@",
+                          turnId, runId, error.localizedDescription)
+            }
+        }
+        return found
     }
 
     public static func savedReply(dataRoot: URL, sessionId: String, runId: String, turnId: String? = nil) async throws -> ChatResponse? {
@@ -170,12 +220,9 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     func settleTurnCheckpoint(_ terminal: TurnTraceEvent, sessionId: String, runId: String) async throws {
-        if case .object(let payload) = terminal.payload, payload["repairPending"] == .bool(true) {
-            try await turnTraceBus.deliverDurably(terminal)
-            return
-        }
-        var checkpoints = try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
-            .filter { $0.runId == runId }
+        // This turn's own checkpoint, read alone: a damaged sibling never holds it.
+        var checkpoints = try [TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: terminal.turnId)]
+            .compactMap { $0 }.filter { $0.runId == runId }
         for index in checkpoints.indices {
             if case .object(let payload) = terminal.payload,
                payload["status"] == .string("completed") || payload["status"] == .string("waiting"),
@@ -274,6 +321,56 @@ extension SwiftNativeChatOrchestrationClient {
 }
 
 extension SwiftNativeTurnEngine {
+    /// What an accepted turn owes its door, from the bindings it runs under.
+    nonisolated static func continuation(runId: String?, sessionId: String?, surface: String, userMessage: String,
+                                         fileAccess: String, capabilityProfile: String?) throws -> DeskContinuation? {
+        guard let runId, !runId.isEmpty else { return nil }
+        let envelope = TurnEnvelope.current(surface: surface)
+        guard case .object(let metadata) = envelope.persistedMetadata() else { throw DeskContinuationError.unavailable }
+        let route = ChatToolSessionContext.replyRoute ?? envelope.deliveryRoute
+        var reply: [String: JSONValue] = ["surface": .string(route?.surface ?? surface)]
+        for (key, value) in [("destinationId", route?.destinationId), ("threadId", route?.threadId),
+                             ("sourceKey", route?.sourceKey), ("replyTo", route?.replyTo),
+                             ("correlationId", route?.correlationId), ("requesterUserId", route?.requesterUserId)] {
+            if let value { reply[key] = .string(value) }
+        }
+        return DeskContinuation(runID: runId, sessionID: sessionId, surface: surface,
+                envelope: metadata, replyRoute: reply, remainingWork: userMessage, fileAccess: fileAccess,
+                peerSources: PeerDataTaint.current?.checkpointSources, capabilityProfile: capabilityProfile,
+                commandSignatureVerified: envelope.commandSignatureVerified, declaredRemote: envelope.declaredRemote,
+                helperDefinition: try StandingBotContinuity.currentBot.map { try JSONValue.fromEncodable($0) })
+    }
+
+    /// Stop is the turn's one cancel link: the run's raised flag cancels its
+    /// work at once, wherever it waits; a door that stops listening never does.
+    nonisolated static func untilStopped<T: Sendable>(_ flag: URL?, _ work: @escaping @Sendable () async throws -> T) async throws -> T {
+        guard let flag else { return try await work() }
+        return try await withThrowingTaskGroup(of: T?.self) { group in
+            group.addTask { try await work() }
+            group.addTask {
+                let changes = FileChangeEvents(paths: [URL(fileURLWithPath: flag.path)])
+                defer { changes.cancel() }
+                for await _ in changes.stream where ChatCancelFlag.isRaised(flag) { break }
+                return nil
+            }
+            // The work's own end (a value, or its stop carrying the partial) is the
+            // answer; only a raised flag cancels it.
+            while let next = try await group.next() {
+                if let value = next { group.cancelAll(); return value }
+                if ChatCancelFlag.isRaised(flag) { group.cancelAll() }
+            }
+            throw CancellationError()
+        }
+    }
+
+    nonisolated static func checkpoint(_ saved: DeskContinuation, turnId: String, sessionId: String) -> TurnCheckpoint {
+        TurnCheckpoint(runId: saved.runID, turnId: turnId, sessionId: sessionId, surface: saved.surface,
+            userMessage: saved.remainingWork, envelope: saved.envelope, replyRoute: saved.replyRoute,
+            fileAccess: saved.fileAccess, capabilityProfile: saved.capabilityProfile, peerSources: saved.peerSources,
+            commandSignatureVerified: saved.commandSignatureVerified, declaredRemote: saved.declaredRemote,
+            helperDefinition: saved.helperDefinition)
+    }
+
     public func executeTurnWithStreamingToolLoop(
         surface: String = "chat", userMessage: String, sessionId: String? = nil,
         toolSessionId: String? = nil, runId: String? = nil,
@@ -294,51 +391,41 @@ extension SwiftNativeTurnEngine {
             }
             await progress?(event)
         }
-        let saved: DeskContinuation?
-        if remPinsDataRoot != nil, let runId, !runId.isEmpty {
-            let envelope = TurnEnvelope.current(surface: surface)
-            let metadata: [String: JSONValue]
-            if case .object(let object) = envelope.persistedMetadata() { metadata = object }
-            else { throw DeskContinuationError.unavailable }
-            let route = ChatToolSessionContext.replyRoute ?? envelope.deliveryRoute
-            var reply: [String: JSONValue] = ["surface": .string(route?.surface ?? surface)]
-            for (key, value) in [("destinationId", route?.destinationId), ("threadId", route?.threadId),
-                                 ("sourceKey", route?.sourceKey), ("replyTo", route?.replyTo),
-                                 ("correlationId", route?.correlationId), ("requesterUserId", route?.requesterUserId)] {
-                if let value { reply[key] = .string(value) }
-            }
-            saved = DeskContinuation(runID: runId, sessionID: sessionId, surface: surface,
-                    envelope: metadata, replyRoute: reply, remainingWork: userMessage, fileAccess: fileAccess,
-                    peerSources: PeerDataTaint.current?.checkpointSources, capabilityProfile: capabilityProfile,
-                    commandSignatureVerified: envelope.commandSignatureVerified, declaredRemote: envelope.declaredRemote,
-                    helperDefinition: try StandingBotContinuity.currentBot.map { try JSONValue.fromEncodable($0) })
-        } else { saved = nil }
+        let saved = remPinsDataRoot == nil ? nil : try Self.continuation(runId: runId, sessionId: sessionId,
+            surface: surface, userMessage: userMessage, fileAccess: fileAccess, capabilityProfile: capabilityProfile)
         let journal: DeskContinuationTurn?
         if let current = DeskContinuationScope.current { journal = current }
         else if let root = remPinsDataRoot, let saved {
             journal = DeskContinuationTurn(store: SwiftNativeDeskStore(dataRoot: root), record: saved)
         } else { journal = nil }
         let ownsJournal = await journal?.snapshot().runID == runId
+        // A worker has no conversation: its run owns the checkpoint, and it
+        // settles that checkpoint itself when it ends (its caller holds the answer).
         let checkpoint: TurnCheckpointWriter?
-        if let root = remPinsDataRoot, let saved, let sessionId, let turnId = TurnTraceContext.turnId {
+        var workerRecord: TurnCheckpoint?
+        if let root = remPinsDataRoot, let saved, let owner = sessionId ?? runId.map({ "worker-" + $0 }),
+           let turnId = TurnTraceContext.turnId {
             let restarted = TurnCheckpointScope.resuming.flatMap { $0.runId == runId && $0.turnId == turnId ? $0 : nil }
-            let record = restarted ?? TurnCheckpoint(runId: saved.runID,
-                turnId: turnId, sessionId: sessionId, surface: surface, userMessage: userMessage,
-                envelope: saved.envelope, replyRoute: saved.replyRoute, fileAccess: saved.fileAccess,
-                capabilityProfile: saved.capabilityProfile, peerSources: saved.peerSources,
-                commandSignatureVerified: saved.commandSignatureVerified, declaredRemote: saved.declaredRemote,
-                helperDefinition: saved.helperDefinition)
+            let record = restarted ?? Self.checkpoint(saved, turnId: turnId, sessionId: owner)
+            if sessionId == nil { workerRecord = record }
             checkpoint = TurnCheckpointWriter(record: record, dataRoot: root)
         } else { checkpoint = nil }
+        func settleWorker() {
+            guard let workerRecord, let root = remPinsDataRoot else { return }
+            do { try workerRecord.remove(dataRoot: root) }
+            catch { nativeLog("A worker's checkpoint was not removed; launch recovery will find it: %@", error.localizedDescription) }
+        }
         return try await TurnCheckpointScope.$current.withValue(checkpoint) {
         return try await DeskContinuationScope.$current.withValue(journal) {
             do {
-                let result = try await executeContinuationTurnBody(
-                    surface: surface, userMessage: userMessage, sessionId: sessionId,
-                    toolSessionId: toolSessionId, runId: runId,
-                    llm: llm, tools: tools,
-                    preBuiltContext: preBuiltContext, progress: effectiveProgress,
-                    cancelFlagPath: cancelFlagPath, providerAdmission: providerAdmission)
+                let result = try await Self.untilStopped(cancelFlagPath) { [self] in
+                    try await executeContinuationTurnBody(
+                        surface: surface, userMessage: userMessage, sessionId: sessionId,
+                        toolSessionId: toolSessionId, runId: runId,
+                        llm: llm, tools: tools,
+                        preBuiltContext: preBuiltContext, progress: effectiveProgress,
+                        cancelFlagPath: cancelFlagPath, providerAdmission: providerAdmission)
+                }
                 let reason = result.terminalReason ?? .incomplete
                 let state: DeskContinuation.State
                 switch reason {
@@ -355,6 +442,7 @@ extension SwiftNativeTurnEngine {
                     try await journal?.finish(state: state, reply: result.reply, reason: reason.rawValue,
                         peerSources: PeerDataTaint.current?.checkpointSources)
                 }
+                settleWorker()
                 return result
             } catch {
                 let canceled = Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath)
@@ -363,6 +451,7 @@ extension SwiftNativeTurnEngine {
                         reason: canceled ? "canceled" : "turn_interrupted",
                         peerSources: PeerDataTaint.current?.checkpointSources)
                 }
+                settleWorker()
                 throw error
             }
         }

@@ -6,8 +6,8 @@ public struct ProviderStreamGuardConfig: Sendable, Equatable {
     public var wallTimeout: TimeInterval
     public var checkInterval: TimeInterval
     /// The provider's first-output deadline for this call, asked as the stream
-    /// starts. Until its first output, a stream that only keeps the connection
-    /// open (headers, comments, pings) is cut there; unmeasured leaves the wall.
+    /// starts. It bounds only a wire with nothing on it (a connection that never
+    /// opened or hung before headers); unmeasured leaves the wall.
     public var firstOutput = FirstOutputDeadline(calls: 0, slowest: nil)
 
     /// The ceiling every configured timeout is clamped to. User, 2026-09-06:
@@ -182,8 +182,6 @@ public enum ProviderStreamGuard {
     private enum TimeoutKind {
         case idle, wall, firstOutput
 
-        /// The cut carries wire evidence so recovery can distinguish a live
-        /// slow start from an unopened connection without reading its wording.
         func error(providerLabel p: String, snapshot: ProviderStreamGuardState.Snapshot,
                    waited: TimeInterval, config: ProviderStreamGuardConfig) -> Error {
             let waited = Int(waited.rounded()), idle = Int(config.idleTimeout.rounded())
@@ -196,17 +194,13 @@ public enum ProviderStreamGuard {
             let account: String
             switch (self, snapshot.yieldedAny) {
             case (.firstOutput, _): account = "No first output from \(p) in \(waited) s (\(arrived)); \(evidence)"
-            case (.wall, false):
-                let evidence = ProviderStreamContext.retryingLiveFirstOutputCut
-                    ? "the learned first-output deadline was skipped after a live-stream cut." : evidence
-                account = "No first output from \(p) by the call's \(waited) s limit (\(arrived)); \(evidence)"
+            case (.wall, false): account = "No first output from \(p) by the call's \(waited) s limit (\(arrived)); \(evidence)"
             case (.idle, false): account = "No first output from \(p), and nothing on the line for \(idle) s (\(arrived) in \(waited) s)."
             case (.wall, true): account = "\(p) was still replying at the call's \(waited) s limit (\(snapshot.eventCount) events)."
             case (.idle, true): account = "\(p) went silent for \(idle) s mid-reply (\(snapshot.eventCount) events in \(waited) s)."
             }
             let cut = ProviderFailure.noReply(provider: p, seconds: waited, events: snapshot.eventCount, account: account)
-            return ProviderFailure.Diagnostic(cause: cut, detail: account, deadlineExpired: true,
-                admitted: snapshot.admitted, liveFirstOutputCut: self == .firstOutput && snapshot.hasWireActivity)
+            return ProviderFailure.Diagnostic(cause: cut, detail: account, deadlineExpired: true, admitted: snapshot.admitted)
         }
     }
 
@@ -219,13 +213,14 @@ public enum ProviderStreamGuard {
            now - snapshot.startedAt >= config.wallTimeout {
             return .wall
         }
-        if !ProviderStreamContext.retryingLiveFirstOutputCut, config.idleTimeout > 0,
+        if config.idleTimeout > 0,
            let lastActivityAt = snapshot.lastActivityAt,
            now - lastActivityAt >= config.idleTimeout {
             return .idle
         }
-        if !ProviderStreamContext.retryingLiveFirstOutputCut,
-           !snapshot.yieldedAny, let deadline = config.firstOutput.seconds,
+        // A live wire is a provider thinking, however slower than last time;
+        // its silence and the wall bound it.
+        if !snapshot.hasWireActivity, !snapshot.yieldedAny, let deadline = config.firstOutput.seconds,
            now - snapshot.startedAt >= deadline {
             return .firstOutput
         }
@@ -238,15 +233,13 @@ public enum ProviderStreamGuard {
         config: ProviderStreamGuardConfig
     ) -> TimeInterval {
         var candidates = [config.checkInterval]
-        if !ProviderStreamContext.retryingLiveFirstOutputCut, config.idleTimeout > 0,
-           let lastActivityAt = snapshot.lastActivityAt {
+        if config.idleTimeout > 0, let lastActivityAt = snapshot.lastActivityAt {
             candidates.append(config.idleTimeout - (now - lastActivityAt))
         }
         if config.wallTimeout > 0 {
             candidates.append(config.wallTimeout - (now - snapshot.startedAt))
         }
-        if !ProviderStreamContext.retryingLiveFirstOutputCut,
-           !snapshot.yieldedAny, let deadline = config.firstOutput.seconds {
+        if !snapshot.hasWireActivity, !snapshot.yieldedAny, let deadline = config.firstOutput.seconds {
             candidates.append(deadline - (now - snapshot.startedAt))
         }
         return max(0.01, candidates.min() ?? config.checkInterval)

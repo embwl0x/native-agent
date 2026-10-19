@@ -88,11 +88,11 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             return
         }
         Task { [weak self] in
-            await self?.startPursuitRefresh(waitForCompletion: false)
+            await self?.startPursuitRefresh()
         }
     }
 
-    func startPursuitRefresh(waitForCompletion: Bool) async {  // internal for actor extensions (move-only Wave C)
+    func startPursuitRefresh() async {  // internal for actor extensions (move-only Wave C)
         guard !isFlushedForTermination else { return }
         if pursuitRefreshInFlight {
             pursuitRefreshQueued = true
@@ -113,9 +113,6 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
             await self?.finishPursuitRefresh(state: state, revision: revision, generation: generation)
         }
         pursuitRefreshTask = task
-        if waitForCompletion {
-            await task.value
-        }
     }
 
     private func finishPursuitRefresh(state: DeskState?, revision: UInt64, generation: UInt64) async {
@@ -182,7 +179,7 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
         // A failed settled refresh stays unavailable, but no longer claims to be pending.
         if !needsFollowUp { pursuitCompletedRefreshRevision = revision }
         if needsFollowUp {
-            await startPursuitRefresh(waitForCompletion: false)
+            await startPursuitRefresh()
         }
     }
 }

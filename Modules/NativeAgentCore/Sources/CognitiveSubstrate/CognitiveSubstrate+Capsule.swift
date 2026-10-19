@@ -76,7 +76,7 @@ extension CognitiveSubstrate {
     ) -> CognitivePreparedCapsule {
         compileFrozenCapsulePresentation(
             request, from: read, remindedOf: remindedOf, dreamTheme: dreamTheme,
-            gapItems: gapItems, felt: nil)
+            gapItems: gapItems, felt: nil, unreadable: [])
     }
 
     private func compileFrozenCapsulePresentation(
@@ -85,7 +85,8 @@ extension CognitiveSubstrate {
         remindedOf: CognitiveRecalledMoment?,
         dreamTheme: CognitiveDreamTheme?,
         gapItems: [String]?,
-        felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?
+        felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?,
+        unreadable: [String]
     ) -> CognitivePreparedCapsule {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
@@ -134,8 +135,10 @@ extension CognitiveSubstrate {
             presentationState: &nextPresentationState,
             why: &cueWhy
         )
-        let dynamicLines = request.surface == Self.cadenceExemptCapsuleSurface
-            ? candidateLines : Self.oneFeltCue(candidateLines)
+        // Receipts are not cues: they never compete for the one felt slot.
+        let dynamicLines = (request.surface == Self.cadenceExemptCapsuleSurface
+            ? candidateLines : Self.oneFeltCue(candidateLines))
+            + Array(Set(unreadable)).sorted().map(Self.unreadableCueLine)
         let capsule = assembledCapsule(
             request, at: read.fixedAt, dynamicLines: dynamicLines,
             workspaceItems: items, thoughtSeeds: read.thoughtSeeds, why: cueWhy,
@@ -826,16 +829,17 @@ extension CognitiveSubstrate {
         // lookup suspended, and an accepted turn may have surfaced this very
         // moment while it did (`revalidatedRemindedOf`).
         var felt: (signals: FeltSignals, fingerprint: FeltLineRender?)?
-        let remindedOf = await remindedOfMoment(for: request, from: read, felt: &felt)
+        var unreadable: [String] = []
+        let remindedOf = await remindedOfMoment(for: request, from: read, felt: &felt, unreadable: &unreadable)
             .flatMap { revalidatedRemindedOf($0, against: read) }
         // Phase 5 B: the two continuity lookups, local and gated the same way
         // (a dream only when the cooldown is open and the message has words;
         // the gap only on User's first turn back).
-        let dreamTheme = await dreamThemeCue(for: request, from: read)
-        let gapItems = await sinceGapItems(for: request, from: read)
+        let dreamTheme = await dreamThemeCue(for: request, from: read, unreadable: &unreadable)
+        let gapItems = await sinceGapItems(for: request, from: read, unreadable: &unreadable)
         let prepared = compileFrozenCapsulePresentation(
             request, from: read, remindedOf: remindedOf,
-            dreamTheme: dreamTheme, gapItems: gapItems, felt: felt)
+            dreamTheme: dreamTheme, gapItems: gapItems, felt: felt, unreadable: unreadable)
         // An empty capsule still returns, carrying its commit (Phase 5A);
         // callers inject only `nonEmptyCapsule`.
         guard prepared.capsule.mode == .inject else { return nil }

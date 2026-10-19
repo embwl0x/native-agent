@@ -824,15 +824,14 @@ public enum QuietSettings {
     }
 
     /// The accounts the Providers page's own account menu offers — every
-    /// connected provider, by the same `auth_status.state == "ready"` test the
-    /// menu applies; one whose last test failed for its key reads
-    /// needs_reconnect. `app_settings_list` reports this list and the write
+    /// eligible provider, by the same test the menu applies (a rejected key
+    /// reads needs_key). `app_settings_list` reports this list and the write
     /// enforces it, so the two are one list.
     @MainActor
     private static func connectedAccountIDs(_ appModel: (any QuietSettingsHost)?) async -> [String] {
         guard let appModel, let providers = try? await appModel.listQuietProviderAccounts() else { return [] }
         return providers
-            .filter { $0.authState == "ready" }
+            .filter(\.eligible)
             .map(\.id)
     }
 

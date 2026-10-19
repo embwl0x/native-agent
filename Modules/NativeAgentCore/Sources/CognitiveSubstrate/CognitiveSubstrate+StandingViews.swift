@@ -1108,7 +1108,7 @@ extension CognitiveSubstrate {
     /// proposals). Score is clamped to [0,1] by the store, so the (possibly negative) mood
     /// valence is floored — it is telemetry only; prune orders artifacts by updated_at.
     func persistStandingView(_ view: CognitiveStandingView) async {
-        try? await persistStandingViewChecked(view)
+        await notingPersistence("artifact.standing_view.\(view.id.uuidString)") { try await persistStandingViewChecked(view) }
     }
 
     /// The same write, surfacing its failure for the lifecycle seams whose

@@ -1269,7 +1269,9 @@ struct SwarmLiveBoard: Sendable {
         let workers = pending.enumerated().map { settled[$0.offset] ?? $0.element }
         try await write(.object([
             "id": .string(id), "status": .string("running"), "objective": .string(objective),
-            "createdAt": .string(createdAt), "pid": .int(Int64(getpid())), "workers": .array(workers),
+            "createdAt": .string(createdAt), "pid": .int(Int64(getpid())),
+            "pidStartedAt": { if case .started(let at) = SwiftNativeSwarmRunsReader.processStart(getpid()) { .double(at) } else { .null } }(),
+            "workers": .array(workers),
             "synthesize": .bool(synthesize),
         ]))
     }

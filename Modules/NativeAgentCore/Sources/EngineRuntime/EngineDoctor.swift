@@ -87,7 +87,8 @@ public final class DoctorFacade {
         }
         return try await AppToolExecutor.doctorStatus(report: report) { dataRoot in
             try await ProvidersFacade(dataRoot: dataRoot).list().map {
-                AppToolProviderHealth(providerID: $0.provider_id, authState: $0.auth_status.state)
+                AppToolProviderHealth(providerID: $0.provider_id, authState: $0.auth_status.state,
+                                      eligible: $0.auth_status.eligible)
             }
         }
     }

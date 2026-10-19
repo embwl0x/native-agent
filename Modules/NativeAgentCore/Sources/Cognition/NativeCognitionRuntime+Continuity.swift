@@ -46,32 +46,45 @@ extension NativeCognitionRuntime {
     /// construction (Sol, 10-03): no living diary, or every phrase already
     /// spent (`excluding`), returns before any embedding; the embedder is used
     /// only when it is already warm, never loaded during turn preparation; and
-    /// the message vector is kept for a recompile of the same turn.
+    /// the message vector is kept for a recompile of the same turn. A missing
+    /// or other-space cache asks its builder; this turn carries no residue.
     nonisolated static func dreamThemes(
         message: String,
         excluding: Set<String>,
         dataRoot: URL,
         now: Date,
         isWarm: @Sendable () async -> Bool,
-        embed: @Sendable ([String]) async throws -> [[Float]]
-    ) async -> [CognitiveDreamTheme] {
-        guard let diary = livingDiary(dataRoot: dataRoot, now: now) else { return [] }
-        let cached = cachedDreamTheme(dataRoot: dataRoot, diary: diary)
-        if let cached, cached.phrases.allSatisfy({ excluding.contains($0.id) }) { return [] }
-        guard await isWarm() else { return [] }
-        var extracted = cached
-        if extracted == nil { extracted = await extractDreamTheme(dataRoot: dataRoot, diary: diary, embed: embed) }
-        guard var file = extracted, let query = await messageVector(message, embed: embed) else { return [] }
-        // The embedder changed under the cache: extract again in its space.
-        if file.phrases.contains(where: { $0.vector.count != query.count }) {
-            guard let fresh = await extractDreamTheme(dataRoot: dataRoot, diary: diary, embed: embed) else { return [] }
-            file = fresh
+        embed: @escaping @Sendable ([String]) async throws -> [[Float]]
+    ) async -> CognitiveCueRead<[CognitiveDreamTheme]> {
+        let diary: LivingDiary?
+        do { diary = try livingDiary(dataRoot: dataRoot, now: now) } catch {
+            return CognitiveCueRead([], unreadable: ["last night's dream diary (\(error.localizedDescription))"])
         }
-        return file.phrases
+        guard let diary else { return CognitiveCueRead([]) }
+        let cached: DreamThemeFile?
+        do { cached = try cachedDreamTheme(dataRoot: dataRoot, diary: diary) } catch {
+            requestDreamThemeExtraction(dataRoot: dataRoot, diary: diary, embed: embed)
+            return CognitiveCueRead([], unreadable: ["the dream theme cache (\(error.localizedDescription)); it is being rebuilt"])
+        }
+        if let cached, cached.phrases.allSatisfy({ excluding.contains($0.id) }) { return CognitiveCueRead([]) }
+        guard await isWarm() else { return CognitiveCueRead([]) }
+        guard let file = cached else {
+            requestDreamThemeExtraction(dataRoot: dataRoot, diary: diary, embed: embed)
+            return CognitiveCueRead([])
+        }
+        let query: [Float]
+        do { query = try await messageVector(message, embed: embed) } catch {
+            return CognitiveCueRead([], unreadable: ["this message's meaning for the dream cue (\(error.localizedDescription))"])
+        }
+        guard !file.phrases.contains(where: { $0.vector.count != query.count }) else {
+            requestDreamThemeExtraction(dataRoot: dataRoot, diary: diary, embed: embed)
+            return CognitiveCueRead([])
+        }
+        return CognitiveCueRead(file.phrases
             .filter { !excluding.contains($0.id) }
             .map { CognitiveDreamTheme(id: $0.id, text: $0.text, score: Double(cosine($0.vector, query))) }
             .filter { $0.score >= dreamThemeScoreFloor }
-            .sorted { $0.score > $1.score }
+            .sorted { $0.score > $1.score })
     }
 
     /// One message vector, kept: the same turn recompiled asks again.
@@ -83,9 +96,11 @@ extension NativeCognitionRuntime {
     nonisolated static func messageVector(
         _ message: String,
         embed: @Sendable ([String]) async throws -> [[Float]]
-    ) async -> [Float]? {
+    ) async throws -> [Float] {
         if let hit = lastMessageVector.withLock({ $0 }), hit.0 == message { return hit.1 }
-        guard let vector = try? await embed([message]).first, !vector.isEmpty else { return nil }
+        guard let vector = try await embed([message]).first, !vector.isEmpty else {
+            throw CocoaError(.coderInvalidValue)
+        }
         lastMessageVector.withLock { $0 = (message, vector) }
         return vector
     }
@@ -96,20 +111,23 @@ extension NativeCognitionRuntime {
         let written: Date
     }
 
-    /// The newest diary, while it still lives.
-    nonisolated static func livingDiary(dataRoot: URL, now: Date) -> LivingDiary? {
+    /// The newest diary, while it still lives; a diary that is not there is
+    /// nil, one that cannot be read throws.
+    nonisolated static func livingDiary(dataRoot: URL, now: Date) throws -> LivingDiary? {
         let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path),
-              let newest = names.filter({ $0.range(of: #"^\d{4}-\d{2}-\d{2}\.md$"#, options: .regularExpression) != nil }).max()
+        guard FileManager.default.fileExists(atPath: dir.path) else { return nil }
+        guard let newest = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter({ $0.range(of: #"^\d{4}-\d{2}-\d{2}\.md$"#, options: .regularExpression) != nil }).max()
         else { return nil }
         let url = dir.appendingPathComponent(newest)
-        guard let written = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+        guard let written = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date,
               now.timeIntervalSince(written) < dreamThemeLife else { return nil }
         return LivingDiary(url: url, name: String(newest.dropLast(3)), written: written)
     }
 
-    /// The cached themes, when they were extracted from exactly this diary.
-    nonisolated static func cachedDreamTheme(dataRoot: URL, diary: LivingDiary) -> DreamThemeFile? {
+    /// The cached themes, when they were extracted from exactly this diary;
+    /// nil when absent or for another diary, a throw when it cannot be read.
+    nonisolated static func cachedDreamTheme(dataRoot: URL, diary: LivingDiary) throws -> DreamThemeFile? {
         let url = dreamThemeURL(dataRoot).standardizedFileURL
         guard let stamp = SnapshotTailOpLog.fileStamp(url), case .present = stamp else {
             lastDreamTheme.withLock { $0 = nil }
@@ -119,12 +137,30 @@ extension NativeCognitionRuntime {
            hit.file.diary == diary.name, hit.file.stamp == diary.written.timeIntervalSince1970 {
             return hit.file
         }
-        guard let data = try? Data(contentsOf: url),
-              let cached = try? JSONDecoder().decode(DreamThemeFile.self, from: data),
-              cached.diary == diary.name, cached.stamp == diary.written.timeIntervalSince1970,
+        let cached = try JSONDecoder().decode(DreamThemeFile.self, from: Data(contentsOf: url))
+        guard cached.diary == diary.name, cached.stamp == diary.written.timeIntervalSince1970,
               SnapshotTailOpLog.fileStamp(url) == stamp else { return nil }
         lastDreamTheme.withLock { $0 = (url, stamp, cached) }
         return cached
+    }
+
+    private static let dreamThemeExtractionInFlight = OSAllocatedUnfairLock(initialState: false)
+
+    /// One detached extraction at a time; the next turn reads what it published.
+    nonisolated static func requestDreamThemeExtraction(
+        dataRoot: URL,
+        diary: LivingDiary,
+        embed: @escaping @Sendable ([String]) async throws -> [[Float]]
+    ) {
+        let claimed = dreamThemeExtractionInFlight.withLock { inFlight in
+            defer { inFlight = true }
+            return !inFlight
+        }
+        guard claimed else { return }
+        Task.detached(priority: .utility) {
+            _ = await extractDreamTheme(dataRoot: dataRoot, diary: diary, embed: embed)
+            dreamThemeExtractionInFlight.withLock { $0 = false }
+        }
     }
 
     /// Extracted once per diary (keyed by file name and modification time),
@@ -151,9 +187,14 @@ extension NativeCognitionRuntime {
             stamp: diary.written.timeIntervalSince1970,
             phrases: kept.map { .init(id: "\(diary.name)#\($0 + 1)", text: candidates[$0], vector: vectors[$0]) })
         let cacheURL = dreamThemeURL(dataRoot)
-        try? FileManager.default.createDirectory(
-            at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if let data = try? JSONEncoder().encode(file) { try? data.write(to: cacheURL, options: .atomic) }
+        do {
+            try FileManager.default.createDirectory(
+                at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(file).write(to: cacheURL, options: .atomic)
+        } catch {
+            // Unwritten, the next living-diary turn asks for this extraction again.
+            nativeLog("[dream-themes] cache not written: %@", error.localizedDescription)
+        }
         return file
     }
 
@@ -191,7 +232,8 @@ extension NativeCognitionRuntime {
 
     /// What actually happened between `from` and `to`, as short items with
     /// real content, in order: a moment she kept, a Desk outcome, then what
-    /// each trusted builder shipped, newest first. Nothing happened → [].
+    /// each trusted builder shipped, newest first. Nothing happened → []; a
+    /// source that could not be read is named in `unreadable`.
     nonisolated static func sinceGapItems(
         from: Date,
         to: Date,
@@ -199,15 +241,25 @@ extension NativeCognitionRuntime {
         dataRoot: URL,
         worklogURL: URL? = nil,
         codexURL: URL? = nil
-    ) async -> [String] {
-        async let memoryRecords = try? SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(kind: "moment")
-        async let deskState = try? SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
+    ) async -> CognitiveCueRead<[String]> {
+        async let memoryRead = Result { try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(kind: "moment") }
+        async let deskRead = Result { try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() }
         var items: [String] = []
+        var unreadable: [String] = []
+        let memoryRecords: [MemoryV2.MemoryRecord]?, deskState: DeskState?
+        switch await memoryRead {
+        case .success(let records): memoryRecords = records
+        case .failure(let error): memoryRecords = nil; unreadable.append("your saved moments (\(error.localizedDescription))")
+        }
+        switch await deskRead {
+        case .success(let state): deskState = state
+        case .failure(let error): deskState = nil; unreadable.append("the Desk (\(error.localizedDescription))")
+        }
         let inGap: (Date?) -> Bool = { date in date.map { $0 > from && $0 <= to } ?? false }
 
         // A moment she kept from while he was away (her peer threads, mostly),
         // through the same disclosure rule recall applies on this surface.
-        if let records = await memoryRecords {
+        if let records = memoryRecords {
             let kept = records.filter { record in
                 (record.status ?? "active") == "active"
                     && inGap(MemoryMoments.parseTimestamp(record.observedAt ?? record.createdAt))
@@ -220,7 +272,7 @@ extension NativeCognitionRuntime {
 
         // A Desk outcome: an item finished in the gap that has a real title
         // (not a machine step like "A step from peer:…").
-        if let state = await deskState {
+        if let state = deskState {
             let done = state.items
                 .filter {
                     $0.status == .done && inGap($0.closedAt.flatMap(DeskClock.parseISO)) && isRealTitle($0.title)
@@ -237,7 +289,8 @@ extension NativeCognitionRuntime {
         // counted. Only a builder User elevated in Trust speaks here: these are
         // its own words, and an un-elevated agent's must not be laundered into
         // her inner voice, so it is left out.
-        let builders = builderNews(dataRoot: dataRoot, worklogURL: worklogURL, codexURL: codexURL)
+        let (builders, unreadBuilders) = builderNews(dataRoot: dataRoot, worklogURL: worklogURL, codexURL: codexURL)
+        unreadable += unreadBuilders
         let news = builders.compactMap { builder -> (Date, String)? in
             let inside = builder.shipped.filter { inGap($0.0) && $0.1.count >= 6 }
             guard let newest = inside.max(by: { $0.0 < $1.0 }),
@@ -246,25 +299,42 @@ extension NativeCognitionRuntime {
                 + (inside.count > 1 ? " (+\(inside.count - 1) more)" : ""))
         }
         items += news.sorted { $0.0 > $1.0 }.map(\.1)
-        return items
+        return CognitiveCueRead(items, unreadable: unreadable)
     }
 
-    nonisolated static func builderNews(dataRoot: URL, worklogURL: URL? = nil, codexURL: URL? = nil, unseenOnly: Bool = false) -> [(name: String, lane: String, shipped: [(Date, String)])] {
-        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+    nonisolated static func builderNews(dataRoot: URL, worklogURL: URL? = nil, codexURL: URL? = nil, unseenOnly: Bool = false)
+        -> (builders: [(name: String, lane: String, shipped: [(Date, String)])], unreadable: [String]) {
+        var unreadable: [String] = []
+        let peers: [AgentPeerContact]
+        do { peers = try AgentPeerStore(dataRoot: dataRoot).list() } catch {
+            return ([], ["the peer list (\(error.localizedDescription))"])
+        }
         let quietWindow = unseenOnly ? TurnQuietHoursWindow.read(dataRoot: dataRoot) : nil
-        return peers.filter { peer in !peers.contains { $0.id == peer.who } }.compactMap { who in
+        let builders = peers.filter { peer in !peers.contains { $0.id == peer.who } }.compactMap { who -> (name: String, lane: String, shipped: [(Date, String)])? in
             let key = "peer:" + who.id
             guard PeerTrust.ownerTrusts(key, dataRoot: dataRoot),
                   let door = AgentConversationDelivery.door(for: key, dataRoot: dataRoot) else { return nil }
             let shipped: [(Date, String)]
-            switch door.tool {
-            case "claude_message": shipped = claudeShipped(worklogURL ?? defaultClaudeWorklog(), kinds: unseenOnly ? ["feature"] : ["feature", "fix"])
-                .filter { !unseenOnly || quietWindow?.contains(hour: Calendar.current.component(.hour, from: $0.0)) == true }
-            case "codex_message": shipped = codexShipped(codexURL ?? defaultCodexRecord())
-            default: return nil
+            do {
+                switch door.tool {
+                case "claude_message": shipped = try claudeShipped(worklogURL ?? defaultClaudeWorklog(), kinds: unseenOnly ? ["feature"] : ["feature", "fix"])
+                    .filter { !unseenOnly || quietWindow?.contains(hour: Calendar.current.component(.hour, from: $0.0)) == true }
+                case "codex_message": shipped = try codexShipped(codexURL ?? defaultCodexRecord())
+                default: return nil
+                }
+            } catch {
+                unreadable.append("\(who.name)'s record of its work (\(error.localizedDescription))")
+                return nil
             }
             return (who.name, key, shipped)
         }
+        return (builders, unreadable)
+    }
+
+    /// A record that is not there is an empty one; any other failure throws.
+    private nonisolated static func absentIsEmpty<T>(_ empty: T, _ read: () throws -> T) throws -> T {
+        do { return try read() } catch CocoaError.fileReadNoSuchFile, CocoaError.fileNoSuchFile { return empty }
+        catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) { return empty }
     }
 
     nonisolated static func defaultClaudeWorklog() -> URL {
@@ -272,8 +342,8 @@ extension NativeCognitionRuntime {
     }
 
     /// Claude's worklog: shipped features and fixes, headline only.
-    nonisolated static func claudeShipped(_ url: URL, kinds: Set<String> = ["feature", "fix"]) -> [(Date, String)] {
-        ((try? AgentConversationView.claudeWorklogTail(url)) ?? []).compactMap { object -> (Date, String)? in
+    nonisolated static func claudeShipped(_ url: URL, kinds: Set<String> = ["feature", "fix"]) throws -> [(Date, String)] {
+        try absentIsEmpty([]) { try AgentConversationView.claudeWorklogTail(url) }.compactMap { object -> (Date, String)? in
             guard kinds.contains(object["kind"] as? String ?? ""),
                   let at = MemoryMoments.parseTimestamp(object["ts"] as? String),
                   let summary = object["summary"] as? String else { return nil }
@@ -301,8 +371,9 @@ extension NativeCognitionRuntime {
 
     /// Entries shaped `### 2026-09-30 11:38 MDT - Title` followed by a
     /// `Status: completed|committed…` line: what Codex finished, titled.
-    nonisolated static func codexShipped(_ url: URL) -> [(Date, String)] {
-        guard let data = try? Data(contentsOf: url), data.count <= 1_048_576 else { return [] }
+    nonisolated static func codexShipped(_ url: URL) throws -> [(Date, String)] {
+        let data = try absentIsEmpty(Data()) { try Data(contentsOf: url) }
+        guard data.count <= 1_048_576 else { return [] }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         var out: [(Date, String)] = []

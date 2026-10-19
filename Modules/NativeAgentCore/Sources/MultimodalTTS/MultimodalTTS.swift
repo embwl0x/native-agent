@@ -31,8 +31,8 @@
 // NOT assumed):
 //   • URL https://api.openai.com/v1/audio/speech
 //   • body {model:"tts-1", input:text[:4096], voice, response_format:fmt}
-// — note input is truncated to 4096 chars,
-//     mirrored here.
+// — note input is truncated to 4096 chars;
+//     the same cap applies here and the unread remainder is reported.
 //   • headers Authorization/Content-Type/User-Agent.
 //   • 60s timeout.
 //   • token from <dataRoot>/providers/openai.json `api_key` only (no env var,
@@ -153,7 +153,8 @@ public final class SwiftOpenAITTSClient: Sendable {
         )
     }
 
-    public func synthesize(text: String, voice: String, format: String) async throws -> Data {
+    /// The audio, and how many scalars past the provider's per-request cap it does not read.
+    public func synthesize(text: String, voice: String, format: String) async throws -> (audio: Data, unread: Int) {
         // Daemon runs _multimodal_policy_check("tts_openai") FIRST
         // — before empty-text/key/network. Default OFF.
         guard ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
@@ -180,13 +181,11 @@ public final class SwiftOpenAITTSClient: Sendable {
             throw MultimodalTTSError.notConfigured
         }
 
-        // Mirror the daemon's text[:4096] input truncation. Python's `str`
-        // slicing is by CODE POINT (Unicode scalar), NOT by grapheme cluster, so
-        // we truncate `unicodeScalars` — `String.prefix(_:)` would slice by
-        // `Character` (grapheme) and drift for combining marks / emoji ZWJ
-        // sequences. `.prefix` on a scalar view can split a grapheme; that
-        // matches Python exactly (Python would split there too).
+        // The endpoint reads at most 4096 code points per request (sliced by
+        // scalar, as the daemon's text[:4096] did); what lies past it is
+        // returned as unread, never dropped in silence.
         let truncated = String(String.UnicodeScalarView(text.unicodeScalars.prefix(SwiftOpenAITTSClient.maxInputChars)))
+        let unread = max(0, text.unicodeScalars.count - SwiftOpenAITTSClient.maxInputChars)
 
         var req = URLRequest(url: SwiftOpenAITTSClient.ttsURL)
         req.httpMethod = "POST"
@@ -226,6 +225,6 @@ public final class SwiftOpenAITTSClient: Sendable {
         guard (200..<300).contains(http.statusCode) else {
             throw MultimodalTTSError.apiError(status: http.statusCode)
         }
-        return data
+        return (data, unread)
     }
 }

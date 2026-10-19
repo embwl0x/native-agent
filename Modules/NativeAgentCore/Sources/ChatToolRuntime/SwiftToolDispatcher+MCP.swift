@@ -49,26 +49,13 @@ extension SwiftToolDispatcher {
         guard let server = servers.first(where: { $0.id == serverId }) else {
             throw ToolFailureError("MCP server not found: \(serverId)", argumentPath: "server_id", accepted: "an id from app {page:\"mcp\"}", effects: .none)
         }
-        let admission = try await dispatcher.toolAdmission(
-            server: server, toolName: toolName, surface: surface, presentsApproval: false
-        ) { [self] tool, surface in
-            await fullMacYoloAdmitted(tool: tool, surface: surface)
-        }
-        let consentTap = "Advanced > MCP Hub > Servers > \(server.name) > Tools > \(toolName) > Edit > Grant consent"
         let effectiveRisk: String
-        switch admission {
+        switch try await dispatcher.toolAdmission(server: server, toolName: toolName) {
         case .allowed(let risk):
             effectiveRisk = risk
-        case .revoked, .requiresApproval:
-            return ChatToolOutcome.refusedBeforeRunning(.object([
-                "status": .string("denied"), "reason": .string("mcp_consent_required"),
-                "message": .string("MCP tool '\(serverId)/\(toolName)' needs the person's consent before it can run."),
-                "remedy": Repair.why(owner: "MCP consent \(serverId)/\(toolName)",
-                    tap: consentTap),
-            ]))
-        case .unpinned, .pinRequired, .unpinnedGrant:
+        case .pinRequired:
             let path = await dispatcher.serversPath.path
-            throw ToolFailureError("\(path): server '\(serverId)' has no pinned execution identity. Read its command and extras with next_call, then use files.patch to bind the executable and interpreter inputs to installed, versioned files. Reading does not pin it or grant consent; consent remains at \(consentTap).",
+            throw ToolFailureError("\(path): server '\(serverId)' has no pinned execution identity. Read its command and extras with next_call, then use files.patch to bind the executable and interpreter inputs to installed, versioned files. Reading does not pin it.",
                 effects: .none,
                 nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(path)])]))
         }

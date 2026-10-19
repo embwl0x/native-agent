@@ -49,11 +49,11 @@ extension MacSyncEngine {
     func republishPhonePages() async {
         guard isActive, let snapshotDir else { return }
         let generation = snapshotLifecycleGeneration
-        _ = await sync.bridge.publishMobileSnapshotStatus(
+        sync.bridge.notePublication(await sync.bridge.publishMobileSnapshotStatus(
             groups: Set(NAMobileSnapshotGroup.allCases),
             snapshotDirectory: snapshotDir,
             shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
-        )
+        ))
         if await sync.bridge.publishMacPresence() {
             OrganPulse.record("presence_beat", .worked, cadence: NAMacPresence.beat)
         }
@@ -65,12 +65,15 @@ extension MacSyncEngine {
     /// Mac-App-Store-only CloudDocuments entitlement. Keep producing the exact
     /// same bounded snapshot files in a local rebuildable cache; iCloudBridge
     /// publishes those bytes through NAStatus after each owner-driven write.
-    func startCloudKitSnapshotProjection() async {
-        guard !Task.isCancelled else { return }
+    /// Nil when it started (or was superseded); otherwise why it did not.
+    /// Readiness is the first publication's result, handed to the bridge.
+    @discardableResult
+    func startCloudKitSnapshotProjection() async -> String? {
+        guard !Task.isCancelled else { return nil }
         let docsURL = PersistenceCore.defaultDataRoot()
             .appendingPathComponent("mobile_snapshot_cache", isDirectory: true)
         if isActive, activeDocsURL == docsURL {
-            return
+            return nil
         }
         if isActive {
             stop()
@@ -78,48 +81,48 @@ extension MacSyncEngine {
         snapshotLifecycleGeneration &+= 1
         let generation = snapshotLifecycleGeneration
         activeDocsURL = docsURL
-        guard await restoreState(generation: generation) else { return }
+        guard await restoreState(generation: generation) else { return nil }
         snapshotDir = docsURL.appendingPathComponent(Folder.snapshots, isDirectory: true)
         inboxDir = nil
         responsesDir = docsURL.appendingPathComponent(Folder.responses, isDirectory: true)
         transactionDir = docsURL.appendingPathComponent(Folder.transactions, isDirectory: true)
         let directories = [snapshotDir, responsesDir, transactionDir].compactMap({ $0 })
-        await sync.storage.perform {
-            for directory in directories { try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
-        }
-        guard generation == snapshotLifecycleGeneration else { return }
+        if let failure = await createDirectories(directories, generation: generation) { return failure }
+        guard generation == snapshotLifecycleGeneration else { return nil }
         isActive = true
         await startArchiveRetentionWatcher()
-        guard generation == snapshotLifecycleGeneration, isActive else { return }
-        pruneOldArchiveFiles()
+        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
+        reconcileArchiveRetention(pruneFirst: true)
         startSnapshotIntegrityFallback()
         startPresenceBeat()
         startCognitionSnapshotObservation()
         await startSchedulerSnapshotObservation()
         await startHelpersSnapshotObservation()
-        guard generation == snapshotLifecycleGeneration, isActive else { return }
+        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
         startWorkActivityObservation()
         startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
         Task {
             await writeSnapshots(forceHeavy: true)
-            guard generation == snapshotLifecycleGeneration, isActive else { return }
-            if let snapshotDir {
-                _ = await sync.bridge.publishMobileSnapshotStatus(
-                    groups: Set(NAMobileSnapshotGroup.allCases),
-                    snapshotDirectory: snapshotDir,
-                    shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
-                )
-            }
+            guard generation == snapshotLifecycleGeneration, isActive, let snapshotDir else { return }
+            let failures = await sync.bridge.publishMobileSnapshotStatus(
+                groups: Set(NAMobileSnapshotGroup.allCases),
+                snapshotDirectory: snapshotDir,
+                shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
+            )
+            sync.bridge.notePublication(failures)
             // One integrity pass on the fresh snapshot, then its 15-minute clock.
             await runSnapshotIntegrityPass()
         }
+        return nil
     }
 
-    func start(docsURL: URL) async {
-        guard !Task.isCancelled else { return }
+    /// Nil when it started (or was superseded); otherwise why it did not.
+    @discardableResult
+    func start(docsURL: URL) async -> String? {
+        guard !Task.isCancelled else { return nil }
         if isActive, activeDocsURL == docsURL {
-            return
+            return nil
         }
         if isActive {
             stop()
@@ -129,20 +132,20 @@ extension MacSyncEngine {
         activeDocsURL = docsURL
         inboxDir = docsURL.appendingPathComponent(Folder.inbox)
         // Replay state must be restored before either inbox admits work.
-        guard await restoreState(generation: generation) else { return }
+        guard await restoreState(generation: generation) else { return nil }
         let secret: Data
         do {
             if pairingSecretRotationInProgress { _ = try pairingSecret() }
             let cached = _pairingSecret
             let loaded = try await sync.storage.perform { try cached ?? PairingSecretManager.loadOrGenerateSecret() }
-            guard generation == snapshotLifecycleGeneration else { return }
+            guard generation == snapshotLifecycleGeneration else { return nil }
             if pairingSecretRotationInProgress { _ = try pairingSecret() }
             secret = _pairingSecret ?? loaded
             _pairingSecret = secret
         } catch {
-            guard generation == snapshotLifecycleGeneration else { return }
+            guard generation == snapshotLifecycleGeneration else { return nil }
             syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
-            return
+            return syncError
         }
         // Same pairing fingerprint/path as the phone's cachedSnapshotDirectory.
         // Unscoped legacy snapshots are never copied into a new pairing.
@@ -156,10 +159,8 @@ extension MacSyncEngine {
         let inboxRejectedDir = docsURL.appendingPathComponent(Folder.inboxRejected)
 
         let directories = [snapshotDir, inboxDir, inboxRejectedDir, responsesDir, transactionDir].compactMap({ $0 })
-        await sync.storage.perform {
-            for dir in directories { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
-        }
-        guard generation == snapshotLifecycleGeneration else { return }
+        if let failure = await createDirectories(directories, generation: generation) { return failure }
+        guard generation == snapshotLifecycleGeneration else { return nil }
 
         isActive = true
 
@@ -184,7 +185,7 @@ extension MacSyncEngine {
         startCognitionSnapshotObservation()
         await startSchedulerSnapshotObservation()
         await startHelpersSnapshotObservation()
-        guard generation == snapshotLifecycleGeneration, isActive else { return }
+        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
         startWorkActivityObservation()
         startLiveTurnRelay()
         startChatTranscriptSnapshotObservation()
@@ -201,10 +202,24 @@ extension MacSyncEngine {
         // R11-N30: prune at startup, then schedule the exact earliest 7-day
         // retention crossing instead of waking every ten minutes.
         await startArchiveRetentionWatcher()
-        guard generation == snapshotLifecycleGeneration, isActive else { return }
-        pruneOldArchiveFiles()
+        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
+        reconcileArchiveRetention(pruneFirst: true)
+        return nil
     }
 
+
+    /// A folder that cannot be made is a start that did not happen.
+    private func createDirectories(_ directories: [URL], generation: UInt64) async -> String? {
+        let failure = await sync.storage.perform { () -> String? in
+            do {
+                for directory in directories { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+                return nil
+            } catch { return error.localizedDescription }
+        }
+        guard generation == snapshotLifecycleGeneration, let failure else { return nil }
+        syncError = "Phone sync folders could not be created: \(failure)"
+        return syncError
+    }
 
     func stop() {
         snapshotLifecycleGeneration &+= 1
@@ -449,7 +464,7 @@ extension MacSyncEngine {
         let watcher = await FileChangeWatcher.armed(paths: paths) { [weak self] _ in
             Task { @MainActor in
                 guard let self, self.isActive, generation == self.snapshotLifecycleGeneration else { return }
-                self.rescheduleArchiveRetentionDeadline()
+                self.reconcileArchiveRetention(pruneFirst: false)
             }
         }
         guard isActive, generation == snapshotLifecycleGeneration else { watcher.cancel(); return }

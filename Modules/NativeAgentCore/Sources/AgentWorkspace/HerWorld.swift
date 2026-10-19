@@ -341,9 +341,11 @@ extension HerScreen {
             try? BotRunQueue(dataRoot: dataRoot).activeOrQueuedIDs(locked: false)
         } ?? []
         if SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot) {
-            world.moments = part("moments", [at("memory/memory.sqlite"), at("memory/memory.sqlite-wal")]) {
-                await AdaptiveMemoryPromoter.shared.pendingMomentCount()
-            } ?? 0
+            // An unread count is not zero: a store that cannot be read leaves moments unread.
+            if let moments: Int = part("moments", [at("memory/memory.sqlite"), at("memory/memory.sqlite-wal")], {
+                try? await AdaptiveMemoryPromoter.shared.pendingMomentCount()
+            }) { world.moments = moments }
+            else if !world.unread.contains("moments") { world.unread.append("moments") }
         }
         world.doors = part("elsewhere", [at("chat/messages"), at("trust/policy.json")],
                 notifications: [.nativeAgentChatTranscriptDidChange], {

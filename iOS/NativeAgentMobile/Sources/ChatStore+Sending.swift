@@ -60,7 +60,8 @@ extension ChatStore {
         replacementAssistantMessageID: UUID? = nil,
         onFailure: (() -> Void)? = nil,
         emitHaptic: Bool = true,
-        queuedSendID: UUID? = nil
+        queuedSendID: UUID? = nil,
+        steer: Bool = false
     ) -> ChatSendDisposition {
         if !MobileChatSelectionIntent.userChoseThisLaunch {
             // The composer may retain the adopted main while a newer Mac
@@ -73,7 +74,7 @@ extension ChatStore {
         }
         guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession else { return .rejected }
         let attachments = ChatAttachmentTypeResolver.submittingSpeech(attachments, text: text)
-        if isLoading {
+        if isLoading, !steer {
             guard appendUser else { return .rejected }
             let queued = QueuedChatSend(
                 id: UUID(),
@@ -149,8 +150,11 @@ extension ChatStore {
             }
             placeholderId = placeholder.id
         }
-        loadingPlaceholderID = placeholderId
-        isLoading = true
+        // A Steer rides beside the working turn; it never takes its place.
+        if !steer {
+            loadingPlaceholderID = placeholderId
+            isLoading = true
+        }
         // 2026-09-13: say what is true of THIS phone — it is waiting for the
         // Mac to receive the request — instead of narrating the Mac's side.
         streamingHintsByMessageId[placeholderId] = ChatWaitStatusPresentation.unacknowledged
@@ -165,7 +169,7 @@ extension ChatStore {
         let correlationID = queuedSendID?.uuidString ?? UUID().uuidString
         let preparedMessage = queuedSends.first { $0.id == queuedSendID }?.preparedMessage
 
-        sendTask?.cancel()
+        if !steer { sendTask?.cancel() }
         inFlightSendIDs.insert(correlationID)
         // 2026-09-06: install the correlation → placeholder mapping BEFORE the
         // transport await. The Mac can answer while `sendMessage` is still
@@ -189,9 +193,8 @@ extension ChatStore {
             placeholderID: placeholderId,
             args: pendingArgs
         )
-        canceledPendingIds.remove(correlationID)
         timedOutPendingIds.removeValue(forKey: correlationID)
-        sendTask = Task {
+        let transport = Task {
             defer { inFlightSendIDs.remove(correlationID) }
             do {
                 let result = try await client.sendMessage(
@@ -238,7 +241,6 @@ extension ChatStore {
                     pendingICloudPlaceholders[messageId] = placeholderId
                     renamePendingExchange(from: correlationID, to: messageId)
                     showWaitStatus(correlationID: messageId)
-                    canceledPendingIds.remove(messageId)
                     timedOutPendingIds.removeValue(forKey: messageId)
                     pendingSendArgs[messageId] = pendingArgs
                     armTimeout(for: messageId, placeholderId: placeholderId)
@@ -277,6 +279,7 @@ extension ChatStore {
                 releaseLoading(for: placeholderId)
             }
         }
+        if !steer { sendTask = transport }
         return .started
     }
 
@@ -291,61 +294,23 @@ extension ChatStore {
                 || timedOutPendingIds[correlationID] == placeholderId)
     }
 
+    /// The Mac's own Stop, scoped to every open run here: a send still
+    /// crossing, a request gone silent, and a live turn another door started.
+    /// Nothing changes on the phone until the Mac says how each run ended
+    /// (its cancelled event or its transcript); a Stop it could not make says
+    /// why.
     func stop(client: MacBridgeClient) {
         if !queuedSendsForSelectedSession.isEmpty {
             pausedQueueSessionKeys.insert(queueSessionKey(selectedSessionID))
         }
-        // 2026-09-06: name the runs being stopped and freeze the session id
-        // BEFORE the local state is cleared. The cancel is asynchronous and a
-        // fresh send is admissible the moment isLoading drops; without both,
-        // that new turn could be the one the Mac cancels.
         let stoppedSessionID = selectedSessionID
-        // 2026-09-06: a send whose transport call has not returned yet is a run
-        // the Mac may already be executing. Name it too, or this Stop goes out
-        // unscoped and cancels whatever holds the session.
-        let stoppedRunIDs = Array(Set(pendingICloudPlaceholders.keys).union(inFlightSendIDs))
-        cancelActiveSendLocally()
-        isLoading = false
+        let stoppedRunIDs = Array(activeTurnRunIDs)
         Task {
             do {
                 try await client.cancelChat(sessionID: stoppedSessionID, runIDs: stoppedRunIDs)
             } catch {
-                await MainActor.run {
-                    errorBanner = "Stop requested, but the Mac did not confirm cancellation: \(error.localizedDescription)"
-                }
+                await MainActor.run { errorBanner = "The Mac did not stop it: \(error.localizedDescription)" }
             }
-        }
-    }
-
-    private func cancelActiveSendLocally() {
-        sendTask?.cancel()
-        sendTask = nil
-        queuedSends.removeAll { inFlightSendIDs.contains($0.id.uuidString) }
-        inFlightSendIDs.removeAll()
-        for pendingId in pendingICloudPlaceholders.keys {
-            canceledPendingIds.insert(pendingId)
-            // A cancel IS terminal for the exchange: close its durable record.
-            closePendingExchange(pendingId)
-            // Retire the old correlation immediately. A late cancel/error/final
-            // must not flip isLoading or overwrite the new turn after Steer.
-            markICloudReplyResolved(pendingId)
-        }
-        pendingICloudPlaceholders.removeAll()
-        pendingSendArgs.removeAll()
-        retriedSignatureCorrelations.removeAll()
-        timedOutPendingIds.removeAll()
-        expiredPendingIds.removeAll()
-        pendingTimeouts.values.forEach { $0.cancel() }
-        pendingTimeouts.removeAll()
-        pendingPolls.values.forEach { $0.cancel() }
-        pendingPolls.removeAll()
-        streamingHintsByMessageId.removeAll()
-        // PATCH-2026-05-30: stop() cancels in-flight turns; clear the text_delta
-        // seq map alongside the other in-flight state.
-        maxDeltaSeqByCorrelation.removeAll()
-        isPollingFallback = false
-        if let idx = messages.lastIndex(where: { $0.isStreaming }) {
-            finishPlaceholder(id: messages[idx].id, text: "(stopped)")
         }
     }
 
@@ -358,45 +323,42 @@ extension ChatStore {
         }
     }
 
+    /// Steer, as on the Mac: the queued message goes, on the Mac's control
+    /// lane, to the turn already working there, which reads it at its next
+    /// step. Nothing is cancelled. With no turn working there it is sent as
+    /// its own message at once; one with files waits for its turn.
     func sendQueuedNow(_ id: UUID, client: MacBridgeClient) {
         guard promoteQueuedSend(id) else { return }
         let key = queueSessionKey(selectedSessionID)
-        if !isLoading {
-            pausedQueueSessionKeys.remove(key)
-            transportPausedQueueSessionKeys.remove(key)
+        pausedQueueSessionKeys.remove(key)
+        transportPausedQueueSessionKeys.remove(key)
+        guard isLoading, let next = queuedSends.first(where: { $0.id == id }), next.attachments.isEmpty,
+              let session = Self.cleanSessionID(selectedSessionID), steeringQueuedIDs.insert(id).inserted else {
             scheduleQueuedSendDrain()
             return
         }
-
-        // Hold the queue paused until the signed Mac cancellation action is
-        // confirmed. This prevents the steered message from racing the old
-        // provider turn through the independent iCloud chat data plane.
-        pausedQueueSessionKeys.insert(key)
-        let steeredSessionID = selectedSessionID
-        let steeredPlaceholderID = loadingPlaceholderID
-        // Same window as Stop: a send still crossing to the Mac is a run this
-        // steer is replacing, so it belongs in the scope.
-        let steeredRunIDs = Array(Set(pendingICloudPlaceholders.keys).union(inFlightSendIDs))
-        cancelActiveSendLocally()
-        Task { @MainActor [weak self, weak client] in
-            guard let self, let client else { return }
+        Task { @MainActor in
             do {
-                try await client.cancelChat(sessionID: steeredSessionID, runIDs: steeredRunIDs)
-                pausedQueueSessionKeys.remove(key)
-                transportPausedQueueSessionKeys.remove(key)
-                guard selectedSessionID == steeredSessionID,
-                      let steeredPlaceholderID,
-                      loadingPlaceholderID == steeredPlaceholderID else { return }
-                releaseLoading(for: steeredPlaceholderID)
-                scheduleQueuedSendDrain()
+                if try await client.steerChat(sessionID: session, runID: id.uuidString, text: next.text) { return }
             } catch {
-                guard selectedSessionID == steeredSessionID,
-                      let steeredPlaceholderID,
-                      loadingPlaceholderID == steeredPlaceholderID else { return }
-                releaseLoading(for: steeredPlaceholderID)
-                errorBanner = "Could not steer because the Mac did not confirm cancellation: \(error.localizedDescription)"
+                steeringQueuedIDs.remove(id)
+                errorBanner = "Steer didn't reach the Mac: \(error.localizedDescription)"
+                return
             }
+            steeringQueuedIDs.remove(id)
+            sendAsOwnMessage(id, client: client)
         }
+    }
+
+    /// A queued message sent beside whatever the phone shows as working, only
+    /// into its own conversation; another one's waits in that queue for its drain.
+    func sendAsOwnMessage(_ id: UUID, client: MacBridgeClient, rowWritten: Bool = false) {
+        guard let next = queuedSends.first(where: { $0.id == id }),
+              queueSessionKey(next.sessionID) == queueSessionKey(selectedSessionID) else { return }
+        _ = send(text: next.text, client: client, controls: next.controls, appendUser: next.userMessageID == nil,
+                 attachments: next.attachments, reusePlaceholderId: next.placeholderID,
+                 retainedUserMessageID: next.userMessageID, suppressRemoteUserAppend: rowWritten,
+                 emitHaptic: false, queuedSendID: next.id, steer: true)
     }
 
     func resumeQueuedSends(startingWith id: UUID? = nil) {
@@ -451,7 +413,7 @@ extension ChatStore {
     private func drainNextQueuedSendIfPossible() {
         guard !isLoading, !isSwitchingSession, !isSelectedQueuePaused,
               let client = pendingRetryClient,
-              let next = queuedSendsForSelectedSession.first
+              let next = queuedSendsForSelectedSession.first(where: { !steeringQueuedIDs.contains($0.id) })
         else { return }
         let disposition = send(
             text: next.text,

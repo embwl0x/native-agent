@@ -483,6 +483,10 @@ final class MacBridgeClient: ObservableObject {
     /// `runIDs` name the in-flight turns this Stop is for. The Mac cancels
     /// only a run it was given, so a send issued straight after Stop is never
     /// cancelled in place of the turn the user stopped.
+    func steerChat(sessionID: String, runID: String, text: String) async throws -> Bool {
+        try await iCloudSyncEngine.shared.steerChat(sessionId: sessionID, runId: runID, text: text)
+    }
+
     func cancelChat(sessionID: String?, runIDs: [String] = []) async throws {
         let hasExplicitSession = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         _ = try await iCloudSyncEngine.shared.cancelChat(
@@ -507,28 +511,17 @@ final class MacBridgeClient: ObservableObject {
 
     @discardableResult
     func observeICloudReplyRejections(onReject: @escaping (ICloudBridgeRejectedMessage) -> Void) -> UUID? {
-        return bridge.observeRejectedMessages { [weak self] rejection in
-            let generation = self?.reconnectGeneration
-            Task { @MainActor in
-                guard self?.reconnectGeneration == generation else { return }
-                self?.recordMacConfirmation()
-            }
-            onReject(rejection)
-        }
+        // A record that failed verification is not the Mac speaking: it never
+        // refreshes presence.
+        bridge.observeRejectedMessages(onReject: onReject)
     }
 
     /// Phase 14e-iCloud HMAC self-heal: observe unsigned signature_invalid_resync
     /// hints from Mac so ChatView can refresh + retry the most recent unACK'd send.
     @discardableResult
     func observeICloudResyncHints(onHint: @escaping (BridgeMessage) -> Void) -> UUID? {
-        return bridge.observeResyncHints { [weak self] hint in
-            let generation = self?.reconnectGeneration
-            Task { @MainActor in
-                guard self?.reconnectGeneration == generation else { return }
-                self?.recordMacConfirmation()
-            }
-            onHint(hint)
-        }
+        // Unsigned, so it is no evidence the Mac is up.
+        bridge.observeResyncHints(onResync: onHint)
     }
 
     func removeICloudResyncHintObserver(_ id: UUID?) {

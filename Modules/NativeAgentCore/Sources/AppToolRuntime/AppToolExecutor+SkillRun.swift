@@ -252,10 +252,10 @@ extension AppToolExecutor {
                     + (queued ? "; MY QUEUE says so." : "."),
                 "Read what changed, check the script still fits, then skill.enable admits it again.")
         }
-        for action in actions where AppActions.action(action, dataRoot: root)?.scriptable != true {
-            return refuse("not_scriptable",
-                "\(entry.name) declares \(action), which never runs inside a skill.",
-                "Fix the skill: its script makes that call nowhere, or you make it yourself outside the skill.")
+        for action in actions where AppActions.action(action, dataRoot: root) == nil {
+            return refuse("unknown_action",
+                "\(entry.name) declares \(action), which is no action now.",
+                "Fix the skill: its script makes that call nowhere, or names the action it means.")
         }
         return (SkillScriptRun(binding: .init(revision: revision), entry: entry, source: source, program: program,
                                params: Self.skillFields(script["params"]), actions: actions, digest: digest,
@@ -425,8 +425,8 @@ extension AppToolExecutor {
                     throw SkillsError.invalidScript("Dependencies changed. Save the routine against the current actions.")
                 }
                 for id in candidate.program.dependencies {
-                    guard AppActions.action(id, dataRoot: root)?.scriptable == true else {
-                        throw SkillsError.invalidScript("Dependency \(id) is not scriptable. Save the routine against the current actions.")
+                    guard AppActions.action(id, dataRoot: root) != nil else {
+                        throw SkillsError.invalidScript("Dependency \(id) is no action now. Save the routine against the current actions.")
                     }
                 }
                 let params = Self.skillFields(Self.skillFields(Self.skillFields(candidate.manifest)["script"])["params"])
@@ -587,8 +587,8 @@ extension AppToolExecutor {
     }
 
     /// Whether the real call would file a card for User, read now and changing
-    /// nothing: SecurityCenter's own reading of it with Trust's saved level,
-    /// the persona guard, explicit card requests, and the peer floor on a turn a peer steered.
+    /// nothing: SecurityCenter's own reading of it, explicit card requests,
+    /// and the peer floor on a turn a peer steered.
     @MainActor
     func doorWouldCard(_ action: AppAction, call: [String: JSONValue], input: [String: JSONValue], surface: String) async -> Bool {
         let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -599,18 +599,12 @@ extension AppToolExecutor {
             tool: tool, input: MacInjectionArgRedaction.redacted(tool: tool, input: args),
             origin: .currentTurn(verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface))
         guard envelope.decision != .block else { return false }
-        if envelope.requiresApproval || PersonaWriteGuard.shouldUpgradeToConfirm(
-            tool: tool, kind: Self.inputString(args["kind"]),
-            personaSettingWrite: PeerTurnEffectPolicy.isPersonaSettingWrite(tool: tool, input: args),
-            resolvedAutonomy: envelope.autonomyLevel,
-            hasExplicitAutonomyOverride: envelope.fullMacYoloAuthority == .admitted) { return true }
+        if envelope.requiresApproval { return true }
         if action.tool == "request_interaction",
            InlineInteractionNeed.interaction(in: await SwiftToolDispatcher.requestedInteraction(input: call, dataRoot: root)) != nil {
             return true
         }
-        let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities, input: args,
-            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: root),
-            relativeBases: SwiftToolDispatcher.builderSourceRepoRoot(dataRoot: root).map { [$0] } ?? [])
+        let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, input: args)
         return PeerDataTaintDispatcher.peerApproval(tool: tool, capabilities: envelope.capabilities, input: args,
             surface: surface, fullMac: [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority),
             protectedAction: protectedAction).required

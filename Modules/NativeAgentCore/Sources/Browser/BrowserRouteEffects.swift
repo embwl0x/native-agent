@@ -49,13 +49,17 @@ public struct BrowserVisibleCapture: Sendable {
     public var textChars: Int?
     public var links: [BrowserLink]?
     public var screenshot: Data?
-    public init(url: URL, nav: BrowserNavigationResult, text: String?, textChars: Int?, links: [BrowserLink]?, screenshot: Data?) {
+    /// Evidence a read was asked for and did not return, with its cause.
+    public var readFailures: [String: String]
+    public init(url: URL, nav: BrowserNavigationResult, text: String?, textChars: Int?, links: [BrowserLink]?, screenshot: Data?,
+                readFailures: [String: String] = [:]) {
         self.url = url
         self.nav = nav
         self.text = text
         self.textChars = textChars
         self.links = links
         self.screenshot = screenshot
+        self.readFailures = readFailures
     }
 }
 

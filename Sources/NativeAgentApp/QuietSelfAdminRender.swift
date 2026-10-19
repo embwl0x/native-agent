@@ -404,7 +404,7 @@ extension QuietSelfAdminRender {
             dataRoot: dataRoot(appModel), platform: AppConnectorStatusPlatform(), workspaceCount: appModel.workspaces.count,
             telegramConfigured: appModel.engine.telegram.status?.tokenConfigured == true, statusText: connectorStatusText)
         case .telegram: return RuntimeReadProjection.quietTelegram(appModel.engine.telegram)
-        case .mcp: return RuntimeReadProjection.quietMCP(servers: appModel.mcpServers, consents: appModel.mcpConsent)
+        case .mcp: return RuntimeReadProjection.quietMCP(servers: appModel.mcpServers)
         case .macIntegration: return await RuntimeReadProjection.quietMacIntegration(
             dataRoot: dataRoot(appModel), platform: AppConnectorStatusPlatform(), workspaceCount: appModel.workspaces.count,
             telegramConfigured: appModel.engine.telegram.status?.tokenConfigured == true,
@@ -569,10 +569,7 @@ extension QuietSelfAdminRender {
             }
             return [section("Providers", ["Providers could not be read."])]
         }
-        return RuntimeReadProjection.quietProviders(routing: snapshot.routing, providers: snapshot.providers) { info in
-            ProvidersFacade.accountStatusLine(state: info.auth_status.state,
-                detail: info.auth_status.detail, failedTest: snapshot.failedTests[info.provider_id])
-        }
+        return RuntimeReadProjection.quietProviders(routing: snapshot.routing, providers: snapshot.providers)
     }
 
 

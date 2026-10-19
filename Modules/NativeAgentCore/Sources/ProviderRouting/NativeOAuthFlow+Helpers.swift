@@ -63,20 +63,26 @@ extension NativeOAuthFlow {
         testProvider: @MainActor () async throws -> NativeAgentShared.ProviderTestResult,
         configureProvider: @MainActor () async throws -> Void
     ) async -> InlineSetupOutcome {
+        // A typed cause decides the sentence; only a peer that sent none is read as prose.
+        func refusal(_ failure: ProviderFailure?, raw: String) -> String {
+            switch failure {
+            case .authExpired?: return "\(name) rejected the key."
+            case .network?: return "Couldn't reach \(name)."
+            case let failure?: return "\(name) could not check the key: \(failure.errorDescription ?? "it did not answer")"
+            case nil: return inlineSetupFailureReason(raw, service: name, secret: "key", typed: [key])
+            }
+        }
         let probe: NativeAgentShared.ProviderTestResult
         do {
             probe = try await testProvider()
         } catch {
-            return InlineSetupOutcome(error: inlineSetupFailureReason(
-                error.localizedDescription, service: name, secret: "key", typed: [key],
-                otherwise: "Couldn't reach \(name)."
-            ))
+            return InlineSetupOutcome(error: refusal(ProviderFailure.classify(error), raw: error.localizedDescription))
         }
-        if probe.tested, probe.status != "ok" {
-            return InlineSetupOutcome(error: inlineSetupFailureReason(
-                probe.error ?? "", service: name, secret: "key", typed: [key],
-                otherwise: "\(name) rejected the key."
-            ))
+        let failure = probe.cause.flatMap(ProviderFailure.decoded)
+        // A refused check neither rejects nor proves the key: saved, unproven.
+        let unproven = probe.tested && probe.status != "ok" && failure == .refused
+        if probe.tested, probe.status != "ok", !unproven {
+            return InlineSetupOutcome(error: refusal(failure, raw: probe.error ?? ""))
         }
         do {
             // Providers' own configure call — the same one its sheet makes.
@@ -88,6 +94,7 @@ extension NativeOAuthFlow {
                 error.localizedDescription, service: name, secret: "key", typed: [key]
             ))
         }
+        if unproven { return InlineSetupOutcome(note: "\(name) API key saved; its last check failed: \(probe.error ?? "refused")") }
         return InlineSetupOutcome(note: probe.tested ? "key checked with \(name)"
                        : "key saved; \(name) has no check to run")
     }

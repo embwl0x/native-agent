@@ -15,7 +15,7 @@ public enum ConnectorCredentialFile {
     private static let metadataStrings: Set<String> = [
         "client_id", "connector_id", "redirect_uri", "provider", "saved_at", "validated_at",
         "token_type", "scope", "account_id", "refresh_token_account_id", "account_sub",
-        "refresh_token_account_sub", "credential_store", "keychain_ref",
+        "refresh_token_account_sub", "credential_store", "keychain_ref", "auth_route",
     ]
     private static let metadataNumbers: Set<String> = ["expires_at", "expires_in", "credential_version"]
 

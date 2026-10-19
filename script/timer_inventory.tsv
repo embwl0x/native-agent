@@ -41,7 +41,7 @@ Modules/NativeAgentCore/Sources/AgentLinkTransport/AgentACPProcess.swift	*	2	tim
 # 2026-09-07: ChatOrchestration bots/shelf tools add no sleep/timer sites; store IO and explicit reads only.
 # StandingBots schedules use BackgroundLoopsManager's existing event/deadline timer; BotRunnerScheduler projects completion-based next occurrences with a person-owned 1–15-minute minimum gap (default 15, user_schedule), with no separate polling timer.
 # BotRunQueue requests and definition changes invalidate that same owner immediately; no enqueue-owned timer or retry.
-Modules/NativeAgentCore/Sources/StandingBots/BotRunnerDeadline.swift	*	1	timeout_retry_deadline	Cancel the ordinary bot session turn at its run duration; retain the run claim until transcript and reply settle
+Modules/NativeAgentCore/Sources/StandingBots/BotRunnerDeadline.swift	*	1	event_deadline	Report the bot run crossing its time budget; the session finishes under its own lifetime
 # ChatShellViews.swift: TimelineView(.explicit(permissionRefreshDates)) is a visible_ui single Trust expiry boundary (not a recurring timer primitive); AppModel observation supplies policy changes.
 Modules/NativeAgentShared/Sources/NativeAgentShared/CloudKitTimeoutResultLatch.swift	Task.sleep(nanoseconds: timeoutNanoseconds)	1	timeout_retry_deadline	CloudKitTimeoutResultLatch.race
 Modules/NativeAgentCore/Sources/BackgroundLoops/BackgroundLoops.swift	timeoutNanoseconds(timeout)	1	timeout_retry_deadline	BackgroundLoops.tickWithTimeout
@@ -118,7 +118,6 @@ Sources/NativeAgentApp/PollScheduler.swift	*	1	visible_ui	PollScheduler
 Modules/NativeAgentCore/Sources/NativeAgentCore/TimeoutRace.swift	*	1	user_schedule	SchedulerExecution.SchedulerDueJobRunner job deadline (shared race primitive stays in NativeAgentCore)
 Sources/NativeAgentApp/SkillLifecycleView.swift	*	2	visible_ui	SkillLifecycleUI
 Modules/NativeAgentCore/Sources/SlackBot/SlackSocketModeLoop.swift	*	5	external_protocol_poll	SlackSocketModeTransport
-Modules/NativeAgentCore/Sources/SlackBot/SlackSocketModeSupport.swift	*	1	timeout_retry_deadline	SlackSocketModeTransport
 Sources/NativeAgentApp/SystemToastBar.swift	*	1	visible_ui	SystemToastUI
 Modules/NativeAgentCore/Sources/ApprovalTransactions/TelegramApprovalCoordinator.swift	*	1	external_protocol_poll	TelegramApprovalWait
 Modules/NativeAgentCore/Sources/ChatTurnRuntime/VoiceInputCapture.swift	*	1	timeout_retry_deadline	The existing 2s recognition completion deadline settles the exact stopped capture generation once
@@ -136,7 +135,6 @@ iOS/NativeAgentMobile/Sources/iCloudBridge.swift	Task.sleep(for: .seconds(8))	1	
 iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift	*	4	external_protocol_poll	MobileICloudActionTransport; rejected-arrival signature retry pays its bounded interval instead of busy-spinning the main actor
 iOS/NativeAgentMobile/Sources/PairingView.swift	Task.sleep(	1	external_protocol_poll	Connection repair waits up to 60 seconds for explicit Mac pairing confirmation, spacing device_not_verified checks by 10 seconds; stops when the pairing sheet is dismissed
 iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Snapshots.swift	*	1	external_protocol_poll	MobileICloudSnapshotFetchAsyncWait
-Modules/NativeAgentCore/Sources/Context/ContextTurnRuntime.swift	timeoutNanoseconds	1	timeout_retry_deadline	ContextTurnRuntime.ticketTimeout
 Sources/NativeAgentApp/InspectorView.swift	cardsDebounceSeconds	1	visible_ui	TurnInspectorStore.cardsDebounce; mounted selection and event coalescing colocated with InspectorView
 Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift	Task.sleep(nanoseconds: 5_000_000_000)	1	timeout_retry_deadline	ActivityWatcher.stopShutdownWatchdog
 Modules/NativeAgentCore/Sources/ActivityWatch/ActivityWatcher.swift	Thread.sleep(forTimeInterval: 0.01)	1	timeout_retry_deadline	ActivityWatcher.runLoopFinishedBackoff

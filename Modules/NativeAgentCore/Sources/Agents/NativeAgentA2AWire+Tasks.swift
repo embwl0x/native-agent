@@ -2,6 +2,7 @@ import Foundation
 import ChatOrchestration
 import NativeAgentCore
 import PersistenceCore
+import AgentConversations
 import ApprovalInbox
 import Darwin
 import CoreFoundation
@@ -32,6 +33,8 @@ public struct AgentContactTask: Codable, Sendable {
     public var approvalIDs: Set<String>?
     public var replyPayloadExpired: Bool?
     public var delegatedCompletionDigests: [String: String]?
+    /// Its registered callbacks, by config id: durable before acceptance.
+    public var callbacks: [String: AgentContactCallback]?
 
     var needsReplyRecovery: Bool {
         // Older receipts conflated file recovery with the canonical turn outcome.
@@ -186,9 +189,14 @@ public actor AgentContactTasks {
                     records.removeValue(forKey: oldest); order.removeAll { $0 == oldest }
                     pushConfigs.removeValue(forKey: oldest)
                 }
-                task = AgentContactTask(id: send.taskID, context: send.context, owner: principal.id,
-                                        acceptedOutputModes: send.acceptedOutputModes)
-                try retain(task)
+                var created = AgentContactTask(id: send.taskID, context: send.context, owner: principal.id,
+                                               acceptedOutputModes: send.acceptedOutputModes)
+                if let pushConfig {
+                    try pushConfig.keep()
+                    created.callbacks = [pushConfig.id: pushConfig.callback]
+                }
+                try retain(created)
+                task = created
                 order.append(task.id)
             }
         } catch { claims.release(key: key); throw error }
@@ -375,7 +383,10 @@ public actor AgentContactTasks {
         guard NativeAgentA2AWire.locator(id) != nil else { throw AgentContactFailure.missing }
         let url = retainedURL(id: id, owner: owner)
         let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
-        if fd < 0, errno == ENOENT, let task = try archivedTask(id: id, owner: owner) { return task }
+        if fd < 0, errno == ENOENT, let task = try archivedTask(id: id, owner: owner) {
+            restoreCallbacks(task)
+            return task
+        }
         guard fd >= 0 else { throw AgentContactFailure.missing }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         defer { try? handle.close() }
@@ -419,6 +430,7 @@ public actor AgentContactTasks {
             }
         }
         try retainCompletionReplies(task)
+        restoreCallbacks(task)
         return task
     }
 
@@ -833,6 +845,8 @@ public actor AgentContactTasks {
             guard (pushConfigs[taskID]?.count ?? 0) < 8 else {
                 throw AgentContactFailure(code: -32004, message: "Too many push notification configurations")
             }
+            try config.keep()
+            try updateCallbacks(taskID, owner: owner) { $0[config.id] = config.callback }
             pushConfigs[taskID, default: [:]][config.id] = config
             return try config.value
         case "GetTaskPushNotificationConfig":
@@ -840,7 +854,8 @@ public actor AgentContactTasks {
             return try config.value
         case "DeleteTaskPushNotificationConfig":
             guard let id = params["id"] as? String, !id.isEmpty else { throw AgentContactPushConfig.invalid }
-            pushConfigs[taskID]?.removeValue(forKey: id)
+            if let config = pushConfigs[taskID]?.removeValue(forKey: id) { try? AgentPeerCredentials.deleteSecret(account: config.account) }
+            try updateCallbacks(taskID, owner: owner) { $0[id] = nil }
             let key = taskID + ":" + id
             if let delivery = pushDeliveries.removeValue(forKey: key) {
                 delivery.cancel()
@@ -870,8 +885,8 @@ public actor AgentContactTasks {
         }
     }
 
-    private func notifyPush(_ task: AgentContactTask) {
-        guard let configs = pushConfigs[task.id], !configs.isEmpty else { return }
+    private func notifyPush(_ task: AgentContactTask, only owed: Set<String>? = nil) {
+        guard let configs = pushConfigs[task.id]?.filter({ owed?.contains($0.key) ?? true }), !configs.isEmpty else { return }
         // A status event contains only the protocol locator and state. Peers fetch
         // artifacts through their authenticated task API instead of webhook copies.
         let event: [String: Any] = ["taskId": task.id, "contextId": task.context,
@@ -884,9 +899,57 @@ public actor AgentContactTasks {
             pushDeliveries[key] = Task {
                 await previous?.value
                 guard !Task.isCancelled, self.pushConfigs[task.id]?[config.id]?.generation == config.generation else { return }
-                await config.deliver(payload)
+                let accepted = await config.deliver(payload)
+                self.recordCallback(task, config: config, accepted: accepted)
                 if task.state.terminal { self.pushDeliveries.removeValue(forKey: key) }
             }
+        }
+    }
+
+    /// The callback's outcome is part of the durable task: accepted, or an
+    /// owed failure with its cause that a relaunch delivers again. Once a
+    /// terminal update is accepted the callback's secret is no longer needed.
+    private func recordCallback(_ sent: AgentContactTask, config: AgentContactPushConfig, accepted: Bool) {
+        var task = records[sent.id]?.task ?? sent
+        guard var callback = task.callbacks?[config.id] else { return }
+        if accepted { callback.delivered = sent.state.rawValue }
+        callback.failure = accepted ? nil : "The callback did not accept the \(sent.state.rawValue) update after three attempts."
+        task.callbacks?[config.id] = callback
+        do { try retain(task); records[sent.id]?.task = task }
+        catch { nativeLog("[a2a] callback outcome could not be saved for %@: %@", sent.id, error.localizedDescription) }
+        if accepted, sent.state.terminal { try? AgentPeerCredentials.deleteSecret(account: config.account) }
+    }
+
+    private func updateCallbacks(_ taskID: String, owner: String, _ change: (inout [String: AgentContactCallback]) -> Void) throws {
+        var task = try get(taskID, owner: owner)
+        var callbacks = task.callbacks ?? [:]
+        change(&callbacks)
+        task.callbacks = callbacks
+        try retain(task)
+        records[taskID]?.task = task
+    }
+
+    /// A task read back from disk resumes its callbacks, and any whose last
+    /// accepted update is not the task's state is owed it again.
+    private func restoreCallbacks(_ task: AgentContactTask) {
+        var owed: Set<String> = []
+        for (id, callback) in task.callbacks ?? [:] where pushConfigs[task.id]?[id] == nil {
+            guard let config = try? AgentContactPushConfig.restored(callback, id: id, taskId: task.id) else { continue }
+            pushConfigs[task.id, default: [:]][id] = config
+            if callback.delivered != task.state.rawValue { owed.insert(id) }
+        }
+        if !owed.isEmpty { notifyPush(task, only: owed) }
+    }
+
+    /// At launch: every retained task whose callback is still owed an update
+    /// gets it, without waiting for its peer to ask.
+    public func redeliverOwedCallbacks() {
+        let directory = dataRoot.appendingPathComponent("agents/a2a-replies")
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
+        for url in urls where url.pathExtension == "json" {
+            guard let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
+                  task.callbacks?.values.contains(where: { $0.delivered != task.state.rawValue }) == true else { continue }
+            _ = try? get(task.id, owner: task.owner)
         }
     }
 
@@ -955,12 +1018,9 @@ public actor AgentContactTasks {
             record.task.detail = "Waiting for the person to answer the permission card"
             event = .status(record.task, final: false)
         case .text(let delta):
-            guard record.task.text.utf8.count + delta.utf8.count <= 1_048_576 else {
-                record.worker?.cancel()
-                record.task.detail = "The reply reached its size limit"
-                records[id] = record
-                return
-            }
+            // The live draft has a size; her turn does not. Past it the draft
+            // stops growing and the finished reply still replaces it whole.
+            guard record.task.text.utf8.count + delta.utf8.count <= 1_048_576 else { return }
             let append = !record.task.text.isEmpty
             record.task.text += delta
             event = .artifact(task: record.task, artifactID: id + "-reply", parts: [.text(delta)], append: append, last: false)

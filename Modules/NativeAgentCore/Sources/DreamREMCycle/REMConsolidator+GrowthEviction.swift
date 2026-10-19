@@ -24,40 +24,31 @@ extension REMConsolidator {
         // growth-journal appends, the daemon routes) serializes under the
         // same `<GROWTH.md>.lock` flock — but this read→splice→write used to
         // run bare, so an append landing mid-eviction was silently erased by
-        // our atomic rewrite of the stale body. The whole read → compute →
-        // (LLM distill) → KG merge → write now runs under withFileLock on
-        // the GROWTH path. Holding the flock across the distill is fine:
-        // eviction fires at most weekly and writers just wait on the lock.
+        // our atomic rewrite of the stale body. The read → KG merge → write
+        // runs under withFileLock on the GROWTH path. The model call does not:
+        // it distills a slice planned from an unlocked read, and the locked
+        // pass splices only if that exact slice still stands, so no GROWTH
+        // writer waits on inference and a slice that moved waits a pass.
+        let planned = Self.evictionRange(
+            in: try String(contentsOf: growth, encoding: .utf8), proposalRows: proposalRows
+        )
+        // A distill failure surfaces inside the lock, after the repair pass.
+        let distilled: Result<(slice: String, node: KGNode), Error>?
+        if let planned {
+            do { distilled = .success((planned.slice, try await distillToKGNode(planned.slice))) }
+            catch { distilled = .failure(error) }
+        } else { distilled = nil }
         let persistence = SwiftNativePersistenceCore()
         return try await persistence.withFileLock(growth) {
-            try await self.evictGrowthUnderLock(growth: growth, proposalRows: proposalRows)
+            try await self.evictGrowthUnderLock(growth: growth, proposalRows: proposalRows, distilled: distilled)
         }
     }
 
-    /// The locked critical section of `runGrowthEviction`. Must only be
-    /// called while holding the GROWTH.md flock.
-    private func evictGrowthUnderLock(growth: URL, proposalRows: [REMProposalRow]) async throws -> Int {
-        // A FAILED READ IS NOT AN EMPTY FILE. The old `try?` turned an
-        // unreadable GROWTH.md into "", and reconciliation below then found
-        // every pending passage "missing from the body" and marked the lot
-        // committed — permanent false rows in an append-only file. Let the read
-        // throw: the pass aborts with nothing touched and the next tick retries.
-        let body = try String(contentsOf: growth, encoding: .utf8)
-        // REPAIR FIRST, BEFORE THE CAP CHECK. The splice below removes the
-        // passage and only then appends the `committed` row; a crash between
-        // the two leaves a pending row for a passage that is already gone, and
-        // the cap check returns early on most passes, so nothing would ever fix
-        // it. Reconciliation runs on every pass, under the GROWTH lock, against
-        // the body we just read — the only moment the file's true contents and
-        // the history are both in hand.
-        await REMGrowthEvictionHistory.reconcilePending(
-            growthBody: body,
-            dataRoot: dataRoot,
-            kgNodeExists: { [dataRoot] id in
-                await Self.growthDistillationNodeExists(id: id, dataRoot: dataRoot)
-            }
-        )
-        if body.count <= REMConstants._REM_GROWTH_CHAR_CAP { return 0 }
+    /// The oldest evictable slice of an over-cap body, or nil.
+    private static func evictionRange(
+        in body: String, proposalRows: [REMProposalRow]
+    ) -> (range: Range<String.Index>, slice: String)? {
+        if body.count <= REMConstants._REM_GROWTH_CHAR_CAP { return nil }
 
         // Find the preamble boundary: the start of the first "evictable"
         // entry. Preamble sections (the file title `# ...`, intro paragraphs,
@@ -75,7 +66,7 @@ extension REMConsolidator {
         // is preamble whatever its heading, so the file reads top to bottom —
         // who she is, then what she learned, newest last (User 10-10).
         let evictableStart = max(preambleEnd, lessonStarts.first ?? body.endIndex)
-        guard evictableStart < body.endIndex else { return 0 }
+        guard evictableStart < body.endIndex else { return nil }
 
         // Walk headings and approved lesson starts from the evictable region until we
         // pass `_REM_GROWTH_EVICT_CHARS` worth of content. Evict everything
@@ -107,16 +98,48 @@ extension REMConsolidator {
             cursor = nextHeading
             evicted = body.distance(from: evictableStart, to: cursor)
         }
-        if cursor == evictableStart { return 0 }
+        if cursor == evictableStart { return nil }
 
-        let evictedSlice = String(body[evictableStart..<cursor])
+        return (evictableStart..<cursor, String(body[evictableStart..<cursor]))
+    }
 
+    /// The locked critical section of `runGrowthEviction`. Must only be
+    /// called while holding the GROWTH.md flock.
+    private func evictGrowthUnderLock(
+        growth: URL, proposalRows: [REMProposalRow], distilled: Result<(slice: String, node: KGNode), Error>?
+    ) async throws -> Int {
+        // A FAILED READ IS NOT AN EMPTY FILE. The old `try?` turned an
+        // unreadable GROWTH.md into "", and reconciliation below then found
+        // every pending passage "missing from the body" and marked the lot
+        // committed — permanent false rows in an append-only file. Let the read
+        // throw: the pass aborts with nothing touched and the next tick retries.
+        let body = try String(contentsOf: growth, encoding: .utf8)
+        // REPAIR FIRST, BEFORE THE CAP CHECK. The splice below removes the
+        // passage and only then appends the `committed` row; a crash between
+        // the two leaves a pending row for a passage that is already gone, and
+        // the cap check returns early on most passes, so nothing would ever fix
+        // it. Reconciliation runs on every pass, under the GROWTH lock, against
+        // the body we just read — the only moment the file's true contents and
+        // the history are both in hand.
+        await REMGrowthEvictionHistory.reconcilePending(
+            growthBody: body,
+            dataRoot: dataRoot,
+            kgNodeExists: { [dataRoot] id in
+                await Self.growthDistillationNodeExists(id: id, dataRoot: dataRoot)
+            }
+        )
         // FAIL CLOSED on distillation failure. The old shape was
         // `(try? distill) ?? stub-node`: the splice below still ran, so an
         // LLM outage permanently destroyed user-approved persona content into
-        // a content-free "LLM unavailable" stub. A distill throw now aborts
-        // this pass's eviction with the content still intact in GROWTH.md.
-        let kgNode = try await distillToKGNode(evictedSlice)
+        // a content-free "LLM unavailable" stub. A distill throw aborts this
+        // pass's eviction with the content still intact in GROWTH.md.
+        guard let planned = Self.evictionRange(in: body, proposalRows: proposalRows),
+              let distilled = try distilled?.get(), planned.slice == distilled.slice else { return 0 }
+        let evictedSlice = planned.slice
+        let evictableStart = planned.range.lowerBound, cursor = planned.range.upperBound
+        let approvedRows = proposalRows
+            .filter { $0.status == "approved" && REMProposalStore.supportsProposalTarget($0.targetDoc) }
+        let kgNode = distilled.node
         // ITEM 5 — KEEP THE EXACT PASSAGE. Written BEFORE the KG merge and the
         // GROWTH splice, under the same fail-closed rule as everything else in
         // this function: if the original cannot be retained, nothing is

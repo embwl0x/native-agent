@@ -77,6 +77,12 @@ public actor NativeAppConnectorProofProvider: ConnectorProofProvider {
         }
         let row = rows?.first { $0.id == id }
         if row?.healthStatus == "ok" { return ["verified": .bool(true)] }
+        // An owner with no registry row (the Mac bridge) is proven the same
+        // way a row is: a successful receipt of its own within the window.
+        if row == nil, let proof = ConnectorProofLedger.latestByConnector(root: root)[ConnectorProofLedger.canonicalID(id)],
+           proof.succeeded, Date().timeIntervalSince(proof.at) < ConnectorHealthDecay.provenWindow {
+            return ["verified": .bool(true)]
+        }
         if let row, ["connected", "configured", "connected_unverified"].contains(row.authState ?? "") {
             let name = row.name.isEmpty ? id : row.name
             return [

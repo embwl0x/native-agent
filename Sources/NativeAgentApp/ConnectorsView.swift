@@ -174,7 +174,7 @@ struct WorkspaceSearchPresentation: Equatable {
 enum SharedFolderSearchState {
     case notSearched
     case searching
-    case completed([WorkspaceSearchResult])
+    case completed(WorkspaceSearchResponse)
     case failed
 
     var isSearching: Bool {
@@ -186,7 +186,7 @@ enum SharedFolderSearchState {
         switch self {
         case .notSearched: "Matching files from the shared folders will be listed here."
         case .searching: "Searching the shared folders…"
-        case .completed(let results): results.isEmpty ? "No files matched. Try another search." : nil
+        case .completed(let response): response.results.isEmpty && response.unexamined == nil ? "No files matched. Try another search." : nil
         case .failed: "Could not search the shared folders. Try again."
         }
     }
@@ -486,8 +486,8 @@ struct ConnectorsView: View {
                             color: searchStatusColor
                         )
                     }
-                    if case .completed(let results) = workspaceSearchState {
-                        let searchPresentation = WorkspaceSearchPresentation.make(results: results)
+                    if case .completed(let response) = workspaceSearchState {
+                        let searchPresentation = WorkspaceSearchPresentation.make(results: response.results)
                         ForEach(searchPresentation.visible) { result in
                             Text("\(result.workspaceName ?? "Folder") · \(result.relativePath)")
                                 .font(ShellType.label)
@@ -500,6 +500,13 @@ struct ConnectorsView: View {
                             ConnectorsNote(
                                 text: "\(searchPresentation.remainingCount) more loaded matches. Narrow the search to see them.",
                                 color: NativeAgentShell.secondary
+                            )
+                        }
+                        // What the search could not look at, so no match there is not a no.
+                        if let unexamined = response.unexamined {
+                            ConnectorsNote(
+                                text: "Not searched:\n" + unexamined.joined(separator: "\n"),
+                                color: NativeAgentShell.trouble
                             )
                         }
                     }
@@ -537,9 +544,8 @@ struct ConnectorsView: View {
         workspaceSearchState = .searching
         do {
             let response = try await ConnectorRegistryActions.searchWorkspace(query: query, root: appModel.engine.dataRoot)
-            appModel.workspaceSearchResults = response.results
             appModel.statusText = "Workspace search found \(response.results.count)"
-            workspaceSearchState = .completed(response.results)
+            workspaceSearchState = .completed(response)
         } catch {
             appModel.setFailureStatus(error, action: "search the workspace")
             workspaceSearchState = .failed

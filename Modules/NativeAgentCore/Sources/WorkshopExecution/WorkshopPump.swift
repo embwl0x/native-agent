@@ -106,16 +106,19 @@ public struct WorkshopPump: Sendable {
         case ran(WorkshopSessionStatus)
     }
 
+    /// The pass, and beside it every cadence whose timing is unknown (an
+    /// unreadable next-refresh time): those items alone are left out.
     @discardableResult
-    public func tick() async -> TickOutcome {
+    public func tick() async -> (outcome: TickOutcome, unknownTiming: [String]) {
+        var unknown: [String] = []
         do {
-            return try await tickChecked()
+            return (try await tickChecked(unknownTiming: &unknown), unknown)
         } catch {
-            return .unavailable(String(error.localizedDescription.prefix(600)))
+            return (.unavailable(String(error.localizedDescription.prefix(600))), unknown)
         }
     }
 
-    private func tickChecked() async throws -> TickOutcome {
+    private func tickChecked(unknownTiming: inout [String]) async throws -> TickOutcome {
         // ---- 1. ZERO-EFFECT DURABLE REPAIR ----
         // Repair admitted/terminal bookkeeping even when new autonomous work
         // is disabled or the machine is conserving resources. This crosses no
@@ -187,6 +190,8 @@ public struct WorkshopPump: Sendable {
             return .postureNotNormal
         }
 
+        // isDue already leaves these out of selection; the pass names them.
+        unknownTiming = Self.unreadableCadences(in: state)
         guard let candidate = Self.selectDueItem(from: state, now: now()) else {
             return .quiet   // quiet day → zero dispatch
         }
@@ -610,15 +615,15 @@ public struct WorkshopPump: Sendable {
         }
         if !eligiblePursuits.isEmpty || !eligibleOwnerCadenceItems.isEmpty {
             if globalToday >= SwiftNativeDeskStore.maxWorkSessionsGlobalPerDay {
-                candidates.append(nextUTCDateBoundary(after: now))
+                candidates.append(deskDay(now).end)
             } else if selectDueItem(from: state, now: now) != nil {
                 // The current event has already had its chance to run. If a
                 // shared lease or admission seam deferred it, retry at the next
                 // exact green window without adding a polling loop.
-                candidates.append(nextUTCWorkshopWindow(after: now))
+                candidates.append(nextWorkshopWindow(after: now))
             }
         }
-        let nextDay = nextUTCDateBoundary(after: now)
+        let nextDay = deskDay(now).end
         for item in eligiblePursuits where
             state.workSessions(on: today, handle: item.handle) >= SwiftNativeDeskStore.maxWorkSessionsPerPursuitPerDay {
             candidates.append(nextDay)
@@ -628,7 +633,7 @@ public struct WorkshopPump: Sendable {
             if state.workSessions(on: today, handle: item.handle) > 0 {
                 // A cadence can become due again minutes after completion,
                 // while its canonical one-per-day admission does not reopen
-                // until the UTC Desk day changes. Sleep until the later seam.
+                // until the Desk day changes. Sleep until the later seam.
                 candidates.append(max(cadenceDue ?? nextDay, nextDay))
             } else if let cadenceDue, cadenceDue > now {
                 candidates.append(cadenceDue)
@@ -637,24 +642,22 @@ public struct WorkshopPump: Sendable {
         return candidates.min()
     }
 
-    static func nextUTCWorkshopWindow(after date: Date) -> Date {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-        let start = calendar.dateInterval(of: .hour, for: date)?.start ?? date
-        let hour = calendar.component(.hour, from: start)
-        let hours = (hour % 2 == 0) ? 2 : 1
-        return calendar.date(byAdding: .hour, value: hours, to: start)
-            ?? date.addingTimeInterval(TimeInterval(hours * 3600))
+    /// The Desk day holding `date`, read through DeskClock's own day stamp and
+    /// parser: the pump's windows, buckets and midnight reopening follow the
+    /// day the Desk counts sessions in, in whatever zone the Desk keeps it.
+    static func deskDay(_ date: Date) -> (start: Date, end: Date) {
+        let start = DeskClock.parseDay(DeskClock.dayStamp(date)) ?? date
+        // 36 hours lands inside the next day whether this one has 23, 24 or 25.
+        let end = DeskClock.parseDay(DeskClock.dayStamp(start.addingTimeInterval(36 * 3600)))
+            ?? start.addingTimeInterval(24 * 3600)
+        return (start, end)
     }
 
-    static func nextUTCDateBoundary(after date: Date) -> Date {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-        return calendar.nextDate(
-            after: date,
-            matching: DateComponents(hour: 0, minute: 0, second: 0),
-            matchingPolicy: .nextTime
-        ) ?? date.addingTimeInterval(24 * 60 * 60)
+    /// The next two-hour green window boundary within the Desk day.
+    static func nextWorkshopWindow(after date: Date) -> Date {
+        let day = deskDay(date)
+        let bucket = (date.timeIntervalSince(day.start) / 7200).rounded(.down) + 1
+        return min(day.start.addingTimeInterval(bucket * 7200), day.end)
     }
 
     /// Blended choice score for a pursuit (Wave C) — a pure read of desk state.
@@ -734,14 +737,23 @@ public struct WorkshopPump: Sendable {
     }
 
     /// A cadence with no `nextRefreshAt` is due now; otherwise due when the next
-    /// refresh time is at or before `now`. An unparseable stamp is treated as due
-    /// (fail-forward: a beating cadence shouldn't stall on a malformed date).
+    /// refresh time is at or before `now`. An unparseable stamp is unknown
+    /// timing, never due: that item is left out and the tick names it.
     public static func isDue(_ nextRefreshAt: String?, now: Date) -> Bool {
         guard let raw = nextRefreshAt, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return true
         }
-        guard let due = DeskClock.parseISO(raw) else { return true }
-        return due <= now
+        return DeskClock.parseISO(raw).map { $0 <= now } ?? false
+    }
+
+    /// Cadences whose saved next-refresh time cannot be read: unknown timing.
+    static func unreadableCadences(in state: DeskState) -> [String] {
+        state.items.compactMap { item in
+            guard !item.status.isTerminal, [.tick, .daily, .weekly].contains(item.cadence.mode),
+                  let raw = item.cadence.nextRefreshAt, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  DeskClock.parseISO(raw) == nil else { return nil }
+            return "\(item.alias) (\"\(raw)\")"
+        }
     }
 
     /// Ordering helper: nil (never worked / no next time) sorts FIRST; otherwise
@@ -765,14 +777,11 @@ public struct WorkshopPump: Sendable {
         }
     }
 
-    /// The green-window key: UTC day + 2h bucket. Two ticks in the same ~2h
+    /// The green-window key: Desk day + 2h bucket. Two ticks in the same ~2h
     /// window share a key, so the lease grants at most one workshop session per
     /// window and the reservation id is idempotent within it.
     public static func windowKey(_ date: Date) -> String {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let hour = cal.component(.hour, from: date)
-        return "\(DeskClock.dayStamp(date))-b\(hour / 2)"
+        "\(DeskClock.dayStamp(date))-b\(Int(date.timeIntervalSince(deskDay(date).start) / 7200))"
     }
 }
 

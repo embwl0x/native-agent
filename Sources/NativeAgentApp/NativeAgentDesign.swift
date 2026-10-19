@@ -47,19 +47,6 @@ struct StatusBadge: View {
     }
 }
 
-/// A fact beside a row. Was a filled capsule; now it is just the fact.
-struct InfoPill: View {
-    var text: String
-    var systemImage: String
-
-    var body: some View {
-        Text(text)
-            .font(ShellType.caption)
-            .foregroundStyle(NativeAgentShell.secondary)
-            .lineLimit(1)
-    }
-}
-
 extension View {
     func sheetCloseButton() -> some View {
         buttonStyle(.bordered)
@@ -470,7 +457,6 @@ enum ShellType {
     static let labelSemibold = Font.system(size: labelSize, weight: .semibold)
     /// The shared settings and content row: 14 medium over 13 regular.
     static let rowTitle = Font.system(size: railSize, weight: .medium)
-    static let rowDetailSize = labelSize
     static let rowDetail = label
     static let pageSentence = Font.system(size: railSize)
     static let pageTitle = Font.system(size: pageTitleSize, design: .serif)
@@ -554,7 +540,6 @@ enum NativeAgentShellLayout {
     /// One list row, fixed. 46 + the 2pt gap between rows = a 48pt pitch,
     /// two 24pt units, the same pitch the rail already runs (44 + 4).
     static let listRowHeight: CGFloat = 46
-    static let listRowGap: CGFloat = 2
     // User, 2026-09-03: the room grows with the window like the Claude app,
     // up to a cap; the composer spans the whole column.
     // User/Agent, 2026-09-03: the measure decides the column, not the window.

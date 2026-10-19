@@ -12,6 +12,25 @@ extension ChatStore {
             .map { $0.sessionID != Self.cleanSessionID(selectedSessionID) } ?? false
         if !offscreen { await sessionCacheLoadTask?.value }
         guard msg.sender == "mac" else { return }  // only accept Mac replies
+        // How a Steer ended: read by the turn that was working (its reply
+        // answers it), or given back, to run as its own message.
+        if let kind = msg.metadata?["kind"], kind == "steered" || kind == "steer_returned",
+           let queued = queuedSends.first(where: { $0.id.uuidString == msg.correlationID }) {
+            steeringQueuedIDs.remove(queued.id)
+            if kind == "steer_returned" {
+                if let client = pendingRetryClient {
+                    sendAsOwnMessage(queued.id, client: client, rowWritten: msg.metadata?["rowWritten"] == "true")
+                }
+                return
+            }
+            queuedSends.removeAll { $0.id == queued.id }
+            // Read by another conversation's turn: its transcript carries it, never this one.
+            guard queueSessionKey(queued.sessionID) == queueSessionKey(selectedSessionID) else { return }
+            var note = ChatMessage(role: .assistant, text: msg.text, awaitingMacTranscript: true, runId: msg.correlationID)
+            note.completionState = "completed"
+            messages.append(contentsOf: [ChatMessage(id: queued.id, role: .user, text: queued.text), note])
+            return
+        }
         if let correlation = msg.correlationID,
            let placeholder = pendingICloudPlaceholders[correlation] ?? timedOutPendingIds[correlation],
            let index = messages.firstIndex(where: { $0.id == placeholder }) {
@@ -24,25 +43,20 @@ extension ChatStore {
            record.sessionID != Self.cleanSessionID(selectedSessionID) {
             let kind = msg.metadata?["kind"]
             if kind == nil || kind == "reply" || kind == "final" || kind == "error" || kind == "cancelled" {
-                let text: String
-                if kind == "cancelled" {
-                    text = "(stopped)"
-                } else if kind == "error" {
-                    let detail = msg.metadata?["errorDetail"] ?? msg.text
-                    let explanation = detail.isEmpty ? msg.text : detail
-                    text = explanation.isEmpty ? "(I hit an error answering that message)" : String(explanation.prefix(600))
-                } else {
-                    text = msg.text
-                }
                 var reply = ChatMessage(
                     id: record.placeholderID,
                     role: .assistant,
-                    text: text,
+                    text: msg.text,
                     attachments: attachmentSummaries(from: msg.attachments),
                     awaitingMacTranscript: true
                 )
                 reply.runId = correlationID
-                reply.completionState = kind == "error" ? "failed" : kind == "cancelled" ? nil : "completed"
+                reply.completionState = "completed"
+                if kind == "cancelled" || kind == "error" {
+                    reply.text = record.partialText
+                    Self.end(&reply, lifecycle: kind == "cancelled" ? "Stopped" : Self.errorExplanation(msg),
+                             state: kind == "cancelled" ? "incomplete" : "failed")
+                }
                 do {
                     try await storage.checkpointReply(reply, key: transcriptStorageKey(for: record.sessionID),
                         legacyKey: transcriptKey, sessionID: record.sessionID)
@@ -146,9 +160,7 @@ extension ChatStore {
                 failPendingReply(
                     pendingId: correlationID,
                     placeholderId: placeholderId,
-                    placeholderText: explanation.isEmpty
-                        ? "(I hit an error answering that message)"
-                        : String(explanation.prefix(600)),
+                    placeholderText: Self.errorExplanation(msg),
                     banner: explanation,
                     awaitingMacTranscript: true
                 )
@@ -159,15 +171,15 @@ extension ChatStore {
         }
         // F7 P0 #3: explicit cancelled kind. Resolve the placeholder, clear
         // the spinner, but don't surface an error banner.
+        // The Mac stopped this request; one gone silent ends the same way.
         if msg.metadata?["kind"] == "cancelled" {
             if let correlationID = msg.correlationID,
-               let placeholderId = pendingICloudPlaceholders.removeValue(forKey: correlationID) {
+               let placeholderId = pendingICloudPlaceholders.removeValue(forKey: correlationID)
+                ?? timedOutPendingIds.removeValue(forKey: correlationID) {
                 cancelReplyWaits(for: correlationID)
                 streamingHintsByMessageId.removeValue(forKey: placeholderId)
                 markICloudReplyResolved(correlationID)
-                if messages.contains(where: { $0.id == placeholderId }) {
-                    finishPlaceholder(id: placeholderId, text: "(stopped)", awaitingMacTranscript: true)
-                }
+                endPlaceholder(id: placeholderId, lifecycle: "Stopped", state: "incomplete", awaitingMacTranscript: true)
                 releaseLoading(for: placeholderId)
             }
             return
@@ -190,20 +202,6 @@ extension ChatStore {
             if mainSessionID == nil {
                 rememberMainSessionIDIfNeeded(incoming)
             }
-        }
-        if let correlationID = msg.correlationID, canceledPendingIds.contains(correlationID) {
-            let placeholderId = pendingICloudPlaceholders[correlationID]
-            canceledPendingIds.remove(correlationID)
-            pendingICloudPlaceholders.removeValue(forKey: correlationID)
-            cancelReplyWaits(for: correlationID)
-            if let placeholderId {
-                streamingHintsByMessageId.removeValue(forKey: placeholderId)
-            }
-            // PATCH-2026-05-30: also mark resolved on the cancel-late path so
-            // any in-flight text_delta stragglers for this correlation get
-            // dropped at the dispatcher.
-            markICloudReplyResolved(correlationID)
-            return
         }
         if let correlationID = msg.correlationID, let placeholderId = timedOutPendingIds.removeValue(forKey: correlationID) {
             cancelReplyWaits(for: correlationID)
@@ -251,12 +249,6 @@ extension ChatStore {
             match = pendingICloudPlaceholders.first
         }
         if let (pendingId, placeholderId) = match {
-            if canceledPendingIds.remove(pendingId) != nil {
-                pendingICloudPlaceholders.removeValue(forKey: pendingId)
-                cancelReplyWaits(for: pendingId)
-                streamingHintsByMessageId.removeValue(forKey: placeholderId)
-                return
-            }
             pendingICloudPlaceholders.removeValue(forKey: pendingId)
             // Phase 14e-iCloud: retire both reply waits — the reply landed.
             cancelReplyWaits(for: pendingId)
@@ -761,7 +753,7 @@ extension ChatStore {
         // need to clear the text_delta seq tracker so the map stays bounded
         // and any straggler deltas for this correlation get dropped.
         maxDeltaSeqByCorrelation.removeValue(forKey: pendingId)
-        finishPlaceholder(id: placeholderId, text: placeholderText, success: false, awaitingMacTranscript: awaitingMacTranscript)
+        endPlaceholder(id: placeholderId, lifecycle: placeholderText, state: "failed", awaitingMacTranscript: awaitingMacTranscript)
         errorBanner = banner
         releaseLoading(for: placeholderId)
     }
@@ -801,14 +793,14 @@ extension ChatStore {
         updated.attachments = attachments
         updated.isStreaming = false
         updated.awaitingMacTranscript = awaitingMacTranscript
-        updated.completionState = text == "(stopped)" ? nil : success ? "completed" : "failed"
+        updated.completionState = success ? "completed" : "failed"
         messages[idx] = updated
         // phase 6: soft confirmation tap once the reply lands — one per turn,
         // never per streamed chunk (this is the single finalize site). Only
         // genuine success: failure paths (failPendingReply: timeouts, stream
         // errors, rejections) pass success=false, and the user-stop sentinel
         // is skipped — a "success" tap on either would lie (gpt-5.5 r2 catch).
-        if success && text != "(stopped)" {
+        if success {
             // A dispatch receipt only means the phone handed the request to
             // transport. Clear prior failure context only once a final reply
             // is actually rendered for this turn.
@@ -820,6 +812,36 @@ extension ChatStore {
         // snapshot right after could drop the just-arrived reply. Resolution
         // is the arrival that matters for the stale-snapshot guard.
         localArrivalDates[placeholderId] = Date()
+    }
+
+    /// Ends a bubble the Mac did not finish. Her words stay exactly as they
+    /// arrived; what stopped or failed it is lifecycle evidence beside them,
+    /// as the Mac's own transcript keeps it.
+    func endPlaceholder(id placeholderId: UUID, lifecycle: String, state: String, awaitingMacTranscript: Bool = false) {
+        guard let idx = messages.firstIndex(where: { $0.id == placeholderId }) else { return }
+        streamingHintsByMessageId.removeValue(forKey: placeholderId)
+        var updated = messages[idx]
+        updated.isStreaming = false
+        updated.awaitingMacTranscript = awaitingMacTranscript
+        Self.end(&updated, lifecycle: lifecycle, state: state)
+        messages[idx] = updated
+        localArrivalDates[placeholderId] = Date()
+    }
+
+    /// A bubble with no words yet has only the evidence to show.
+    static func end(_ message: inout ChatMessage, lifecycle: String, state: String) {
+        message.completionState = state
+        if message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            message.text = lifecycle
+        } else {
+            message.failureDetail = lifecycle
+        }
+    }
+
+    static func errorExplanation(_ msg: BridgeMessage) -> String {
+        let detail = msg.metadata?["errorDetail"] ?? msg.text
+        let explanation = detail.isEmpty ? msg.text : detail
+        return explanation.isEmpty ? "(I hit an error answering that message)" : String(explanation.prefix(600))
     }
 
     private func attachmentSummaries(from attachments: [MultimodalAttachment]?) -> [ChatAttachmentSummary] {

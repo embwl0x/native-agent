@@ -2,14 +2,20 @@ import Foundation
 
 public struct ProviderAuthStatus: Codable, Hashable, Sendable {
     public var provider_id: String
-    public var state: String           // "ready" | "needs_key" | "needs_oauth" | "error"
+    /// How far the credential is proven: ready, saved, failed, rejected or a
+    /// needs_* state. Never read for eligibility; `eligible` is that answer.
+    public var state: String
     public var detail: String
     /// Free-form metadata projected by the shared compatibility decoder.
     public var user_info: [String: String]?
     public var last_checked_at: String?
 
+    /// May dispatch, as ProviderRouting publishes it (the provider's
+    /// `configured`). An older Mac's wire has none; there "ready" meant it.
+    public var eligible: Bool
+
     private enum CodingKeys: String, CodingKey {
-        case provider_id, state, detail, user_info, last_checked_at
+        case provider_id, state, detail, user_info, last_checked_at, eligible
     }
 
     public init(
@@ -17,13 +23,15 @@ public struct ProviderAuthStatus: Codable, Hashable, Sendable {
         state: String,
         detail: String,
         user_info: [String: String]?,
-        last_checked_at: String?
+        last_checked_at: String?,
+        eligible: Bool
     ) {
         self.provider_id = provider_id
         self.state = state
         self.detail = detail
         self.user_info = user_info
         self.last_checked_at = last_checked_at
+        self.eligible = eligible
     }
 
     public init(from decoder: Decoder) throws {
@@ -33,6 +41,7 @@ public struct ProviderAuthStatus: Codable, Hashable, Sendable {
         self.detail = snapshot.detail
         self.last_checked_at = snapshot.last_checked_at
         self.user_info = snapshot.user_info
+        self.eligible = snapshot.eligible
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -42,5 +51,6 @@ public struct ProviderAuthStatus: Codable, Hashable, Sendable {
         try c.encode(detail, forKey: .detail)
         try c.encodeIfPresent(last_checked_at, forKey: .last_checked_at)
         try c.encodeIfPresent(user_info, forKey: .user_info)
+        try c.encode(eligible, forKey: .eligible)
     }
 }

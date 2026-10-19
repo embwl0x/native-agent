@@ -1,5 +1,6 @@
 import AuthoredCapabilities
 import AgentWorkspace
+import Experiences
 import Foundation
 import ApprovalInbox
 import CryptoKit
@@ -22,11 +23,10 @@ import StandingBots
 
 // MARK: - File-access wrapping dispatcher
 
-/// Wraps a ToolDispatchClient and rejects calls to a hard-coded set of
-/// filesystem / shell tool name prefixes when fileAccess == "none".
-/// Honest carve: we do not introspect tool metadata for "writes_fs" — we
-/// gate by name prefix, which is the same coarse rule the daemon uses
-/// when fileAccess=none is asserted upstream.
+/// Carries the chain's file access down to the organs that read it and refuses
+/// what no name can decide: an unrecognized mode, and under `none` a read that
+/// names a file. Which calls a restriction admits is the posture and the
+/// call's declared class, decided once in TrustCenter, never a tool-name list.
 final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValidating, @unchecked Sendable {
     private let inner: any ToolDispatchClient
     private let mode: Mode
@@ -89,124 +89,6 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         self.fileAccess = fileAccess
     }
 
-    // HOTFIX 2026-06-03: prefix list was dot-namespaced only ("fs.", "file.",
-    // "shell.") which missed the new snake_case tools (`read_file`,
-    // `list_dir`) the SwiftToolDispatcher exposes — fileAccess=none was
-    // letting them through. Also added exact names + snake_case prefixes.
-    private static let blockedPrefixes: [String] = [
-        "fs.", "file.", "files.", "read.", "write.", "shell.", "bash.", "exec.",
-        // snake_case forms the SwiftToolDispatcher built-in set uses:
-        "read_file", "write_file", "list_dir", "list_directory",
-        "read_skill", "shell_", "bash_", "exec_",
-    ]
-    private static let blockedExact: Set<String> = [
-        "read_file", "list_dir", "file_info", "copy_file", "move_file", "trash_file", "read_skill", "list_skills", "save_skill",
-        "get_persona_doc", "persona_read", "persona_write", "persona_append_section",
-        // agent-builder-tools (2026-06-08) — defense in depth. Builder
-        // Process-spawn tools must never dispatch when fileAccess=none.
-        "shell", "bash", "git", "apply_patch",
-        "swift_build", "swift_test",
-        // restart_app (2026-06-10) — process_spawn + app termination.
-        // Defense in depth: even if a refactor ever moves its schema out of
-        // the Full-Mac block, fileAccess=none keeps it unreachable.
-        "restart_app", "install_app",
-        // 2026-07-31 audit fix: the Full-Mac file/git read tools
-        // (SwiftToolDispatcher.fullMacFileToolNames + the git group) matched
-        // neither blockedExact nor any blockedPrefix, so fileAccess=none was
-        // letting six real filesystem/repo readers through. `write_file` was
-        // already covered by prefix. These stay PERMITTED under .readOnly —
-        // they are reads, and read_only exists to allow exactly this.
-        "file_excerpt", "grep",
-        "git_status", "git_diff", "git_log", "repo_dirty_summary",
-        // W2/W3 (2026-08-12) — INPUT INJECTION. Defense in depth: a session
-        // with no file access has no business synthesizing keystrokes or
-        // clicks either, and a keystroke IS a route to arbitrary file access
-        // (type into a terminal). Blocked in both restricted modes.
-        // W6 `mac_wake` joins them: it posts input, and a session with no file
-        // access has no business synthesizing any.
-        // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
-        // Nothing." The Mac motor tools are removed from the read_only
-        // blocklist at his explicit direction so they work on the bridge and
-        // other non-interactive surfaces. Full Mac + the accessibility category
-        // + the macOS TCC grant remain their real gates.
-        // (was: "legacy keystroke tool", "legacy click tool", "legacy scroll tool", "legacy AX act tool", "mac_wake",)
-    ]
-    private static let readOnlyBlockedPrefixes: [String] = [
-        "write.", "write_", "shell.", "shell_", "bash.", "bash_", "exec.", "exec_",
-        // 2026-06-08 NARROWED from broad `mac_` to `mac_write_` only. The
-        // previous prefix caught legitimate read tools like
-        // mac_reminders_list_due_today / mac_calendar_list_upcoming /
-        // mac_contacts_search / mac_mail_list_recent — all READ-tier
-        // tools that Claude legitimately uses through the bridge in
-        // read_only mode. The destructive mac_ tools (focus_app /
-        // quit_app / set_volume / sleep_display / lock_screen /
-        // run_shortcut) are now listed explicitly in
-        // readOnlyBlockedExact below.
-        "mac_write_",
-    ]
-    private static let readOnlyBlockedExact: Set<String> = [
-        "write_file", "file_write", "copy_file", "move_file", "trash_file", "apply_patch",
-        "swift_build", "swift_test",
-        // agent-builder-tools (2026-06-08) — even in read_only mode,
-        // process-spawn / git mutators / arbitrary shell stay denied.
-        "shell", "bash", "git",
-        // restart_app (2026-06-10) — read_only must never bounce the app.
-        "restart_app", "install_app",
-        // USER YOLO 2026-08-12: legacy app focus tool / legacy app quit tool freed too.
-        // (was: "legacy app focus tool", "legacy app quit tool",)
-        // W1b/W3.5 — legacy AX status tool / legacy AX tree tool / legacy AX find tool / mac_view are
-        // deliberately NOT listed here. read_only exists to allow exactly this
-        // class: they read the on-screen AX tree (and, for mac_view, take a
-        // picture of it) and mutate nothing. They are likewise absent
-        // from blockedExact/blockedPrefixes above — AX perception is not file
-        // access, so fileAccess=none does not bear on it; the Trust Center
-        // accessibility category remains their real gate.
-        // USER YOLO 2026-08-12: the remaining mac system tools freed.
-        // (was: "mac_set_volume", "mac_sleep_display", "mac_lock_screen", "mac_run_shortcut",)
-        // W7 — legacy bare cursor move tool is likewise NOT listed. read_only exists to prevent
-        // writes; moving the cursor one point writes nothing — it cannot
-        // click, type, scroll or drag, so there is no write for the mode to
-        // prevent. It sits with the AX reads, not with the four below.
-        //
-        // W2/W3 — INPUT INJECTION. read_only exists to allow READS; typing and
-        // clicking are the opposite of that, and a synthesized keystroke can
-        // reach any write the mode is trying to prevent. Denied.
-        // W6 `mac_wake` too — the view it returns is not what makes it a write,
-        // the mouse event it posts is.
-        // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
-        // Nothing." The Mac motor tools are removed from the read_only
-        // blocklist at his explicit direction so they work on the bridge and
-        // other non-interactive surfaces. Full Mac + the accessibility category
-        // + the macOS TCC grant remain their real gates.
-        // (was: "legacy keystroke tool", "legacy click tool", "legacy scroll tool", "legacy AX act tool", "mac_wake",)
-        // W7 — `activity_query` is deliberately NOT listed here, and its
-        // absence is not an oversight. This wrapper gates on fileAccess MODE,
-        // which is the wrong axis for it: the tool is refused by SURFACE, not
-        // by mode, and read_only sessions on the Mac are exactly who should be
-        // able to ask it. The Mac-local refusal lives in
-        // `impl_activity_query_tool`, which throws an explicit
-        // `toolDenied` naming the surface — an EXPLICIT refusal, per the
-        // build-plan W7 decision, rather than a silent 404 that would read as
-        // "this tool does not exist" from the phone.
-        // `ActivityQueryToolReachabilityTests` pins that refusal.
-        "persona_write", "persona_append_section", "save_skill",
-    ]
-
-    private func isBlocked(_ name: String) -> Bool {
-        let lower = name.lowercased()
-        switch mode {
-        case .allow:
-            return false
-        case .none, .invalid:
-            if Self.blockedExact.contains(lower) { return true }
-            for p in Self.blockedPrefixes where lower.hasPrefix(p) { return true }
-        case .readOnly:
-            if Self.readOnlyBlockedExact.contains(lower) { return true }
-            for p in Self.readOnlyBlockedPrefixes where lower.hasPrefix(p) { return true }
-        }
-        return false
-    }
-
     /// User, 2026-09-06: `read` with an explicit `path` OPENS A FILE OFF DISK,
     /// and the name-only blocklists missed it — `"read."` is a namespace
     /// prefix, and bare `read` is in neither exact set — so fileAccess=none
@@ -240,9 +122,6 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         if isPathfulReadUnderNoFileAccess(tool: tool, input: input) {
             return ToolFailureError("\(source) blocks \(tool) with an explicit path. The request issuer must resubmit with file access; changing the requested operation to a screen read would not repair this file read.", effects: .none)
         }
-        if isBlocked(tool) {
-            return ToolFailureError("\(source) blocks \(tool). The request issuer must change its fileAccess restriction; the person's saved access is controlled by Trust > Access and policy > Access.", effects: .none)
-        }
         return nil
     }
 
@@ -263,23 +142,13 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         }
     }
 
-    func listAvailableTools() async throws -> [String] {
-        let all = try await inner.listAvailableTools()
-        if mode == .allow { return all }
-        return all.filter { !isBlocked($0) }
-    }
+    func listAvailableTools() async throws -> [String] { try await inner.listAvailableTools() }
 
     func listAvailableToolSchemas(named names: Set<String>) async throws -> [LLMToolSchema] {
-        let all = try await inner.listAvailableToolSchemas(named: names)
-        return mode == .allow ? all : all.filter { !isBlocked($0.name) }
+        try await inner.listAvailableToolSchemas(named: names)
     }
 
-    // Forward schemas when permitted; filter blocked tools by fileAccess mode.
-    func listAvailableToolSchemas() async throws -> [LLMToolSchema] {
-        let all = try await inner.listAvailableToolSchemas()
-        if mode == .allow { return all }
-        return all.filter { !isBlocked($0.name) }
-    }
+    func listAvailableToolSchemas() async throws -> [LLMToolSchema] { try await inner.listAvailableToolSchemas() }
 }
 
 /// The file access the chat hands its chain, for the permissions proof.
@@ -347,12 +216,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         let name = peer.name.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? nil : name
     }
-    private static let approvalStagingToolNames: Set<String> = [
-        "agentmail.send",
-        "agentmail_send",
-        "slack.post_message",
-        "slack_post_message",
-    ]
 
     init(
         inner: any ToolDispatchClient,
@@ -382,6 +245,18 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         self.verifiedSessionId = verifiedSessionId
         self.approvedReplay = approvedReplay
         self.injectionApprovalVerifier = injectionApprovalVerifier
+    }
+
+    /// The audit row this decision owes. A write that fails is a receipt owed
+    /// under the audit file, never dropped; the decision itself stands.
+    private func audit(_ envelope: SecurityToolEnvelope) async {
+        do { try await securityCenter.record(envelope) } catch {
+            let file = securityCenter.dataRoot.appendingPathComponent("security/audit.jsonl").path
+            RepairOwed.owe(securityCenter.dataRoot, id: "security-audit:" + UUID().uuidString, kind: .run,
+                operation: "security.audit", owner: file,
+                words: "The security audit row for \(envelope.tool) (\(envelope.decision.rawValue)) was not written: \(error.localizedDescription)",
+                nextCall: ToolFailureError.call("app", ["action": .string("files.info"), "args": .object(["path": .string(file)])]))
+        }
     }
 
     private static func requiresDesktopInteraction(tool: String, capabilities: [String]) -> Bool {
@@ -496,14 +371,13 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // requireApproval flow below (filer / resolveWithApproval / honest
         // no-filer deny), exactly like an autonomy-level requireApproval.
         if envelope.decision == .block {
-            try? await securityCenter.record(envelope)
+            await audit(envelope)
             throw AutonomyGateError.toolDenied(reason: envelope.primaryReason, remedy: envelope.remedy)
         }
 
         // SecurityCenter judged this exact call once (its roots, profile,
         // class and reach, then User's saved entries); that is the answer.
         let autonomyLevel = envelope.autonomyLevel
-        let admittedFullMacYolo = envelope.fullMacYoloAuthority == .admitted
         // The saved posture is Full Mac, whoever is asking (a peer or helper
         // surface is never admitted, but it is still running under Full Mac).
         let fullMacOn = [.admitted, .untrustedOrigin].contains(envelope.fullMacYoloAuthority)
@@ -537,7 +411,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 let reason = "approved_replay_evidence_unverified: \(verdict.rawValue) "
                     + "(\(tool) replay claimed approval \(replay.approvalID))"
                     + ". Authority: workflows/approvals/requests.json and effect_spends.json. Inspect this card's execution receipt and the effect owner's state before any new request; a missing or unreadable spend does not prove nothing ran."
-                try? await securityCenter.record(
+                await audit(
                     Self.securityEnvelope(envelope, decision: .block, reason: reason)
                 )
                 let store = verdict == .spendUnavailable || verdict == .notSpentByExecutor ? "effect_spends.json" : "requests.json"
@@ -552,49 +426,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         } else {
             approvedReplayAuthorizes = false
         }
-        // The first conversation's ONE documented line (User, 2026-09-15;
-        // hardened after Sol's P0-1/2/3, same day).
-        //
-        // This is a one-shot bearer token, not a re-evaluatable predicate. It
-        // is only ever offered to the Mac chat chain (`firstConversationDataRoot`
-        // is nil everywhere else), it must name THIS verified session, it must
-        // carry the exact section title the app armed it with, and granting it
-        // RENAMES it — so of any number of concurrent or repeated dispatches
-        // exactly one can win, and there is no second write to race with the
-        // append. Everything else `persona_append_section` does keeps the guard.
-        //
-        // The surface is pinned too: a remote conversation riding this chain
-        // under its own surface name is not the person sitting in front of the
-        // first-run window.
-        let firstConversationWriteExempt = surface == "chat"
-            && FirstConversationPersonaExemption.consumeIfExempt(
-                tool: tool,
-                input: input,
-                dataRoot: firstConversationDataRoot,
-                sessionID: verifiedSessionId
-            )
-        let guardResult = PersonaWriteGuard.apply(
-            tool: tool,
-            kind: Self.jsonString(input["kind"]),
-            personaSettingWrite: PeerTurnEffectPolicy.isPersonaSettingWrite(tool: tool, input: input),
-            resolvedAutonomy: autonomyLevel,
-            // A resolved approval is equivalent to the explicit confirmation
-            // PersonaWriteGuard was created to require, but only for the exact
-            // persisted call and authenticated origin, and only once the
-            // approval record itself has been verified. A mismatch falls back
-            // to the normal guard and fails closed when no filer is present.
-            hasExplicitAutonomyOverride: admittedFullMacYolo || approvedReplayAuthorizes
-                || firstConversationWriteExempt
-        )
-        if firstConversationWriteExempt {
-            // The exemption is audited, not silent — same posture as the
-            // admitted-YOLO and approved-replay exemptions below.
-            try? await securityCenter.record(Self.securityEnvelope(
-                envelope,
-                decision: .allow,
-                reason: "first conversation persona write exempt from "
-                    + PersonaWriteGuard.autonomySource
-            ))
+        // The first conversation's one documented line still spends its token,
+        // which arms the voice step after it; posture alone authorizes the write.
+        if surface == "chat" {
+            _ = FirstConversationPersonaExemption.consumeIfExempt(
+                tool: tool, input: input, dataRoot: firstConversationDataRoot, sessionID: verifiedSessionId)
         }
         // W2/W3-FIX 3 — injection authority is enforced HERE as well as in the
         // trust resolver, because this dispatcher accepts ANY
@@ -631,7 +467,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             guard verdict == .verified else {
                 let reason = "injection_replay_evidence_unverified: \(verdict.rawValue) "
                     + "(\(tool) replay claimed approval \(replay.approvalID))"
-                try? await securityCenter.record(
+                await audit(
                     Self.securityEnvelope(envelope, decision: .block, reason: reason)
                 )
                 throw AutonomyGateError.toolDenied(reason: reason)
@@ -639,24 +475,11 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             injectionReplayApprovalID = replay.approvalID
         }
         let autonomyDecision: AutonomyDecision
-        if guardResult.source == PersonaWriteGuard.autonomySource
-            && !admittedFullMacYolo && !approvedReplayAuthorizes {
-            autonomyDecision = .requireApproval(
-                reason: "autonomy=\(guardResult.autonomy) source=\(PersonaWriteGuard.autonomySource)"
-            )
-        } else {
-            let mapped = AutonomyGate.map(level: guardResult.autonomy, toolName: tool)
-            let approvedAsk: Bool
-            if case .requireApproval = mapped { approvedAsk = approvedReplayAuthorizes }
-            else { approvedAsk = false }
-            if approvedAsk { autonomyDecision = .allow }
-            else {
-                switch mapped {
-                case .requireApproval: autonomyDecision = .requireApproval(reason: envelope.autonomyReason ?? "autonomy=\(guardResult.autonomy)")
-                case .deny: autonomyDecision = .deny(reason: envelope.autonomyReason ?? "autonomy=\(guardResult.autonomy)")
-                case .allow: autonomyDecision = .allow
-                }
-            }
+        switch AutonomyGate.map(level: autonomyLevel, toolName: tool) {
+        case .requireApproval where approvedReplayAuthorizes: autonomyDecision = .allow
+        case .requireApproval: autonomyDecision = .requireApproval(reason: envelope.autonomyReason ?? "autonomy=\(autonomyLevel)")
+        case .deny: autonomyDecision = .deny(reason: envelope.autonomyReason ?? "autonomy=\(autonomyLevel)")
+        case .allow: autonomyDecision = .allow
         }
         // Deny outranks every ask; a security .ask outranks autonomy allow
         // (the external-send gate exists precisely to force a human look).
@@ -676,10 +499,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // does NOT cover injection tools — those keep the inbox-verified
         // `injectionReplayApprovalID` path above, which is stricter.
         // `approvedReplayAuthorizes` was resolved (and the approval record
-        // verified and burned) before the persona guard above.
+        // verified and burned) above.
         if approvedReplayAuthorizes, envelope.requiresApproval {
             // The exemption is audited, not silent.
-            try? await securityCenter.record(Self.securityEnvelope(
+            await audit(Self.securityEnvelope(
                 envelope,
                 decision: .allow,
                 reason: "approved replay of \(tool) honours approval "
@@ -715,7 +538,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         var decidedRequester = fullMacOn && protectedAction
             && ChatToolSessionContext.envelope?.workIdentity?.hasPrefix("carry.") == true ? "Full Mac" : nil
         if botDesktop, fullMacOn, case .allow = decision {
-            try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
+            await audit(Self.securityEnvelope(envelope, decision: .allow,
                 reason: "Agent decided for a helper"))
             decidedRequester = "a helper"
         }
@@ -744,7 +567,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 if fullMacOn {
                     // Hers under Full Mac (User 10-01): no card, and he sees it.
                     if case .allow = decision {
-                        try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
+                        await audit(Self.securityEnvelope(envelope, decision: .allow,
                             reason: "Agent decided for \(requester)"))
                         decidedRequester = requester
                     }
@@ -766,15 +589,15 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             switch decision {
             case .allow: break
             case .requireApproval where Set(envelope.capabilities).isSubset(of: PersonInitiatedSend.sendOnly):
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow,
+                await audit(Self.securityEnvelope(envelope, decision: .allow,
                     reason: "person-initiated send from a contact thread"))
                 decision = .allow
             case .requireApproval:
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask,
+                await audit(Self.securityEnvelope(envelope, decision: .ask,
                     reason: "person-initiated send needs more than the send"))
                 return PersonInitiatedSend.refusal("\(name) runs on this Mac, and your Trust setting asks before starting it. Nothing was sent.")
             case .deny:
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block,
+                await audit(Self.securityEnvelope(envelope, decision: .block,
                     reason: "person-initiated send refused by Trust"))
                 return PersonInitiatedSend.refusal("Your Trust settings don't allow messaging \(name) right now. Nothing was sent.")
             }
@@ -783,7 +606,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         switch decision {
         case .allow:
             if AuthoredToolEffects.call?.tool == tool {
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .allow, reason: "admitted"))
+                await audit(Self.securityEnvelope(envelope, decision: .allow, reason: "admitted"))
             }
             if AuthoredToolEffects.admissionOnly {
                 return .object(["status": .string("admitted"), "effects": .string("none"),
@@ -813,7 +636,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             }
             return result
         case .deny(let reason):
-            try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: reason))
+            await audit(Self.securityEnvelope(envelope, decision: .block, reason: reason))
             throw AutonomyGateError.toolDenied(reason: reason, remedy: envelope.remedy)
         case .requireApproval(let gateReason):
             // A switch User turned off refuses before any card, whatever the
@@ -865,7 +688,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                input["transport"] == nil || input["transport"] == .string("auto") {
                 ownsACPConnectCard = AgentHostDirectory.row(named: name)?.acp != nil
             } else { ownsACPConnectCard = false }
-            if !securityAsked, Self.approvalStagingToolNames.contains(tool.lowercased()) || ownsACPConnectCard {
+            if !securityAsked, envelope.capabilities.contains("approval_stage") || ownsACPConnectCard {
                 // ACP files and awaits its own canonical connect card over an
                 // immutable executable proposal; no executable grant precedes it.
                 // These tools only persist a bounded replay request. The actual
@@ -884,7 +707,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // When none is wired, surface as a deny so the loop records the rejection
             // rather than hanging — same as the legacy behavior.
             guard approvalFiler != nil, !AuthoredToolEffects.admissionOnly || approvalFiler is any NonBlockingApprovalFiler else {
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
+                await audit(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
                 // Raw/noninteractive callers can deliberately omit a filer and
                 // remain fail-closed. Never teach a model to bypass TrustCenter
                 // by editing policy; production user-chat profiles wire the
@@ -924,7 +747,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                         secrets: injectionSecrets
                     )
                 }
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
+                await audit(Self.securityEnvelope(envelope, decision: .ask, reason: reason))
                 var pending = await nonBlocking.pendingApprovalResult(
                     id: approvalId,
                     toolName: tool,
@@ -981,7 +804,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     guard verdict == .verified else {
                         let r = "injection_approval_unverified: \(verdict.rawValue) "
                             + "(\(tool) resolved approval \(resolved.approvalID ?? "<none>"))"
-                        try? await securityCenter.record(
+                        await audit(
                             Self.securityEnvelope(envelope, decision: .block, reason: r)
                         )
                         throw AutonomyGateError.toolDenied(reason: r)
@@ -996,10 +819,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     personApprovedHost: namedConnect
                 )
             case .deny(let r):
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: r))
+                await audit(Self.securityEnvelope(envelope, decision: .block, reason: r))
                 throw AutonomyGateError.notRun(resolved.notRunStatus ?? .blocked)
             case .requireApproval(let r):
-                try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .ask, reason: r))
+                await audit(Self.securityEnvelope(envelope, decision: .ask, reason: r))
                 throw AutonomyGateError.toolDenied(reason: r)
             }
         }

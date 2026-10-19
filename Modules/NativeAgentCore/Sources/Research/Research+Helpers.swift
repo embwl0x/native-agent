@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
 
 extension SwiftNativeResearchClient {
     // MARK: Helpers
@@ -43,12 +44,26 @@ extension SwiftNativeResearchClient {
     /// file with no retention — an unbounded pile under data/.
     static let receiptRetentionLimit = 200
 
+    /// Receipt folders with an aging pass in flight: one at a time per folder.
+    private static let aging = Mutex<Set<String>>([])
+
     /// Keep the newest `receiptRetentionLimit` receipt files; delete the
-    /// rest. Best-effort and non-throwing — a prune failure must never fail
-    /// the search/fetch that just succeeded. Only receipt-shaped files are
-    /// eligible (`source-*.json`, or `<uuid>.json`): `config.json` and the
-    /// `lab/` subdirectory share the directory and are never touched.
-    func pruneReceiptsIfNeeded() {
+    /// rest. Housekeeping: it runs on its own, off this call's return path, so
+    /// an arrived result never waits on a directory scan, and a prune failure
+    /// never fails the search/fetch that just succeeded. Only receipt-shaped
+    /// files are eligible (`source-*.json`, or `<uuid>.json`): `config.json`
+    /// and the `lab/` subdirectory share the directory and are never touched.
+    nonisolated func pruneReceiptsIfNeeded() {
+        let receiptsDir = receiptsDir
+        guard Self.aging.withLock({ $0.insert(receiptsDir.path).inserted }) else { return }
+        // The scan blocks on the filesystem, so it runs on VolumeIO, never the pool.
+        Task {
+            defer { _ = Self.aging.withLock { $0.remove(receiptsDir.path) } }
+            _ = try? await VolumeIO.run { Self.pruneReceipts(in: receiptsDir) }
+        }
+    }
+
+    private static func pruneReceipts(in receiptsDir: URL) {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
             at: receiptsDir,

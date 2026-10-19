@@ -128,6 +128,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     private let feedbackReducer = ContextFeedbackReducer()
     private var feedbackEvents: [ContextFeedbackEvent] = []
     private var feedbackOrdinal: UInt64 = 0
+    /// The last feedback that applied; a failed update never replaces it.
+    private var publishedFeedback: ContextFeedbackSnapshot?
     private var cachedFeedback: (
         generationID: Int64, feedbackOrdinal: UInt64, timeBucket: Int64,
         snapshot: ContextFeedbackSnapshot
@@ -147,7 +149,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
     /// the newest waiter compiles: an older one's commit would be refused.
     private var compileInProgress = false
     private var compileWaiters: [CheckedContinuation<Void, Never>] = []
-    private var liveSourceReconciliation: Task<Bool, Never>?
+    /// Housekeeping rebuilds a turn requested or launch started; no turn awaits it.
+    private var backgroundReconciliation: Task<Void, Never>?
     private var degradedSourceIDs: Set<ContextSourceID> = []
     /// Per-generation derivations whose inputs are immutable for a complete
     /// mirror/kernel/surface/privacy behavior key. This keeps repeated turns
@@ -281,13 +284,33 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
         self.monitor = monitor
 
-        await reconcileAll(reason: "launch")
+        // Turns read the generation published before this launch while the
+        // launch rebuild runs as housekeeping. A store that never published
+        // one has nothing to read yet: its turns get the unavailable-generation
+        // receipt until the first build publishes; none waits for it.
+        do {
+            if let published = try await store.loadActiveGeneration() {
+                try await activate(published, projectionResults: [:])
+            }
+        } catch {
+            lastError = "the published context generation could not be reopened: \(error)"
+        }
+        reconcileInBackground(reason: "launch")
         await restoreFeedbackEvents()
-        await refreshWatchedDirectories()
+    }
+
+    private func reconcileInBackground(reason: String) {
+        guard backgroundReconciliation == nil else { return }
+        backgroundReconciliation = Task {
+            await reconcileAll(reason: reason)
+            await refreshWatchedDirectories()
+            if !Task.isCancelled { backgroundReconciliation = nil }
+        }
     }
 
     public func stop() async {
-        liveSourceReconciliation?.cancel()
+        backgroundReconciliation?.cancel()
+        backgroundReconciliation = nil
         await coalescer?.cancel()
         await monitor?.stop()
         coalescer = nil
@@ -542,25 +565,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         guard started, mode != .off else {
             throw ContextTurnPreparationError.coordinatorNotStarted
         }
-        if activeStoredGeneration == nil {
-            await reconcileAll(reason: "turn_generation_recovery")
-        }
-        let live = Set(compiledProjectionProviders.filter(\.refreshesBeforeTurn).map(\.projectionIdentifier))
-        if !live.isEmpty {
-            let reconciled = await reconcileLiveSources(live)
-            try Task.checkCancellation()
-            guard started, mode != .off else { throw ContextTurnPreparationError.coordinatorNotStarted }
-            guard reconciled else { throw ContextTurnPreparationError.generationUnavailable }
-        }
+        // The turn reads the published generation; it never joins a compile.
         guard let generation = activeStoredGeneration else {
+            reconcileInBackground(reason: "turn_generation_recovery")
             throw ContextTurnPreparationError.generationUnavailable
         }
         let lease = try arena.acquireSnapshot()
         do {
-            var excludedLiveAtoms = Set<ContextAtomID>()
-            for provider in compiledProjectionProviders {
-                excludedLiveAtoms.formUnion(await provider.excludedAtomIDs(in: generation))
-            }
             let surfaceVariant = ContextSurfaceVariant(rawValue: request.surface.rawValue)
             let mirrorCandidates = lease.snapshot.requiredDocumentMirrors.filter {
                 $0.kernel(for: surfaceVariant) != nil
@@ -708,7 +719,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     }.map(\.draft.id)),
                     // `deletedAtomIDs` is the selector's existing exclusion;
                     // here it carries her rejections (Phase 5 B0).
-                    deletedAtomIDs: request.suppressedAtomIDs.union(excludedLiveAtoms),
+                    deletedAtomIDs: request.suppressedAtomIDs,
                     queryEmbedding: request.queryEmbedding,
                     alternateQueryEmbedding: request.alternateQueryEmbedding,
                     queryEmbeddingModelFingerprint: request.queryEmbeddingModelFingerprint,
@@ -722,7 +733,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             }
             var need = makeNeed(request.characterBudget)
             var budgetExpansion: ContextFlowBudgetExpansion?
-            let packet: ContextPacket
+            var packet: ContextPacket
             do {
                 packet = try selector.select(
                     need,
@@ -761,11 +772,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     measureLatency: true
                 )
             }
+            let verifier = Self.verifier(compiledProjectionProviders, generation: generation, surface: request.surface)
+            packet = await Self.verified(packet, by: verifier, in: generation)
             let recordsFeedback = !Self.isTestSession(request.sessionID)
             if recordsFeedback {
                 await recordFeedback(
                     signal: .selection,
-                    atomIDs: packet.receipt.selectedAtomIDs,
+                    atomIDs: packet.selectedItems.map(\.pointer.atomID),
                     evidenceIDs: [packet.receipt.id],
                     generationID: generation.generation.id
                 )
@@ -801,7 +814,8 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 need: need,
                 budgetExpansion: budgetExpansion,
                 deliveryHandler: deliveryHandler,
-                feedbackHandler: feedbackHandler
+                feedbackHandler: feedbackHandler,
+                verifier: verifier
             )
         } catch {
             lease.release()
@@ -809,8 +823,46 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
     }
 
+    /// Every projection checks exactly the atoms chosen against its owner.
+    private static func verifier(
+        _ providers: [any ContextCompiledProjectionProvider], generation: ContextStoredGeneration, surface: ContextSurface
+    ) -> @Sendable ([ContextStoredAtom]) async -> ContextTurnExclusion {
+        { chosen in
+            var exclusion = ContextTurnExclusion()
+            for provider in providers {
+                let check = await provider.verify(chosen, in: generation, surface: surface)
+                exclusion.atomIDs.formUnion(check.atomIDs)
+                exclusion.unverified += check.unverified
+            }
+            return exclusion
+        }
+    }
+
+    /// The body never speaks what its owner no longer stands behind: chosen
+    /// atoms that fail are dropped, and their receipts join the packet.
+    private static func verified(
+        _ packet: ContextPacket, by verifier: @Sendable ([ContextStoredAtom]) async -> ContextTurnExclusion,
+        in generation: ContextStoredGeneration
+    ) async -> ContextPacket {
+        let chosenIDs = Set(packet.selectedItems.map(\.pointer.atomID) + packet.expandablePointers.map(\.atomID))
+        let check = await verifier(generation.atoms.filter { chosenIDs.contains($0.draft.id) })
+        guard !check.atomIDs.isEmpty || !check.unverified.isEmpty else { return packet }
+        return ContextPacket(
+            generationID: packet.generationID, sourceFingerprint: packet.sourceFingerprint,
+            selectedItems: packet.selectedItems.filter { !check.atomIDs.contains($0.pointer.atomID) },
+            expandablePointers: packet.expandablePointers.filter { !check.atomIDs.contains($0.atomID) },
+            conflictSets: packet.conflictSets, degradedSources: packet.degradedSources + check.unverified,
+            budget: packet.budget, receipt: packet.receipt)
+    }
+
     public func health() async -> ContextFlowCoordinatorHealth {
-        let storeHealth = try? await store.healthSnapshot()
+        // An unread store is not a store with no degraded sources: the zero
+        // travels with the failed measurement as the health error.
+        var storeHealth: ContextStoreHealthSnapshot?
+        var measurementError: String?
+        do { storeHealth = try await store.healthSnapshot() } catch {
+            measurementError = "context store health could not be read: \(error)"
+        }
         let metrics = arena.metrics()
         return ContextFlowCoordinatorHealth(
             mode: mode,
@@ -823,7 +875,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
             feedbackEventCount: feedbackEvents.count,
             newestFeedbackEventID: feedbackEvents.last?.id,
             lastReconciledAt: lastReconciledAt,
-            lastError: lastError
+            lastError: measurementError ?? lastError
         )
     }
 
@@ -861,14 +913,19 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 evidenceIDs: event.evidenceIDs
             )
         }
-        let snapshot = (try? feedbackReducer.rebuild(
-            seeds: seeds,
-            events: applicable,
-            through: bucket
-        )) ?? (try? feedbackReducer.rebuild(seeds: seeds, events: []))
-            ?? ContextFeedbackSnapshot(states: [])
-        cachedFeedback = (generation.generation.id, feedbackOrdinal, bucket, snapshot)
-        return snapshot
+        do {
+            let snapshot = try feedbackReducer.rebuild(seeds: seeds, events: applicable, through: bucket)
+            cachedFeedback = (generation.generation.id, feedbackOrdinal, bucket, snapshot)
+            publishedFeedback = snapshot
+            return snapshot
+        } catch {
+            // The published feedback stands and the failed update is the
+            // receipt; nothing is rebuilt without the retained events, and
+            // nothing is cached, so the next turn tries the update again.
+            lastError = "a context feedback update could not be applied; the last published feedback stands: \(error)"
+            diagnostics("[context-flow] \(lastError ?? "")")
+            return publishedFeedback ?? ContextFeedbackSnapshot(states: [])
+        }
     }
 
     private func recordFeedback(
@@ -1321,30 +1378,6 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         return await reconcilePending(requestID: requestID)
     }
 
-    /// Turn preparations share one result. Only external demand supersedes
-    /// this flight; joining/retrying never creates another request ID.
-    private func reconcileLiveSources(_ identifiers: Set<String>) async -> Bool {
-        if let flight = liveSourceReconciliation { return await flight.value }
-        let flight = Task { await self.refreshLiveSources(identifiers) }
-        liveSourceReconciliation = flight
-        return await flight.value
-    }
-
-    private func refreshLiveSources(_ identifiers: Set<String>) async -> Bool {
-        defer { liveSourceReconciliation = nil }
-        var requestID = nextReconciliationRequestID &+ 1
-        var completed = await reconcile(registrations: [], reason: "turn_live_sources",
-                                        compiledProjectionIdentifiers: identifiers)
-        while !completed {
-            guard started, mode != .off, !Task.isCancelled else { return false }
-            // No newer demand means a real failure, never a self-retry.
-            guard requestID != nextReconciliationRequestID else { return false }
-            requestID = nextReconciliationRequestID
-            completed = await reconcilePending(requestID: requestID)
-        }
-        return true
-    }
-
     private func reconcilePending(requestID: UInt64) async -> Bool {
         // Launch used to compile twice at once (start, and the memory
         // migration's invalidation). Pending demand accumulates, so the newest
@@ -1572,41 +1605,7 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                 }
                 stored = loaded
             }
-            let mirrors = try await mirrorProvider.requiredDocumentMirrors()
-            let currentSnapshot = arena.currentSnapshot()
-            let snapshot: ContextGenerationSnapshot
-            if let currentSnapshot,
-               currentSnapshot.generationID == stored.generation.id,
-               currentSnapshot.sourceFingerprint == stored.generation.sourceFingerprint,
-               currentSnapshot.requiredDocumentMirrors == mirrors.sorted(by: { $0.personaID < $1.personaID }),
-               currentSnapshot.hotEntries.count + currentSnapshot.warmEntries.count == stored.atoms.count {
-                snapshot = currentSnapshot
-            } else {
-                snapshot = try Self.makeArenaSnapshot(stored: stored, mirrors: mirrors)
-            }
-            let outcome: ContextArenaPublicationOutcome?
-            if currentSnapshot == snapshot {
-                outcome = nil
-            } else if currentSnapshot?.generationID == stored.generation.id {
-                outcome = arena.rehydrate(snapshot)
-            } else {
-                outcome = arena.publish(snapshot)
-            }
-            switch outcome {
-            case nil, .published, .rehydrated:
-                lastError = nil
-                activateStoredGeneration(stored)
-                let pinnedGenerationIDs = Set(arena.metrics().pinnedGenerations.keys)
-                for provider in compiledProjectionProviders {
-                    provider.didPublish(
-                        candidate.projectionResults[provider.projectionIdentifier],
-                        generation: stored,
-                        retaining: pinnedGenerationIDs
-                    )
-                }
-            case .retainedLastGood(let failure, _):
-                throw ContextFlowCoordinatorError.arenaPublicationFailed(String(describing: failure))
-            }
+            try await activate(stored, projectionResults: candidate.projectionResults)
             lastReconciledAt = Date()
             acknowledge(candidate.batch)
             await pruneStoreIfDue()
@@ -1621,8 +1620,52 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
         }
     }
 
+    /// Make `stored` the generation turns read: its mirrors, arena snapshot
+    /// and projection identities publish together or not at all.
+    private func activate(
+        _ stored: ContextStoredGeneration,
+        projectionResults: [String: ContextCompiledProjectionResult]
+    ) async throws {
+        let mirrors = try await mirrorProvider.requiredDocumentMirrors()
+        let currentSnapshot = arena.currentSnapshot()
+        let snapshot: ContextGenerationSnapshot
+        if let currentSnapshot,
+           currentSnapshot.generationID == stored.generation.id,
+           currentSnapshot.sourceFingerprint == stored.generation.sourceFingerprint,
+           currentSnapshot.requiredDocumentMirrors == mirrors.sorted(by: { $0.personaID < $1.personaID }),
+           currentSnapshot.hotEntries.count + currentSnapshot.warmEntries.count == stored.atoms.count {
+            snapshot = currentSnapshot
+        } else {
+            snapshot = try Self.makeArenaSnapshot(stored: stored, mirrors: mirrors)
+        }
+        let outcome: ContextArenaPublicationOutcome?
+        if currentSnapshot == snapshot {
+            outcome = nil
+        } else if currentSnapshot?.generationID == stored.generation.id {
+            outcome = arena.rehydrate(snapshot)
+        } else {
+            outcome = arena.publish(snapshot)
+        }
+        switch outcome {
+        case nil, .published, .rehydrated:
+            lastError = nil
+            activateStoredGeneration(stored)
+            let pinnedGenerationIDs = Set(arena.metrics().pinnedGenerations.keys)
+            for provider in compiledProjectionProviders {
+                provider.didPublish(
+                    projectionResults[provider.projectionIdentifier],
+                    generation: stored,
+                    retaining: pinnedGenerationIDs
+                )
+            }
+        case .retainedLastGood(let failure, _):
+            throw ContextFlowCoordinatorError.arenaPublicationFailed(String(describing: failure))
+        }
+    }
+
     /// Bound retained generations and versions after successful commits.
-    /// Maintenance failures remain non-fatal; the next due commit retries.
+    /// Maintenance failures never block a commit; they stay in health until
+    /// the next due commit retries them.
     private func pruneStoreIfDue(now: Date = Date()) async {
         if let lastPruneAt, now.timeIntervalSince(lastPruneAt) < pruneInterval { return }
         do {
@@ -1638,12 +1681,13 @@ public actor ContextFlowCoordinator: DerivedStateInvalidationSink {
                     try await store.vacuum()
                     lastVacuumAt = now
                 } catch {
-                    // VACUUM is best-effort disk reclamation; a failure just
-                    // defers to the next due window.
+                    lastError = "context store vacuum failed; retried in the next due window: \(error)"
+                    diagnostics("[context-flow] \(lastError ?? "")")
                 }
             }
         } catch {
-            // Pruning is maintenance, never a reconcile blocker.
+            lastError = "context store prune failed; retried at the next due commit: \(error)"
+            diagnostics("[context-flow] \(lastError ?? "")")
         }
     }
 

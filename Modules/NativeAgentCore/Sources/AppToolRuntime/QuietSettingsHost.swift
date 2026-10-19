@@ -107,11 +107,14 @@ public struct QuietProviderModel: Sendable {
 public struct QuietProviderAccount: Sendable {
     public let id: String
     public let authState: String
+    /// ProviderRouting's published eligibility; `authState` is never read for it.
+    public let eligible: Bool
     public let models: [QuietProviderModel]
 
-    public init(id: String, authState: String, models: [QuietProviderModel]) {
+    public init(id: String, authState: String, eligible: Bool, models: [QuietProviderModel]) {
         self.id = id
         self.authState = authState
+        self.eligible = eligible
         self.models = models
     }
 }

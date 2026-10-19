@@ -166,21 +166,31 @@ actor ToolPrimitiveBroker {
         let signal = SwiftNativeToolExecution.fields(SkillRunContext.input ?? .null)["signal"]
         let suffix = if case .string(let signal)? = signal { [signal] } else { [String]() }
         let auditPurpose = (["ability", abilityID, purpose] + suffix).joined(separator: ":")
-        let reply = try await LLMCallContext.$purpose.withValue(auditPurpose) {
+        let (reply, cut) = try await LLMCallContext.$purpose.withValue(auditPurpose) {
             try await LLMCallContext.$turnTokenBudget.withValue(nil) {
             try await LLMCallContext.$botOutputTokenLimit.withValue(nil) {
             try await LLMCallContext.$systemSegments.withValue(nil) {
             try await ConversationPrefixTelemetry.$sink.withValue(.unmeasuredRequestShape) {
                 var reply = ""
+                var cut: LLMToolBoundaryReason?
                 for try await event in client.streamMessages(messages: messages, system: nil, model: model,
                     surface: LLMCallContext.surface ?? "chat", tools: nil) {
-                    if case .textDelta(let text) = event { reply += text }
+                    switch event {
+                    case .textDelta(let text): reply += text
+                    case .toolBoundary(let reason): cut = cut ?? reason
+                    default: break
+                    }
                 }
-                return reply
+                return (reply, cut)
             }
             }
             }
             }
+        }
+        // A reply the stream cut short is not an answer: it comes back as incomplete.
+        if let cut {
+            throw SenseFailure(code: "incomplete", message: "model.call stopped early (\(cut.rawValue)) after \(reply.count) characters; "
+                + "the partial reply is not returned as an answer. Ask for less, or split the request.")
         }
         guard let schema = args["schema"] else { return .string(reply) }
         let value = try JSONValue.parse(Data(reply.utf8))

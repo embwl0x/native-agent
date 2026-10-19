@@ -9,6 +9,7 @@ import MacControl
 import PersistenceCore
 import ToolRegistry
 import Transcripts
+import TurnTrace
 import ProviderRouting
 
 struct ICloudChatReplacementIntent: Equatable, Sendable {
@@ -225,6 +226,13 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         } else {
             resolvedSessionID = UUID().uuidString
         }
+        // The run is registered for Stop at admission, before any await: a Stop
+        // from here on names this message's run wherever it has got to, and the
+        // turn's own acceptance of the same run is the same registration.
+        let turnID = TurnTraceContext.mintTurnId()
+        let stopFlag = ChatCancelFlag.accept(dataRoot: PersistenceCore.defaultDataRoot(),
+                                             sessionId: resolvedSessionID, runId: msg.id, turnId: turnID)
+        defer { ChatCancelFlag.finish(stopFlag) }
         do {
             try await iCloudBridge.bindReplySession(msg, sessionID: resolvedSessionID, dataRoot: PersistenceCore.defaultDataRoot())
         } catch {
@@ -364,6 +372,7 @@ public struct ICloudIncomingTurnForwarder: Sendable {
         let streamTask = Task.detached(priority: .userInitiated) { () -> (text: String, deltaSeq: Int, error: String?, toolEvents: Int) in
             do {
             return try await TurnAdmission.shared.run(sessionID: resolvedSessionID) {
+            return await TurnTraceContext.$turnId.withValue(turnID) {
             await ChatPersistenceContext.$pinnedTurnRunID.withValue(msg.id) {
             await ChatToolSessionContext.$commandSignatureVerified.withValue(commandSignatureVerified) {
             var accumulated = ""
@@ -570,9 +579,11 @@ public struct ICloudIncomingTurnForwarder: Sendable {
             // Keep the phone's admission slot until that writer has joined.
             await execution.waitForProducerTermination()
             } onCancel: {
-                execution.cancel()
+                // Stop is the turn's one cancel link: the run's flag, not the stream.
+                Task { try? await MacChatTurnRuntime(dataRoot: PersistenceCore.defaultDataRoot()).stop(sessionId: resolvedSessionID) }
             }
             return (accumulated, deltaCoalescer.sequence, sawError, toolEventCounter)
+            }
             }
             }
             }

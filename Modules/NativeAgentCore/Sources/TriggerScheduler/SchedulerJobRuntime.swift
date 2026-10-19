@@ -39,7 +39,8 @@ public enum SchedulerJobRuntime {
               let schedule = wallClockSchedule(job) else { return nil }
         let zone = SchedulerJobNormalizer.resolveTimezone(schedule["timezone"] ?? schedule["tz"])
         func civil(_ value: JSONValue?) -> Double? {
-            string(value).flatMap(SchedulerJobNormalizer.parseISO).flatMap {
+            // Machine stamps: an offset-less one was written as UTC.
+            string(value).flatMap { SchedulerJobNormalizer.parseISO($0, zone: TimeZone(secondsFromGMT: 0)!) }.flatMap {
                 civilEpoch(occurrence(at: Date(timeIntervalSince1970: $0), zone: zone))
             }
         }

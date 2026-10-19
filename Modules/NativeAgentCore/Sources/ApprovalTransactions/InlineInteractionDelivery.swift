@@ -74,9 +74,16 @@ public enum InlineInteractionDelivery {
         if descriptor.control == .providerAPIKey, (payload["value"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return ["status": "error", "message": "Enter the provider key or setup token to continue. Browser sign-in needs the Mac."]
         }
+        let scope = payload["scope"].flatMap(InlineInteraction.Scope.init(rawValue:)) ?? card.primaryScope
+        if descriptor.control == .providerGroupModel, let picked = payload["choice"] {
+            let settled = try await InlineInteractionResolver.answerModelChoice(card, sessionID: session,
+                picked: picked, scope: scope, controls: { controls }, dataRoot: dataRoot)
+            return ["status": settled.state.failureReason == nil ? "ok" : "error",
+                    "ok": settled.state.failureReason == nil ? "true" : "false", "state": settled.state.name,
+                    "message": settled.state.failureReason ?? settled.state.outcome?.summary ?? ""]
+        }
         let running = try await InlineInteractionResolver.begin(id: id, sessionID: session,
             expectedRevision: revision, dataRoot: dataRoot)
-        let scope = payload["scope"].flatMap(InlineInteraction.Scope.init(rawValue:)) ?? card.primaryScope
         var setupError: String?
         var note: String?
         switch descriptor.control {
@@ -108,11 +115,6 @@ public enum InlineInteractionDelivery {
             if let flag = InlineInteractionRegistry.capabilityFlags[card.target] {
                 await controls.grantCapabilityFlag(policyKey: flag.policyKey, dataRoot: dataRoot, logTag: "signed-phone-card")
             }
-        case .providerGroupModel where (scope ?? .persistent) == .persistent:
-            do {
-                guard let picked = payload["choice"] else { throw ProviderRoutingError.invalidRequest }
-                try await InlineInteractionResolver.saveModelSelection(target: card.target, picked: picked, controls: controls)
-            } catch { setupError = error.localizedDescription }
         default: break
         }
         let settled = try await InlineInteractionResolver.complete(id: id, sessionID: session,
@@ -248,6 +250,8 @@ public enum InlineInteractionDelivery {
                     "severity": .string("actionable"), "status": .string("unread"),
                     "title": .string(title), "summary": .string(body),
                     "interaction_session_id": .string(sessionID), "interaction_id": .string(card.id),
+                    "presentation": InboxSourcePresentation(icon: "hand.raised.fill", badge: "REQUEST",
+                        words: "Asking you", actLabel: nil).row,
                     "actions": .array(choices + [
                         .object(["id": .string("act"), "label": .string("Open request")]),
                         .object(["id": .string("reject"), "label": .string("Not now")]),

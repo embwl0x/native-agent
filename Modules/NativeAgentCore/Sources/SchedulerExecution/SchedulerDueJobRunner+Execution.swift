@@ -57,10 +57,12 @@ extension SchedulerDueJobRunner {
             )
         case .part:
             // The deadline only fires the signal; the run is the stem's, on its own gate chain.
-            // Fires that land while the part's run still waits are one news.
+            // Fires that land while the part's run still waits are one news. Posting is all
+            // this job knows: acceptance is the part's run, never claimed here.
             let part = string(job.payload["part"]) ?? "", signal = string(job.payload["signal"]) ?? ""
             AbilityStore(dataRoot: root).signal(signal, part: part)
-            return JobResult(status: "completed", detail: "\(signal) delivered to \(part)", output: .object(["part": .string(part)]))
+            return JobResult(status: "completed", detail: "\(signal) posted for \(part); not yet accepted by its run",
+                             output: .object(["part": .string(part), "delivery": .string("posted")]))
         case .workshop:
             let title = string(job.payload["title"]) ?? job.name
             let objective = string(job.payload["objective"]) ?? ""
@@ -330,7 +332,8 @@ extension SchedulerDueJobRunner {
             severity: entries > 0 || failedWithoutEntry ? "important" : "info",
             jobId: job.id,
             itemId: itemId,
-            relatedPaths: paths
+            relatedPaths: paths,
+            presentation: Self.dreamCardPresentation
         )
         let archivedDreamCards = try await archiveOlderDreamInboxItems(keeping: itemId)
         let delivery = entries > 0
@@ -424,7 +427,8 @@ extension SchedulerDueJobRunner {
             severity: "info",
             jobId: job.id,
             itemId: itemId,
-            relatedPaths: paths
+            relatedPaths: paths,
+            presentation: Self.remCardPresentation
         )
         let delivery = await postCycleNotification(title: title, body: Self.notificationBody(message), jobId: job.id, source: "rem_cycle", itemId: itemId)
         var outputObj = Self.object(output)

@@ -82,21 +82,31 @@ struct ReachLedger: Codable, Equatable {
         /// When the thing itself happened, for the delivery-time re-check.
         var at: Date?
 
-        /// `sending` is written before delivery; one a crash left behind may
-        /// have reached him, so it counts as sent everywhere.
-        var isSent: Bool { outcome == "sent" || outcome == "sending" }
+        /// Confirmed in his conversation.
+        var isSent: Bool { outcome == "sent" }
+        /// `sending` is written before delivery and a crash can leave it
+        /// behind: it may have reached him, so pacing holds back for it, but
+        /// it is never counted as sent nor settled as answered.
+        var mayHaveReachedHim: Bool { isSent || outcome == "sending" }
     }
     var offers: [Offer] = []
     static let cap = 40
 
     static func url(_ root: URL) -> URL { root.appendingPathComponent("cognition/reach.json") }
 
-    static func read(_ root: URL) -> ReachLedger {
-        (try? Data(contentsOf: url(root))).flatMap {
+    /// Nil when the ledger exists and cannot be read: an unreadable history
+    /// is never an empty one to pace by or write over, so outreach waits.
+    static func read(_ root: URL) -> ReachLedger? {
+        guard FileManager.default.fileExists(atPath: url(root).path) else { return ReachLedger() }
+        do {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .secondsSince1970
-            return try? decoder.decode(ReachLedger.self, from: $0)
-        } ?? ReachLedger()
+            return try decoder.decode(ReachLedger.self, from: Data(contentsOf: url(root)))
+        } catch {
+            nativeLog("reach: ledger %@ unreadable, outreach paused until it reads: %@",
+                      url(root).path, error.localizedDescription)
+            return nil
+        }
     }
 
     @discardableResult
@@ -139,6 +149,7 @@ struct ReachLedger: Codable, Equatable {
         for offer in offers where offer.isSent { subjects[offer.subject, default: 0] += 1 }
         var out: [String: JSONValue] = [
             "outreach_7d": .int(Int64(week.filter(\.isSent).count)),
+            "unconfirmed_7d": .int(Int64(week.filter { $0.outcome == "sending" }.count)),
             "answered": .int(Int64(offers.filter { $0.answered == true }.count)),
             "unanswered": .int(Int64(offers.filter { $0.answered == false }.count)),
             "interruptions_7d": .int(Int64(week.filter { $0.knocked == true }.count)),
@@ -197,7 +208,7 @@ enum Reach {
     /// apart, and after a message he has not come back to, nothing more until
     /// he takes a turn — no escalation.
     static func pace(_ t: Timing, ledger: ReachLedger) -> Verdict {
-        let sent = ledger.offers.filter(\.isSent).compactMap(\.sentAt)
+        let sent = ledger.offers.filter(\.mayHaveReachedHim).compactMap(\.sentAt)
         if sent.filter({ t.calendar.isDate($0, inSameDayAs: t.now) }).count >= dailyCap { return .dailyCap }
         guard let last = sent.max() else { return .offer }
         if t.now.timeIntervalSince(last) < minimumSpacing { return .spacing }
@@ -328,7 +339,7 @@ extension NativeCognitionRuntime {
     func withdrawReachIfDisabled() {
         guard !reachEnabled else { return }
         _ = ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "reach")
-        var ledger = ReachLedger.read(dataRoot)
+        guard var ledger = ReachLedger.read(dataRoot) else { return }
         var changed = false
         for index in ledger.offers.indices where ledger.offers[index].outcome == "offered" {
             ledger.offers[index].outcome = "withheld"
@@ -366,7 +377,7 @@ extension NativeCognitionRuntime {
         // Each read-modify-write of the ledger below is one synchronous
         // segment on this actor: no await between the read and the write, so
         // a delivery's `sending` row can never be overwritten by a stale copy.
-        var ledger = ReachLedger.read(dataRoot)
+        guard var ledger = ReachLedger.read(dataRoot) else { return }
         var changed = ledger.settleAnswers(lastUserTurn: timing.lastUserTurn, now: instant)
         // An offer still waiting for her wake whose moment has passed (he came
         // back, quiet hours began) is taken back before it costs a turn.
@@ -389,7 +400,8 @@ extension NativeCognitionRuntime {
             return
         }
         // Fresh read, decided and written in one segment.
-        ledger = ReachLedger.read(dataRoot)
+        guard let fresh = ReachLedger.read(dataRoot) else { return }
+        ledger = fresh
         guard let pick = candidates.first(where: {
             Reach.decide($0, timing: timing, ledger: ledger, rejectedSources: rejected) == .offer
         }) else { return }
@@ -430,9 +442,9 @@ extension NativeCognitionRuntime {
         let anchor = ConversationAnchor.currentSessionId(dataRoot: dataRoot).flatMap { $0 == ResidentWake.session ? nil : $0 }
         // One segment: every gate again on delivery time, then a durable
         // `sending` row BEFORE anything can reach him. A crash after delivery
-        // leaves that row, which counts as sent, so the no-reply gate can never
-        // reopen on a message he has.
-        var ledger = ReachLedger.read(dataRoot)
+        // leaves that row, which pacing holds back for, so the no-reply gate
+        // can never reopen on a message he may have.
+        guard var ledger = ReachLedger.read(dataRoot) else { return }
         guard let index = ledger.offers.firstIndex(where: { $0.id == itemID && $0.outcome == "offered" }) else { return }
         if Reach.isDecline(text) {
             ledger.offers[index].outcome = "declined"
@@ -472,9 +484,10 @@ extension NativeCognitionRuntime {
                 // "Not proven posted"; the seam rolled its own claim back.
                 nativeLog("reach: not delivered: %@", error.localizedDescription)
             }
-            // One segment again: patch this row only, on a fresh read.
-            ledger = ReachLedger.read(dataRoot)
-            if let row = ledger.offers.firstIndex(where: { $0.id == itemID }) {
+            // One segment again: patch this row only, on a fresh read. An
+            // unreadable ledger leaves the row `sending`: uncertain, not sent.
+            if let fresh = ReachLedger.read(dataRoot), let row = fresh.offers.firstIndex(where: { $0.id == itemID }) {
+                ledger = fresh
                 ledger.offers[row].outcome = outcome
                 ledger.offers[row].knocked = knocked
                 if outcome != "sent" { ledger.offers[row].sentAt = nil }
@@ -543,7 +556,8 @@ extension NativeCognitionRuntime {
             }
         }
 
-        let builders = Self.builderNews(dataRoot: dataRoot, unseenOnly: true)
+        // Outreach offers only what it read; an unreadable record offers nothing.
+        let builders = Self.builderNews(dataRoot: dataRoot, unseenOnly: true).builders
         for builder in builders where PeerTrust.ownerTrusts(builder.lane, dataRoot: dataRoot) {
             guard let newest = builder.shipped.filter({ $0.1.count >= 6 }).max(by: { $0.0 < $1.0 }) else { continue }
             out.append(ReachCandidate(
@@ -555,7 +569,7 @@ extension NativeCognitionRuntime {
         }
 
         // A dream association, only about him and gentle, marked as a dream.
-        if let diary = Self.livingDiary(dataRoot: dataRoot, now: instant),
+        if let diary = try? Self.livingDiary(dataRoot: dataRoot, now: instant),
            let markdown = try? String(contentsOf: diary.url, encoding: .utf8) {
             for (index, phrase) in Self.dreamThemeCandidates(markdown).phrases.enumerated()
             where Reach.isGentleAboutHim(phrase, person: person) {

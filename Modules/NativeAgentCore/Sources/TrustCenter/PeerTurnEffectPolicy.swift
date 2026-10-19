@@ -3,219 +3,29 @@ import PersistenceCore
 import ToolRegistry
 
 /// Peer sessions receive the ordinary full Agent context and tool policy.
-/// The extra peer approval rule protects destructive/unknown execution without
-/// making conversation itself require repeated approval. `isEffect` remains
-/// a general side-effect classifier; it is not the approval predicate.
+/// What a peer the person has not trusted may do alone is read; every other
+/// call it steers is the person's card, decided by the call's declared class.
 public enum PeerTurnEffectPolicy {
-    /// The extra peer-origin approval rule is narrower than the general
-    /// side-effect classifier. A saved connection authorizes conversation;
-    /// merely reading a reply must not turn the next message into a new ask.
-    /// Normal TrustCenter and domain gates still run independently.
+    /// The declared contract, not a name or argument reading: a peer-steered
+    /// call that is not a read needs the person. The other parameters are the
+    /// callers' old shape and decide nothing.
     public static func requiresPeerApproval(
         _ tool: String,
-        capabilities: [String],
+        capabilities: [String] = [],
         externalToolIsEffect: ((String) -> Bool)? = nil,
         input: [String: JSONValue] = [:],
         workspaceRoot: URL? = nil,
         relativeBases: [URL] = [],
         fullMac: Bool = false
     ) -> Bool {
-        let name = normalized(tool)
-        // These dispatchers own their connection, route and executable checks.
-        // A host-backed message may carry a shell capability for its transport;
-        // that does not make its text an arbitrary local shell command.
-        // claude/codex/omp_message are not exempt; they carry no shell or
-        // process capability, so they card only on the floors below.
-        if ["agent_message", "agent_read", "bot_ask"].contains(name) { return false }
-        // An app write can send or delete through the declared app's own reach.
-        if name == "apps_call", !AuthoredToolEffects.appReadOnly(input) { return true }
-        let destructive: Set<String> = ["destructive", "filesystem_delete", "system_permission_reset"]
-        if !destructive.isDisjoint(with: capabilities) { return true }
-        if isPersonaSettingWrite(tool: name, input: input) { return true }
-        // Agent 10-02: under Full Mac what she does on a peer's word is her
-        // call, and he sees each as a decided row. Three acts stay the
-        // person's: a delete or irreversible loss (the set above, and the
-        // app's own), a send or post in his name, and a write to her persona
-        // (by its tools or by a path under persona/). Messaging a peer back is
-        // a routine peer step, not a send in his name.
-        if fullMac {
-            // Folded actions re-enter under their tool's name and keep that
-            // call's approval/replay. The outer app call only passes them on.
-            let action = string(input["action"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-            let appAction = AppActionBinding.action(tool: name, input: input)
-            let passesThrough = name == "app" && appAction?.folded == true
-            // A preview does nothing, so it never cards. An id the table doesn't
-            // know can never run (the door refuses it as unknown_action); only
-            // before the table is installed does a missing entry card.
-            if name == "app", input["preview"] == .bool(true) { return false }
-            if name == "app", !passesThrough, !action.isEmpty, appAction == nil, !AppActionBinding.isRegistered { return true }
-            // A delete to trash is reversible, but still belongs on the delete floor.
-            // inbox.approve stays on this floor for a peer turn: a card can carry a
-            // persona or growth change, and only the person approves those for a peer.
-            if !passesThrough, appAction?.isHis == true || appAction?.irreversible == true
-                || appAction?.lifecycle == .drop { return true }
-            if capabilities.contains("external_send"), !capabilities.contains("notification"),
-               !capabilities.contains("approval_stage"),
-               !["claude_message", "codex_message", "omp_message"].contains(name) { return true }
-            if name == "github_mutate" { return true }
-            if ["persona_write", "persona_append_section"].contains(name) { return true }
-            let writes: Set<String> = ["filesystem_write", "shell", "process_spawn"]
-            return !writes.isDisjoint(with: capabilities) && mentionsPersonaPath(.object(input))
-        }
-        // Match the executor's sandbox parsing. Omitted or invalid values
-        // execute as workspace-write and must keep the peer approval card.
-        if name == "invoke_codex", case .string(let sandbox)? = input["sandbox"],
-           sandbox.lowercased() == "read-only" { return false }
-        // Arbitrary code and unknown external effects cannot be established as
-        // non-destructive from a peer's description. Keep their existing ask.
-        if capabilities.contains("shell") || capabilities.contains("process_spawn") { return true }
-        // 2026-09-22: a write outside her workspace (her data root, the
-        // person's files) is the person's call.
-        if capabilities.contains("filesystem_write"), let workspaceRoot,
-           writesOutsideWorkspace(input: input, workspaceRoot: workspaceRoot, relativeBases: relativeBases) {
-            return true
-        }
-        if name.hasPrefix("mcp__") { return externalToolIsEffect?(name) ?? true }
-        return externalToolIsEffect?(tool) ?? false
+        // A folded door action is a read here: it re-enters under its own tool and is judged there.
+        PermissionLaw.toolClass(tool, input: input) != .read
     }
-
-    /// Any string in the call naming a path under `persona/` (a target, a
-    /// shell command, a patch header).
-    static func mentionsPersonaPath(_ value: JSONValue) -> Bool {
-        switch value {
-        case .string(let text):
-            return text.range(of: #"(^|[^A-Za-z0-9_])persona/"#, options: [.regularExpression, .caseInsensitive]) != nil
-        case .array(let items): return items.contains(where: mentionsPersonaPath)
-        case .object(let fields): return fields.values.contains(where: mentionsPersonaPath)
-        default: return false
-        }
-    }
-
-    /// Every target path, resolved the way the file tools will: a relative
-    /// path against the workspace AND every other base a write may use (Full
-    /// Mac file ops resolve against the source repo), `~` expanded, symlinks
-    /// resolved. A `..` component is not resolved confidently, so it counts
-    /// as outside. `content` is skipped so a file body starting with "/" is
-    /// not mistaken for a target.
-    static func writesOutsideWorkspace(input: [String: JSONValue], workspaceRoot: URL,
-                                       relativeBases: [URL]) -> Bool {
-        let fields = input.filter { $0.key != "content" }
-        var targets = SwiftNativeSecurityCenter.pathLikeStrings(in: .object(fields))
-        for key in ["source", "destination", "dest", "src", "to", "from"] {
-            if case .string(let value)? = fields[key] { targets.append(value) }
-        }
-        for raw in targets {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            if trimmed.split(separator: "/").contains("..") { return true }
-            let expanded = HomePath.expand(trimmed)
-            let candidates = expanded.hasPrefix("/")
-                ? [URL(fileURLWithPath: expanded)]
-                : ([workspaceRoot] + relativeBases).map { $0.appendingPathComponent(expanded) }
-            if candidates.contains(where: { candidate in
-                guard let resolved = resolvedWriteTarget(candidate) else { return true }
-                return !SwiftNativeSecurityCenter.isSelfOrAncestor(root: workspaceRoot, of: resolved)
-            }) { return true }
-        }
-        return false
-    }
-
-    /// The real location a write would land: the deepest existing ancestor
-    /// through realpath (so a symlinked directory counts where it points),
-    /// plus the not-yet-created remainder. Nil when that cannot be proven —
-    /// e.g. a dangling symlink — which the caller treats as outside.
-    static func resolvedWriteTarget(_ url: URL) -> URL? {
-        var existing = url.standardizedFileURL
-        var tail: [String] = []
-        while (try? FileManager.default.attributesOfItem(atPath: existing.path)) == nil {
-            guard existing.path != "/" else { return nil }
-            tail.insert(existing.lastPathComponent, at: 0)
-            existing.deleteLastPathComponent()
-        }
-        guard let real = realpath(existing.path, nil) else { return nil }
-        defer { free(real) }
-        var resolved = URL(fileURLWithPath: String(cString: real))
-        for part in tail { resolved.appendPathComponent(part) }
-        return resolved
-    }
-
-    /// Effect tools whose NAME does not carry an effect verb, so the token
-    /// rule below cannot see them. Durable writes to her own mind, to the
-    /// person's configuration, and to the outside world.
-    static let effectTools: Set<String> = [
-        // Her mind and the person's configuration.
-        "persona_write", "persona_append_section", "save_skill",
-        "forget_memory", "rebuild_knowledge_graph",
-        "hold_view", "release_view",
-        "studio_canon_resolve", "bot_ask",
-        "mac_calendar_modify_event",
-        // Desk STATE transitions whose names carry no effect verb.
-        "desk_blocked_on", "desk_breakdown",
-        // Shell, builder and Mac verbs. Sol, 2026-09-15: `screen`, `wait`,
-        // `menu`, `mac_look`, `mac_view` and `mac_attention` are registered
-        // READ/PERCEPTION tools — looking at the screen changes nothing, and
-        // gating them made her blind on a peer turn for no safety. Only the
-        // verbs that MOVE the Mac stay.
-        "shell", "bash", "git", "apply_patch",
-        "swift_build", "swift_test", "act", "go", "mac_wake",
-        // Outward sends and other agents.
-        "agent_message", "claude_message", "codex_message", "omp_message",
-        "invoke_codex", "agent_swarm",
-        "mail_reply", "mail_archive", "mail_triage_batch", "github_mutate",
-        // Defaults `persist: true` and REPLACES the durable tracking config,
-        // so the name's "discover" reads like a probe and is not one.
-        "github_discover_tracking", "github_project_digest",
-    ]
-
-    /// Underscore-separated name tokens that mean "this call changes
-    /// something". Matched as whole tokens, never substrings, so
-    /// `app_settings_list` (tokens: app, settings, list) stays a read while
-    /// `app_setting_set` (…, set) does not.
-    static let effectVerbs: Set<String> = [
-        "send", "post", "write", "create", "update", "delete", "remove", "add",
-        "set", "act", "notify", "install", "uninstall", "execute", "submit",
-        "control", "click", "type", "keystroke", "scroll", "drag", "fill",
-        "press", "keypress", "quit", "open", "navigate", "mutate", "run",
-        "build", "restart", "propose", "withdraw", "connect", "invoke",
-        "apply", "acquire", "release", "hold", "reply", "mark", "complete",
-        "focus", "select", "renew", "mute", "unmute", "render", "generate",
-        "pause", "amend", "defer", "close", "archive", "review", "save", "modify", "nudge",
-    ]
 
     public static func normalized(_ tool: String) -> String {
         tool.trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: ".", with: "_")
-    }
-
-    /// External MCP tools (`mcp__server__tool`) are named by somebody else, so
-    /// the verb rule above means nothing for them — `mcp__broker__place_order`
-    /// and `mcp__docs__place_lookup` are the same shape. `externalToolIsEffect`
-    /// asks the MCP registry for that tool's own risk metadata instead.
-    ///
-    /// Fail closed: no resolver, or a server that ships no metadata, means the
-    /// call ASKS. That is the safe direction here — the worst case is the
-    /// person seeing a card for a read, never a peer moving money unattended.
-    static let ownNotes: Set<String> = [
-        "commit_memory", "studio_journal", "studio_journal_amend", "studio_consult",
-        "desk_note", "desk_work_log", "shelf_entry", "task_ledger_post",
-    ]
-
-    public static func isEffect(
-        _ tool: String,
-        externalToolIsEffect: ((String) -> Bool)? = nil
-    ) -> Bool {
-        let name = normalized(tool)
-        if name.isEmpty { return false }
-        if name.hasPrefix("mcp__") { return externalToolIsEffect?(name) ?? true }
-        // Her OWN notes (Agent's ruling, 2026-09-15): a note of her own
-        // volition appends to her own mind and never asks the person.
-        // commit_memory carries its own provenance rule instead.
-        if ownNotes.contains(name) { return false }
-        if effectTools.contains(name) { return true }
-        if name.split(separator: "_").contains(where: { effectVerbs.contains(String($0)) }) { return true }
-        // Custom registry tools execute code regardless of their chosen name.
-        return externalToolIsEffect?(tool) ?? false
     }
 
     /// The opening of the bridge turn header the transport prepends to a
@@ -277,11 +87,11 @@ public enum PeerTurnEffectPolicy {
         let who = requester.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = who.isEmpty ? "another agent" : who
         return "\(name) asked for this on the agent bridge, not you. "
-            + "\(tool) may perform a destructive action, so it waits for you."
+            + "\(tool) is not a read, so it waits for you."
     }
 
-    /// The Full Mac floor's card: whose turn it was, and the line of theirs
-    /// that led here (Agent, 10-02).
+    /// The floor's card: whose turn it was, the line of theirs that led
+    /// here (Agent, 10-02), and what the call is by its declared class.
     public static func floorReason(tool: String, input: [String: JSONValue] = [:], capabilities: Set<String> = [],
                                    requester: String, quote: String) -> String {
         let who = requester.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -289,34 +99,14 @@ public enum PeerTurnEffectPolicy {
         // Name the act itself: through the app door that is the action, not "app".
         var shown = tool
         if tool == "app", case .string(let action)? = input["action"] { shown = action }
-        let kind: String
-        if ["chat.send"].contains(shown) || tool == "github_mutate" || capabilities.contains("external_send") {
-            kind = "a send in your name"
-        } else if shown.hasSuffix(".approve") || shown == "mind.approve_view" {
-            kind = "an approval"
-        } else if ["persona_write", "persona_append_section"].contains(tool) || isPersonaSettingWrite(tool: tool, input: input) {
-            kind = "a persona write"
-        } else {
-            kind = "a delete or something that can't be undone"
+        let ran = ToolNameAliases.ranCall(tool, input: input)
+        let kind = switch PermissionLaw.toolClass(ran.tool, input: ran.input) {
+        case .send: "a send"
+        case .destructive: "a delete or something that can't be undone"
+        case .read, .write: "a change"
         }
         return "This turn was steered by \(who.isEmpty ? "another agent" : who), not you.\(said) "
             + "\(shown) is \(kind), so it waits for you."
-    }
-
-    /// The setting registry accepts both IDs and labels.
-    public static func isPersonaSettingWrite(tool: String, input: [String: JSONValue]) -> Bool {
-        let name = normalized(tool)
-        let args: [String: JSONValue]
-        if name == "app" {
-            guard input["preview"] != .bool(true),
-                  normalized(string(input["action"]) ?? "") == "setting_set",
-                  case .object(let given)? = input["args"] else { return false }
-            args = given
-        } else if name == "app_setting_set" {
-            args = input
-        } else { return false }
-        let setting = string(args["setting"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        return ["personality.boundaries", "boundaries", "personality.forbidden_patterns", "forbidden patterns"].contains(setting)
     }
 
     /// Agent's ruling, 2026-09-15: her OWN memory notes stay allowed on a peer

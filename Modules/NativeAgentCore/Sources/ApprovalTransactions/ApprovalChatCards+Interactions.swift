@@ -24,8 +24,7 @@ extension ApprovalChatCards {
     /// Telegram. Kinds answered by a pick get buttons there; the rest a line.
     static func telegramReach(_ card: InlineInteraction) -> (send: Bool, buttons: Bool) {
         switch card.kind {
-        case .choose: return (true, true)
-        case .modelChoice: return (true, card.primaryScope == .thisRequestOnly)
+        case .choose, .modelChoice: return (true, true)
         case .permission, .capability: return (true, false)
         case .connector, .apiKey, .unknown: return (false, false)
         }
@@ -160,11 +159,12 @@ extension ApprovalChatCards {
         let summary = card.state.outcome?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // Telegram caps a message at 4096 characters.
         let text = String((title + "\n\n" + (summary.isEmpty ? "Closed." : "✓ " + NativeAppSecretRedactor.redactText(summary))).prefix(3500))
-        // One attempt: a deleted message or a refused edit won't succeed later either.
-        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
-        guard (try? await inbox.patch(id: "interaction:\(id)", unlessPresent: "telegram_card_settled", ["telegram_card_settled": .bool(true)])) == true else { return }
+        // Settled on Telegram's receipt only: a failed edit stays outstanding,
+        // and the card's next change tries it again.
         do {
             try await filer.settleChatCard(chatId: chatId, messageId: messageId, text: text)
+            let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+            _ = try await inbox.patch(id: "interaction:\(id)", unlessPresent: "telegram_card_settled", ["telegram_card_settled": .bool(true)])
         } catch {
             nativeLog("[approval-chat-card] Telegram settle failed: %@", error.localizedDescription)
         }
@@ -200,17 +200,17 @@ extension ApprovalChatCards {
                                                             expectedRevision: card.revision, dataRoot: dataRoot)
             return "Not now — \(card.declineConsequence)"
         }
-        if card.kind == .modelChoice, card.primaryScope != .thisRequestOnly {
-            return "Choose the model in Providers on the Mac."
-        }
         guard let choice, card.options.indices.contains(choice),
               !isControlOption(card.options[choice].id) else {
             return "Pick one of the card's buttons."
         }
-        let settled = try await InlineInteractionResolver.complete(
-            id: id, sessionID: session, selection: card.options[choice].id,
-            scope: card.kind == .modelChoice ? .thisRequestOnly : nil,
-            expectedRevision: card.revision, attribution: "User on Telegram", dataRoot: dataRoot)
+        let picked = card.options[choice].id
+        let settled = card.kind == .modelChoice
+            ? try await InlineInteractionResolver.answerModelChoice(card, sessionID: session, picked: picked,
+                scope: card.primaryScope, attribution: "User on Telegram",
+                controls: { @MainActor in InlineInteractionResolver.platform.interactionControls() }, dataRoot: dataRoot)
+            : try await InlineInteractionResolver.complete(id: id, sessionID: session, selection: picked,
+                expectedRevision: card.revision, attribution: "User on Telegram", dataRoot: dataRoot)
         return settled.state.failureReason ?? "Chose: \(card.options[choice].label)."
     }
 }

@@ -337,7 +337,6 @@ public actor SwiftNativeMemoryV2 {
     var actionIndexUpdate: Task<Void, Never>?
     var actionIndexDirty = false
     var actionIndexFailure: String?
-    var actionIndexWrite: Task<[String: [Float]], Error>?
     private struct EmbeddingRetryKey: Hashable {
         let epoch: String
         let kind: String
@@ -354,14 +353,8 @@ public actor SwiftNativeMemoryV2 {
     // Reuse candidates only while their provider epoch and canonical content match.
     private var embeddingRetryVectors: [EmbeddingRetryKey: [Float]] = [:]
     private var embeddingReindexID: UUID?
-    /// (persona|surface) signatures whose persona-recall starvation has already
-    /// been reported. The alarm fires on the zero-hit path, which a tool loop
-    /// re-enters on every call: unbounded, it spams one error AND pays for one
-    /// extra store probe per call. Same bound as
-    /// `ContextFlowCoordinator.PrecoverageFailureReporter` — one line per
-    /// distinct failure, memoized per instance so tests never leak into
-    /// each other.
-    internal var reportedStarvationSignatures: Set<String> = []
+    var embeddingEpochReconcile: Task<Bool, Never>?
+    var embeddingEpochDirty = false
 
     internal func emitDiagnostic(_ message: String) {
         nativeLog("%@", message)
@@ -397,6 +390,15 @@ public actor SwiftNativeMemoryV2 {
         return try await storage.listMemory(kind: kind)
     }
 
+    /// The rows behind a turn's chosen atoms, by id, so the turn never speaks
+    /// one the store retired or narrowed after it was compiled.
+    public func memoryRecords(ids: [String]) async throws -> [MemoryRecord] {
+        try await ensureCanonicalAttachment()
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        return try await storage.lookupMemoryRecords(ids: ids)
+    }
+
+
     public func updateMemory(id: String, update: JSONValue) async throws -> MemoryRecord {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
@@ -411,7 +413,9 @@ public actor SwiftNativeMemoryV2 {
             existingKind = nil
         }
         let update = Self.sanitizedMemoryUpdate(update, existingKind: existingKind)
-        let newEmbedding = try await reembedIfContentChanged(update: update)
+        let newText = Self.patchText(update)
+        var newEmbedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?
+        if let newText { newEmbedding = try await residentWriteEmbedding(newText) }
         try await gateUpdatedContentAgainstTombstones(update: update, embedding: newEmbedding, storage: storage)
         let updated = try await storage.updateMemory(
             id: id,
@@ -419,8 +423,7 @@ public actor SwiftNativeMemoryV2 {
             newEmbedding: newEmbedding?.vector,
             embeddingEpoch: newEmbedding?.epoch
         )
-        await flushDerivedMemoryChanges()
-        return updated
+        return newText != nil && newEmbedding == nil ? owedVector(updated) : updated
     }
 
     /// Edits go through the same denylist gates as inserts: without this, a
@@ -450,12 +453,12 @@ public actor SwiftNativeMemoryV2 {
     }
 
     /// Foreground callers that distinguish a missing row use the atomic
-    /// deletion result while sharing the canonical projection completion.
+    /// deletion result. Derived indexes catch up on their own; a turn leaves
+    /// a retired memory out of published context.
     public func deleteMemoryIfPresent(id: String) async throws -> Bool {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let deleted = try await storage.deleteMemory(id: id)
-        await flushDerivedMemoryChanges()
         return deleted
     }
 
@@ -463,6 +466,32 @@ public actor SwiftNativeMemoryV2 {
     public func embedderDimensions() -> Int? { embedder?.dimensions }
 
     public func embeddingEpoch() -> MemoryEmbeddingEpoch? { embedder?.embeddingEpoch }
+
+    /// A write's vector from the resident model only: a cold model is never
+    /// loaded on a write. Nil means the row lands with its vector owed and the
+    /// write's record says so (`owedVector`).
+    func residentWriteEmbedding(_ text: String) async throws -> (vector: [Float], epoch: MemoryEmbeddingEpoch)? {
+        guard residentEmbeddingEpoch() != nil else { return nil }
+        return try await embedOneWithEpoch(text)
+    }
+
+    /// Called once the vector-less row has committed, so the fill finds it.
+    func owedVector(_ record: MemoryRecord) -> MemoryRecord {
+        requestEmbeddingEpochReconcile()
+        var record = record
+        var extras: [String: JSONValue] = [:]
+        if case .object(let current)? = record.extras { extras = current }
+        extras["vector_pending"] = .string("Saved; its search vector is owed until the memory-search model is resident, then MemoryV2 fills it. Until then semantic recall cannot find it.")
+        record.extras = .object(extras)
+        return record
+    }
+
+    /// The vector space a turn can query now. Nil while the managed model is
+    /// cold: a read names that instead of loading the model itself.
+    func residentEmbeddingEpoch() -> MemoryEmbeddingEpoch? {
+        guard let managed = embedder as? ManagedEmbeddingProvider else { return embedder?.embeddingEpoch }
+        return managed.residentEmbeddingEpoch
+    }
 
     /// Phase 5 D: vectors from the already-resident model, or nil. Never loads.
     public func embedIfWarm(_ texts: [String]) async -> [[Float]]? {
@@ -549,21 +578,6 @@ public actor SwiftNativeMemoryV2 {
             return MemoryEmbeddingBatch(epoch: embedder.embeddingEpoch, vectors: [])
         }
         return try await embedder.embedWithEpoch(texts)
-    }
-
-    func flushDerivedMemoryChanges() async {
-        if let bridge = storage {
-            let underlying = await bridge.underlyingStorage()
-            await underlying.flushProjectionHooks()
-        }
-        await DerivedStateInvalidationCenter.shared.flush()
-    }
-
-    public func configureEmbeddingMemoryMode(_ mode: String) async throws {
-        guard embedder is ManagedEmbeddingProvider else {
-            throw MemoryV2Error.underlying("embedding runtime is not configurable")
-        }
-        // Legacy mode requests already resolve to the single performance mode.
     }
 
     @discardableResult
@@ -677,15 +691,12 @@ public actor SwiftNativeMemoryV2 {
         return (vector, batch.epoch)
     }
 
-    private func reembedIfContentChanged(
-        update: JSONValue
-    ) async throws -> (vector: [Float], epoch: MemoryEmbeddingEpoch)? {
+    /// Only a patch carrying new `text`/`content` needs a vector; otherwise
+    /// the existing embedding stays valid.
+    private static func patchText(_ update: JSONValue) -> String? {
         guard case .object(let obj) = update else { return nil }
-        // Only re-embed if the patch carries a new `text`/`content` field; otherwise
-        // the existing embedding stays valid and we skip the (expensive) Neural Engine
-        // round-trip.
-        if case .string(let s)? = obj["text"] { return try await embedOneWithEpoch(s) }
-        if case .string(let s)? = obj["content"] { return try await embedOneWithEpoch(s) }
+        if case .string(let s)? = obj["text"] { return s }
+        if case .string(let s)? = obj["content"] { return s }
         return nil
     }
 

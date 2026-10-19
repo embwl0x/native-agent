@@ -17,12 +17,16 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
         public var requestID: String?
         public var readOnly = false
         public var runID: String?
+        /// Digest of the exact call (tool and full arguments): the same effect
+        /// proposed again has the same digest.
+        public var effect: String?
 
-        public init(id: String, tool: String, input: String, reference: [String: JSONValue]? = nil) {
+        public init(id: String, tool: String, input: String, reference: [String: JSONValue]? = nil, effect: String? = nil) {
             self.id = id
             self.tool = tool
             self.input = input
             self.reference = reference
+            self.effect = effect
         }
     }
     public var version = 1
@@ -171,6 +175,8 @@ public actor DeskContinuationTurn {
     private var writing = false
     private var writers: [CheckedContinuation<Void, Never>] = []
     private var fenced = false
+    /// Steps this process began; any other pending step lost its receipt.
+    private var begun: Set<String> = []
 
     public init(store: SwiftNativeDeskStore, record: DeskContinuation, handle: String? = nil) {
         self.store = store
@@ -215,11 +221,14 @@ public actor DeskContinuationTurn {
         try await save()
     }
 
-    public func begin(_ step: DeskContinuation.Step, peerSources: [String]) async throws {
+    /// Returns the step as admitted: a call whose earlier run lost its receipt
+    /// is admitted as that same step, so its settlement resolves it.
+    @discardableResult
+    public func begin(_ step: DeskContinuation.Step, peerSources: [String]) async throws -> DeskContinuation.Step {
         await acquireWriter()
         defer { releaseWriter() }
         retainPeerSources(peerSources)
-        guard handle != nil else { return }
+        guard handle != nil else { return step }
         guard !fenced, record.state == .running else {
             throw DeskContinuationError.unsafe
         }
@@ -230,10 +239,17 @@ public actor DeskContinuationTurn {
             throw DeskContinuationError.full
         }
         var inFlight = step
+        if let effect = step.effect,
+           let earlier = record.pending.first(where: { !begun.contains($0.id) && $0.tool == step.tool && $0.effect == effect }) {
+            inFlight.id = earlier.id
+            record.pending.removeAll { $0.id == earlier.id }
+        }
+        begun.insert(inFlight.id)
         inFlight.owner = "turn"
         inFlight.runID = record.runID
         record.pending.append(inFlight)
         try await save(requiresActive: true)
+        return inFlight
     }
 
     /// `settled` is true only for a definite outcome. An owner-run effect

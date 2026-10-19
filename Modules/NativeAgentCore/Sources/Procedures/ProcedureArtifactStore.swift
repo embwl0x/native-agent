@@ -145,6 +145,9 @@ public struct ProcedureArtifactStatusSnapshot: Sendable, Equatable {
     public let activeAutomaticProcedureCount: Int
     public let automaticSelectionEnabled: Bool
     public let payloadFree: Bool
+    /// Sources this snapshot could not read or resolve, each with its cause.
+    /// Empty means every count above was observed, zeros included.
+    public let unreadable: [String]
 }
 
 /// Injected-root immutable artifact owner plus a manual-only canonical
@@ -155,6 +158,8 @@ public actor ProcedureArtifactStore {
     package let root: URL
     package let persistence: any PersistenceCoreProtocol
     package let clock: @Sendable () -> Date
+    private var retentionFlight: Task<Void, Never>?
+    private var retentionOwed = false
 
     public init(
         dataRoot: URL,
@@ -202,9 +207,9 @@ public actor ProcedureArtifactStore {
             }
             try await persistence.writeJSON(value, to: path)
         }
-        // Best-effort GC after the install lands: retention must never fail
-        // the install that triggered it.
-        _ = await sweepUnreferencedArtifacts()
+        // Retention is housekeeping: it runs off this actor after the install
+        // lands, and neither the install nor a later selection waits for it.
+        requestRetentionSweep()
         return path
     }
 
@@ -255,7 +260,7 @@ public actor ProcedureArtifactStore {
         return artifact
     }
 
-    private func legacyRevalidationMatches(_ artifact: DeclarativeProcedureArtifact) -> Bool {
+    private nonisolated func legacyRevalidationMatches(_ artifact: DeclarativeProcedureArtifact) -> Bool {
         let path = legacyRevalidationPath(artifact.id)
         guard let data = Self.checkedRegularFile(path, maximumBytes: 64 * 1_024),
               let receipt = try? JSONValue.parse(data),
@@ -263,12 +268,12 @@ public actor ProcedureArtifactStore {
         return receipt == expected
     }
 
-    private func legacyRevalidationPath(_ artifactID: String) -> URL {
+    private nonisolated func legacyRevalidationPath(_ artifactID: String) -> URL {
         root.appendingPathComponent("legacy_revalidations", isDirectory: true)
             .appendingPathComponent("\(artifactID).json")
     }
 
-    private func legacyRevalidationReceipt(_ artifact: DeclarativeProcedureArtifact) throws -> JSONValue {
+    private nonisolated func legacyRevalidationReceipt(_ artifact: DeclarativeProcedureArtifact) throws -> JSONValue {
         .object([
             "schema": .string("declarative-procedure-revalidation.v1"),
             "artifactID": .string(artifact.id),
@@ -287,9 +292,6 @@ public actor ProcedureArtifactStore {
         if let domain, !Self.token(domain, maximum: 64) {
             throw ProcedureArtifactStoreError.invalidArtifact
         }
-        // Best-effort GC BEFORE the ceiling check so an over-ceiling store
-        // self-heals instead of fail-closing forever (audit 2026-07-21).
-        _ = await sweepUnreferencedArtifacts()
         let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
         guard FileManager.default.fileExists(atPath: artifactsDirectory.path) else { return [] }
         let urls: [URL]
@@ -305,6 +307,8 @@ public actor ProcedureArtifactStore {
             throw ProcedureArtifactStoreError.corruptArtifact
         }
         guard urls.count <= Self.maxInstalledArtifacts else {
+            // An over-ceiling store heals by its sweep, never fail-closed forever.
+            requestRetentionSweep()
             throw ProcedureArtifactStoreError.artifactCapacityExceeded
         }
         var artifacts: [DeclarativeProcedureArtifact] = []
@@ -332,12 +336,10 @@ public actor ProcedureArtifactStore {
     }
 
     public func statusSnapshot() async -> ProcedureArtifactStatusSnapshot {
-        let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
-        let artifactURLs = ((try? FileManager.default.contentsOfDirectory(
-            at: artifactsDirectory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )) ?? []).filter { $0.pathExtension == "json" }.prefix(1_024)
+        var unreadable: [String] = []
+        let artifactURLs = Self.statusListing(
+            root.appendingPathComponent("artifacts", isDirectory: true), unreadable: &unreadable
+        ).prefix(1_024)
         var validArtifacts = 0
         var corruptArtifacts = 0
         for url in artifactURLs {
@@ -357,11 +359,16 @@ public actor ProcedureArtifactStore {
         // invocation ledger from a bounded read that skipped malformed JSONL.
         // `tailJSONL` intentionally hides malformed physical rows for normal
         // consumers, but status is the explicit integrity-facing surface.
-        let invocationRead = try? await persistence.tailJSONLReadReceipt(
-            invocationPath,
-            limit: 10_000,
-            maxBytes: 8 * 1_024 * 1_024
-        )
+        var invocationRead: SwiftNativePersistenceCore.JSONLTailReadReceipt?
+        do {
+            invocationRead = try await persistence.tailJSONLReadReceipt(
+                invocationPath,
+                limit: 10_000,
+                maxBytes: 8 * 1_024 * 1_024
+            )
+        } catch {
+            unreadable.append("invocations.jsonl: \(error.localizedDescription)")
+        }
         let rows = invocationRead?.rows ?? []
         var corruptInvocations = invocationRead?.malformedJSONRowCount ?? 0
         let receipts = rows.compactMap { value -> ProcedureInvocationReceipt? in
@@ -385,8 +392,24 @@ public actor ProcedureArtifactStore {
             corruptActivationArtifactCount: activation.corruptActivationArtifactCount,
             activeAutomaticProcedureCount: activation.activeAutomaticProcedureCount,
             automaticSelectionEnabled: activation.activeAutomaticProcedureCount > 0,
-            payloadFree: true
+            payloadFree: true,
+            unreadable: unreadable + activation.unreadable
         )
+    }
+
+    /// A directory that does not exist is an observed empty one; any other
+    /// listing failure is a source the snapshot did not inspect.
+    static func statusListing(_ directory: URL, unreadable: inout [String]) -> [URL] {
+        do {
+            return try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+            ).filter { $0.pathExtension == "json" }
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return []
+        } catch {
+            unreadable.append("\(directory.lastPathComponent)/: \(error.localizedDescription)")
+            return []
+        }
     }
 
     /// Checked bounded evidence read for the existing procedure owner. This is
@@ -603,7 +626,7 @@ public actor ProcedureArtifactStore {
     /// stays put), never deletes a pointer-referenced artifact, and aborts
     /// entirely if any active pointer is undecodable (its artifactID is then
     /// unknowable, so nothing is provably safe to delete). Never throws — a GC
-    /// failure must not break install or discovery. Returns the removal count.
+    /// failure must not break install or discovery. Returns the confirmed removals.
     ///
     /// Round-3 audit (F3-M2): manual-invocable artifacts are loaded by
     /// `invoke()`/`invokeManual()` by artifactID with NO active pointer — the
@@ -617,8 +640,28 @@ public actor ProcedureArtifactStore {
     /// or undecodable ledger aborts the sweep, exactly like an undecodable
     /// pointer — a recent receipt we cannot parse might name an artifact we are
     /// about to delete.
+    /// One store-owned housekeeping flight: requests coalesce into it, a
+    /// request during a pass earns one more pass, and each pass runs off this
+    /// actor with its own single removal count.
+    func requestRetentionSweep() {
+        retentionOwed = true
+        guard retentionFlight == nil else { return }
+        retentionFlight = Task.detached(priority: .utility) { [self] in
+            while await claimRetentionPass() { _ = await sweepUnreferencedArtifacts() }
+        }
+    }
+
+    private func claimRetentionPass() -> Bool {
+        guard retentionOwed else {
+            retentionFlight = nil
+            return false
+        }
+        retentionOwed = false
+        return true
+    }
+
     @discardableResult
-    public func sweepUnreferencedArtifacts(now: Date = Date()) async -> Int {
+    public nonisolated func sweepUnreferencedArtifacts(now: Date = Date()) async -> Int {
         let fm = FileManager.default
         let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
         guard let urls = try? fm.contentsOfDirectory(
@@ -724,16 +767,27 @@ public actor ProcedureArtifactStore {
         candidates.sort { $0.modified < $1.modified }
         var removed = 0
         var remaining = urls.count
+        var failures: [String] = []
         for candidate in candidates {
             // Oldest-first: once a candidate is neither aged out nor needed
             // for the target, no later (newer) candidate is either.
             guard candidate.modified < cutoff || remaining > Self.artifactRetentionTarget else { break }
-            try? fm.removeItem(at: candidate.url)
-            removed += 1
-            remaining -= 1
+            // Counts follow effects: a file still present is neither removed
+            // nor off the retention bound.
+            do {
+                try fm.removeItem(at: candidate.url)
+                removed += 1
+                remaining -= 1
+            } catch {
+                failures.append("\(candidate.url.lastPathComponent): \(error.localizedDescription)")
+            }
         }
         if removed > 0 {
             nativeLog("ProcedureArtifactStore: retention sweep removed %d unreferenced artifact(s)", removed)
+        }
+        if !failures.isEmpty {
+            nativeLog("ProcedureArtifactStore: retention sweep could not remove %d artifact(s): %@",
+                      failures.count, failures.joined(separator: "; "))
         }
         let reapedLocks = await reapOrphanArtifactLocks(in: artifactsDirectory, cutoff: cutoff)
         if reapedLocks > 0 {
@@ -768,7 +822,7 @@ public actor ProcedureArtifactStore {
     ///    fresh one instead of proceeding on a deleted inode.
     /// The aged-mtime pre-filter remains as a cheap candidate gate; both gates
     /// are re-checked inside the lock before the unlink.
-    private func reapOrphanArtifactLocks(in directory: URL, cutoff: Date) async -> Int {
+    private nonisolated func reapOrphanArtifactLocks(in directory: URL, cutoff: Date) async -> Int {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
             at: directory,
@@ -813,20 +867,7 @@ public actor ProcedureArtifactStore {
     }
 
     private static func valid(_ value: DeclarativeProcedureArtifact) -> Bool {
-        let expectedDomain: (
-            oracle: ProcedureCanonicalOracle,
-            fallback: ProcedureFallbackRoute,
-            capability: String
-        )? = switch value.domain {
-        case "github_command": (.githubCommandReducer, .githubCanonicalReducer, "github_connector")
-        case "workshop_execution": (
-            .workshopRecordAndTimeline,
-            .ordinaryWorkshopPlannerExecutor,
-            "workshop_execution"
-        )
-        default: nil
-        }
-        guard let expectedDomain else { return false }
+        guard let expectedDomain = ProcedureDomainContract.named(value.domain) else { return false }
         let allowedEffects = Set(value.inputContract.allowedExternalEffectClasses)
         let expectedPreconditions = Set([
             "authority_class_matches",

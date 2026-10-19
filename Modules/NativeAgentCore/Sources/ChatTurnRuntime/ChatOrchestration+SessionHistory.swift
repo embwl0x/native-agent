@@ -90,12 +90,15 @@ extension SwiftNativeTurnEngine {
         let middleCandidates: [ChatMessage]
         let priorStats: SessionHistoryReadStats
         let middleStats: SessionHistoryReadStats?
+        var unreadHistory: Error?
+        var unreadArchive: Error?
         if historyLimit > 0 {
             // One transcript read per turn: the bytes this turn's compaction
             // pass already read under its lock, else the file once, here.
             // Every selection below (prompt head and tail, middle candidates)
             // runs over those bytes.
-            let selected = try? await trace.measure(.promptRead) {
+            let selected: (Data?, SessionHistoryReadResult)?
+            do { selected = try await trace.measure(.promptRead) {
                 let bytes: Data?
                 if let transcript { bytes = transcript } else {
                     bytes = try await historyReader.transcriptBytes(forSessionId: sessionId)
@@ -117,6 +120,10 @@ extension SwiftNativeTurnEngine {
                     tailLimit: max(96, prefixRowCap * 2),
                     excludingRunId: excludeHistoryRunId
                 ))
+            } } catch {
+                if error is CancellationError { throw error }
+                selected = nil
+                unreadHistory = error
             }
             let priorResult = selected?.1 ?? SessionHistoryReadResult(
                 messages: [],
@@ -261,11 +268,13 @@ extension SwiftNativeTurnEngine {
             let archive = await TurnVolatileArchiveRegistry.shared
                 .archive(dataRoot: historyReader.dataRoot)
             if replaysClearAt {
-                archivedTurnMessages = await archive.load(sessionId: sessionId)
-                    .mapValues { entries in
-                        entries.filter { $0.toolChanges.isEmpty }.map(\.message)
-                    }
-                    .filter { !$0.value.isEmpty }
+                do {
+                    archivedTurnMessages = try await archive.load(sessionId: sessionId)
+                        .mapValues { entries in
+                            entries.filter { $0.toolChanges.isEmpty }.map(\.message)
+                        }
+                        .filter { !$0.value.isEmpty }
+                } catch { unreadArchive = error }
             }
             let projected = SessionHistoryMessageProjection.project(
                 admission,
@@ -273,11 +282,12 @@ extension SwiftNativeTurnEngine {
                 archivedTurnMessages: archivedTurnMessages
             )
             // Bound the sidecar to the window the prefix actually replays: when
-            // the cursor drops a turn, its archived messages go with it.
+            // the cursor drops a turn, its archived messages go with it. That is
+            // the archive's own chore; the turn does not wait for it, and it
+            // keeps this turn's own block whenever it lands.
             if !archivedTurnMessages.isEmpty {
-                await archive.prune(
-                    sessionId: sessionId, keeping: projected.replayedRunIds
-                )
+                let keeping = projected.replayedRunIds.union([excludeHistoryRunId].compactMap { $0 })
+                Task { await archive.prune(sessionId: sessionId, keeping: keeping) }
             }
             replayedRunIds = projected.replayedRunIds
             historyMessages = projected.messages
@@ -355,6 +365,15 @@ extension SwiftNativeTurnEngine {
             clocked,
             cue: naturalExpressionCue
         )
+        // An unread history is a fact of this turn, never a quiet empty one.
+        if let unreadHistory {
+            finalContext = Self.contextByAppendingRuntimeContext(finalContext, runtimeContext:
+                "This conversation's history could not be read for this turn (\(unreadHistory.localizedDescription)); nothing before this message is in front of you.")
+        }
+        if let unreadArchive {
+            finalContext = Self.contextByAppendingRuntimeContext(finalContext, runtimeContext:
+                "Earlier turns' turn-scoped messages could not be read for this turn (\(unreadArchive.localizedDescription)); those turns are in front of you without them.")
+        }
         trace.record(ContextHistoryStageName.contextClockRuntime, since: runtimeStartNs)
         trace.setCount("userMessageChars", finalContext.userMessage.count)
         trace.setCount("toolSchemaCount", finalContext.toolSchemas.count)
@@ -447,12 +466,27 @@ extension SwiftNativeTurnEngine {
         // uses — non-empty prior ⇒ a history block renders — and the current
         // turn's own user row is excluded by runId, so turn 1 is empty here.
         guard !hasPriorHistory else { return base }
-        let digest: String
+        // The handoff is housekeeping: the turn takes what is published. When
+        // none is, its builder runs on its own and the turn says what is missing.
+        let unavailable: String
         do {
-            guard let value = try await provider.digest(
-                forSessionId: sessionId, model: base.modelId, surface: base.surface, userMessage: base.userMessage),
-                  !value.isEmpty else { return base }
-            digest = value
+            if let digest = try await provider.published(forSessionId: sessionId) {
+                guard !digest.isEmpty else { return base }
+                var copy = base
+                copy.turnReach.digest = digest
+                return copy
+            }
+            guard let prior = try PriorChatSession.latest(excluding: sessionId, dataRoot: provider.dataRoot) else { return base }
+            let (model, surface, message) = (base.modelId, base.surface, base.userMessage)
+            Task {
+                do { _ = try await provider.digest(forSessionId: sessionId, model: model, surface: surface, userMessage: message) }
+                catch {
+                    TurnTraceBus.fireFromContext(kind: "context.digest.failed", sessionId: sessionId, surface: surface,
+                        payload: .object(["reason": .string(String(describing: error))]))
+                }
+            }
+            unavailable = "The handoff from your previous conversation with this participant was not ready for this message; the handoff builder is writing it from that conversation now. "
+                + SessionDigestProvider.pointerSentence(sessionId: prior.id)
         } catch {
             if error is CancellationError { throw error }
             try Task.checkCancellation()
@@ -460,10 +494,8 @@ extension SwiftNativeTurnEngine {
                 kind: "context.digest.failed", sessionId: sessionId, surface: base.surface,
                 payload: .object(["reason": .string(String(describing: error))])
             )
-            return base
+            unavailable = "The handoff from your previous conversation with this participant could not be read (\(error.localizedDescription))."
         }
-        var copy = base
-        copy.turnReach.digest = digest
-        return copy
+        return contextByAppendingRuntimeContext(base, runtimeContext: unavailable)
     }
 }

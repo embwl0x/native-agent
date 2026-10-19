@@ -98,7 +98,6 @@ extension ChatStore {
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
             .union(pendingSendArgs.keys)
             .union(timedOutPendingIds.keys)
-            .union(canceledPendingIds)
             .union(maxDeltaSeqByCorrelation.keys)
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
@@ -112,7 +111,6 @@ extension ChatStore {
         retriedSignatureCorrelations.removeAll()
         timedOutPendingIds.removeAll()
         expiredPendingIds.removeAll()
-        canceledPendingIds.removeAll()
         streamingHintsByMessageId.removeAll()
         maxDeltaSeqByCorrelation.removeAll()
         // 2026-09-06: both sets name rows of the session being left.
@@ -160,7 +158,6 @@ extension ChatStore {
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
             .union(pendingSendArgs.keys)
             .union(timedOutPendingIds.keys)
-            .union(canceledPendingIds)
             .union(maxDeltaSeqByCorrelation.keys)
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
@@ -174,7 +171,6 @@ extension ChatStore {
         retriedSignatureCorrelations.removeAll()
         timedOutPendingIds.removeAll()
         expiredPendingIds.removeAll()
-        canceledPendingIds.removeAll()
         streamingHintsByMessageId.removeAll()
         // PATCH-2026-05-30: session switch — clear text_delta seq tracking too.
         maxDeltaSeqByCorrelation.removeAll()

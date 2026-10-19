@@ -95,19 +95,11 @@ extension RuntimeReadProjection {
         return [quietPageSection("Telegram", lines)]
     }
 
-    public static func quietMCP(servers: [MCPServer], consents: [MCPConsentRecord]) -> [JSONValue] {
-        var sections = [quietPageSection("MCP", [
-            quietCountLine(servers.count, "server", "servers"),
-            quietCountLine(consents.count, "consent", "consents"),
-        ])]
+    public static func quietMCP(servers: [MCPServer]) -> [JSONValue] {
+        var sections = [quietPageSection("MCP", [quietCountLine(servers.count, "server", "servers")])]
         if !servers.isEmpty {
             sections.append(quietPageSection("Servers", servers.map {
                 "\($0.name) [\($0.id)]: \($0.status) · \($0.toolCount) tools"
-            }))
-        }
-        if !consents.isEmpty {
-            sections.append(quietPageSection("Consents", consents.prefix(30).map {
-                "\($0.toolName ?? "a tool") on \($0.serverId ?? "a server"): \($0.status ?? "unknown") (\($0.risk ?? "risk unknown"))"
             }))
         }
         return sections
@@ -537,15 +529,14 @@ extension RuntimeReadProjection {
         ])]
     }
 
-    public static func quietProviders(routing: ProviderRoutingSnapshot, providers: [ProviderInfo], accountLine: (ProviderInfo) -> String) -> [JSONValue] {
+    public static func quietProviders(routing: ProviderRoutingSnapshot, providers: [ProviderInfo]) -> [JSONValue] {
         var sections: [JSONValue] = []
         for group in ProviderSurfaceGroups.all {
             sections.append(quietPageSection(group.title, RuntimeReadProjection.quietModelLines(group.members, routing: routing)))
         }
         let accounts = providers.map { info -> String in
             let mode = info.auth_mode.map { " via \($0)" } ?? ""
-            let line = accountLine(info)
-            return "\(info.display_name): \(line)\(mode)"
+            return "\(info.display_name): \(info.auth_status.state) — \(info.auth_status.detail)\(mode)"
         }
         sections.append(quietPageSection("Accounts", accounts.isEmpty ? ["No providers listed."] : accounts))
         return sections

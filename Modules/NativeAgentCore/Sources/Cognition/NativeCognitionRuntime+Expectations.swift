@@ -450,7 +450,7 @@ extension NativeCognitionRuntime {
             guard item.status != .done, item.status != .canceled else { continue }
             guard let raw = item.deferUntil?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty,
-                  let until = Self.parseDeferStamp(raw),
+                  let until = DeskSequencing.parseDeferStamp(raw),
                   until > now else { continue }
             guard let token = token(.statedPlan, label: item.title, natural: until, at: now) else {
                 continue
@@ -476,19 +476,6 @@ extension NativeCognitionRuntime {
         let manager = FileManager.default
         return manager.fileExists(atPath: store.opsPath.path)
             || manager.fileExists(atPath: store.basePath.path)
-    }
-
-    /// The defer-stamp contract, mirrored from `DeskSequencing.parseDeferStamp`
-    /// (which is module-internal): a bare `yyyy-MM-dd` UTC day means the END of
-    /// that day — an item parked "until 2026-09-05" is still parked during the
-    /// 5th — otherwise a full ISO timestamp.
-    private static func parseDeferStamp(_ raw: String) -> Date? {
-        let day = DateFormatter()
-        day.locale = Locale(identifier: "en_US_POSIX")
-        day.timeZone = TimeZone(identifier: "UTC")
-        day.dateFormat = "yyyy-MM-dd"
-        if let d = day.date(from: raw) { return d.addingTimeInterval(86_400) }
-        return DeskClock.parseISO(raw)
     }
 
     /// Schedules do not mint anticipation. Availability still settles legacy

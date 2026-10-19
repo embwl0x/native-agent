@@ -87,7 +87,7 @@ enum TrustSafetyBoundariesPresentation {
                 // toolAutonomy, autonomyDefault and Full Mac, which the
                 // guardrail summary already says; a line here could claim a
                 // boundary the gate does not hold.
-                externalSendRow(policy.connectorPolicy, fullMacActive: TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy)),
+                externalSendRow(TrustAccessModeCapabilityCatalog.posture(policy)),
                 macControlRow(TrustAccessModeCapabilityCatalog.effectiveMacControlPolicy(policy)),
                 receiptsRow(policy.workshopPolicy),
             ],
@@ -120,29 +120,28 @@ enum TrustSafetyBoundariesPresentation {
         }
     }
 
-    private static func externalSendRow(_ connectors: TrustConnectorPolicy?, fullMacActive: Bool) -> TrustSafetyBoundaryRow {
-        if fullMacActive {
-            return TrustSafetyBoundaryRow(
+    /// A send is a write on the person's side: the posture alone decides it.
+    private static func externalSendRow(_ posture: PermissionPosture) -> TrustSafetyBoundaryRow {
+        switch posture {
+        case .fullMac:
+            TrustSafetyBoundaryRow(
                 id: "external_send", title: "External messages",
                 detail: "Under Full Mac I can send messages without asking you first. Your connected accounts' own limits still apply. Agents you enabled in Trust inherit your authority. Other agents do not, and their requests can require approval.",
                 systemImage: "paperplane.fill", tone: .caution
             )
-        }
-        guard let requiresApproval = connectors?.sendExternalMessagesRequiresApproval else {
-            return TrustSafetyBoundaryRow(
-                id: "external_send", title: "External messages", detail: "External-send approval policy is unavailable.",
-                systemImage: "paperplane", tone: .unavailable
+        case .work:
+            TrustSafetyBoundaryRow(
+                id: "external_send", title: "External messages",
+                detail: "Messages to other people wait for your approval before they are sent.",
+                systemImage: "paperplane", tone: .neutral
+            )
+        case .readOnly:
+            TrustSafetyBoundaryRow(
+                id: "external_send", title: "External messages",
+                detail: "Safe sends nothing to other people.",
+                systemImage: "paperplane", tone: .neutral
             )
         }
-        return TrustSafetyBoundaryRow(
-            id: "external_send",
-            title: "External messages",
-            detail: requiresApproval
-                ? "Connector messages require approval before they are sent."
-                : "The connector-wide send confirmation is off; individual message tools can still require approval.",
-            systemImage: requiresApproval ? "paperplane" : "paperplane.fill",
-            tone: requiresApproval ? .neutral : .caution
-        )
     }
 
     private static func macControlRow(_ mac: TrustMacControlPolicy?) -> TrustSafetyBoundaryRow {
@@ -346,8 +345,6 @@ struct TrustCenterView: View {
     // PATCH-2026-05-06: dev-mode local binding mirrors trustPolicy.developerMode
     @State private var developerMode = false
     @State private var isApplyingPolicy = false
-    @State private var savedToolPermissions: [String: String] = [:]
-    @State private var savedToolPermissionsError: String?
     @State private var pendingRestore: BackupRecord?
     @State private var restoringBackupID: String?
 
@@ -455,20 +452,6 @@ struct TrustCenterView: View {
                 applyPolicy(newPolicy)
             }
         }
-        .task(id: appModel.engine.trust.policy) {
-            guard shows(.access) else { return }
-            do {
-                let snapshot = try await SwiftNativeTrustCenter().loadAuthorizationSnapshotChecked()
-                savedToolPermissions = snapshot.userConfiguredAutonomyOverrides.compactMapValues {
-                    if case .string(let value) = $0 { value } else { nil }
-                }
-                savedToolPermissionsError = nil
-            } catch {
-                let detail = UserFacingError.message(error, action: "read saved tool permissions")
-                savedToolPermissionsError = detail
-                appModel.recordTrustActionFailure(detail, cause: error)
-            }
-        }
         .alert(item: $pendingRestore) { backup in
             Alert(
                 title: Text("Restore backup?"),
@@ -510,15 +493,13 @@ struct TrustCenterView: View {
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
                 .disabled(isApplyingPolicy || appModel.engine.trust.policy == nil)
-                if appModel.engine.trust.policy == nil || savedToolPermissionsError != nil || appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains("trust policy") == true {
+                if appModel.engine.trust.policy == nil || appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains("trust policy") == true {
                     Button("Preserve damaged policy and authorize Safe") {
                         isApplyingPolicy = true
                         Task { @MainActor in
                             defer { isApplyingPolicy = false }
                             do {
                                 let policy = try await SwiftNativeTrustCenter().reauthorizeSafePolicy()
-                                savedToolPermissions = [:]
-                                savedToolPermissionsError = nil
                                 appModel.engine.trust.policy = policy
                                 applyPolicy(policy)
                                 appModel.statusText = "The damaged policy was preserved beside trust/policy.json. Safe is now authorized; choose any further access here."
@@ -539,33 +520,6 @@ struct TrustCenterView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(minHeight: 16, alignment: .leading)
-                if let savedToolPermissionsError {
-                    Text(savedToolPermissionsError).foregroundStyle(NativeAgentShell.trouble)
-                }
-                if !savedToolPermissions.isEmpty {
-                    Text("Saved tool permissions").font(ShellType.labelSemibold)
-                    ForEach(savedToolPermissions.keys.sorted(), id: \.self) { key in
-                        HStack {
-                            Text("\(key): \(savedToolPermissions[key] ?? "")")
-                            Button("Use posture") {
-                                guard let level = savedToolPermissions[key] else { return }
-                                isApplyingPolicy = true
-                                Task { @MainActor in
-                                    defer { isApplyingPolicy = false }
-                                    do {
-                                        let trust = SwiftNativeTrustCenter()
-                                        guard try await trust.compareAndSetToolAutonomy(tool: key, expectedCurrentTiers: [level], newTier: "auto") else {
-                                            throw TrustCenterError.underlying("The saved entry changed; reopen Trust to read it again.")
-                                        }
-                                        savedToolPermissions[key] = "auto"
-                                        appModel.applySavedTrustPolicy(try await trust.getTrust(), status: "\(key) now follows the Trust posture.")
-                                    } catch { appModel.statusText = UserFacingError.message(error, action: "change that saved tool permission") }
-                                }
-                            }
-                            .disabled(isApplyingPolicy || savedToolPermissionsError != nil)
-                        }
-                    }
-                }
                 // "Back up now" lives on the "If I get something wrong" row of
                 // What I can do right now, where it says what it copies.
             }

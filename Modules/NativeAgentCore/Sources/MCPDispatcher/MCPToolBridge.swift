@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import Experiences
 import Privacy
@@ -201,16 +202,13 @@ public enum MCPToolBridge {
                 ? serverRisk
                 : "approval_gated_missing_tool_risk"
         }
-        let toolRequiresApproval = riskRequiresApproval(toolRisk)
-        let serverRequiresApproval = riskRequiresApproval(serverRisk)
-        if toolRequiresApproval != serverRequiresApproval {
-            return toolRequiresApproval ? toolRisk : serverRisk
-        }
-        return riskRank(toolRisk) > riskRank(serverRisk) ? toolRisk : serverRisk
+        // The tool's own declaration is its class: a server-level class never
+        // replaces it, so a destructive tool stays destructive and a read stays read.
+        return toolRisk
     }
 
-    /// Explicit read tiers stamped for side-effect-free MCP tools — the ONLY
-    /// effective-risk classes safe to auto-grant low-risk consent for.
+    /// Explicit read tiers stamped for side-effect-free MCP tools — the only
+    /// effective-risk classes that declare a read.
     /// app_data_read / network_read are what's actually stamped today
     /// (MCPDispatcher seeds + the network_read fallback); the synonyms are
     /// defensive against future naming.
@@ -218,28 +216,22 @@ public enum MCPToolBridge {
         "app_data_read", "network_read", "read", "read_only", "readonly", "none", "low", "safe",
     ]
 
-    /// Only explicit read tiers may auto-grant. Unknown, write, network-reach,
-    /// money, and missing-metadata classes all require approval.
+    /// The class an MCP tool's declared risk names, in our four: explicit read
+    /// tiers read; a delete is destructive; a send, external reach or money is
+    /// a send; anything else, missing metadata included, is a write.
+    public static func declaredClass(_ riskClass: String) -> ToolClass {
+        let lower = riskClass.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if autoGrantReadTiers.contains(lower) { return .read }
+        if lower.contains("destructive") || lower.contains("delete") { return .destructive }
+        if lower.contains("send") || lower.contains("external") || lower.contains("money") { return .send }
+        return .write
+    }
+
+    /// Only explicit read tiers are reads. Unknown, write, network-reach,
+    /// money, and missing-metadata classes all declare a write.
     public static func riskRequiresApproval(_ riskClass: String) -> Bool {
         let lower = riskClass.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return !autoGrantReadTiers.contains(lower)
-    }
-
-    public static func consent(
-        _ consent: MCPConsent,
-        matchesCurrentEffectiveRisk effectiveRiskClass: String
-    ) -> Bool {
-        // 2026-09-06: unresolved and legacy grants require renewed consent.
-        guard !consent.unpinned else { return false }
-        guard let currentIdentity = consent.validatedServerIdentity,
-              case .object(let extras)? = consent.extras,
-              extras["serverIdentity"] == .string(currentIdentity) else { return false }
-        guard consent.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "granted" else {
-            return false
-        }
-        let consentRisk = normalizedRisk(consent.risk, fallback: "")
-        let currentRisk = normalizedRisk(effectiveRiskClass, fallback: "")
-        return !consentRisk.isEmpty && consentRisk == currentRisk
     }
 
     // MARK: - Silent-loss warnings
@@ -309,28 +301,10 @@ public enum MCPToolBridge {
         case "nativeagent-internal":
             return true
         case "searxng-local":
-            return riskRank(serverRiskClass) <= riskRank("network_read")
+            return declaredClass(serverRiskClass) == .read
         default:
             return false
         }
-    }
-
-    private static func riskRank(_ risk: String) -> Int {
-        let lower = risk.lowercased()
-        if lower.contains("critical") || lower.contains("admin") || lower.contains("delete")
-            || lower.contains("write") || lower.contains("send") || lower.contains("money") {
-            return 50
-        }
-        if lower.contains("approval") || lower.contains("risky") || lower.contains("high") {
-            return 40
-        }
-        if lower.contains("medium") || lower.contains("network") || lower.contains("external") {
-            return 30
-        }
-        if lower.contains("read") || lower.contains("low") || lower.contains("app_data") {
-            return 10
-        }
-        return 20
     }
 
     private struct CachedTool {
@@ -340,13 +314,25 @@ public enum MCPToolBridge {
         let inputSchema: JSONValue?
     }
 
+    /// A missing cache is no tools yet; an unreadable one owes its repair,
+    /// as the server registry does, rather than reading as an empty inventory.
     private static func readToolsCache(at url: URL) -> [String: Any] {
-        guard let data = try? Data(contentsOf: url),
-              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
+        let dataRoot = url.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        do {
+            let data: Data
+            do { data = try Data(contentsOf: url) }
+            catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
+            guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            RepairOwed.settle(dataRoot, operation: "mcp.tools_cache", evidence: .init(source: url.path, id: UUID().uuidString))
+            return parsed
+        } catch {
+            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act, operation: "mcp.tools_cache", owner: url.path,
+                words: "\(url.path) did not read (\(error.localizedDescription)), so no MCP tool is offered until mcp.refresh rewrites it.",
+                lever: "mcp.refresh")
             return [:]
         }
-        return parsed
     }
 
     private static func cachedTools(_ entry: Any?) -> [CachedTool]? {

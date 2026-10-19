@@ -1,20 +1,46 @@
 import Foundation
 import NativeAgentCore
 
-/// Transport capability, independent of the selected model's catalog claims.
+/// How a transport carries tools. Each adapter declares its own; nothing
+/// decides it from a provider's name.
+public enum ProviderToolWire: Sendable, Equatable {
+    /// A `tools` array on the request, calls back as structured events.
+    case native
+    /// The catalog as prose, calls as markers in the reply. The Claude
+    /// subscription rejects a request body that carries `tools`.
+    case textMarkers
+    /// The transport carries no NativeAgent tools.
+    case unsupported
+}
+
+/// Transport capability, independent of the selected model's catalog claims:
+/// the route id names its adapter, and the adapter's declarations answer.
 public enum ProviderToolCapability {
-    public static func supportsTools(providerID: String) -> Bool {
+    static func transport(providerID: String) -> (any LLMAdapter.Type)? {
         switch providerID {
-        case "anthropic", "kimi-code": AnthropicAdapter.supportsTools
-        case "anthropic_oauth_direct": AnthropicOAuthDirectAdapter.supportsTools
-        case "openai": OpenAIAdapter.supportsTools
-        case "openai_oauth_direct": OpenAIOAuthDirectAdapter.supportsTools
-        case "openrouter": OpenRouterAdapter.supportsTools
-        case "moonshot": MoonshotAdapter.supportsTools
-        case "xai_oauth_direct": XAIOAuthDirectAdapter.supportsTools
-        case "codex": CodexAdapter.supportsTools
-        default: false
+        case "anthropic", "kimi-code": AnthropicAdapter.self
+        case "anthropic_oauth_direct": AnthropicOAuthDirectAdapter.self
+        case "openai": OpenAIAdapter.self
+        case "openai_oauth_direct": OpenAIOAuthDirectAdapter.self
+        case "openrouter": OpenRouterAdapter.self
+        case "moonshot": MoonshotAdapter.self
+        case "xai_oauth_direct": XAIOAuthDirectAdapter.self
+        case "codex": CodexAdapter.self
+        default: nil
         }
+    }
+
+    public static func wire(providerID: String) -> ProviderToolWire {
+        transport(providerID: providerID)?.toolWire ?? .unsupported
+    }
+
+    public static func supportsTools(providerID: String) -> Bool {
+        wire(providerID: providerID) != .unsupported
+    }
+
+    /// Whether the route's transport puts an image in front of the model.
+    public static func carriesImages(providerID: String) -> Bool {
+        transport(providerID: providerID)?.carriesImages ?? false
     }
 
     public static func caption(providerID: String) -> String? {
@@ -30,5 +56,12 @@ public enum ProviderToolCapability {
         if tools?.isEmpty == false, !supportsTools(providerID: providerID) {
             LLMCallContext.toolCapabilityNote?(unavailableNote)
         }
+    }
+}
+
+/// The text-marker codec's question, answered by the declared wire.
+public enum NativeToolCapability {
+    public static func providerSupportsNativeTools(_ providerId: String?) -> Bool {
+        providerId.map { ProviderToolCapability.wire(providerID: $0) == .native } ?? false
     }
 }

@@ -4,6 +4,7 @@ import PersistenceCore
 public struct ProviderModelDescriptor: Sendable, Equatable {
     public var id: String
     public var name: String
+    /// Tokens, or 0 when the provider's catalog states none: never a guess.
     public var contextLength: Int
     public var supportsStreaming: Bool
     public var supportsVision: Bool
@@ -121,19 +122,6 @@ public enum OpenRouterModelCatalog {
         return cached.isComplete == true ? .unavailable : .unknown
     }
 
-    /// Read-only exact capability projection from the last live-backed cache.
-    /// A stale cache remains evidence of the model's published window; TTL
-    /// controls picker refresh, not whether prompt budgeting may remember a
-    /// previously verified smaller bound.
-    public static func cachedDescriptor(
-        for modelID: String,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> ProviderModelDescriptor? {
-        let wanted = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !wanted.isEmpty else { return nil }
-        return readCache(dataRoot: dataRoot)?.first { $0.id == wanted }
-    }
-
     static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
         let raw = try JSONSerialization.jsonObject(with: data, options: [])
         guard let root = raw as? [String: Any],
@@ -238,7 +226,7 @@ public enum OpenRouterModelCatalog {
             ?? id
         let context = positiveInt(row["context_length"])
             ?? positiveInt((row["top_provider"] as? [String: Any])?["context_length"])
-            ?? 128_000
+            ?? 0
         let architecture = row["architecture"] as? [String: Any]
         let inputModalities = stringSet(architecture?["input_modalities"])
         let supportedParameters = stringSet(row["supported_parameters"])
@@ -315,6 +303,10 @@ public enum OpenRouterModelCatalog {
     /// key keeps every caller's fail-closed semantics — a rewritten or removed
     /// file is visible on the very next read — while the unchanged case costs
     /// one stat.
+    static func cacheFault(dataRoot: URL) -> String? {
+        modelCatalogFault(at: cachePath(dataRoot: dataRoot), read: readCache(dataRoot: dataRoot) != nil, owner: "OpenRouter")
+    }
+
     static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
         readDecodedCache(dataRoot: dataRoot)?.models
     }
@@ -350,7 +342,7 @@ public enum OpenRouterModelCatalog {
             return ProviderModelDescriptor(
                 id: id,
                 name: name,
-                contextLength: int(row["context_length"]) ?? 128_000,
+                contextLength: int(row["context_length"]) ?? 0,
                 supportsStreaming: bool(row["supports_streaming"]) ?? true,
                 supportsVision: bool(row["supports_vision"]) ?? false,
                 supportsTools: bool(row["supports_tools"]) ?? false,

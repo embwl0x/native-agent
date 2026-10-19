@@ -460,7 +460,6 @@ final class AppModel: Sendable {
     /// the ApprovalInbox actor remains the durable terminal-decision authority.
     var approvalResolutionInFlightIDs: Set<String> = []
     var mcpServers: [MCPServer] = []
-    var mcpConsent: [MCPConsentRecord] = []
     var mcpTools: [MCPTool] = []
     var mcpToolReadState: MCPHubToolReadState = .notLoaded
     var mcpResources: [MCPResource] = []
@@ -528,7 +527,6 @@ final class AppModel: Sendable {
     var trustCenterActionOutcome: TrustCenterActionOutcome?
     var connectors: [ConnectorRecord] = []
     var workspaces: [WorkspaceRecord] = []
-    var workspaceSearchResults: [WorkspaceSearchResult] = []
     var evals: [EvalRun] = []
     var isSavingChatBrain: Bool {
         get { engine.providers.isSavingChatBrain }

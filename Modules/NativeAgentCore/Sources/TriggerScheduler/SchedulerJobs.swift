@@ -1144,7 +1144,7 @@ enum SchedulerJobNormalizer {
         let scheduledRun = try nextFromSchedule(schedule, afterEpoch: nil, now: now)
         let nextRun: Double
         if let fr = firstRun, truthy(fr) {
-            nextRun = try epochFromValue(fr, now: now)
+            nextRun = try epochFromValue(fr, zone: resolveTimezone(schedule["timezone"] ?? schedule["tz"]), now: now)
             schedule["firstRunAt"] = fr
         } else {
             nextRun = scheduledRun
@@ -1397,7 +1397,7 @@ enum SchedulerJobNormalizer {
     }
 
     /// _scheduler_epoch_from_value (L43076)
-    static func epochFromValue(_ raw: JSONValue, now: @Sendable () -> Date) throws -> Double {
+    static func epochFromValue(_ raw: JSONValue, zone: TimeZone, now: @Sendable () -> Date) throws -> Double {
         let nowEpoch = now().timeIntervalSince1970
         let epoch: Double
         switch raw {
@@ -1409,7 +1409,7 @@ enum SchedulerJobNormalizer {
             let text = s.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.isEmpty { throw TriggerSchedulerError.schedulerInvalid("run_at is required") }
             if let d = Double(text) { epoch = d }
-            else if let parsed = parseISO(text) { epoch = parsed }
+            else if let parsed = parseISO(text, zone: zone) { epoch = parsed }
             else { throw TriggerSchedulerError.schedulerInvalid("run_at must be an epoch timestamp or ISO-8601 datetime") }
         case .null:
             throw TriggerSchedulerError.schedulerInvalid("run_at is required")
@@ -1470,7 +1470,7 @@ enum SchedulerJobNormalizer {
         switch typ {
         case "once":
             // run_at or runAt or at  (Python `or`)
-            return try epochFromValue(pyOr(schedule["run_at"], schedule["runAt"], schedule["at"]) ?? .null, now: now)
+            return try epochFromValue(pyOr(schedule["run_at"], schedule["runAt"], schedule["at"]) ?? .null, zone: tz, now: now)
         case "every":
             let resolved = try everyInterval(schedule)
             // datetime.fromtimestamp(after_epoch or now, UTC) + seconds → epoch.
@@ -1947,49 +1947,17 @@ enum SchedulerJobNormalizer {
     /// This DIFFERS from `SwiftNativeTriggerScheduler.isoTimestamp` (which always
     /// emits millisecond ".SSS"), so we cannot reuse it for the decoration.
     static func epochToDecorationISO(_ epoch: Double) -> String {
-        // Split into whole seconds + microseconds, rounding microseconds the way
-        // CPython's fromtimestamp does (round-half-to-even at microsecond
-        // resolution). Compute the fractional part against the floored second.
-        let floored = epoch.rounded(.down)
-        // CPython's datetime.fromtimestamp rounds the sub-second remainder to
-        // microseconds with round-HALF-to-EVEN (banker's rounding), NOT
-        // round-half-away-from-zero. Exact half-microsecond ties differ between
-        // the two (0.0000005 → 0 even; 0.0000025 → 2 even, not 3). Use
-        // .toNearestOrEven so the rare tie case stays byte-identical to Python
-        // (gpt-5.5 review, wave 38 W15). Real daemon-written epochs are integral
-        // or clean fractions and never hit a tie, but this keeps the mirror exact.
-        var micros = Int(((epoch - floored) * 1_000_000.0).rounded(.toNearestOrEven))
-        var wholeSeconds = floored
-        // Guard the boundary where rounding pushes micros to 1_000_000.
-        if micros >= 1_000_000 {
-            micros -= 1_000_000
-            wholeSeconds += 1
-        }
-        if micros < 0 { micros = 0 }
-
-        let date = Date(timeIntervalSince1970: wholeSeconds)
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
-        let base = String(
-            format: "%04d-%02d-%02dT%02d:%02d:%02d",
-            c.year ?? 1970, c.month ?? 1, c.day ?? 1,
-            c.hour ?? 0, c.minute ?? 0, c.second ?? 0
-        )
-        if micros == 0 {
-            return base + "+00:00"
-        }
-        return base + String(format: ".%06d", micros) + "+00:00"
+        NativeTimestampFormat.microsecondUTCOffset(Date(timeIntervalSince1970: epoch), rounding: .toNearestOrEven)
     }
 
-    /// Mirror `datetime.fromisoformat(text.replace("Z","+00:00"))` with the
-    /// daemon's `if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=UTC)`.
-    /// Python's fromisoformat accepts both `T` and space separators and naive
-    /// (offset-less) forms, including date-only. We try, in order:
+    /// Mirror `datetime.fromisoformat(text.replace("Z","+00:00"))`, accepting
+    /// both `T` and space separators and naive (offset-less) forms, including
+    /// date-only. We try, in order:
     ///   1. offset-bearing forms (with/without fractional seconds)
-    ///   2. naive datetime forms → interpreted as UTC (Python's tzinfo=UTC rule)
-    ///   3. date-only `YYYY-MM-DD` → midnight UTC
-    static func parseISO(_ text: String) -> Double? {
+    ///   2. naive datetime forms → wall-clock time in `zone`: the item's own
+    ///      zone, or the Mac's current zone when it set none
+    ///   3. date-only `YYYY-MM-DD` → midnight in `zone`
+    static func parseISO(_ text: String, zone: TimeZone = .autoupdatingCurrent) -> Double? {
         let normalized = text.replacingOccurrences(of: "Z", with: "+00:00")
 
         // 1. Offset-bearing (Internet date-time).
@@ -2000,8 +1968,7 @@ enum SchedulerJobNormalizer {
         noFrac.formatOptions = [.withInternetDateTime]
         if let d = noFrac.date(from: normalized) { return d.timeIntervalSince1970 }
 
-        // 2 & 3. Naive forms (no offset) → UTC. Accept both `T` and space.
-        let utc = TimeZone(identifier: "UTC")!
+        // 2 & 3. Naive forms (no offset) → `zone`. Accept both `T` and space.
         let candidates = ["yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
                           "yyyy-MM-dd'T'HH:mm:ss.SSS",
                           "yyyy-MM-dd'T'HH:mm:ss",
@@ -2014,7 +1981,7 @@ enum SchedulerJobNormalizer {
         for fmt in candidates {
             let df = DateFormatter()
             df.locale = Locale(identifier: "en_US_POSIX")
-            df.timeZone = utc
+            df.timeZone = zone
             df.dateFormat = fmt
             if let d = df.date(from: normalized) { return d.timeIntervalSince1970 }
         }

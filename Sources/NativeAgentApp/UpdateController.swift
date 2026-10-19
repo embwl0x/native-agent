@@ -197,11 +197,6 @@ final class UpdateController: NSObject {
         return updatesAreAvailable ? "Check for Updates…" : "About Software Updates…"
     }
 
-    /// One-line notice for the Settings row; nil when no update is known.
-    var updateNoticeText: String? {
-        status.availableVersion.map { "NativeAgent \($0) is available." }
-    }
-
     /// Compact copy shared by the visible Settings row and its footer.
     var settingsDetail: String {
         Self.settingsDetail(for: unavailability, automaticChecksEnabled: automaticChecksEnabled)

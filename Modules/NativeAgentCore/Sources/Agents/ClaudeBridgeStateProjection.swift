@@ -28,6 +28,8 @@ public enum ClaudeBridgeStateProjection {
             "artifacts": status.artifactCount,
             "corruptArtifacts": status.corruptArtifactCount,
             "corruptInvocations": status.corruptInvocationCount,
+            // What could not be read, named, so an empty count is never mistaken for none.
+            "unreadable": status.unreadable,
             "invocations": status.invocationCount,
             "verifiedInvocations": status.verifiedInvocationCount,
             "lastInvocationStatus": status.lastInvocationStatus.map { $0.rawValue as Any }

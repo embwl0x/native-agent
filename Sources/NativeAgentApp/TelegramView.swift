@@ -7,7 +7,6 @@ import ScreenCaptureKit
 import ScreenVision
 import Speech
 import TelegramBot
-import EngineRuntime
 import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
@@ -46,8 +45,6 @@ enum TelegramPanelPresentation {
 }
 
 enum TelegramSettingsPresentation {
-    static let statusPanelTitle = "Telegram Status"
-
     struct TokenStatus: Equatable, Sendable {
         let label: String
         let systemImage: String

@@ -74,17 +74,6 @@ extension SwiftNativeSecurityCenter {
         "codex_message",
         "omp_message",
     ]
-    // Local agent bridge handoffs are meant to carry task specifications to
-    // another local agent. Those specs often contain instruction-looking text
-    // ("do not edit X", "system prompt", "Personal Access Token") that should
-    // still be audited/redacted, but not converted into an unserviceable
-    // approval ask when the origin is already local or trusted.
-    static let localAgentBridgeToolNames: Set<String> = [
-        "claude_message",
-        "codex_message",
-        "omp_message",
-        "invoke_codex",
-    ]
     static let approvalStagingToolNames: Set<String> = [
         "agentmail.send",
         "agentmail_send",
@@ -104,12 +93,6 @@ extension SwiftNativeSecurityCenter {
     struct ToolProfile: Sendable {
         var capabilities: Set<String>
         var risk: SecurityRisk
-    }
-
-    public static func sendsExternally(tool: String, input: [String: JSONValue], dataRoot: URL) -> Bool {
-        if tool == "interaction_act", input["target"] == .string("composer"), input["verb"] == .string("send") { return true }
-        if notificationToolNames.contains(tool), !localAgentBridgeToolNames.contains(tool), tool != "bot_ask" { return false }
-        return profile(tool: policyToolName(tool), input: input, dataRoot: dataRoot).capabilities.contains("external_send")
     }
 
     /// Classify a tool through the same profile owner used by authorization.
@@ -673,9 +656,6 @@ extension SwiftNativeSecurityCenter {
         ),
            capabilities.contains("filesystem_write") || capabilities.contains("filesystem_delete") {
             add("outside_app_data_write", .high)
-        }
-        if !secretKeys(in: .object(input)).isEmpty {
-            add("secret_input", .high)
         }
         return ToolProfile(capabilities: capabilities, risk: risk)
     }

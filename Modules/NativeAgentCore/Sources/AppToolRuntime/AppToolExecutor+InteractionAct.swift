@@ -46,33 +46,6 @@ extension AppToolExecutor {
         case needsGlass(String)
     }
 
-    /// Remote, decided the fail-CLOSED way.
-    ///
-    /// `ConversationSurfaceProfile.isRemote` is a denylist, so a surface it has
-    /// never heard of reads as LOCAL — and a surface nobody has thought of yet
-    /// is exactly the class that must not be trusted with someone else's card.
-    /// So the question is inverted, the same way `ActivityQuery` inverted it:
-    /// name the lanes that are this Mac, and refuse everything else, including
-    /// what is added tomorrow.
-    ///
-    /// The app's own loopback bridges are on the list. They are this machine,
-    /// token-authenticated, and they are how the agent reaches its own app at
-    /// all — they raise these cards and they answer them.
-    private static let localOriginSurfaceIDs: Set<String> = [
-        "chat",             // the Mac chat window
-        "mac", "app",       // in-process Mac surfaces (what the row records)
-        "observatory",      // local inspector UI
-        "claude-bridge", "claude_bridge",
-        "codex-bridge", "codex_bridge",
-        "",                 // unset/in-process default
-    ]
-
-    private static func isRemoteOrigin(_ envelope: TurnEnvelope) -> Bool {
-        if envelope.declaredRemote == true { return true }
-        if ConversationSurfaceProfile(envelope.surface).isRemote { return true }
-        return !localOriginSurfaceIDs.contains(ConversationSurfaceProfile(envelope.surface).id)
-    }
-
     /// The card and this caller are the same person.
     ///
     /// Surface NAMES are not compared: the row records the persistence-side
@@ -185,11 +158,9 @@ extension AppToolExecutor {
         // answer to "I can't tell" — exactly the wrong way for unverifiable
         // provenance to fail. It now refuses.
         //
-        // The caller's origin was never asked at all: only the CARD was
-        // checked for remoteness, so a Telegram or iPhone turn could settle a
-        // question asked of the person at the Mac window. Both sides must be
-        // local, decided by allowlist, and the transport-verified chat and
-        // person must agree where either side recorded one.
+        // The caller is asked by identity, not by door: the transport-verified
+        // chat and person must agree where either side recorded one, and the
+        // turn must be in the conversation that raised the card.
         guard let cardOrigin = await interactions.originEnvelope(
             of: id, sessionID: sessionID, dataRoot: dataRoot
         ), !cardOrigin.surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -201,29 +172,6 @@ extension AppToolExecutor {
             ))
         }
         let caller = TurnEnvelope.current(surface: surface)
-        if Self.isRemoteOrigin(cardOrigin) {
-            return refuse(Self.interactionFailure(
-                "not_yours_to_answer",
-                "That card was raised from \(cardOrigin.surface) — it's the person "
-                + "on that surface who was asked, so it isn't mine to answer.",
-                extra: [
-                    "interaction_id": .string(id),
-                    "origin_surface": .string(cardOrigin.surface),
-                ]
-            ))
-        }
-        if Self.isRemoteOrigin(caller) {
-            return refuse(Self.interactionFailure(
-                "not_yours_to_answer",
-                "This turn came in from \(caller.surface), and the card was raised in the app "
-                + "here — answering it from there would settle a question I wasn't asked.",
-                extra: [
-                    "interaction_id": .string(id),
-                    "origin_surface": .string(cardOrigin.surface),
-                    "caller_surface": .string(caller.surface),
-                ]
-            ))
-        }
         guard Self.sameOriginLane(card: cardOrigin, caller: caller) else {
             return refuse(Self.interactionFailure(
                 "not_yours_to_answer",
@@ -830,11 +778,6 @@ extension AppToolExecutor {
     private func composerGate(
         verb: String, input: [String: JSONValue], host: any QuietToolHost
     ) async -> Result<(QuietPosture?, [URL]), GateRefusal> {
-        if verb == "send", ChatToolSessionContext.forbidsSending(ChatToolSessionContext.userText ?? ""),
-           let refusal = await AppDoorReentry.validate?("interaction_act",
-                input.merging(["target": .string("composer"), "verb": .string("send")]) { _, new in new }) {
-            return .failure(GateRefusal(answer: refusal))
-        }
         let dataRoot = host.dataRootOverride ?? PersistenceCore.defaultDataRoot()
         var posture: QuietPosture?
         if verb != "check_updates" {

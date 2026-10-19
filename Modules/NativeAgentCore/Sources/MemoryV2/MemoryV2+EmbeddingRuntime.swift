@@ -103,6 +103,12 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             ?? FailClosedEmbeddingProvider(dimensions: mock.dimensions).embeddingEpoch
     }
 
+    /// The loaded model's space, or the mock's; never a hash or a load.
+    var residentEmbeddingEpoch: MemoryEmbeddingEpoch? {
+        if Self.readBackend(dataRoot: dataRoot) == Self.mockBackend { return mock.embeddingEpoch }
+        return lock.withLock { state.coreMLProvider?.embeddingEpoch }
+    }
+
     /// Embed `texts` via the CoreML MiniLM backend.
     ///
     /// FAIL-CLOSED CONTRACT: when CoreML is unavailable (resources missing,
@@ -420,10 +426,8 @@ extension SwiftNativeMemoryV2 {
             while actionIndexDirty {
                 actionIndexDirty = false
                 do {
-                    try await warmUpEmbedder()
-                    guard let source = actionIndexSource, let epoch = embeddingEpoch() else { return }
-                    let texts = try await source()
-                    _ = try await fillActionIndex(texts, epoch: epoch, prune: true)
+                    guard let source = actionIndexSource else { return }
+                    try await fillActionIndex(try await source())
                     actionIndexFailure = nil
                 } catch {
                     actionIndexFailure = error.localizedDescription
@@ -437,62 +441,57 @@ extension SwiftNativeMemoryV2 {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// The published index only. A find whose actions are not all indexed in
+    /// the resident model's space is told so and ranks by words that once;
+    /// the fill is requested, never awaited.
     public func indexedActionVectors(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
         try await ensureCanonicalAttachment()
-        guard let storage, let epoch = embeddingEpoch() else { throw MemoryV2Error.storageUnavailable }
-        var indexed = try await storage.underlyingStorage().actionEmbeddings(epoch: epoch)
-        if indexed.isEmpty {
-            // A find while the index is first being built waits for it, as one.
+        guard let storage else { throw MemoryV2Error.storageUnavailable }
+        guard let epoch = residentEmbeddingEpoch() else {
             requestActionIndexUpdate()
-            await actionIndexUpdate?.value
-            indexed = try await storage.underlyingStorage().actionEmbeddings(epoch: epoch)
+            throw MemoryV2Error.underlying(actionIndexFailure ?? "The MemoryV2 action index waits for the memory-search model to load; an index update has been requested.")
         }
-        guard !indexed.isEmpty else {
+        let indexed = try await storage.underlyingStorage().actionEmbeddings(epoch: epoch)
+        let hashes = texts.map(Self.actionTextHash)
+        let dimensions = embedder?.dimensions
+        guard hashes.allSatisfy({ indexed[$0]?.count == dimensions }) else {
+            requestActionIndexUpdate()
             if let actionIndexFailure {
                 throw MemoryV2Error.underlying("The MemoryV2 action index for epoch \(epoch.rawValue) could not be built: \(actionIndexFailure)")
             }
-            throw MemoryV2Error.underlying("The MemoryV2 action index for epoch \(epoch.rawValue) is being built.")
+            throw MemoryV2Error.underlying("The MemoryV2 action index for epoch \(epoch.rawValue) is incomplete; an index update has been requested.")
         }
-        let hashes = texts.map(Self.actionTextHash)
-        let vectors: [String: [Float]]
-        if hashes.allSatisfy({ indexed[$0] != nil }) { vectors = indexed }
-        else { vectors = try await fillActionIndex(texts, epoch: epoch, prune: false) }
-        return MemoryEmbeddingBatch(epoch: epoch, vectors: hashes.compactMap { vectors[$0] })
+        return MemoryEmbeddingBatch(epoch: epoch, vectors: hashes.compactMap { indexed[$0] })
     }
 
-    /// One writer for background updates and a just-added action's first find.
-    /// Only in-flight work lives in RAM; completed vectors are read from SQLite.
-    private func fillActionIndex(_ texts: [String], epoch: MemoryEmbeddingEpoch,
-                                 prune: Bool) async throws -> [String: [Float]] {
-        let byHash = Dictionary(texts.map { (Self.actionTextHash($0), $0) }, uniquingKeysWith: { first, _ in first })
-        let prior = actionIndexWrite
-        let writing = Task {
-            _ = await prior?.result
-            try await ensureCanonicalAttachment()
-            guard let storage else { throw MemoryV2Error.storageUnavailable }
-            let disk = await storage.underlyingStorage()
-            let dimensions = embedder?.dimensions
+    /// Only the background updater fills, in bounded chunks on a detached
+    /// task, so prediction never occupies this actor; vectors live in SQLite.
+    private func fillActionIndex(_ texts: [String]) async throws {
+        try await ensureCanonicalAttachment()
+        guard let storage, let embedder else { throw MemoryV2Error.storageUnavailable }
+        let disk = await storage.underlyingStorage()
+        try await Task.detached(priority: .utility) {
+            let epoch = embedder.embeddingEpoch
+            let byHash = Dictionary(texts.map { (Self.actionTextHash($0), $0) }, uniquingKeysWith: { first, _ in first })
+            let dimensions = embedder.dimensions
             let indexed = try await disk.actionEmbeddings(epoch: epoch).filter { $0.value.count == dimensions }
             let missing = byHash.keys.filter { indexed[$0] == nil }.sorted()
-            let batch = try await embedForDerivedContextWithEpoch(missing.map { byHash[$0]! })
-            guard batch.epoch == epoch, embeddingEpoch() == epoch else {
-                requestActionIndexUpdate()
-                throw MemoryV2Error.underlying("The MemoryV2 action index changed epoch while updating.")
+            for start in stride(from: 0, to: missing.count, by: 8) {
+                let hashes = Array(missing[start..<min(start + 8, missing.count)])
+                let batch = try await embedder.embedWithEpoch(hashes.map { byHash[$0]! })
+                guard batch.epoch == epoch, embedder.embeddingEpoch == epoch else {
+                    await self.requestActionIndexUpdate()
+                    throw MemoryV2Error.underlying("The MemoryV2 action index changed epoch while updating.")
+                }
+                guard batch.vectors.count == hashes.count,
+                      batch.vectors.allSatisfy({ !$0.isEmpty && $0.count == dimensions && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 }) }) else {
+                    throw MemoryV2Error.underlying("The MemoryV2 action index received unusable vectors from the memory-search model.")
+                }
+                // Each chunk lands as it finishes, so an interrupted fill keeps its progress.
+                try await disk.writeActionEmbeddings(Dictionary(uniqueKeysWithValues: zip(hashes, batch.vectors)), epoch: epoch)
             }
-            guard batch.vectors.count == missing.count,
-                  batch.vectors.allSatisfy({ !$0.isEmpty && $0.count == dimensions && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 }) }) else {
-                throw MemoryV2Error.underlying("The MemoryV2 action index received unusable vectors from the memory-search model.")
-            }
-            let written = Dictionary(uniqueKeysWithValues: zip(missing, batch.vectors))
-            try await disk.writeActionEmbeddings(written, epoch: epoch, retaining: prune ? Set(byHash.keys) : nil)
-            return indexed.merging(written) { _, new in new }
-        }
-        actionIndexWrite = writing
-        // Only the tail in flight is held: a finished fill's vectors live in SQLite.
-        defer { if actionIndexWrite == writing { actionIndexWrite = nil } }
-        let vectors = try await writing.value
-        if !prune { requestActionIndexUpdate() }
-        return vectors
+            try await disk.writeActionEmbeddings([:], epoch: epoch, retaining: Set(byHash.keys))
+        }.value
     }
 
     public func warmUpEmbeddingsAtLaunch() async {

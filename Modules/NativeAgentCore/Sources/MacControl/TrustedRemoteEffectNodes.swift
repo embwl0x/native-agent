@@ -193,10 +193,9 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
     }
 
     private func write(_ rows: [TrustedRemoteEffectNode]) throws {
-        try FileManager.default.createDirectory(at: nodesPath.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(rows).write(to: nodesPath, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(rows), to: nodesPath)
     }
 
     private func validate(_ node: TrustedRemoteEffectNode) throws -> TrustedRemoteEffectNode {

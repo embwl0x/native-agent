@@ -1,7 +1,6 @@
 import Foundation
 import NativeAgentShared
 import NativeAgentCore
-import NativeAgentShared
 import PersistenceCore
 
 // MARK: - Persona writes
@@ -292,7 +291,7 @@ extension SwiftNativePersonaEngine {
             return spec
         }
 
-        await flushDerivedPersonaChange(path, reason: "persona_document_saved")
+        await publishDerivedPersonaChange(path, reason: "persona_document_saved")
         return result
     }
 
@@ -378,7 +377,6 @@ extension SwiftNativePersonaEngine {
                 )
             }
             await DerivedStateInvalidationCenter.shared.publish(changes)
-            await DerivedStateInvalidationCenter.shared.flush()
         }
         return written
     }

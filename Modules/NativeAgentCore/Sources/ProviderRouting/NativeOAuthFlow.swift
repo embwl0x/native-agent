@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Darwin
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - NativeOAuthFlow
@@ -58,10 +59,17 @@ public enum NativeOAuthFlow {
         case "xai_oauth_direct": path = OAuthCredentialDestinations.xAIProvider(dataRoot: dataRoot)
         default: throw ProviderRoutingError.providerNotFound
         }
-        if normalizedOAuthProviderId(providerId) == "xai_oauth_direct" {
-            _ = try ProviderStateValidation.credentialMetadata(at: path)
-        } else {
-            _ = try ProviderStateValidation.credential(at: path)
+        do {
+            if normalizedOAuthProviderId(providerId) == "xai_oauth_direct" {
+                _ = try ProviderStateValidation.credentialMetadata(at: path)
+            } else {
+                _ = try ProviderStateValidation.credential(at: path)
+            }
+        } catch {
+            // The checker, its reason and the lever: an absent file passes, so moving it aside clears the way.
+            throw ToolFailureError(
+                "Sign-in was not started: \(path.path) could not be read as a saved sign-in (\(error.localizedDescription)). Move that file aside on the Mac, then sign in again.",
+                effects: .none, owner: path.path, tap: "Finder › \(path.path)", personDecides: true)
         }
     }
 

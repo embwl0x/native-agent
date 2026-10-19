@@ -93,10 +93,6 @@ public enum TriggerNotificationDelivery {
                 // card IS in the inbox either way, so this is a delivered fire
                 // with no APNS receipt — never `.null`, which means "the card
                 // never landed" and would make the scheduler re-mirror.
-                //
-                // `deliveryFailed` is the third case and is NOT a delivery: the
-                // Telegram send failed with the phone switched off, so nothing
-                // reached him. Reporting it as delivered was the lying signal.
                 let projection = outcome.deliveryProjection
                 if !projection.reachedAChannel {
                     nativeLog("trigger_notify: %@ mirrored but no channel accepted the knock (%@)",
@@ -112,7 +108,6 @@ public enum TriggerNotificationDelivery {
                     "mirrored": .bool(true),
                     "routedTo": .string(outcome.delivery.rawValue),
                     "suppressed": .bool(outcome.suppressed),
-                    "delivery_failed": .bool(outcome.deliveryFailed),
                 ]
                 if projection == .failed {
                     fields["error"] = .string(

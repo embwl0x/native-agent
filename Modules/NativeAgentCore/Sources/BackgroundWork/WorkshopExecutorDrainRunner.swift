@@ -32,12 +32,16 @@ public struct WorkshopExecutorDrainRunner: EventDeadlineLoopRunner {
     }
 
     public func tickOutcome() async -> LoopTickOutcome {
-        let ran = await executor.drainOnce()
+        let pass = await executor.drainOnce()
         if Task.isCancelled { return .skipped(reason: "Desk executor canceled") }
+        let drained = "drained \(pass.ran) queued Desk execution(s)"
+        guard pass.faults.isEmpty else {
+            return .failed(error: (pass.faults + (pass.ran > 0 ? [drained] : [])).joined(separator: "\n"))
+        }
         // A drain that claimed nothing did no work. Reporting it `.completed`
         // advanced the dormancy clock on every idle tick, so an executor that
         // has not run a mission in weeks looked freshly successful.
-        guard ran > 0 else { return .skipped(reason: "no queued Desk executions") }
-        return .completed(result: "drained \(ran) queued Desk execution(s)")
+        guard pass.ran > 0 else { return .skipped(reason: "no queued Desk executions") }
+        return .completed(result: drained)
     }
 }

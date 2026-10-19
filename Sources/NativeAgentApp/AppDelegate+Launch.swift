@@ -83,8 +83,10 @@ extension AppDelegate {
             },
             spawnRelauncher: AppRestartCoordinator.spawnDetached(argv:)
         )
-        // Finish updating the folder before the runtime can ask Chrome to reload it.
-        await Task.detached(priority: .utility) { ChromeExtensionFolder.refreshIfPresent() }.value
+        // Housekeeping, never awaited by launch: an older extension without
+        // extension.reload, or a same-version resource change, still gets the
+        // new copy. A reload request prepares the folder itself first.
+        Task.detached(priority: .utility) { ChromeExtensionFolder.refreshIfPresent() }
         do {
             try await NativeAgentEngine.prepareExecutionStorageAtLaunch(dataRoot: PersistenceCore.defaultDataRoot())
         } catch {

@@ -85,14 +85,18 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     }
 
     public static func forSession(dataRoot: URL, sessionId: String) throws -> [Self] {
+        try turnIds(dataRoot: dataRoot, sessionId: sessionId).compactMap {
+            try read(dataRoot: dataRoot, sessionId: sessionId, turnId: $0)
+        }
+    }
+
+    /// The turns a session holds checkpoints for, each readable on its own.
+    public static func turnIds(dataRoot: URL, sessionId: String) throws -> [String] {
         let directory = try path(dataRoot: dataRoot, sessionId: sessionId, turnId: "checkpoint").deletingLastPathComponent()
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
         return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.lastPathComponent.hasPrefix("turn-") && $0.pathExtension == "json" }
-            .compactMap { file in
-                try read(dataRoot: dataRoot, sessionId: sessionId,
-                    turnId: String(file.deletingPathExtension().lastPathComponent.dropFirst(5)))
-            }
+            .map { String($0.deletingPathExtension().lastPathComponent.dropFirst(5)) }
     }
 
     public func remove(dataRoot: URL) throws {
@@ -165,7 +169,7 @@ public struct AbandonedTurnReconciler: Sendable {
         let today = now()
         var accepted: [String: Accepted] = [:]
         var terminated: Set<String> = []
-        var terminalIndex: [URL: (terminated: Set<String>, replyReady: Set<String>, repairPending: Set<String>)] = [:]
+        var terminalIndex: [URL: (terminated: Set<String>, replyReady: Set<String>)] = [:]
 
         let scan = scanRange(today: today)
         // Catch-up terminals are written today, outside a historical window.
@@ -176,7 +180,6 @@ public struct AbandonedTurnReconciler: Sendable {
             guard terminalIndex[path] == nil else { return }
             var terminalTurns = Set<String>()
             var replyReadyTurns = Set<String>()
-            var repairPendingTurns = Set<String>()
             if FileManager.default.fileExists(atPath: path.path) {
                 let text = try String(contentsOf: path, encoding: .utf8)
                 for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
@@ -194,13 +197,11 @@ public struct AbandonedTurnReconciler: Sendable {
                         accepted[turnId] = Accepted(ts: ts,
                             sessionId: Self.string(row["sessionId"]), surface: Self.string(row["surface"]))
                     case "turn.terminal", "turn.cancelled", "turn.failed":
-                        if case .object(let payload)? = row["payload"], payload["status"] == .string("abandoned") { continue }
+                        // An older build parked a turn on recollection repair; it resumes now.
+                        if case .object(let payload)? = row["payload"],
+                           payload["status"] == .string("abandoned") || payload["repairPending"] == .bool(true) { continue }
                         terminalTurns.insert(turnId)
-                        // A terminal still waiting on recollection repair has no reply
-                        // ready: its checkpoint stays until that repair lands.
-                        if case .object(let payload)? = row["payload"], payload["repairPending"] == .bool(true) {
-                            repairPendingTurns.insert(turnId)
-                        } else if case .object(let payload)? = row["payload"],
+                        if case .object(let payload)? = row["payload"],
                            payload["status"] == .string("completed") || payload["status"] == .string("waiting") {
                             replyReadyTurns.insert(turnId)
                         }
@@ -209,8 +210,11 @@ public struct AbandonedTurnReconciler: Sendable {
                     }
                 }
             }
-            terminalIndex[path] = (terminalTurns, replyReadyTurns, repairPendingTurns)
+            terminalIndex[path] = (terminalTurns, replyReadyTurns)
         }
+        // An unreadable day hides only what it holds: checkpoints are still found
+        // and judged on their own days, and the window stays pending.
+        var persistenceFailures: [String] = []
         for dayOffset in terminalOnlyDays + Array(scan.newestOffset...scan.oldestOffset) {
             guard let day = Self.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
             else { continue }
@@ -219,40 +223,49 @@ public struct AbandonedTurnReconciler: Sendable {
                 try readDay(path, includeAccepted: dayOffset >= scan.newestOffset)
                 terminated.formUnion(terminalIndex[path]!.terminated)
             } catch {
-                return Outcome(acceptedScanned: 0, reconciled: [], tooRecentToJudge: 0,
-                               failure: "\(path.lastPathComponent) is unreadable")
+                persistenceFailures.append("\(path.lastPathComponent) is unreadable: \(error.localizedDescription)")
             }
         }
+        let ledgerComplete = persistenceFailures.isEmpty
 
         var tooRecent = 0
         var written: [String] = []
         var writeAttempts = 0
-        var persistenceFailures: [String] = []
         var deferred = false
         var resumable: [TurnCheckpoint] = []
         var checkpoints: [String: TurnCheckpoint] = [:]
-        var unreadableSessions: Set<String> = []
+        // Unreadable checkpoints owe their own repair; their siblings still resume.
+        var unreadable: Set<String> = []
         do {
             let root = dataRoot.appendingPathComponent("chat/session_state")
             if FileManager.default.fileExists(atPath: root.path) {
                 for session in try FileManager.default.contentsOfDirectory(at: root,
                     includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
+                    let sessionId = session.lastPathComponent
                     do {
                         let values = try session.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                         guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
-                        for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: session.lastPathComponent) {
-                            let turnId = checkpoint.turnId
-                            checkpoints[turnId] = checkpoint
-                            if accepted[turnId] == nil {
-                                accepted[turnId] = Accepted(ts: checkpoint.acceptedAt,
-                                    sessionId: checkpoint.sessionId, surface: checkpoint.surface)
+                        for turnId in try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: sessionId) {
+                            do {
+                                guard let checkpoint = try TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId)
+                                else { continue }
+                                checkpoints[turnId] = checkpoint
+                                if accepted[turnId] == nil {
+                                    accepted[turnId] = Accepted(ts: checkpoint.acceptedAt,
+                                        sessionId: checkpoint.sessionId, surface: checkpoint.surface)
+                                }
+                            } catch {
+                                unreadable.insert(turnId)
+                                let detail = "Turn checkpoint is unreadable; repair chat/session_state/\(sessionId)/turn-\(turnId).json before resuming: \(error)"
+                                persistenceFailures.append(detail)
+                                Self.owe(dataRoot: dataRoot, sessionId: sessionId, turnId: turnId, detail: detail)
                             }
                         }
                     } catch {
-                        unreadableSessions.insert(session.lastPathComponent)
-                        let detail = "Turn checkpoint is unreadable; repair chat/session_state/\(session.lastPathComponent) before resuming: \(error)"
+                        unreadable.insert(sessionId)
+                        let detail = "Turn checkpoint is unreadable; repair chat/session_state/\(sessionId) before resuming: \(error)"
                         persistenceFailures.append(detail)
-                        Self.owe(dataRoot: dataRoot, sessionId: session.lastPathComponent, turnId: "", detail: detail)
+                        Self.owe(dataRoot: dataRoot, sessionId: sessionId, turnId: "", detail: detail)
                     }
                 }
             }
@@ -261,10 +274,12 @@ public struct AbandonedTurnReconciler: Sendable {
             Self.owe(dataRoot: dataRoot, sessionId: "", turnId: "", detail: detail)
             return Outcome(acceptedScanned: accepted.count, reconciled: [], tooRecentToJudge: 0, failure: detail)
         }
+        // A turn with no checkpoint is judged from the ledger alone, so only a
+        // ledger read whole may owe its recovery.
         let candidates = accepted
-            .filter { (!terminated.contains($0.key) || checkpoints[$0.key] != nil)
+            .filter { (checkpoints[$0.key] != nil || (ledgerComplete && !terminated.contains($0.key)))
                 && !inFlightTurnIds.contains($0.key)
-                && !unreadableSessions.contains($0.value.sessionId ?? "") }
+                && !unreadable.contains($0.key) && !unreadable.contains($0.value.sessionId ?? "") }
             .sorted {
                 if (checkpoints[$0.key] != nil) != (checkpoints[$1.key] != nil) { return checkpoints[$0.key] != nil }
                 return $0.value.ts < $1.value.ts
@@ -282,13 +297,6 @@ public struct AbandonedTurnReconciler: Sendable {
                         [day] + [-1, 1].compactMap { Self.dayCalendar.date(byAdding: .day, value: $0, to: day) }
                     }.map { lane.path(for: $0) })
                     for path in days { try readDay(path, includeAccepted: false) }
-                    if days.contains(where: { terminalIndex[$0]!.repairPending.contains(turnId) }),
-                       !days.contains(where: { terminalIndex[$0]!.replyReady.contains(turnId) }) {
-                        Self.owe(dataRoot: dataRoot, sessionId: checkpoint.sessionId, turnId: turnId,
-                            detail: "This turn awaits recollection repair. Reconcile its saved checkpoint without repeating completed effects.",
-                            id: "turn-recovery:" + turnId)
-                        continue
-                    }
                     let hasTerminal = days.contains { terminalIndex[$0]!.terminated.contains(turnId) }
                     if hasTerminal, checkpoint.deliveryPending, !checkpoint.hasRedeliveryOwner {
                         // A finished turn whose route cannot redeliver: the retirement row
@@ -510,11 +518,5 @@ public struct AbandonedTurnReconciler: Sendable {
         withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let parsed = withFraction.date(from: raw) { return parsed }
         return ISO8601DateFormatter().date(from: raw)
-    }
-
-    private static func iso8601String(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
     }
 }

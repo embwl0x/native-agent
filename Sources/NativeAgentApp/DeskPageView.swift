@@ -27,9 +27,6 @@ enum DeskPageMetrics {
     static let metaSize: CGFloat = ShellType.labelSize
     /// How many rows a fold shows before it says how many more there are.
     static let foldRowCap = 60
-    /// Finished work is bounded harder than the board: it is a shelf of what
-    /// just landed, not an archive. The history fold keeps older records reachable.
-    static let finishedRowCap = 5
 }
 
 extension DeskPageContent {

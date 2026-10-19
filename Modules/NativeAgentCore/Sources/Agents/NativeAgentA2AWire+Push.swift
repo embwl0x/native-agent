@@ -1,8 +1,21 @@
 import Foundation
 import Darwin
 import PersistenceCore
+import AgentConversations
 
-/// The canonical 1.0 configuration. Secrets stay in the task actor's memory.
+/// A registered callback as the durable task keeps it: only a reference to
+/// its Keychain account (the URL, which may carry a bearer secret, and its
+/// credentials live there), and what it still owes.
+public struct AgentContactCallback: Codable, Sendable, Equatable {
+    let account: String
+    /// The last task state the callback accepted.
+    var delivered: String?
+    /// Why the newest update was not accepted after its attempts: owed.
+    var failure: String?
+}
+
+/// The canonical 1.0 configuration. Its secrets are kept in Keychain from
+/// acceptance, so the callback outlives this process.
 struct AgentContactPushConfig: Codable, Sendable {
     struct Authentication: Codable, Sendable { let scheme: String; let credentials: String? }
     let id: String
@@ -40,6 +53,24 @@ struct AgentContactPushConfig: Codable, Sendable {
         return Self(id: identifier, taskId: taskID, url: rawURL, token: token, authentication: authentication)
     }
     var value: JSONValue { get throws { try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(self)) } }
+
+    private struct Secret: Codable { let url: String; let token: String?; let scheme: String?; let credentials: String? }
+    var account: String { "a2a-push:" + taskId + ":" + id }
+    var callback: AgentContactCallback { .init(account: account) }
+
+    /// Keep the whole callback (URL and credentials) before it is acknowledged.
+    func keep() throws {
+        try AgentPeerCredentials.writeSecret(JSONEncoder().encode(Secret(url: url, token: token,
+            scheme: authentication?.scheme, credentials: authentication?.credentials)), account: account)
+    }
+
+    /// The callback a relaunched task resumes, read back from Keychain.
+    static func restored(_ callback: AgentContactCallback, id: String, taskId: String) throws -> Self {
+        guard let data = try AgentPeerCredentials.readSecret(account: callback.account) else { throw AgentContactFailure.missing }
+        let secret = try JSONDecoder().decode(Secret.self, from: data)
+        return Self(id: id, taskId: taskId, url: secret.url, token: secret.token,
+                    authentication: secret.scheme.map { Authentication(scheme: $0, credentials: secret.credentials) })
+    }
     static var invalid: AgentContactFailure { .init(code: -32602, message: "Invalid or unsafe push notification configuration") }
     private static func safeHeader(_ value: String) -> Bool { value.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value != 127 } }
 
@@ -131,12 +162,13 @@ struct AgentContactPushConfig: Codable, Sendable {
     /// curl is the OS-provided HTTP/TLS client. --resolve keeps TLS certificate
     /// and SNI checks on the original hostname while preventing DNS rebinding.
     /// No shell, user curlrc, proxy, redirect, credential argv, or response body.
-    func deliver(_ payload: Data) async {
+    /// True when the callback accepted it.
+    func deliver(_ payload: Data) async -> Bool {
         for attempt in 0..<3 {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return false }
             if attempt > 0 { try? await Task.sleep(for: .seconds(attempt == 1 ? 1 : 2)) }
-            guard !Task.isCancelled else { return }
-            guard let target = try? await Self.destination(url), !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return false }
+            guard let target = try? await Self.destination(url), !Task.isCancelled else { return false }
             let succeeded = await Task.detached(priority: .utility) { () -> Bool in
                 func quoted(_ value: String) -> String {
                     "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -170,7 +202,8 @@ struct AgentContactPushConfig: Codable, Sendable {
                     return process.terminationStatus == 0 && (200..<300).contains(status)
                 } catch { if process.isRunning { process.terminate() }; return false }
             }.value
-            if succeeded { return }
+            if succeeded { return true }
         }
+        return false
     }
 }

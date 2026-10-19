@@ -174,17 +174,6 @@ extension AppModel {
     }
 
     @MainActor
-    func searchWorkspace(_ query: String) async {
-        do {
-            let response = try await ConnectorRegistryActions.searchWorkspace(query: query, root: engine.dataRoot)
-            workspaceSearchResults = response.results
-            statusText = "Workspace search found \(response.results.count)"
-        } catch {
-            setFailureStatus(error, action: "search the workspace")
-        }
-    }
-
-    @MainActor
     func updateConnector(_ connector: ConnectorRecord, enabled: Bool) async -> ConnectorUpdateOutcome {
         do {
             let result = try await ConnectorStatusProjection.updateConnectorAndVerify(

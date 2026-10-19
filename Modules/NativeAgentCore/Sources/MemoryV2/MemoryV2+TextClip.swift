@@ -29,11 +29,6 @@ public let memoryRecallContentCap = 2000
 public let memoryRecallPreviewCap = 200
 
 
-/// Rows the persona-starvation alarm pulls unfiltered before applying the
-/// disclosure gate. Wide enough that one undisclosable top row cannot mask a
-/// disclosable neighbour, small enough to stay a bounded one-off probe.
-public let personaStarvationProbeTopK = 8
-
 // MARK: - MemoryTextClip
 
 public enum MemoryTextClip {

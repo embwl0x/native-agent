@@ -4,125 +4,8 @@ import AppToolRuntime
 import PersistenceCore
 import MCPDispatcher
 
-enum MCPHubConsentPresentation {
-    enum State: Equatable {
-        case loading
-        case empty
-        case available
-        case stale
-        case unavailable
-    }
-
-    static func resolve(
-        consentCount: Int,
-        refresh: AppModel.PanelRefreshStatus?
-    ) -> State {
-        let failedConsentRead = refresh?.failedEndpoints.contains { endpoint in
-            endpoint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "mcp consent"
-        } ?? false
-        if failedConsentRead { return consentCount > 0 ? .stale : .unavailable }
-        if consentCount > 0 { return .available }
-        return refresh == nil ? .loading : .empty
-    }
-}
-
-struct MCPHubConsentSection: View {
-    @Environment(AppModel.self) private var appModel
-
-    private var presentation: MCPHubConsentPresentation.State {
-        MCPHubConsentPresentation.resolve(
-            consentCount: appModel.mcpConsent.count,
-            refresh: appModel.panelRefreshStatus[.mcp]
-        )
-    }
-
-    var body: some View {
-        AdvancedSection(title: "Consent log", card: .bare) {
-            switch presentation {
-            case .loading:
-                MCPNote("Reading the consent decisions I've been given.")
-            case .empty:
-                MCPNote("No consent decisions yet. Granting a tool records one here.")
-            case .unavailable:
-                MCPNote(
-                    "Tool permissions could not be loaded. Refresh this page before using these tools.",
-                    tone: NativeAgentShell.trouble
-                )
-                .accessibilityIdentifier("mcp.consent.unavailable")
-            case .stale:
-                MCPNote(
-                    "Showing the last loaded consent decisions.",
-                    tone: NativeAgentShell.trouble
-                )
-                .accessibilityIdentifier("mcp.consent.stale")
-                consentRows
-            case .available:
-                consentRows
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var consentRows: some View {
-        AliveGroupCard(lazy: true) {
-            ForEach(appModel.mcpConsent) { consent in
-                MCPHubConsentRow(consent: consent)
-            }
-        }
-    }
-}
-
-private struct MCPHubConsentRow: View {
-    @Environment(AppModel.self) private var appModel
-    let consent: MCPConsentRecord
-
-    var body: some View {
-        MCPCard {
-            HStack(alignment: .center, spacing: 8) {
-                Text("\(consent.serverId ?? "Unknown server") · \(consent.toolName ?? "Unknown tool")")
-                    .font(ShellType.labelSemibold.monospaced())
-                    .foregroundStyle(NativeAgentShell.text)
-                Spacer(minLength: 8)
-                ConnectorsStatusPill(text: MCPHubWords.consentStatus(consent.status), tone: color(consent.status))
-            }
-            HStack(spacing: 12) {
-                if let granted = consent.grantedAt, !granted.isEmpty {
-                    Text("Granted \(granted)")
-                }
-                if let revoked = consent.revokedAt, !revoked.isEmpty {
-                    Text("Revoked \(revoked)")
-                }
-                if let risk = consent.risk, !risk.isEmpty {
-                    Text("Risk: \(risk)")
-                }
-                Spacer(minLength: 0)
-            }
-            .font(ShellType.caption)
-            .foregroundStyle(NativeAgentShell.secondary)
-            if (consent.status ?? "") == "granted" {
-                HStack {
-                    Spacer(minLength: 0)
-                    Button("Revoke", role: .destructive) {
-                        Task { await appModel.revokeMCPConsent(consent) }
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("mcp.consent.revoke.\(consent.id)")
-                }
-            }
-        }
-    }
-
-    private func color(_ status: String?) -> Color {
-        switch status {
-        case "granted": NativeAgentShell.calm
-        case "revoked", "denied": NativeAgentShell.trouble
-        default: NativeAgentShell.secondary
-        }
-    }
-}
-
 // MCP server control hub — the page that surfaces all connected MCP servers,
-// their tools, the consent log, and the most recent tool call. The backend
+// their tools, and the most recent tool call. The backend
 // (AppModel + MCPDispatcher) is fully wired; this view is purely the SwiftUI
 // layer. Dressed 2026-09-03 in the Advanced page kit: the room's sheet under
 // eyebrow-and-card sections (`MCPSection` / `MCPCard` / `MCPNote` at the foot
@@ -137,7 +20,6 @@ struct MCPHubView: View {
                 serversSection
                 toolsSection
                 resourcesSection
-                consentSection
                 recentCallSection
             }
             .padding(.bottom, 32)
@@ -373,12 +255,6 @@ struct MCPHubView: View {
         }
     }
 
-    // MARK: - Consent log
-
-    private var consentSection: some View {
-        MCPHubConsentSection()
-    }
-
     // MARK: - Recent call
 
     private var recentCallSection: some View {
@@ -496,15 +372,6 @@ private enum MCPHubWords {
         }
     }
 
-    static func consentStatus(_ status: String?) -> String {
-        switch status {
-        case "granted": "Granted"
-        case "revoked": "Revoked"
-        case "denied": "Denied"
-        default: "Unknown"
-        }
-    }
-
     static func callStatus(_ status: String) -> String {
         switch status {
         case "ok", "success": "Succeeded"
@@ -574,9 +441,6 @@ private struct MCPHubToolRow: View {
                 .buttonStyle(.bordered)
             }
             if form.isExpanded {
-                let consentRisk = appModel.selectedMCPServer.map {
-                    appModel.mcpConsentRisk(server: $0, toolName: tool.name)
-                }
                 MCPInputSchemaForm(schema: tool.inputSchema, values: values,
                                    jsonErrors: $form.parseErrors, draft: $form.draft,
                                    onEdit: {
@@ -585,16 +449,7 @@ private struct MCPHubToolRow: View {
                                        }
                                    })
                     .id(ObjectIdentifier(form))
-                if let consentRisk {
-                    Text("Consent risk: \(consentRisk)")
-                        .font(ShellType.caption)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                }
                 HStack {
-                    Button("Grant consent") {
-                        guard let server = appModel.selectedMCPServer else { return }
-                        Task { await appModel.grantMCPConsent(server: server, toolName: tool.name, risk: consentRisk) }
-                    }
                     Button("Run") {
                         guard form.parseErrors.isEmpty else { return }
                         guard let server = appModel.selectedMCPServer else { return }
@@ -910,39 +765,6 @@ extension AppModel {
                 "status": .string("failed"), "command_completed": .bool(false),
                 "detail": .string(UserFacingError.forAgent(line, cause: error.localizedDescription))
             ])
-        }
-    }
-
-    @MainActor
-    func mcpConsentRisk(server: MCPServer, toolName: String) -> String {
-        MCPUIActions.consentRisk(server: server, toolName: toolName, dataRoot: engine.dataRoot)
-    }
-
-    @MainActor
-    func grantMCPConsent(server: MCPServer, toolName: String, risk: String? = nil) async {
-        do {
-            let granted = try await MCPUIActions.grantConsent(
-                serverId: server.id, toolName: toolName,
-                risk: risk ?? mcpConsentRisk(server: server, toolName: toolName),
-                dispatcher: engine.tools.mcp, dataRoot: engine.dataRoot
-            )
-            mcpConsent = (try? await engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)) ?? mcpConsent
-            statusText = "MCP consent granted (\(granted.risk ?? "unknown"))"
-        } catch {
-            setFailureStatus(error, action: "grant that MCP consent")
-        }
-    }
-
-    @MainActor
-    func revokeMCPConsent(_ consent: MCPConsentRecord) async {
-        do {
-            _ = try await MCPUIActions.revokeConsent(
-                id: consent.id, serverId: consent.serverId, toolName: consent.toolName, dispatcher: engine.tools.mcp
-            )
-            mcpConsent = (try? await engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)) ?? mcpConsent
-            statusText = "MCP consent revoked"
-        } catch {
-            setFailureStatus("Revoking MCP consent failed. " + UserFacingError.cause(error, action: "revoke MCP consent"), cause: error)
         }
     }
 

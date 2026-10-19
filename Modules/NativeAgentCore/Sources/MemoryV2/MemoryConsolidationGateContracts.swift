@@ -83,7 +83,6 @@ struct MemoryConsolidationProjectionEnvironment: Sendable {
             spotlightClient: client,
             publishInvalidation: { change in
                 await DerivedStateInvalidationCenter.shared.publish(change)
-                await DerivedStateInvalidationCenter.shared.flush()
             }
         )
     }

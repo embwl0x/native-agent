@@ -35,8 +35,12 @@ struct TurnPart {
     private(set) var system: SystemPromptSegments?
     private(set) var offeredTools: [String]?
     private(set) var afterTurn = false
-    /// Reply text the part streamed, exactly as sent.
-    private(set) var streamed = ""
+    /// Her final words as the log holds them, in order: the model's answer and
+    /// the reply text the part streamed. A resumed turn settles with them.
+    private(set) var answered = ""
+    /// The calls her log shows started with no result: a relaunch names them
+    /// to her exactly, so a call she proposes again is the same call.
+    private(set) var uncertain: [JSONValue] = []
     private var finished = false
     private var queue: [(effect: [String: JSONValue], identity: String, digest: String, step: Int)] = []
     private var state: JSONValue = .null
@@ -66,14 +70,22 @@ struct TurnPart {
             file = chosen
             var metadata = chosen.metadata
             metadata["version"] = seed.metadata["version"]
-            // Upgrade only the unchanged shipped version, never an authored part.
-            if !current.unreadable, chosen.metadata["version"] == .int(1), metadata == seed.metadata,
-               chosen.bodyDigest == "f9eecf7ec5040bb1ec7bf56f5fdf27b10b21d6c01304dd88ef015f9cb9e2ff40" {
+            // Upgrade only an unchanged shipped version, never an authored part.
+            let shipped: [Int64: String] = [1: "f9eecf7ec5040bb1ec7bf56f5fdf27b10b21d6c01304dd88ef015f9cb9e2ff40",
+                                            2: "faedb551d5d16a20d7a474c8926841d8d42c6995b1e4b196660d54c452cb412e"]
+            if current.unread == nil, case .int(let version)? = chosen.metadata["version"], metadata == seed.metadata,
+               shipped[version] == chosen.bodyDigest {
                 file = await Self.install(seed, over: chosen, store: store, dataRoot: dataRoot)
             }
         } else {
             file = seed
-            if !current.unreadable { file = await Self.install(seed, over: nil, store: store, dataRoot: dataRoot) }
+            if current.unread == nil { file = await Self.install(seed, over: nil, store: store, dataRoot: dataRoot) }
+        }
+        // Another version running in place of an unreadable one is hers to hear.
+        if let why = current.unread {
+            arrivals.append(.init(id: "turn-unreadable:" + file.bodyDigest, line:
+                "Your turn part abilities/turn.js could not be read (\(why)), so I ran \(Self.name(file, seed: seed)) for that turn.",
+                key: "turn-heal", home: true))
         }
     }
 
@@ -151,7 +163,7 @@ struct TurnPart {
 
     /// A reply.stream chunk the stem sent; a resumed turn restores it.
     mutating func sent(_ text: String) {
-        streamed += text
+        answered += text
         log.append(.object(["streamed": .string(text)]))
     }
 
@@ -165,13 +177,14 @@ struct TurnPart {
 
     private struct Fault: Error { let code: String; let why: String }
 
-    private static func read(_ store: AbilityStore, _ slot: AbilityStore.Slot) -> (file: AbilityStore.File?, unreadable: Bool) {
+    /// `unread`: why the slot holds no usable turn part, when it holds something.
+    private static func read(_ store: AbilityStore, _ slot: AbilityStore.Slot) -> (file: AbilityStore.File?, unread: String?) {
         do {
             let found = try store.read(id: id, slot: slot)
-            return (found?.kind == .turn ? found : nil, found.map { $0.kind != .turn } ?? false)
+            return (found?.kind == .turn ? found : nil, found.flatMap { $0.kind != .turn ? "it is not a turn part" : nil })
         } catch {
             nativeLog("Her turn part's %@ file is unreadable: %@", slot.rawValue, error.localizedDescription)
-            return (nil, true)
+            return (nil, error.localizedDescription)
         }
     }
 
@@ -186,8 +199,9 @@ struct TurnPart {
     /// without one (in flight). Everything else it queued is pending.
     private mutating func reconstruct() async throws -> Bool {
         state = .null; queue = []; round = nil; rounds = 0; seen = [:]
-        system = nil; offeredTools = nil; finished = false; afterTurn = false; streamed = ""
+        system = nil; offeredTools = nil; finished = false; afterTurn = false; answered = ""
         var open: Set<String> = []
+        var named: [String: JSONValue] = [:]
         for index in log.indices {
             guard case .object(let entry) = log[index] else { continue }
             if case .object(let start)? = entry["start"], case .string(let identity)? = start["id"] {
@@ -196,7 +210,7 @@ struct TurnPart {
                 if identity.hasPrefix("after:") { afterTurn = true }
                 if identity.hasPrefix("model.call:") || identity.hasPrefix("app:") { open.insert(identity) }
             } else if case .string(let text)? = entry["streamed"] {
-                streamed += text
+                answered += text
             } else if case .object(let event)? = entry["event"] {
                 switch event["type"] {
                 case .string("model"), .string("observation"), .string("provider_failure"):
@@ -208,8 +222,14 @@ struct TurnPart {
                 default: break
                 }
                 try await step(index)
+                if event["type"] == .string("model"), let round, case .array(let calls)? = event["calls"] {
+                    for (at, call) in calls.enumerated() where round.ids.indices.contains(at) {
+                        named[Self.callIdentity(round, at)] = call
+                    }
+                }
             }
         }
+        uncertain = open.sorted().compactMap { named[$0] }
         return !open.isEmpty
     }
 
@@ -309,6 +329,7 @@ struct TurnPart {
         }
         state = next
         queue += effects
+        if event["type"] == .string("model"), calls.isEmpty, case .string(let text)? = event["text"] { answered += text }
     }
 
     /// The step's answer object; nil when the turn was stopped meanwhile. A
@@ -388,12 +409,12 @@ struct TurnPart {
         helper = nil; heals += 1
         guard broken.bodyDigest != seed.bodyDigest else { throw TurnEngineError.turnPartFailed(fault.why) }
         let store = AbilityStore(dataRoot: dataRoot), seed = seed, failed = failed
-        let outcome = try await Task.detached { () -> (file: AbilityStore.File, swapped: Bool, kept: String, refused: String?) in
+        let outcome = try await Task.detached { () -> (file: AbilityStore.File, swapped: Bool, kept: String, refused: String?, unread: String?) in
             AbilityStore.withLock {
                 let usable = { (file: AbilityStore.File?) in file.flatMap { failed.contains($0.bodyDigest) ? nil : $0 } }
-                let current = Self.read(store, .current).file, previous = Self.read(store, .previous).file
+                let read = Self.read(store, .current), current = read.file, previous = Self.read(store, .previous).file
                 guard current?.bodyDigest == broken.bodyDigest else {
-                    return (usable(current) ?? usable(previous) ?? seed, false, "", nil)
+                    return (usable(current) ?? usable(previous) ?? seed, false, "", nil, read.unread)
                 }
                 var chosen = seed, kept = "\(Self.name(broken, seed: seed)) is kept as abilities/turn.prev.js."
                 do {
@@ -407,8 +428,8 @@ struct TurnPart {
                         try store.write(seed, slot: .previous)
                         try store.swap(id: Self.id)
                     }
-                    return (chosen, true, kept, nil)
-                } catch { return (chosen, true, kept, error.localizedDescription) }
+                    return (chosen, true, kept, nil, nil)
+                } catch { return (chosen, true, kept, error.localizedDescription, nil) }
             }
         }.value
         file = outcome.file
@@ -421,6 +442,10 @@ struct TurnPart {
             let steering = (PeerDataTaint.current?.checkpointSources ?? []).filter { !PeerDataTaint.ownerTrusts($0) }
             if !steering.isEmpty { line += " The turn was steered by \(steering.joined(separator: ", "))." }
             arrivals.append(.init(id: "turn-heal:" + broken.bodyDigest, line: line, key: "turn-heal", home: true))
+        } else if let why = outcome.unread {
+            arrivals.append(.init(id: "turn-unreadable:" + file.bodyDigest, line:
+                "Your turn part \(Self.name(broken, seed: seed)) failed (\(fault.code)) and abilities/turn.js could not be read (\(why)), so I ran \(Self.name(file, seed: seed)) for that turn.",
+                key: "turn-heal", home: true))
         }
         return try await rebuild()
     }

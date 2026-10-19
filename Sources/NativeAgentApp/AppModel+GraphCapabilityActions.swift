@@ -24,7 +24,6 @@ import ChatOrchestration
 import TrustCenter
 import DreamREMCycle
 import DoctorChecks
-import SelfImprovement
 import Research
 import MultimodalTTS
 import TriggerScheduler

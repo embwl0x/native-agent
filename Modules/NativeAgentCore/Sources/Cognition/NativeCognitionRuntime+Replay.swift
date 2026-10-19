@@ -6,8 +6,11 @@ import PersistenceCore
 extension NativeCognitionRuntime {
     func makeReplayIntegrationInput(reason: String) async -> CognitiveReplayIntegrationInput {
         let root = dataRoot
-        let dreamEntries = FileBackedDreamDiary(dataRoot: root)
-            .listEntries(limit: 8)
+        var unavailable: [String] = []
+        let diary = FileBackedDreamDiary(dataRoot: root).listEntriesChecked(limit: 8)
+        if diary.storageUnreadable { unavailable.append("dream_diary: the diary could not be listed") }
+        unavailable += diary.failures.sorted { $0.key < $1.key }.map { "dream_diary/\($0.key): \($0.value)" }
+        let dreamEntries = diary.entries
             .compactMap { entry -> CognitiveDreamReplayReference? in
                 guard let content = entry.content?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !content.isEmpty else { return nil }
@@ -20,8 +23,9 @@ extension NativeCognitionRuntime {
                 )
             }
 
-        let remProposals = REMProposalStore(dataRoot: root)
-            .loadAll()
+        let rem = REMProposalStore(dataRoot: root).loadAllChecked()
+        unavailable += rem.unreadable.map { "rem_proposals/\($0)" }
+        let remProposals = rem.rows
             .sorted { lhs, rhs in
                 if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
                 return lhs.id < rhs.id
@@ -41,7 +45,8 @@ extension NativeCognitionRuntime {
         return CognitiveReplayIntegrationInput(
             reason: reason,
             dreamEntries: dreamEntries,
-            remProposals: Array(remProposals)
+            remProposals: Array(remProposals),
+            unavailableEvidence: unavailable
         )
     }
 }

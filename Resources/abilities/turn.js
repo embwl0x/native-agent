@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id": "turn", "kind": "turn", "version": 2,
+{"id": "turn", "kind": "turn", "version": 3,
  "reach": {"capabilities": ["model"], "readPaths": [], "hosts": [], "apps": []},
  "wake": [], "face": {}, "resident": false, "learned": {}, "choices": {}}
 */
@@ -22,8 +22,11 @@ function step(state, event) {
       var left = state.calls - 1;
       return next({purpose: "tool_round", calls: left}, left ? [] : [{effect: "model.call", purpose: "tool_round"}]);
     case "observation":
-      return next(state, [{effect: "model.call", purpose: state.purpose}]);
+      return next({purpose: state.purpose, calls: state.calls}, [{effect: "model.call", purpose: state.purpose}]);
     case "provider_failure":
+      // Nothing ran and nothing is owed: ask once more under the stem's notice; the same cut again is hers to say.
+      if ((event.work === "nothing ran" || event.work === "not sent") && !event.owed && !state.recalled)
+        return next({purpose: state.purpose, calls: state.calls, recalled: true}, [{effect: "model.call", purpose: state.purpose}]);
       return next(state, [{effect: "reply.stream", text: event.text}, {effect: "reply.end"}]);
     case "resumed":
       var purpose = event.steps ? "tool_round" : state.purpose;

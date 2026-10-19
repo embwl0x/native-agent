@@ -227,43 +227,24 @@ extension ChatToolOutcome {
         case unknown
     }
 
+    /// The algebra as one status word: ok only for a known success, unknown
+    /// for an outcome nobody established, failed for every failure shape.
+    package static func statusWord(_ output: JSONValue) -> String {
+        guard outputLooksSuccessful(output) else { return "failed" }
+        return exactResultClass(output) == .succeeded ? "ok" : "unknown"
+    }
+
+    /// Not failure-shaped, as the one outcome algebra (`exactResultClass`)
+    /// grades it: an unknown outcome is not a failure, except a skipped call
+    /// or a raised need, which did not run.
     package static func outputLooksSuccessful(_ output: JSONValue) -> Bool {
-        if MCPInvocationOutcome.classify(response: output).providerToolResultIsError {
-            return false
+        switch exactResultClass(output) {
+        case .failed, .refused, .timeout, .cancelled: return false
+        case .succeeded: return true
+        case .unknown:
+            guard case .object(let object) = output, case .string(let status)? = object["status"] else { return true }
+            return !["skipped", "needs_input"].contains(status.lowercased())
         }
-        guard case .object(let obj) = output else { return true }
-        if [.timeout, .cancelled, .refused].contains(exactResultClass(output)) { return false }
-        // A PRESENT key holding JSON `null` is "no error", not an error.
-        // `MacControlResult.toJSON()` always emits `"error": null` on success,
-        // and `obj["error"] != nil` is true for `.some(.null)` — so every
-        // Full-Mac tool (view/click/ax_find/…) traced as failed AND reached
-        // the model as `is_error:true` for months (root-caused 2026-08-21
-        // from the 08-18 "legacy AX find tool 12/12 failed" burst: MacControl's op
-        // store had all 12 `completed`). Mirrors `exactResultClass`.
-        if let error = obj["error"], error != .null { return false }
-        if obj["outcome"] == .string("unmet") { return false }
-        // An explicit boolean failure beside a null error is still a failure
-        // (gpt-5.5 review 2026-08-21: `{ok:false, error:null}` must not flip
-        // to ok once null stops counting). Mirrors `exactResultClass`.
-        if case .bool(false)? = obj["ok"] { return false }
-        if case .bool(false)? = obj["success"] { return false }
-        // Most non-throwing failures on this surface use status:"failed"/
-        // "denied" envelopes with NO "error" key (builder tools, Full-Mac
-        // gates, lazy-load misses) — without this they persisted as ok:true
-        // and the UI rendered failures as successes (audit 2026-06-09).
-        if case .string(let status)? = obj["status"] {
-            let s = status.lowercased()
-            if failureStatuses.contains(s) || s == "skipped" { return false }
-            // A raised need did not run. Counting it as a successful round let
-            // the whole-turn budget renew on a card the person had not touched
-            // yet — the same shape as the re-asked CONFIRM above.
-            if s == "needs_input" { return false }
-        }
-        // A command's exit code is its answer once the tool says its call completed.
-        if case .string(let status)? = obj["status"], successStatuses.contains(status.lowercased()) { return true }
-        if case .int(let code)? = obj["exit_code"], code != 0 { return false }
-        if case .double(let code)? = obj["exit_code"], code != 0 { return false }
-        return true
     }
 
     /// User, 2026-09-06: a slot the Stop reached NEVER RAN. Its envelope is
@@ -589,7 +570,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         // made the chat fold read "1 of 3 failed" for a card nobody had
         // answered yet. The row stays honest: it is waiting.
         let waiting = ChatToolOutcome.isWaitingOnPerson(result)
-        let status = waiting ? "waiting" : (ok ? "ok" : "failed")
+        let status = waiting ? "waiting" : ChatToolOutcome.statusWord(result)
         let failureShaped = !ok && !waiting
         let evidence = Self.dispatchEvidence(tool: tool, input: input, status: status, result: result, receiptID: receiptID)
         await recordCompletion(

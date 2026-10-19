@@ -102,9 +102,12 @@ extension CognitiveSubstrate {
         }
 
         let receiptPayload: JSONValue? =
-            !writes.isEmpty
+            !writes.isEmpty || !input.unavailableEvidence.isEmpty
             ? .object([
                     "reason": .string(bounded(input.reason, maxCharacters: 120)),
+                    "unavailableEvidence": .array(input.unavailableEvidence.prefix(16).map {
+                        .string(bounded($0, maxCharacters: 240))
+                    }),
                     "episodeCount": .int(Int64(episodeIds.count)),
                     "schemaProposalCount": .int(Int64(schemaProposalIds.count)),
                     "episodeIds": .array(episodeIds.map { .string($0.uuidString) }),
@@ -324,7 +327,8 @@ extension CognitiveSubstrate {
         guard parts.count == 3 else { return nil }
         var components = DateComponents()
         components.calendar = Calendar(identifier: .gregorian)
-        components.timeZone = TimeZone(secondsFromGMT: 0)
+        // A dream's date is the Mac's local day it was keyed to.
+        components.timeZone = .current
         components.year = parts[0]
         components.month = parts[1]
         components.day = parts[2]

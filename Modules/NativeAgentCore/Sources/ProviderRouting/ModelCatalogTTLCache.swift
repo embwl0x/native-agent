@@ -51,6 +51,13 @@ public enum ModelCatalogFreshness: String, Sendable, Equatable {
 /// cache only the nil result for that observed mtime; a later mtime always
 /// retries the decode. Mirrors `REMPinsDecodedCache` in DreamREMCycle — same
 /// invariant, same retry-on-concurrent-write guard.
+/// A saved model list that is there but cannot be read: the receipt that
+/// replaces its rows, never the shipped rows. Nil when absent or read.
+func modelCatalogFault(at url: URL, read: Bool, owner: String) -> String? {
+    guard !read, FileManager.default.fileExists(atPath: url.resolvingSymlinksInPath().path) else { return nil }
+    return "\(url.path) could not be read as \(owner)'s model list, so its models and windows are unknown; move that file aside on the Mac and the next refresh fetches it again."
+}
+
 final class ModelCatalogDecodeCache: @unchecked Sendable {
     private struct Entry {
         let modifiedAt: Date

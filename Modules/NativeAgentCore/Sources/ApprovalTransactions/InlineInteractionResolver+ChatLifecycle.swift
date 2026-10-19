@@ -173,7 +173,7 @@ extension InlineInteractionResolver {
             if choice == InlineInteractionRegistry.persistentChoiceOptionID {
                 present(.providerGroupModel)
             } else if let picked = choice, !picked.isEmpty {
-                await completeModelChoice(interaction, target: descriptor.target, picked: picked,
+                await completeModelChoice(interaction, picked: picked,
                     sessionID: sessionID, controls: controls, dataRoot: dataRoot)
                 await refresh()
             } else {
@@ -313,22 +313,45 @@ extension InlineInteractionResolver {
             model: option?.modelID ?? picked)
     }
 
+    /// The one way any door answers a model choice: begin on the card's
+    /// revision, save a lasting choice through the Mac's controls, complete
+    /// with what that save did. A door adds only its authentication.
+    public static func answerModelChoice(
+        _ card: InlineInteraction, sessionID: String, picked: String, scope: InlineInteraction.Scope?,
+        attribution: String? = nil, controls: @MainActor () -> (any InlineInteractionControlPort)?, dataRoot: URL
+    ) async throws -> InlineInteraction {
+        let running = try await begin(id: card.id, sessionID: sessionID, expectedRevision: card.revision, dataRoot: dataRoot)
+        return try await settleModelChoice(card, sessionID: sessionID, picked: picked, scope: scope,
+            expectedRevision: running.revision, attribution: attribution, controls: controls(), dataRoot: dataRoot)
+    }
+
+    /// The Mac card's control already began the card.
     public static func completeModelChoice(
-        _ interaction: InlineInteraction, target: String, picked: String, sessionID: String,
+        _ interaction: InlineInteraction, picked: String, sessionID: String,
         controls: any InlineInteractionControlPort, dataRoot: URL
     ) async {
-        let scope = interaction.primaryScope ?? .persistent
-        if scope == .persistent {
+        do {
+            _ = try await settleModelChoice(interaction, sessionID: sessionID, picked: picked,
+                scope: interaction.primaryScope ?? .persistent, controls: controls, dataRoot: dataRoot)
+        } catch { nativeLog("[interaction] complete failed for \(interaction.id): \(error)") }
+    }
+
+    private static func settleModelChoice(
+        _ card: InlineInteraction, sessionID: String, picked: String, scope: InlineInteraction.Scope?,
+        expectedRevision: Int? = nil, attribution: String? = nil,
+        controls: (any InlineInteractionControlPort)?, dataRoot: URL
+    ) async throws -> InlineInteraction {
+        var setupError: String?
+        if (scope ?? .persistent) == .persistent {
             do {
-                try await saveModelSelection(target: target, picked: picked, controls: controls)
-            } catch {
-                await completeControl(interaction.id, sessionID: sessionID, selection: picked,
-                    scope: scope, setupError: error.localizedDescription, note: nil, dataRoot: dataRoot)
-                return
-            }
+                guard let controls else {
+                    throw NSError(domain: "InteractionCard", code: 2, userInfo: [NSLocalizedDescriptionKey: "The Mac's controls are unavailable."])
+                }
+                try await saveModelSelection(target: card.target, picked: picked, controls: controls)
+            } catch { setupError = error.localizedDescription }
         }
-        await completeControl(interaction.id, sessionID: sessionID, selection: picked,
-            scope: scope, setupError: nil, note: nil, dataRoot: dataRoot)
+        return try await complete(id: card.id, sessionID: sessionID, selection: picked, scope: scope,
+            expectedRevision: expectedRevision, attribution: attribution, setupError: setupError, dataRoot: dataRoot)
     }
 
     public static func settleVerifiedControls(

@@ -55,7 +55,8 @@ extension CognitiveSubstrate {
     /// against the LIVE ledger after the await, as Reminded-of is.
     func dreamThemeCue(
         for request: CognitiveCapsuleRequest,
-        from read: CognitiveFrozenRead
+        from read: CognitiveFrozenRead,
+        unreadable: inout [String]
     ) async -> CognitiveDreamTheme? {
         guard read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
@@ -67,7 +68,9 @@ extension CognitiveSubstrate {
         guard terms.count >= Self.dreamThemeMinimumTerms else { return nil }
         let spent = Set(read.capsulePresentationState.dreamThemeSurfaced
             .filter { read.fixedAt.timeIntervalSince($0.value) < Self.dreamThemeRepeatWindow }.keys)
-        let residues = await dependencies.dreamThemes(request.userMessage, spent)
+        let themes = await dependencies.dreamThemes(request.userMessage, spent)
+        unreadable += themes.unreadable
+        let residues = themes.value
         let live = capsulePresentationStateSnapshot().dreamThemeSurfaced
         guard !residues.isEmpty, Self.dreamThemeCadenceAllows(live, at: read.fixedAt) else { return nil }
         return residues
@@ -122,7 +125,8 @@ extension CognitiveSubstrate {
     /// after a real gap; nil (no lookup at all) on every other turn.
     func sinceGapItems(
         for request: CognitiveCapsuleRequest,
-        from read: CognitiveFrozenRead
+        from read: CognitiveFrozenRead,
+        unreadable: inout [String]
     ) async -> [String]? {
         guard read.configuration.enabled,
               read.configuration.enabled,
@@ -133,7 +137,15 @@ extension CognitiveSubstrate {
               let opened = Self.sinceGapOpened(
                 read.capsulePresentationState, previousUserTurn: request.previousUserTurnAt,
                 dynamics: read.personalityDynamics, at: read.fixedAt) else { return nil }
-        return await dependencies.sinceGap(opened, read.fixedAt, request.surface)
+        let gap = await dependencies.sinceGap(opened, read.fixedAt, request.surface)
+        unreadable += gap.unreadable
+        return gap.value
+    }
+
+    /// The receipt for a continuity source that could not be read: one line
+    /// each, so its silence never reads as an empty past.
+    static func unreadableCueLine(_ source: String) -> String {
+        "- Unreadable just now: \(source). Nothing from it came to mind, which is not the same as nothing there."
     }
 
     static func sinceGapPhrase(_ elapsed: TimeInterval) -> String {

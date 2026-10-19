@@ -659,12 +659,4 @@ extension MemoryStorage {
         }
     }
 
-    @discardableResult
-    public func deleteProposal(id: String) async throws -> Bool {
-        try await dbPool.write { db in
-            try db.execute(sql: "DELETE FROM proposals WHERE id = ?", arguments: [id])
-            return db.changesCount > 0
-        }
-    }
-
 }

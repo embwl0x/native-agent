@@ -35,7 +35,7 @@ extension AppActions {
             let reader = all.first { $0.id == id }!
             return AppAction(id, record.corner.key, "Read \(record.id) · \(record.corner.key)", reader.args,
                 warn: reader.warn, tool: reader.tool, input: reader.input.merging(input) { _, bound in bound },
-                scriptable: reader.scriptable, read: true,
+                read: true,
                 scope: ([record.id, record.corner.key, record.grownBecause ?? ""] + record.verbs).joined(separator: " "),
                 schema: schema(reader).map { LLMToolSchema(name: reader.tool,
                     description: "Read \(record.id) · \(record.corner.key)", parametersJSON: $0.parametersJSON) },
@@ -325,7 +325,7 @@ extension AppToolExecutor {
                 fields["provenance"] = .string(provenance.line(now: Date()))
                 return .object(fields)
             }
-            return .object(["status": .string(ChatToolOutcome.outputLooksSuccessful(result) ? "ok" : "failed"),
+            return .object(["status": .string(ChatToolOutcome.statusWord(result)),
                 "result": result, "provenance": .string(provenance.line(now: Date()))])
         case .page(var page, let provenance):
             guard page.corner == record.corner, page.text.utf8.count <= NativePage.maximumTextBytes else {

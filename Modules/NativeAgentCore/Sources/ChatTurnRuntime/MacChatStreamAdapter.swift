@@ -93,10 +93,10 @@ public enum MacChatStreamAdapter {
         makeExecution: @escaping @Sendable () -> ChatStreamExecution
     ) -> AsyncThrowingStream<MacChatStreamUpdate, Error> {
         AsyncThrowingStream { continuation in
-            // Surface cancellation propagates into the concrete core producer,
-            // but this adapter does not resolve its completion receipt until
-            // that producer has finished its canonical partial/terminal write.
-            let producer = Task {
+            // A surface that stops listening only detaches; Stop (the run's flag)
+            // is what ends the turn. This adapter does not resolve its completion
+            // receipt until the producer has finished its canonical write.
+            Task {
                 defer { metaBox.recordProducerFinished() }
                 await TurnTraceContext.$turnId.withValue(activityIdentity.turnId) {
                 // The live computer pane's channel, bound for the WHOLE life of
@@ -113,24 +113,17 @@ public enum MacChatStreamAdapter {
                 // remote turn.
                 await MacScreenPreviewBus.$publish.withValue(onScreenPreview) {
                 let swiftExecution = makeExecution()
-                await withTaskCancellationHandler {
-                    await Self.bridgeChatStreamEvents(
-                        swiftExecution.events,
-                        sessionId: sessionId,
-                        activityIdentity: activityIdentity,
-                        metaBox: metaBox,
-                        onTurnActivity: onTurnActivity,
-                        continuation: continuation
-                    )
-                    await swiftExecution.waitForProducerTermination()
-                } onCancel: {
-                    swiftExecution.cancel()
+                await Self.bridgeChatStreamEvents(
+                    swiftExecution.events,
+                    sessionId: sessionId,
+                    activityIdentity: activityIdentity,
+                    metaBox: metaBox,
+                    onTurnActivity: onTurnActivity,
+                    continuation: continuation
+                )
+                await swiftExecution.waitForProducerTermination()
                 }
                 }
-                }
-            }
-            continuation.onTermination = { termination in
-                if case .cancelled = termination { producer.cancel() }
             }
         }
     }

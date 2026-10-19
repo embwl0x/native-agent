@@ -380,7 +380,7 @@ extension CognitiveSubstrate {
             await persistArtifact(kind: "affect", id: stableArtifactID("affect"), status: "current",
                 score: updated.arousal, payload: updated.toJSON(
                     lastUserPresenceAt: lastUserPresenceAt, lastWarmPresenceAt: lastWarmPresenceAt))
-            try? await persistSnapshot()
+            await notingPersistence("snapshot") { try await persistSnapshot() }
         }
         if let request = context.caring, let caring, let kind = caring.kind {
             let scope = "\(request.session)|\(request.turn)"

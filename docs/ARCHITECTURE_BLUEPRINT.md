@@ -380,7 +380,7 @@ NativeAgent approval cards cover only requests the agent submits.
 | `AgentHostConfigWriter+Goose.swift` | `AgentHostConfigWriter`: `writeGooseEntry`, `removeGooseEntry` |
 | `AgentHostConfigWriter.swift` | `AgentHostConfigWriter` enum; `writeEnvironment`, `ensureEnvironment`; settings splice accepts an absent or exact entry, or a same-contact credential repair differing only in its secret; all other collisions fail before mutation; `checking` requires the saved entry without writing; removal names missing ownership receipts and preserves unproven bytes |
 | `AgentHostConnection.swift` | `AgentHostConnection` enum; `builderWorkspaceRoot`, `isNamedConnect`; Connect resolves host or exact peer identity (a peer only in its own workspace; another folder is that folder's own contact), re-mints a missing key on the same contact, retires proof and rewrites only its connector entry under the settings lock; elevation remains store-owned; disconnect revokes before settings cleanup and keeps failed cleanup owed through RepairOwed; `verifySetup` stays read-only |
-| `AgentHostDirectory.swift` | `AgentHostDirectory` enum; `bridgeDiscoveryDirectory`, `peerDescriptorDirectory`; `installationEvidence` is discovery/Connect/verify's one installation check; install markers must resolve to executable files or app bundles with executable programs, never profiles; recipe `executables`, `discoveryWords`, `searchPaths` and `messagingPermissionsPath` replace inferred program names, fixed discovery words, ambient path additions and a hardcoded host permission file |
+| `AgentHostDirectory.swift` | `AgentHostDirectory` enum; `bridgeDiscoveryDirectory`, `peerDescriptorDirectory`; `installation.evidence` is discovery/Connect/verify's one installation check; install markers must resolve to executable files or app bundles with executable programs, never profiles; recipe `executables`, `discoveryWords`, `searchPaths` and `messagingPermissionsPath` replace inferred program names, fixed discovery words, ambient path additions and a hardcoded host permission file |
 | `AgentLinkTransport.swift` | Re-exports `AgentLinkTransport` |
 | `AgentMailActions.swift` | `AgentMailActions` enum; `listRecent`, `readMessage` |
 | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `authenticatedInterface`, `a2aCheck` (an A2A call's card held to its recipe; its dry run), `listTasks`, `localCandidates` (ports from every recipe); launch directly discovers/connects settings hosts from recipes without awaiting Spotlight; the index watcher adds later arrivals after any in-flight scan; no program launch or elevation; persistent declines/disconnects win, running hosts get one restart note; host and pass-wide setup failures name files/fields and remedies per candidate and wake key, keep dismissible offers, and clear on automatic/manual recovery; `app.installed` for each whole bundle at a bundle id and version new since the first, silent installed-apps.json baseline |
@@ -598,7 +598,6 @@ Directory: `Modules/NativeAgentCore/Sources/BackgroundWork/`
 | File | Owns |
 |---|---|
 | `DelegationOutcomeLoop.swift` | Delegation terminal snapshots, exact durable cursor, outcome/liveness classification and settlement runner |
-| `AutonomyBackgroundWork.swift` | `AutonomyBackgroundWork` enum; `trustPolicyPath`, `makeAutonomyPromotionLoop`; `AutonomyPromotionLoop` owns promotion work |
 | `BackgroundWorkClients.swift` | `PersonaBackedBackgroundLLMClient` struct; `complete`, `completeMessages` |
 | `BackgroundWorkPorts.swift` | `BackgroundWorkEventPort` protocol; `storeAndFileEvents` |
 | `ChatSurfaceBackgroundWork.swift` | `ChatSurfaceBackgroundWork` enum; `makeTelegramChatHandler`, `fileSystemPermissionNotice` |
@@ -739,7 +738,6 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `SwiftToolDispatcher+DesktopPixels.swift` | `SwiftToolDispatcher`: `desktopPixelsRequested`, `desktopPixels`, `impl_mac_screenshot_save` saves system captures without model pixel delivery |
 | `SwiftToolDispatcher+Dispatch.swift` | `SwiftToolDispatcher`: `withWebScheme`, `dispatch`, `preApprovalRefusal`; `mac_location` answers with the fix the kept CoreLocation owner holds, and its age, or requests its ordinary Location permission card |
 | `SwiftToolDispatcher+DreamDiaryTools.swift` | `SwiftToolDispatcher`: `impl_dream_diary_read`, `dreamDiaryEntryJSON`, `dreamDiaryStorageFields` |
-| `SwiftToolDispatcher+ExternalConnectors.swift` | `SwiftToolDispatcher`: `xConnectorWithOAuthFallback` |
 | `SwiftToolDispatcher+FourVerbPerception.swift` | `SwiftToolDispatcherFourVerbPerceptionSource` struct; whole native masked observation through recognition, region crop and JPEG fitting only at model delivery; window obstructions from MacControl's `SystemMacVisualObstructionProbe` |
 | `SwiftToolDispatcher+HumanConversations.swift` | `HumanConversationSnapshot` struct |
 | `SwiftToolDispatcher+ImageGenerationTools.swift` | `SwiftToolDispatcher`: `impl_image_generate`, `showGeneratedImages`, `imageGenerationReferences` |
@@ -806,13 +804,13 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `ChatLiveTap.swift` | `ChatLiveTap` enum; `observe` (every turn's deltas and saved answer, for the phone) |
 | `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop`; `TurnCheckpointScope`, serialized `TurnCheckpointWriter`; same-turn transcript/receipt recovery and finished-run cleanup |
 | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory` (history and digest gathered for them turn part), `fireAssemblyStageEvent`, `injectingSessionDigest` |
-| `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: runs their turn part's effects, hands it each event, logs at every host-call boundary), `joinedProse`; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; live first-output cuts carry wall-only retry scope until the round succeeds |
+| `ChatOrchestration+StreamingToolLoop.swift` | `SwiftNativeTurnEngine`: `executeContinuationTurnBody` (the stem's loop: runs their turn part's effects, hands it each event, logs at every host-call boundary), `joinedProse`; round-scoped OAuth provider-event capture through the existing cutoff writer for suspicious cleaned replies and malformed streams; a `provider_failure` event carries the failure's work state and whether repair is owed |
 | `ChatOrchestration+ToolDispatch.swift` | Shared per-iteration tool dispatch and refusal of unoffered folded calls |
 | `ChatOrchestration+ToolLoop.swift` | `TurnContext`: `withToolSchemas` |
 | `ChatOrchestration+TurnEngine.swift` | `SwiftNativeTurnEngine`: gathers their turn part's reach (persona, pins, recall, packet, facts) and provider execution |
 | `ChatOrchestrationClient+Attachments.swift` | image/document admission and voice evidence projection; audio remains an attachment, never a provider content block |
 | `ChatOrchestrationClient+Client.swift` | `SwiftNativeChatOrchestrationClient` actor; `drainDeferredMemoryPromotion`, `chat`; `withCurrentChatModel` admits the current Chat pick once for a wake; `withModelContext` binds the same client/provider/model/effort/tier for turns and wakes |
-| `ChatOrchestrationClient+DispatchWrappers.swift` | `FileAccessGatedDispatcher` class; `preApprovalRefusal`, `approvalCardReason`, `sharedFileAccess` (a caller's read-only request fences; the posture-synced saved choice does not); `sharedChatFileAccess`; declared part app-data reach approves only matching read/write paths, retaining ordinary file-mode checks elsewhere |
+| `ChatOrchestrationClient+DispatchWrappers.swift` | `FileAccessGatedDispatcher` class; `preApprovalRefusal`, `approvalCardReason`, `sharedFileAccess`; `sharedChatFileAccess`; carries the chain's file access to the organs and refuses only an unrecognized mode and a pathful read under `none` (no tool-name lists; admission is posture × declared class in TrustCenter); declared part app-data reach approves matching read/write paths; `AutonomyGatedDispatcher` audit rows that fail are owed repairs |
 | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`: `runEphemeralToolTurn` |
 | `ChatOrchestrationClient+Factories.swift` | `complete`, `makeChatOrchestrationClient`, `makeGatedToolDispatchClient`, canonical `makeResidentProviderLLMClient` shared by turns and background body work; stall-only calls share a transport without a resource wall; `SwiftNativeMemoryV2RecallingAdapter`: disclosure-aware recall and served-hit credit |
 | `ChatOrchestrationClient+HumanConversationReply.swift` | `SwiftNativeChatOrchestrationClient`: `appendHumanConversationReply` |
@@ -857,7 +855,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnRuntime/`
 | `ToolLoopSupport.swift` | `ToolLoopTraceObservation`, `ToolDispatchDeadline`, `ToolLoopNoProgressGuard` |
 | `TurnEngineContracts.swift` | `TurnContext` value projections with module-scoped setters and immutable admitted routing; `TurnEngineResult`; `SharedAdaptiveMemoryPromoter`: full turn evidence and telemetry |
 | `TurnObservation.swift` | `TurnObservation` enum; `text`, `apply`, shared trace emission in `record` |
-| `TurnPart.swift` | `TurnPart`: their turn as a part (`abilities/turn.js` `step(state, event)`) in one held helper per turn (a helper short of resources is an observation retried on the helper backoff until Stop; any other start failure ends the turn with its fix), version choice and seed install, the effect queue, the turn's event log and reconstruction for resume and heal; `provider_failure` carries the repair's callable input, permits explicit `app` repair calls through the ordinary dispatcher, and can end incomplete without healing an authored part; compare-and-swap heal in one store transaction |
+| `TurnPart.swift` | `TurnPart`: their turn as a part (`abilities/turn.js` `step(state, event)`) in one held helper per turn (a helper short of resources is an observation retried on the helper backoff until Stop; any other start failure ends the turn with its fix), version choice and seed install, the effect queue, the turn's event log and reconstruction for resume and heal; `provider_failure` carries the repair's callable input, permits explicit `app` repair calls through the ordinary dispatcher or a re-issued `model.call`, and can end incomplete without healing an authored part; compare-and-swap heal in one store transaction |
 | `TurnSettle.swift` | `TurnSettle` enum; `requestedResultIntent`, `waitingOnCard` |
 | `TurnRequest.swift` | `TurnRequest`: shared turn binding; `TurnAdmission`: per-session serialization, bounded admission queues and release/cancellation capacity signals for durable arrivals |
 
@@ -1402,7 +1400,7 @@ Directory: `Modules/NativeAgentCore/Sources/NativeAgentCore/`
 | `NativeAgentBuildIdentity.swift` | process-cached current identity, injectable `from`, `writeLaunchStamp` |
 | `NativeTimestampFormat.swift` | `NativeTimestampFormat` enum; `flooredOptionalMicrosecondUTCOffset`, `utcDay` |
 | `ProviderFamilyIdentity.swift` | `ProviderFamilyIdentity` enum; `normalize` |
-| `SSEEventStream.swift` | Shared SSE framing and `ProviderStreamContext`; transport opening and activity for every event/comment; optional round-scoped diagnostic event capture before provider decoding and live first-output retry scope |
+| `SSEEventStream.swift` | Shared SSE framing and `ProviderStreamContext`; transport opening and activity for every event/comment; optional round-scoped diagnostic event capture before provider decoding |
 | `TurnDeadline.swift` | `TurnDeadline` class; shared active-work deadline pauses while awaiting a person |
 | `TurnTokenBudget.swift` | `TurnTokenBudget` class; `take`, `beginRequest` |
 
@@ -1443,6 +1441,7 @@ Directory: `Modules/NativeAgentCore/Sources/PersistenceCore/`
 | `PersistenceCore.swift` | Shared JSON/JSONL atomic/durable persistence, strict UTF-8 physical-line tails with rejected-row accounting and directory sync; CapabilityLifecycle guards ability changes and reconciles owner-off attribution; VerifiedPath owns descriptor-relative IO and transfers |
 | `PersistenceDataRoot.swift` | `ResolvedDataRootCache` class; `resolve` |
 | `RegistryTimestampSortKey.swift` | `RegistryTimestampSortKey` enum; `sortKey` |
+| `VolumeIO.swift` | The one owner of blocking file work that can touch a File Provider or network volume (iCloud Drive): one serial queue off the cooperative pool, awaited by its callers |
 
 ### Experiences
 
@@ -1525,9 +1524,9 @@ Directory: `Modules/NativeAgentCore/Sources/ProviderRouting/`
 | `ModelCatalogTTLCache.swift` | shared live fetch and TTL/backoff state machine; `ModelCatalogDecodeCache` memoizes each provider's decoded rows and authority stamps by canonical file path and mtime |
 | `ProviderAPIKeyStore.swift` | `ProviderAPIKeyStore` enum; `insert`, `read` |
 | `XAIOAuthCredentialStore.swift` | Locked xAI token migration, immutable Keychain references, refresh reads and sign-out cleanup |
-| `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence, live first-output cuts and the owner's `ToolFailureError` repair through normalization; `repair` decides once whether a failed call owes repair (sign-in, account, model choice) or is a correction that owes nothing |
+| `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence and the owner's `ToolFailureError` repair through normalization; `repair` decides once whether a failed call owes repair (sign-in, account, model choice) or is a correction that owes nothing |
 | `ProviderRecoveryPolicy.swift` | Shared failure classification and helper-start backoff; provider calls do not repeat through a retry ladder |
-| `ProviderStreamGuard.swift` | Configured idle/wall cuts on wire activity for every provider stream, typed no-reply failure, cancellation-owned stream forwarding and uncapped model URLSession; retries after a learned first-output cut with wire activity use only the call wall; wall-off streams forward without a watchdog |
+| `ProviderStreamGuard.swift` | Configured idle/wall cuts on wire activity for every provider stream, typed no-reply failure, cancellation-owned stream forwarding and uncapped model URLSession; the learned first-output deadline bounds only a wire with nothing on it; wall-off streams forward without a watchdog |
 | `ProviderRouting.swift` | `SwiftNativeProviderRouting` actor; `checkedProviderSnapshot`, `checkedRoutingSnapshot`, `saveGroupSelection`, `catalogContextLength`, `routingRepairInput`, `reconstructRouting`; provider interpretation, recoverable group writes and byte-preserving explicit routing reconstruction |
 | `ProviderRoutingContracts.swift` | `ProviderRoutingProtocol`: `listProviders`, `getProvider`, `configureProvider` |
 | `ProviderStateValidation.swift` | `ProviderStateValidation` enum; `dataIfPresent`, `credential` |

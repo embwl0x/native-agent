@@ -300,17 +300,6 @@ extension TelegramPollLoop {
         sessionId: String?,
         runId: String?
     ) async throws -> (reply: String, imagePaths: [String]) {
-        // The retired model/effort/fast/persona commands, said in words.
-        // This is the single choke point every non-slash Telegram text turn
-        // passes through, so the words reach the preference writers without
-        // a round trip through the model. It fires only on an unambiguous
-        // whole-message request (and never when an image is attached);
-        // everything else falls straight through to the chat handler.
-        if attachments.isEmpty,
-           let spoken = await spokenPreferenceReply(destination: destination, text: text) {
-            return (spoken, [])
-        }
-
         let context = TelegramChatAttemptContext(
             replyTo: replyTo,
             fromUserId: fromUserId,

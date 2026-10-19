@@ -45,9 +45,23 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
                 guard let pid = row["pid"] as? Int, pid > 0, pid <= Int(Int32.max) else {
                     throw PersistenceCoreError.ioFailure("Swarm live store malformed; repair swarms/live.json without discarding retained worker results.")
                 }
-                if kill(pid_t(pid), 0) == 0 || errno != ESRCH {
+                // Running needs the incarnation that wrote the row: the pid's
+                // start time must match. A row without a readable stamp, or a
+                // process table that cannot be read, is unknown, never running
+                // and never ended; it stays on the board, unsettled, as it is.
+                let stamp = row["pidStartedAt"] as? Double
+                switch Self.processStart(pid_t(pid)) {
+                case .started(let started) where stamp.map({ abs($0 - started) < 0.001 }) == true:
                     working.append(row)
                     continue
+                case .unreadable, .started where stamp == nil:
+                    var unknown = row
+                    unknown["status"] = "unknown"
+                    unknown["liveness"] = "Whether crew process \(pid) is still this crew's cannot be established; it was not settled or replayed."
+                    working.append(unknown)
+                    continue
+                case .started, .gone:
+                    break
                 }
                 var receipt = row
                 receipt.removeValue(forKey: "pid")
@@ -77,6 +91,20 @@ public struct SwiftNativeSwarmRunsReader: Sendable {
         }
         if locked { return try CredentialFileLock.withLock(livePath, project) }
         return try project()
+    }
+
+    enum ProcessStart { case started(Double), gone, unreadable }
+
+    /// When the process with this pid started: with the pid it names one
+    /// process incarnation. `gone` only when the process table says so.
+    static func processStart(_ pid: pid_t) -> ProcessStart {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0 else { return .unreadable }
+        guard size > 0 else { return .gone }
+        let start = info.kp_proc.p_un.__p_starttime
+        return .started(Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000)
     }
 
     static func rows(at path: URL) throws -> [[String: Any]] {

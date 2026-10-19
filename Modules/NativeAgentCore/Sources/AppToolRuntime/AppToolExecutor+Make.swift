@@ -12,10 +12,14 @@ extension AppToolExecutor {
         let studio = MakeStudio(dataRoot: root)
         let ref = Self.inputString(input["ref"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if verb == "read" {
-            guard let meta = (ref.isEmpty ? studio.newestRef() : ref).flatMap(studio.meta) else {
+            let found: MakeStudio.Meta?
+            do { found = try (ref.isEmpty ? studio.newestRef() : ref).flatMap(studio.readMeta) } catch {
+                return Self.failure("make_unreadable", "Make could not be read: \(error.localizedDescription)", extra: ["effects": .string("none")])
+            }
+            guard let meta = found else {
                 return Self.failure("unknown_ref", ref.isEmpty ? "Nothing is in Make yet." : "No Make ref is called \(ref).")
             }
-            return .object([
+            var receipt: [String: JSONValue] = [
                 "status": .string("ok"), "ref": .string(meta.ref),
                 "versions": .array(meta.versions.map { version in
                     var row: [String: JSONValue] = [
@@ -26,7 +30,10 @@ extension AppToolExecutor {
                     if let model = version.model { row["model"] = .string(model) }
                     return .object(row)
                 }),
-            ])
+            ]
+            // What the shelf could not read stays on the receipt beside what it could.
+            if let fault = MakeStudio.Shelf.shared.fault { receipt["shelf_fault"] = .string(fault) }
+            return .object(receipt)
         }
         let path = Self.inputString(input["path"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the file to add to Make.") }

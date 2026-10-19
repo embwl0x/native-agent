@@ -63,10 +63,22 @@ struct WorkPaneMakeView: View {
                     preparedRevision = revision
                 }
             } else {
-                Text("Nothing made yet.")
+                Text(shelf.fault == nil ? "Nothing made yet." : "Nothing on the shelf could be read.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        // The shelf shows its last good read; what it could not read is said.
+        .safeAreaInset(edge: .bottom) {
+            if let fault = shelf.fault {
+                Text(fault)
+                    .font(ShellType.caption)
+                    .foregroundStyle(NativeAgentShell.trouble)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .task(id: ref) {

@@ -66,6 +66,9 @@ extension ProvidersFacade {
                     try await llm.complete(prompt: "ping", system: "This is a provider connection check. Reply with one word.", model: probeModel, surface: "chat", purpose: "probe")
                 }
             }
+            // The sign-in this check sends, hashed before it is sent, as a key's
+            // probe does; a refresh during the call leaves the receipt unbound.
+            let signIn = LLMProviderStatusFeed.credentialFingerprint(providerID: id, dataRoot: dataRoot)
             do {
                 _ = try await withTaskCancellationHandler {
                     try await probe.value
@@ -75,7 +78,8 @@ extension ProvidersFacade {
                 return await recordProbeResult(NativeAgentShared.ProviderTestResult(
                     provider_id: id, status: "ok", tested: true,
                     response: nil, model_used: probeModel,
-                    detail: "latency=\(Int(Date().timeIntervalSince(start) * 1000))ms", error: nil
+                    detail: "latency=\(Int(Date().timeIntervalSince(start) * 1000))ms", error: nil,
+                    credential: signIn
                 ))
             } catch is CancellationError {
                 // The caller gave up; that says nothing about the provider.
@@ -84,7 +88,8 @@ extension ProvidersFacade {
                 return await recordProbeResult(NativeAgentShared.ProviderTestResult(
                     provider_id: id, status: "error", tested: true,
                     response: nil, model_used: probeModel,
-                    detail: nil, error: error.localizedDescription
+                    detail: nil, error: error.localizedDescription,
+                    cause: ProviderFailure.classify(error)?.encoded, credential: signIn
                 ))
             }
         }
@@ -150,7 +155,7 @@ extension ProvidersFacade {
         _ provider: ProviderInfo, authMode: String, apiKey: String
     ) async throws -> (result: NativeAgentShared.ProviderTestResult, credentialReady: Bool) {
         let current = try await list().first { $0.provider_id == provider.provider_id }
-        let credentialReady = current?.auth_status.state == "ready"
+        let credentialReady = current?.auth_status.eligible == true
             && (current?.auth_mode == authMode || (current?.auth_mode == nil && provider.auth_modes.count == 1))
         let result: NativeAgentShared.ProviderTestResult
         if authMode != "api_key" {

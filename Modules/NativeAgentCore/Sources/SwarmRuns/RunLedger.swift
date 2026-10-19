@@ -1,4 +1,5 @@
 import PersistenceCore
+import Experiences
 import Foundation
 import NativeAgentCore
 
@@ -25,9 +26,10 @@ import NativeAgentCore
 ///   with an atomic rewrite, so concurrent producers (chat tool loop,
 ///   background execution executor, Mac UI swarm) can't interleave or tear
 ///   the file.
-/// - Appends are BEST-EFFORT by design: a ledger-write failure must never
-///   fail the run it records. Failures are logged loudly to stderr instead
-///   of thrown.
+/// - A ledger-write failure never fails the run it records. It is a repair
+///   owed on the ledger, retained across relaunch, and settled by the next
+///   append that lands. A damaged ledger is never replaced by a fresh one:
+///   its rows stay where they are until it is repaired or moved aside.
 public enum RunLedger {
     /// Cap on retained run records. The daemon-era reader slices to 200;
     /// keep a deeper on-disk tail so the UI cap isn't also the history cap.
@@ -43,7 +45,7 @@ public enum RunLedger {
     static let outputCap = 8_000
     static let errorCap = 4_000
 
-    /// Append one completed run to the ledger. Never throws; see best-effort
+    /// Append one completed run to the ledger. Never throws; see the failure
     /// note on the type. `createdAt` is the run START; `durationSeconds`
     /// spans start → completion.
     public static func append(
@@ -81,84 +83,43 @@ public enum RunLedger {
         let persistence = SwiftNativePersistenceCore()
         do {
             try await persistence.withFileLock(path) {
-                let raw = try Self.readLedgerJSON(at: path)
-                var rows: [JSONValue]
-                switch raw {
-                case .array(let existing):
-                    rows = existing
-                case .object(let obj):
-                    // Daemon-era wrapper tolerance: keep the rows, drop the
-                    // wrapper (readers accept both; the writer emits bare).
-                    if case .array(let existing)? = obj["runs"] {
-                        rows = existing
-                    } else {
-                        try Self.preserveUnexpectedLedger(at: path)
-                        rows = []
-                    }
-                default:
-                    try Self.preserveUnexpectedLedger(at: path)
-                    rows = []
-                }
+                var rows = try Self.readLedgerRows(at: path)
                 rows.insert(finalRow, at: 0)
                 if rows.count > maxRetainedRuns {
                     rows.removeLast(rows.count - maxRetainedRuns)
                 }
                 try await persistence.writeJSON(.array(rows), to: path)
             }
+            RepairOwed.settle(dataRoot, operation: ledgerOperation, evidence: .init(source: "run", id: id))
         } catch {
             fputs("[RunLedger] append failed (run \(id), kind \(kind)): \(error)\n", stderr)
+            RepairOwed.owe(dataRoot, id: "run-ledger:" + id, kind: .run, operation: ledgerOperation, owner: path.path,
+                           words: "Run \(id) (\(kind), \(status)) was not recorded in the run ledger: \(error.localizedDescription). "
+                               + "Its existing rows are untouched; repair or move aside \(path.path) and the next run records again.")
         }
     }
 
-    /// Unexpected valid JSON may contain content we do not understand. Move it
-    /// aside before writing, and abort this append if preservation fails.
-    private static func preserveUnexpectedLedger(at path: URL) throws {
-        let backup = path.deletingLastPathComponent()
-            .appendingPathComponent("\(path.lastPathComponent).unexpected-\(UUID().uuidString).bak")
-        try FileManager.default.moveItem(at: path, to: backup)
-        fputs("[RunLedger] Unexpected ledger shape preserved at \(backup.path) before starting a fresh ledger\n", stderr)
-    }
+    static let ledgerOperation = "runs.ledger.append"
 
-    /// Read the existing ledger, distinguishing a MISSING file (normal first
-    /// run → empty) from a CORRUPT one. Scoped to RunLedger (audit 2026-07-21):
-    /// `readJSON`'s default-on-any-failure contract is right for its many other
-    /// callers, but here one corrupted runs.json would silently wipe up to
-    /// `maxRetainedRuns` retained rows on the next append. A corrupt file is
-    /// preserved as a timestamped sibling BEFORE the rewrite (bounded to the
-    /// newest `maxCorruptBackups`) and the loss is logged loudly.
-    private static func readLedgerJSON(at path: URL) throws -> JSONValue {
-        guard FileManager.default.fileExists(atPath: path.path) else { return .array([]) }
-        if let data = try? Data(contentsOf: path), let parsed = try? JSONValue.parse(data) {
-            return parsed
+    /// Missing means a first run. Anything that is not the ledger's shape is
+    /// damaged history: the append refuses rather than replacing it.
+    private static func readLedgerRows(at path: URL) throws -> [JSONValue] {
+        let data: Data
+        do {
+            data = try Data(contentsOf: path)
+        } catch CocoaError.fileReadNoSuchFile {
+            return []
         }
-        try preserveCorruptLedger(at: path)
-        fputs(
-            "[RunLedger] \(path.path) exists but does not parse — preserving it as a .corrupt-*.bak sibling and starting a fresh ledger (previous rows survive in the backup)\n",
-            stderr
-        )
-        return .array([])
-    }
-
-    /// Corrupt-ledger backups retained beside runs.json (bounded writer).
-    private static let maxCorruptBackups = 3
-
-    /// Copy the unreadable ledger to a timestamped sibling and prune older
-    /// backups past `maxCorruptBackups`. Abort the append if preservation fails.
-    private static func preserveCorruptLedger(at path: URL) throws {
-        let fm = FileManager.default
-        let stamp = NativeTimestampFormat.fractionalZulu(Date()).replacingOccurrences(of: ":", with: "-")
-        let backup = path.deletingLastPathComponent()
-            .appendingPathComponent("\(path.lastPathComponent).corrupt-\(stamp).bak")
-        try fm.copyItem(at: path, to: backup)
-        guard let siblings = try? fm.contentsOfDirectory(
-            at: path.deletingLastPathComponent(), includingPropertiesForKeys: nil
-        ) else { return }
-        let backups = siblings.filter {
-            $0.lastPathComponent.hasPrefix("\(path.lastPathComponent).corrupt-")
-                && $0.pathExtension == "bak"
-        }.sorted { $0.lastPathComponent > $1.lastPathComponent }
-        for stale in backups.dropFirst(maxCorruptBackups) {
-            try? fm.removeItem(at: stale)
+        switch try JSONValue.parse(data) {
+        case .array(let rows):
+            return rows
+        // Daemon-era wrapper tolerance: keep the rows, drop the wrapper
+        // (readers accept both; the writer emits bare).
+        case .object(let obj):
+            if case .array(let rows)? = obj["runs"] { return rows }
+            fallthrough
+        default:
+            throw PersistenceCoreError.ioFailure("\(path.path) is not a run ledger (expected an array of runs)")
         }
     }
 

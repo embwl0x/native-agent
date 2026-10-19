@@ -13,6 +13,56 @@ public enum InboxSourceReadState: Hashable, Sendable {
     case malformed
 }
 
+/// What an inbox card means, declared by the producer that files it (the
+/// card's `presentation` field): its icon, badge, plain words and act-button
+/// label. The Mac's inbox renders it and the phone reads it from the
+/// snapshot. A card that declares nothing is shown as unclassified, never
+/// classified here; a missing or malformed source stays an explicit adverse
+/// state.
+public struct InboxSourcePresentation: Codable, Hashable, Sendable {
+    public let icon: String
+    public let badge: String
+    public let words: String
+    /// Nil: the card's own action label says it.
+    public let actLabel: String?
+
+    enum CodingKeys: String, CodingKey { case icon, badge, words, actLabel = "act_label" }
+
+    public init(icon: String, badge: String, words: String, actLabel: String? = "Go ahead") {
+        self.icon = icon; self.badge = badge; self.words = words; self.actLabel = actLabel
+    }
+
+    /// The field a producer puts on its card.
+    public var row: JSONValue {
+        .object(["icon": .string(icon), "badge": .string(badge), "words": .string(words),
+                 "act_label": actLabel.map(JSONValue.string) ?? .null])
+    }
+
+    init(source: String, readState: InboxSourceReadState, hasLinkedApproval: Bool, declared: InboxSourcePresentation?) {
+        func unclassified(_ badge: String) -> Self { .init(icon: "bell.fill", badge: badge, words: "A note from me") }
+        if hasLinkedApproval { self.init(icon: "checkmark.shield.fill", badge: "APPROVAL", words: "Asking first"); return }
+        let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_:-")
+        switch readState {
+        case .missing: self = unclassified("SOURCE MISSING")
+        case .malformed: self = unclassified("SOURCE INVALID")
+        case .present where normalized.isEmpty: self = unclassified("SOURCE UNKNOWN")
+        case .present where !normalized.unicodeScalars.allSatisfy(allowed.contains): self = unclassified("SOURCE INVALID")
+        case .present: self = declared ?? unclassified(Self.humanized(normalized))
+        }
+    }
+
+    private static func humanized(_ source: String) -> String {
+        var label = ""
+        for word in source.split(whereSeparator: { $0 == "_" || $0 == ":" || $0 == "-" }).map({ $0.uppercased() }) {
+            let candidate = label.isEmpty ? word : label + " " + word
+            if candidate.count > 16 { break }
+            label = candidate
+        }
+        return label.isEmpty ? "SOURCE UNKNOWN" : label
+    }
+}
+
 /// One card of the live notification inbox (`notifications/inbox.jsonl`), read
 /// straight from its parsed row. The Mac's inbox surfaces render it; the
 /// phone's inbox snapshot is its encoding.
@@ -37,12 +87,14 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
     /// The conversation an interaction card was mirrored into for User
     /// (`ApprovalChatCards`); the phone draws the card in that chat.
     public let chat_session_id: String?
+    /// What its producer declared it means.
+    let declaredPresentation: InboxSourcePresentation?
 
     enum CodingKeys: String, CodingKey {
         case id, created_at, source, severity, title, summary, detail
         case relatedWorkshopExecutionId = "related_mission_id" // compatibility wire ID
         case related_approval_id, related_paths, related_groups
-        case actions, status, read_at, chat_session_id
+        case actions, status, read_at, chat_session_id, presentation
     }
 
     /// A row without a string `id` is not a card. Every other field keeps the
@@ -81,6 +133,7 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
         status = Self.string(o["status"]) ?? "unread"
         read_at = Self.string(o["read_at"])
         chat_session_id = Self.string(o["chat_session_id"])
+        declaredPresentation = o["presentation"].flatMap { try? JSONDecoder().decode(InboxSourcePresentation.self, from: $0.serializedData(pretty: false)) }
     }
 
     /// A producer may re-file a settled card under its stable id. Its newest
@@ -110,6 +163,13 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
         try c.encode(status, forKey: .status)
         try c.encodeIfPresent(read_at, forKey: .read_at)
         try c.encodeIfPresent(chat_session_id, forKey: .chat_session_id)
+        try c.encode(presentation, forKey: .presentation)
+    }
+
+    /// What this card means, as its producer declared it, for every door.
+    public var presentation: InboxSourcePresentation {
+        InboxSourcePresentation(source: source, readState: sourceReadState,
+                                hasLinkedApproval: !(related_approval_id ?? "").isEmpty, declared: declaredPresentation)
     }
 
     // MARK: - Row fields

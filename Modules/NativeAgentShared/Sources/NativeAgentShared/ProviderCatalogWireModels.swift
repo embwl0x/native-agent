@@ -51,6 +51,10 @@ public struct ProviderTestResult: Codable, Hashable, Sendable {
     public var model_used: String?
     public var detail: String?
     public var error: String?
+    /// The failed check's typed cause, encoded by the provider router; nil from older peers.
+    public var cause: String? = nil
+    /// Short hash of the exact key the check sent, taken before it was sent.
+    public var credential: String? = nil
 
     public init(
         provider_id: String,
@@ -59,7 +63,9 @@ public struct ProviderTestResult: Codable, Hashable, Sendable {
         response: String? = nil,
         model_used: String? = nil,
         detail: String? = nil,
-        error: String? = nil
+        error: String? = nil,
+        cause: String? = nil,
+        credential: String? = nil
     ) {
         self.provider_id = provider_id
         self.status = status
@@ -68,5 +74,7 @@ public struct ProviderTestResult: Codable, Hashable, Sendable {
         self.model_used = model_used
         self.detail = detail
         self.error = error
+        self.cause = cause
+        self.credential = credential
     }
 }

@@ -278,22 +278,19 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
             if case .string(let s)? = proof["nextStep"] { return s }
             return ""
         }
-        let macState = macEnabled ? "ready" : "needs_policy"
-        let macNotificationsState = (macEnabled && notificationsAllowed) ? "ready" : "needs_policy"
+        // Ready means proven: a successful Mac action receipt in the proof
+        // window. A switch that is on is only waiting for that proof.
+        let macProven = await proofs.proofStatus(provider: "mac")["verified"] == .bool(true)
+        let macState = !macEnabled ? "needs_policy" : macProven ? "ready" : "probe_needed"
+        let macNotificationsState = !(macEnabled && notificationsAllowed) ? "needs_policy" : macProven ? "ready" : "probe_needed"
 
-        // iPhone push state — ready if status in {ok,ready,configured}
-        // OR tokenConfigured is truthy.
-        var pushReady = false
-        if case .string(let s)? = pushStatus["status"] {
-            let lower = s.lowercased()
-            if lower == "ok" || lower == "ready" || lower == "configured" {
-                pushReady = true
-            }
+        let pushState: String
+        switch (pushStatus["status"].flatMap { if case .string(let s) = $0 { s.lowercased() } else { nil } }) {
+        case "ok", "ready": pushState = "ready"
+        case "failed", "error": pushState = "failed"
+        case "configured": pushState = "probe_needed"
+        default: pushState = pushStatus["tokenConfigured"] == .bool(true) ? "probe_needed" : "needs_setup"
         }
-        if !pushReady, case .bool(true)? = pushStatus["tokenConfigured"] {
-            pushReady = true
-        }
-        let pushState = pushReady ? "ready" : "needs_setup"
         var pushNextStep = ""
         if case .string(let s)? = pushStatus["nextStep"] { pushNextStep = s }
 
@@ -340,7 +337,7 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
                 detail: "App-owned local control bridge for shortcuts, notifications, file reads, and Apple Events.",
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_mail", "local_calendar", "local_reminders", "mac_notifications"],
-                nextStep: macEnabled ? "" : "Enable Mac Control in Trust Center.",
+                nextStep: !macEnabled ? "Enable Mac Control in Trust Center." : macProven ? "" : "Run mac.self_test once to prove the bridge.",
                 actionIds: ["mac.self_test"]
             ),
             MacAssistantAccessItem(
@@ -554,8 +551,8 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
             ),
         ]
 
-        let okStates: Set<String> = ["ready", "probe_needed"]
-        let blocked = access.filter { !okStates.contains($0.status) }.count
+        let blocked = access.filter { !["ready", "probe_needed"].contains($0.status) }.count
+        let unproven = access.contains { $0.status == "probe_needed" }
         let templateAttention = templates.filter { $0.status != "ready" }.count
 
         let lazyContract: JSONValue = .object([
@@ -567,7 +564,7 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         let createdAt = NativeTimestampFormat.fractionalUTCOffset(Date())
 
         return MacAssistantStatusResult(
-            status: blocked == 0 ? "ready" : "attention",
+            status: blocked > 0 ? "attention" : (unproven ? "probe_needed" : "ready"),
             summary: "Mac assistant watch setup is manifest-only here; no watcher jobs are created until scheduler.schedule_job is called.",
             access: lightweight ? Array(access.prefix(5)) : access,
             watchTemplates: lightweight ? Array(templates.prefix(3)) : templates,

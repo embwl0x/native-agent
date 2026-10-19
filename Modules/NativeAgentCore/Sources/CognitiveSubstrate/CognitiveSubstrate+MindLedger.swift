@@ -156,7 +156,7 @@ extension CognitiveSubstrate {
         if undoLedger.count > Self.maximumUndoEntries {
             undoLedger.removeFirst(undoLedger.count - Self.maximumUndoEntries)
         }
-        try? await persistMindLedger()
+        await notingPersistence("mind_ledger") { try await persistMindLedger() }
     }
 
     public func undoSnapshot() -> [CognitiveUndoEntry] { undoLedger }

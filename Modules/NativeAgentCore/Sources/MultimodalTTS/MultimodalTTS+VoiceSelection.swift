@@ -54,7 +54,7 @@ extension SwiftOpenAITTSClient {
     /// from that route's catalog entry. A route with no speech model refuses
     /// here — it never borrows another provider's voice or a model literal
     /// (2026-09-13 rulings), and nothing is read aloud.
-    public static func synthesizeChat(text: String, voice: @Sendable () -> String) async throws -> Data {
+    public static func synthesizeChat(text: String, voice: @Sendable () -> String) async throws -> (audio: Data, unread: Int) {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let router = SwiftNativeProviderRouting(
             dataRoot: dataRoot,
@@ -65,12 +65,10 @@ extension SwiftOpenAITTSClient {
                 .appendingPathComponent("providers", isDirectory: true)
                 .appendingPathComponent("active.json")
         )
-        let snapshot = try? await router.checkedRoutingSnapshot()
+        // An unreadable route is its own failure, never evidence about that route's voice.
+        let snapshot = try await router.checkedRoutingSnapshot()
         // S12a: Chat's chosen route only, never one inferred from its model.
-        let chatProvider = snapshot.flatMap {
-            ProviderRoutingSurfaceLookup.value($0.activeProviders, "chat")
-        }
-        guard let chatProvider,
+        guard let chatProvider = ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat"),
               let model = FirstPartyModelCatalog.speechModel(forProviderID: chatProvider) else {
             throw MultimodalTTSError.routeHasNoSpeech(route: "Chat's provider")
         }
@@ -143,7 +141,7 @@ public final class VoiceOutputController: NSObject {
 
     private var synthesizer: AVSpeechSynthesizer?
     private var audioPlayer: AVAudioPlayer?
-    private var pendingSynthesis: Task<Data, Error>?
+    private var pendingSynthesis: Task<(audio: Data, unread: Int), Error>?
     // Bumped on every speak()/stop() so an in-flight speakOpenAI can detect it was superseded across its network await.
     private var speechGeneration: Int = 0
     private let failureMessage: @Sendable (Error, String) -> String
@@ -267,12 +265,19 @@ public final class VoiceOutputController: NSObject {
 
     private func speakLocal(text: String) {
         let utterance = GenerationTaggedUtterance(string: text, generation: speechGeneration)
-        // An unset or unrecognised name leaves `voice` nil, which is the Mac's
-        // own chosen system voice — what shipped before this was settable.
+        // An unset name leaves `voice` nil: the Mac's own chosen system voice.
+        // A named voice this Mac lacks says so; it never reads in another one.
         let chosenVoice = VoicePreference.name()
         if !chosenVoice.isEmpty {
-            utterance.voice = AVSpeechSynthesisVoice(identifier: chosenVoice)
-                ?? AVSpeechSynthesisVoice(language: chosenVoice)
+            guard let voice = AVSpeechSynthesisVoice(identifier: chosenVoice)
+                ?? AVSpeechSynthesisVoice(language: chosenVoice) else {
+                let owner = speechOwnerID
+                stop()
+                errorMessage = "The read-aloud voice \"\(chosenVoice)\" is not on this Mac, so nothing was read aloud. Set chat.voice_name to an installed voice, or leave it empty for the Mac's own voice."
+                errorOwnerID = owner
+                return
+            }
+            utterance.voice = voice
         }
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
@@ -298,8 +303,7 @@ public final class VoiceOutputController: NSObject {
             // resolved against PersistenceCore.defaultDataRoot(), so an
             // installed .app bundle reads the app-owned provider config instead
             // of a CWD-relative path.
-            let audioData: Data
-            audioData = try await withTaskCancellationHandler {
+            let (audioData, unread) = try await withTaskCancellationHandler {
                 try await synthesis.value
             } onCancel: {
                 synthesis.cancel()
@@ -321,6 +325,10 @@ public final class VoiceOutputController: NSObject {
                 return
             }
             isSpeaking = true
+            if unread > 0 {
+                errorMessage = "Reading the first \(SwiftOpenAITTSClient.maxInputChars) characters aloud; the cloud voice takes no more in one request, so the last \(unread) will not be read."
+                errorOwnerID = speechOwnerID
+            }
         } catch {
             // Don't report/clear state if a concurrent stop()/speak() already superseded this call.
             guard generation == speechGeneration else { return }

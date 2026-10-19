@@ -26,6 +26,32 @@ public extension SwiftNativeProviderRouting {
             )
         }
 
+        // Hashed before anything is sent: the verdict belongs to exactly this key.
+        let credential = LLMProviderStatusFeed.fingerprint(apiKey)
+        func failed(_ failure: ProviderFailure, model: String?, evidence: String,
+                    meaning: String? = nil) -> NativeAgentShared.ProviderTestResult {
+            NativeAgentShared.ProviderTestResult(
+                provider_id: id, status: "error", tested: true, response: nil, model_used: model, detail: evidence,
+                error: failure == .authExpired ? LLMProviderStatusFeed.keyRejected
+                    : evidence + " — " + (meaning ?? failure.errorDescription ?? "the check failed"),
+                cause: failure.encoded, credential: credential)
+        }
+        // Status and the provider's own words through the one typed classifier.
+        // A key is rejected only on invalid-credential evidence: a 401, or a 403
+        // whose words say the key is invalid. Any other 403 is an unexplained
+        // refusal (an OpenAI key may generate without listing models): it
+        // neither rejects the key nor proves it; quota and rate limits stay theirs.
+        func refused(_ code: Int, _ body: Data, model: String?, ms: Int) -> NativeAgentShared.ProviderTestResult {
+            let detail = String(ProviderFailure.wireDetail(body).replacingOccurrences(of: apiKey, with: "[redacted]").prefix(160))
+            let evidence = "HTTP \(code) after \(ms)ms" + (detail.isEmpty ? "" : ": " + detail)
+            guard code == 403 else { return failed(ProviderFailure.http(status: code, detail: detail), model: model, evidence: evidence) }
+            let worded = ProviderFailure.wire(detail, fallback: .refused)
+            return worded == .refused
+                ? failed(.refused, model: model, evidence: evidence,
+                         meaning: "this check's endpoint refused without saying why; the key is neither rejected nor proven")
+                : failed(worded, model: model, evidence: evidence)
+        }
+
         if id == "kimi-code" {
             let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedProviderSnapshot()
             let probeModel = try snapshot.probeModel(for: id)
@@ -46,28 +72,20 @@ public extension SwiftNativeProviderRouting {
             ])
             let start = Date()
             do {
-                let (_, response) = try await URLSession.shared.data(for: req)
+                let (body, response) = try await URLSession.shared.data(for: req)
                 let ms = Int(Date().timeIntervalSince(start) * 1000)
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if (200..<300).contains(code) {
                     return NativeAgentShared.ProviderTestResult(
                         provider_id: id, status: "ok", tested: true,
                         response: nil, model_used: probeModel,
-                        detail: "latency=\(ms)ms", error: nil
+                        detail: "latency=\(ms)ms", error: nil, credential: credential
                     )
                 }
-                let hint = code == 401 ? "key rejected" : "HTTP \(code)"
-                return NativeAgentShared.ProviderTestResult(
-                    provider_id: id, status: "error", tested: true,
-                    response: nil, model_used: probeModel,
-                    detail: "latency=\(ms)ms", error: hint
-                )
+                return refused(code, body, model: probeModel, ms: ms)
             } catch {
-                return NativeAgentShared.ProviderTestResult(
-                    provider_id: id, status: "error", tested: true,
-                    response: nil, model_used: nil,
-                    detail: nil, error: error.localizedDescription
-                )
+                return failed(ProviderFailure.classify(error) ?? .network, model: nil,
+                              evidence: error.localizedDescription.replacingOccurrences(of: apiKey, with: "[redacted]"))
             }
         }
 
@@ -91,7 +109,7 @@ public extension SwiftNativeProviderRouting {
         req.timeoutInterval = 15
         let start = Date()
         do {
-            let (_, response) = try await URLSession.shared.data(for: req)
+            let (body, response) = try await URLSession.shared.data(for: req)
             let ms = Int(Date().timeIntervalSince(start) * 1000)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if (200..<300).contains(code) {
@@ -101,23 +119,13 @@ public extension SwiftNativeProviderRouting {
                 return NativeAgentShared.ProviderTestResult(
                     provider_id: id, status: "ok", tested: true,
                     response: nil, model_used: nil,
-                    detail: "latency=\(ms)ms", error: nil
+                    detail: "latency=\(ms)ms", error: nil, credential: credential
                 )
             }
-            return NativeAgentShared.ProviderTestResult(
-                provider_id: id, status: "error", tested: true,
-                response: nil, model_used: nil,
-                // Anthropic answers a bad key with 401 or 403.
-                detail: "latency=\(ms)ms",
-                error: code == 401 || (id == "anthropic" && code == 403) ? "key rejected" : "HTTP \(code)"
-            )
+            return refused(code, body, model: nil, ms: ms)
         } catch {
-            return NativeAgentShared.ProviderTestResult(
-                provider_id: id, status: "error", tested: true,
-                response: nil, model_used: nil,
-                detail: nil, error: error.localizedDescription
-                    .replacingOccurrences(of: apiKey, with: "[redacted]")
-            )
+            return failed(ProviderFailure.classify(error) ?? .network, model: nil,
+                          evidence: error.localizedDescription.replacingOccurrences(of: apiKey, with: "[redacted]"))
         }
     }
 }

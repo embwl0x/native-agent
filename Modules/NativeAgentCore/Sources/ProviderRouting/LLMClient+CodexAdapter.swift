@@ -214,7 +214,9 @@ public typealias CodexStreamingProcessRunner = @Sendable (CodexProcessInvocation
 /// (LLMAdapter default `stream` → `complete`) is still callable by adapters
 /// that explicitly want the single-chunk path.
 public final class CodexAdapter: LLMAdapter {
-    public static let supportsTools = false
+    public static let toolWire = ProviderToolWire.unsupported
+    /// The CLI prompt is text: images are flattened away (`messagesPrompt`).
+    public static let carriesImages = false
     public let providerId: String = "codex"
     private let codexBin: String
     private let timeout: TimeInterval
@@ -452,7 +454,7 @@ public final class CodexAdapter: LLMAdapter {
 
     // MARK: - Buffered text-only messages contract
 
-    /// The CLI carries no NativeAgent tools (`supportsTools` is false and
+    /// The CLI carries no NativeAgent tools (`toolWire` is unsupported and
     /// ProviderToolCapability admits the turn as text-only), so `tools` never
     /// reaches the process.
     public func complete(
@@ -626,22 +628,24 @@ public final class CodexAdapter: LLMAdapter {
                 .appendingPathComponent("codex_home", isDirectory: true)
                 .appendingPathComponent("models_cache.json")
         }
+        let accountRow = CodexAccountModelCatalog.matchingModels(
+            providerID: "codex",
+            oauthAuthURL: cacheURL.deletingLastPathComponent().appendingPathComponent("auth.json"),
+            fallbackCacheURL: cacheURL
+        ).first { $0.id == model }
         if let effort = OpenAIExecutionControls.reasoningEffort(
             model: model,
             requested: LLMCallContext.reasoningEffort,
             transport: .codexCLI,
-            supportedEfforts: CodexAccountModelCatalog.matchingModels(
-                providerID: "codex",
-                oauthAuthURL: cacheURL.deletingLastPathComponent().appendingPathComponent("auth.json"),
-                fallbackCacheURL: cacheURL
-            ).first { $0.id == model }?.supportedReasoningEfforts
+            supportedEfforts: accountRow?.supportedReasoningEfforts
         ) {
             args.append(contentsOf: ["-c", "model_reasoning_effort=\"\(effort)\""])
         }
         if let tier = OpenAIExecutionControls.serviceTier(
             model: model,
             requested: LLMCallContext.serviceTier,
-            transport: .codexCLI
+            transport: .codexCLI,
+            supportsFast: accountRow?.supportsFast
         ) {
             args.append(contentsOf: ["-c", "service_tier=\"\(tier)\""])
         }

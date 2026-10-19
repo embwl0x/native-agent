@@ -740,7 +740,7 @@ struct SetupReflectionModelPicker: View {
                         ProviderThenModelPicker.Provider(
                             id: provider.provider_id,
                             name: ProviderThenModelPicker.plainProviderName(provider.display_name),
-                            ready: provider.auth_status.state == "ready",
+                            ready: provider.auth_status.eligible,
                             models: provider.models.map { ProviderThenModelPicker.Model(id: $0.id, name: $0.name) }
                         )
                     },
@@ -855,7 +855,7 @@ struct SetupStudioWanderPicker: View {
                         }
                     )) {
                         ForEach(providers) { provider in
-                            let ready = provider.auth_status.state == "ready"
+                            let ready = provider.auth_status.eligible
                             Text(provider.display_name + (ready ? "" : " ⚠️"))
                                 .tag(provider.provider_id)
                         }

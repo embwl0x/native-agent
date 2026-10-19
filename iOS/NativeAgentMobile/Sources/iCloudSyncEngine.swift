@@ -117,7 +117,6 @@ final class iCloudSyncEngine {
     var memories: [MemoryRecord] = []
     var memoryProposals: [MemoryProposalRecord] = []
     var trainingProposals: [TrainingProposalSummary] = []
-    var promotionCandidates: [PromotionCandidateSummary] = []
     /// Set only after both self-improvement projections arrive together. Empty
     /// arrays before this point mean “not published yet”, not a measured clear
     /// queue on the iPhone.
@@ -174,7 +173,6 @@ final class iCloudSyncEngine {
         memories = []
         memoryProposals = []
         trainingProposals = []
-        promotionCandidates = []
         selfImprovementSnapshotPublishedAt = nil
         trustPolicy = nil
         personalityPairing = nil

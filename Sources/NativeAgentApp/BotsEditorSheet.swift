@@ -104,7 +104,7 @@ struct BotsEditorSheet: View {
             case .loaded(let snapshot):
                 providers = snapshot.providers.map { account in
                     ProviderThenModelPicker.Provider(id: account.provider_id, name: account.provider_id == "codex" ? "OpenAI (subscription)" : account.display_name,
-                        ready: account.auth_status.state == "ready", models: account.models.map {
+                        ready: account.auth_status.eligible, models: account.models.map {
                             ProviderThenModelPicker.Model(id: $0.id, name: $0.name,
                                 supportedEfforts: $0.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"], supportsFast: $0.supports_fast)
                         })

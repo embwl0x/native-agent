@@ -66,9 +66,9 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
 
     func listQuietProviderAccounts() async throws -> [QuietProviderAccount] {
-        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        return try await appModel.engine.providers.list().map {
-            QuietProviderAccount(providerID: $0.provider_id, authState: $0.auth_status.state, models: $0.models, dataRoot: root)
+        try await appModel.engine.providers.list().map {
+            QuietProviderAccount(providerID: $0.provider_id, authState: $0.auth_status.state,
+                                 eligible: $0.auth_status.eligible, models: $0.models)
         }
     }
 

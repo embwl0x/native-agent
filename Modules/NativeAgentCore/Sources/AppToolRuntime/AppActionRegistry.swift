@@ -50,14 +50,10 @@ public struct AppAction: Sendable {
     /// What she must know before doing it, shown on its line.
     public let warn: String
     /// The code it runs (`runFolded`), and the input that picks the verb.
-    /// The name also supplies the saved Trust key unless the row declares others.
     public let tool: String
-    public let savedTrustKeys: [String]
     public let input: [String: JSONValue]
     /// Door arg name → the host call's own input key, where the two differ.
     public let rename: [String: String]
-    /// A script may call it; each call retains ordinary dispatch admission.
-    public let scriptable: Bool
     /// Reads its subject and raises no note, so the door reads no inbox around it.
     public let read: Bool
     public let readWhen: [String: JSONValue]
@@ -76,14 +72,14 @@ public struct AppAction: Sendable {
 
     init(_ id: String, _ page: String, _ label: String, _ args: [String] = [], owner: Owner = .hers,
          irreversible: Bool = false, toolClass: ToolClass = .write, screen: Bool = false, warn: String = "", tool: String = "",
-         input: [String: JSONValue] = [:], rename: [String: String] = [:], scriptable: Bool = true, read: Bool = false,
+         input: [String: JSONValue] = [:], rename: [String: String] = [:], read: Bool = false,
          versionExempt: Bool = false, revision: Int = 1, readWhen: [String: JSONValue] = [:], scope: String = "",
          advisory: Bool = false, resultSchema: JSONValue = AppActions.resultEnvelope,
          lifecycle: CapabilityLifecycle.Action? = nil, schema: LLMToolSchema? = nil, partAction: Bool = false,
-         folded: Bool = false, savedTrustKeys: [String]? = nil, reachesHim: Bool? = nil) {
+         folded: Bool = false, reachesHim: Bool? = nil) {
         self.id = id; self.page = AppDoorNames.resolve(page); self.label = label; self.args = args; self.owner = owner
         self.irreversible = irreversible; self.toolClass = toolClass; self.screen = screen; self.warn = warn; self.tool = tool
-        self.input = input; self.rename = rename; self.scriptable = scriptable; self.read = read
+        self.input = input; self.rename = rename; self.read = read
         self.versionExempt = versionExempt
         self.revision = revision
         self.readWhen = readWhen
@@ -91,7 +87,6 @@ public struct AppAction: Sendable {
         self.schema = schema
         self.partAction = partAction
         self.folded = folded
-        self.savedTrustKeys = savedTrustKeys ?? (tool.isEmpty ? [] : [tool])
         self.advisory = advisory
         self.resultSchema = resultSchema
         self.lifecycle = lifecycle
@@ -104,11 +99,11 @@ public struct AppAction: Sendable {
     /// It runs as itself: the door re-enters under the tool's own name,
     /// so that call's gates, Trust key, cards and result are the ones that apply.
     /// Args and label left out are the tool's own: every argument its schema
-    /// takes, and its description's first sentence. Every action is scriptable
-    /// unless its entry says otherwise; each call retains its own gates.
+    /// takes, and its description's first sentence. A script may call every
+    /// action; each call retains its own gates.
     static func fold(_ tool: String, _ page: String, id: String? = nil, _ label: String? = nil, _ args: [String]? = nil,
-                     input: [String: JSONValue] = [:], read: Bool = false, scriptable: Bool = true,
-                     irreversible: Bool = false, screen: Bool = false,
+                     input: [String: JSONValue] = [:], read: Bool = false,
+                     irreversible: Bool = false, toolClass: ToolClass = .write, screen: Bool = false,
                      warn: String = "", schema: LLMToolSchema? = nil, versionExempt: Bool = false,
                      readWhen: [String: JSONValue] = [:], advisory: Bool = false,
                      resultSchema: JSONValue = AppActions.resultEnvelope, lifecycle: CapabilityLifecycle.Action? = nil) -> AppAction {
@@ -124,9 +119,9 @@ public struct AppAction: Sendable {
                          (args ?? schema.map { ToolSignature.doorArgs($0.parametersJSON) } ?? []).map(door)
                             + (["screen", "read", "read_file", "read_page", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(tool)
                                ? ["raw?:boolean", "wrong?:boolean", "why?:string"] : []),
-                         irreversible: irreversible, screen: screen, warn: warn, tool: tool, input: input,
+                         irreversible: irreversible, toolClass: toolClass, screen: screen, warn: warn, tool: tool, input: input,
                          rename: Dictionary(uniqueKeysWithValues: names.map { ($0.value, $0.key) }),
-                         scriptable: scriptable, read: read, versionExempt: versionExempt, readWhen: readWhen,
+                         read: read, versionExempt: versionExempt, readWhen: readWhen,
                          advisory: advisory, resultSchema: resultSchema, lifecycle: lifecycle, schema: schema, folded: true)
     }
 
@@ -150,7 +145,7 @@ public struct AppAction: Sendable {
 
     public var binding: AppActionBinding {
         AppActionBinding(isHis: isHis, irreversible: irreversible, read: read, secretArgs: secretArgs,
-                         readWhen: readWhen, lifecycle: lifecycle, savedTrustKeys: isFold ? savedTrustKeys.filter { $0 != tool } : savedTrustKeys,
+                         readWhen: readWhen, lifecycle: lifecycle,
                          tool: tool, fixedInput: input, rename: rename, folded: isFold,
                          descriptor: schema.map { ToolDescriptor(schema: $0, bucket:
                              SwiftToolDispatcher.catalogBucket(forRegisteredToolNamed: tool) ?? AppToolExecutor.buckets[tool] ?? .unclassified) },
@@ -170,7 +165,6 @@ public struct AppAction: Sendable {
         var text = "\(id)(\(args.joined(separator: ", "))) \(label)"
         if screen { text += " · screen" }
         if irreversible { text += " · irreversible" }
-        if !scriptable { text += " · not in scripts" }
         if !warn.isEmpty { text += " · \(warn)" }
         // Only while Simple view is on screen does showing a page change the view itself.
         if id == "page.show", SimpleViewMode.isShowing { text += " · " + SimpleViewMode.noPagesNote }
@@ -230,12 +224,12 @@ public enum AppActions {
                   AgentConversationDelivery.lane(for: "peer:" + who.id, dataRoot: dataRoot) != nil else { return nil }
             if action.read {
                 return AppAction(action.id, action.page, "Read \(who.name)'s worklog, newest first", action.args,
-                    warn: action.warn, tool: action.tool, read: true, savedTrustKeys: action.savedTrustKeys)
+                    warn: action.warn, tool: action.tool, read: true)
             }
             return AppAction(action.id, action.page, "Message \(who.name)",
                 ["text", "conversation?", "new_conversation?:bool", "expects_reply?:bool", "options?:object"],
                 tool: "agent_message", input: ["agent": .string(handle)], schema: foldSchemas["agent_message"],
-                folded: true, savedTrustKeys: action.savedTrustKeys)
+                folded: true)
         }
     }
 
@@ -384,14 +378,14 @@ public enum AppActions {
                   tool: "request_interaction", input: ["kind": .string("permission")], folded: true),
         AppAction("card.answer", "chat", "The card's own button (its Do: line)", ["id", "value?:secret", "choice?"],
                   irreversible: true, warn: "never ask the owner for a key or token in chat: they type it into the card",
-                  tool: "interaction_act", input: card("primary"), rename: ["id": "interaction_id"], scriptable: false),
+                  tool: "interaction_act", input: card("primary"), rename: ["id": "interaction_id"]),
         AppAction("card.not_now", "chat", "Not now", ["id", "reason?"], irreversible: true, tool: "interaction_act",
-                  input: card("decline"), rename: ["id": "interaction_id"], scriptable: false),
+                  input: card("decline"), rename: ["id": "interaction_id"]),
         // Irreversible (flag audit, 10-02): it runs the card's own control as
         // card.answer does, a capability grant included.
         AppAction("card.try_again", "chat", "Try again", ["id", "value?:secret", "choice?"], irreversible: true,
                   tool: "interaction_act",
-                  input: card("retry"), rename: ["id": "interaction_id"], scriptable: false),
+                  input: card("retry"), rename: ["id": "interaction_id"]),
 
         // Providers.
         AppAction("provider.test", "providers", "Test the connection", ["provider"],tool: "provider",
@@ -400,7 +394,7 @@ public enum AppActions {
         AppAction("provider.set_fallback_model", "providers", "Model it falls back to", ["provider", "model"],
                   tool: "provider", input: verb("set_default_model")),
         AppAction("provider.sign_in", "providers", "Sign in",
-                  owner: .his("he signs in through the browser window Providers → Sign in opens, or pastes the key there"), savedTrustKeys: ["provider"]),
+                  owner: .his("he signs in through the browser window Providers → Sign in opens, or pastes the key there")),
         AppAction("provider.disconnect", "providers", "Disconnect", ["provider"],
                   owner: .his("only he can sign back in; he disconnects on Providers"), irreversible: true,
                   tool: "provider", input: verb("disconnect")),
@@ -430,9 +424,6 @@ public enum AppActions {
         AppAction("mcp.restart", "mcp", "Restart", ["server_id"], tool: "connections", input: verb("mcp_restart")),
         AppAction("mcp.refresh", "mcp", "Refresh", ["server_id"], tool: "connections", input: verb("mcp_refresh")),
         AppAction("mcp.repair", "mcp", "Reconstruct saved server records", ["records:array", "expected_sha256"], tool: "connections", input: verb("mcp_repair")),
-        AppAction("mcp.revoke_consent", "mcp", "Revoke", ["id"],
-                  owner: .his("consent is his; he revokes it in Connectors → MCP"), irreversible: true,
-                  tool: "connections", input: verb("mcp_revoke_consent")),
 
         // Upkeep buttons, on the pages that carry them.
         AppAction("doctor.run", "diagnostics", "Run Doctor checks",tool: "doctor_status", input: ["repair": .bool(false)], read: true),
@@ -946,8 +937,8 @@ public enum AppActions {
     public static func mcp(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> [AppAction] {
         SwiftToolDispatcher.mountedMCPToolSchemas(dataRoot: dataRoot).map { schema in
             .fold(schema.name, schema.name.hasPrefix("mcp__searxng-local__") ? "web" : "mcp",
-                  firstSentence(schema.description), read: schema.name == "mcp__searxng-local__search",
-                  schema: schema)
+                  firstSentence(schema.description), read: schema.toolClass == .read,
+                  irreversible: schema.toolClass == .destructive, toolClass: schema.toolClass ?? .write, schema: schema)
         }
     }
 
@@ -1191,7 +1182,7 @@ public enum AppActions {
         return .object(["id": .string(action.id), "args_schema": contractSchema(args),
             "result_schema": contractSchema(action.resultSchema), "revision": .int(Int64(action.revision)),
             "read": .bool(action.read), "readWhen": .object(action.readWhen),
-            "irreversible": .bool(action.irreversible), "owner": .bool(action.isHis), "scriptable": .bool(action.scriptable)])
+            "irreversible": .bool(action.irreversible), "owner": .bool(action.isHis), "scriptable": .bool(true)])
     }
 
     /// The current contract still accepts every call the saved one did: all
@@ -1300,7 +1291,7 @@ public enum AppActions {
         var call: [String: JSONValue] = ["action": .string(action.id), "args": .object(example.merging(bound) { _, bound in bound })]
         if action.irreversible { call["preview"] = .bool(true) }
         var result: [String: JSONValue] = action.effectFields().merging(["page": .string(action.page), "action": .string(action.line),
-            "args_schema": .object(args), "scriptable": .bool(action.scriptable),
+            "args_schema": .object(args),
             "read_when": .object(action.readWhen),
             "example": .object(call)]) { _, value in value }
         let plural = pluralKeys(action, properties: props)
@@ -1391,7 +1382,7 @@ public enum AppActions {
             let triggers: [JSONValue] = if case .array(let values)? = entry.row["triggers"] { values } else { [] }
             return AppAction(action.id, action.page, entry.name + ": " + description, action.args,
                 warn: action.warn, tool: action.tool, input: action.input.merging(["name": .string(entry.name)]) { _, bound in bound },
-                scriptable: action.scriptable, read: action.read,
+                read: action.read,
                 scope: (triggers.map { text($0) } + (entry.row["script"].map(SkillScript.actions) ?? [])).joined(separator: " "),
                 schema: LLMToolSchema(name: action.tool, description: description, parametersJSON: try JSONValue.object(parameters).serializedData(pretty: false)),
                 folded: action.folded)
@@ -1460,12 +1451,11 @@ public enum AppActions {
         "email": "mail", "emails": "mail", "mails": "mail", "unread": "read", "reading": "read",
         "searching": "search", "listing": "list", "files": "file", "calendars": "calendar", "events": "event"]
 
-    private static let vectors = ActionVectors()
     private static let negation = try! NSRegularExpression(
         pattern: #"(?i)\b(?:no|without|never|avoid|do\s+not|don['’]t|not)(?!\s+only\b)\s+(.+?)(?=[,.;!?\n]|\s+\b(?:but|instead|however|then)\b|$)"#)
 
     /// `degraded` says why the ranking fell back to words alone; nil when the embedder ranked it.
-    static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL)
+    static func ranked(_ query: String, pages: [String: QuietToolPage], dataRoot: URL, memory: SwiftNativeMemoryV2)
         async throws -> (actions: [AppAction], degraded: String?) {
         let range = NSRange(query.startIndex..., in: query)
         let negative = negation.matches(in: query, range: range).compactMap {
@@ -1517,16 +1507,7 @@ public enum AppActions {
             .filter { !(mailAsk || mailDraft) || $0.id != "bot.reply" }
             .filter { !systemUpdates || $0.id != "app.check_updates" }
             .filter { window || reminderListAction.isEmpty || !["mac.look", "mac.go", "mac.act"].contains($0.id) }
-        let texts = actions.map { action in
-            let names = ["agent.message", "agent.read"].contains(action.id) ? contacts
-                : (["bot.ask", "bot.list"].contains(action.id) ? helpers : [])
-            return [firstSentence(ToolNameAliases.foldedProse(action.schema?.description ?? foldSchemas[action.tool]?.description ?? action.label)),
-                    action.id.replacingOccurrences(of: ".", with: " "), action.label,
-                    action.scope, pages[action.page]?.title ?? action.page, pages[action.page]?.summary ?? "",
-                    action.argSpecs.flatMap(\.names).joined(separator: " "),
-                    names.joined(separator: ", ")].joined(separator: " ")
-        }
-        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
+        let texts = actionTexts(actions, pages: pages, contacts: contacts, helpers: helpers)
         let rejected = negative.map(intentWords)
         let named = named(positive)
         // Named contacts, helpers and window observations pick their own route.
@@ -1626,7 +1607,7 @@ public enum AppActions {
         var embedding: (asked: [[Float]], actions: [[Float]])?
         var degraded: String?
         do {
-            let indexed = try await vectors.read(texts, memory: memory)
+            let indexed = try await memory.indexedActionVectors(texts)
             let embedded = try await memory.embedForDerivedContextWithEpoch([positive] + negative)
             if embedded.epoch == indexed.epoch, embedded.vectors.count == negative.count + 1,
                indexed.vectors.count == actions.count,
@@ -1635,7 +1616,10 @@ public enum AppActions {
                        && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 })
                }) {
                 embedding = (embedded.vectors, indexed.vectors)
-            } else { degraded = "The memory-search model changed or returned unusable vectors during find." }
+            } else {
+                await memory.requestActionIndexUpdate()
+                degraded = "The MemoryV2 action index and query vectors changed epoch or returned unusable vectors during find. An index update has been requested."
+            }
         } catch { degraded = error.localizedDescription }
         var ranked: [(offset: Int, action: AppAction, score: Double)] = []
         for (offset, action) in actions.enumerated() {
@@ -1663,35 +1647,17 @@ public enum AppActions {
                 degraded)
     }
 
-    /// Share in-flight batches too, so concurrent finds embed each action once per model.
-    private actor ActionVectors {
-        private var epoch: MemoryEmbeddingEpoch?
-        private var cached: [String: (Task<MemoryEmbeddingBatch, Error>, Int)] = [:]
-
-        func read(_ texts: [String], memory: SwiftNativeMemoryV2) async throws -> MemoryEmbeddingBatch {
-            try await memory.warmUpEmbedder()
-            guard let current = await memory.embeddingEpoch() else { throw MemoryV2Error.storageUnavailable }
-            if epoch != current { cached.removeAll(); epoch = current }
-            let wanted = Set(texts)
-            cached = cached.filter { wanted.contains($0.key) }
-            let missing = wanted.filter { cached[$0] == nil }.sorted()
-            if !missing.isEmpty {
-                let task = Task { try await memory.embedForDerivedContextWithEpoch(missing) }
-                for (offset, text) in missing.enumerated() { cached[text] = (task, offset) }
-            }
-            let entries = texts.compactMap { cached[$0] }
-            var result: [[Float]] = []
-            do {
-                for (task, offset) in entries {
-                    let batch = try await task.value
-                    guard batch.epoch == current, batch.vectors.indices.contains(offset),
-                          !batch.vectors[offset].isEmpty, batch.vectors[offset].allSatisfy(\.isFinite) else {
-                        throw MemoryV2Error.underlying("Action search vectors are unavailable. Retry find.")
-                    }
-                    result.append(batch.vectors[offset])
-                }
-            } catch { cached.removeAll(); throw error }
-            return MemoryEmbeddingBatch(epoch: current, vectors: result)
+    /// The same exact text feeds launch/change indexing and query ranking.
+    static func actionTexts(_ actions: [AppAction], pages: [String: QuietToolPage],
+                            contacts: [String], helpers: [String]) -> [String] {
+        actions.map { action in
+            let names = ["agent.message", "agent.read"].contains(action.id) ? contacts
+                : (["bot.ask", "bot.list"].contains(action.id) ? helpers : [])
+            return [firstSentence(ToolNameAliases.foldedProse(action.schema?.description ?? foldSchemas[action.tool]?.description ?? action.label)),
+                    action.id.replacingOccurrences(of: ".", with: " "), action.label,
+                    action.scope, pages[action.page]?.title ?? action.page, pages[action.page]?.summary ?? "",
+                    action.argSpecs.flatMap(\.names).joined(separator: " "),
+                    names.joined(separator: ", ")].joined(separator: " ")
         }
     }
 

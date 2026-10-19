@@ -534,8 +534,14 @@ public actor SwiftNativeLoopScheduler {
     /// The last `OrganPulse` per organ, flushed under the "pulses" key.
     private var persistedPulses: [String: OrganPulse] = [:]
     package typealias PersistedLoopState = (
-        runs: [String: Date], completions: [String: Date], firstSeen: [String: Date], pulses: [String: OrganPulse], available: Bool
+        runs: [String: Date], completions: [String: Date], firstSeen: [String: Date], pulses: [String: OrganPulse], fault: String?
     )
+    /// Damaged run history found at load. Timing restarts from this launch
+    /// (a clock must be chosen), but the damage is a durable receipt and no
+    /// loop is stamped as first seen now: its dormancy floor is unknown.
+    private var persistedStateFault: String?
+    /// The pseudo loop id that the run-history store files its receipts under.
+    static let loopStateReceiptId = "loop_state"
     private var persistedStateLoaded = false
     private var persistedStateLoad: Task<PersistedLoopState, Never>?
     public static let healthCheckpointInterval: TimeInterval = 60
@@ -700,13 +706,17 @@ public actor SwiftNativeLoopScheduler {
         // weekly loop's clock resets on every restart, which is the starvation
         // bug itself.
         let stampedFirstSeen: Bool
-        if persistedFirstSeen[id] == nil {
+        if persistedFirstSeen[id] == nil, persistedStateFault == nil {
             persistedFirstSeen[id] = clock()
             stampedFirstSeen = true
         } else {
             stampedFirstSeen = false
         }
-        if persistedLastRun[id] == nil {
+        // Damaged history is unknown, not fresh: no stamp is written over it,
+        // and the loop carries the fault until it truly runs.
+        if persistedLastRun[id] == nil, let fault = persistedStateFault {
+            states[id, default: LoopState(loopId: id)].lastError = fault + "; this loop's last run is unknown"
+        } else if persistedLastRun[id] == nil {
             await recordDurableRun(loopId: id, at: clock())
         } else if stampedFirstSeen {
             // `recordDurableRun` above flushes; this is the OTHER case — a loop
@@ -992,34 +1002,46 @@ public actor SwiftNativeLoopScheduler {
         for (organ, pulse) in loaded.pulses where persistedPulses[organ] == nil {
             persistedPulses[organ] = pulse
         }
+        if let fault = loaded.fault {
+            persistedStateFault = fault
+            await appendFailureReceipt(loopId: Self.loopStateReceiptId,
+                error: fault + "; every loop's timing restarted from this launch")
+        }
     }
 
 
-    /// A missing file yields no persisted history. A corrupt one is reported
-    /// (readJSON keeps its bytes beside it) and also yields none, which
-    /// degrades to the pre-LOOPS-4 behavior rather than blocking startup.
+    /// A missing file yields no persisted history. A damaged one (readJSON
+    /// keeps corrupt bytes beside it) or damaged entries yield what survived
+    /// plus the fault, so startup never blocks and the damage is never silent.
     package static func readLoopState(
         _ path: URL?
     ) async -> PersistedLoopState {
-        guard let path else { return ([:], [:], [:], [:], true) }
+        guard let path else { return ([:], [:], [:], [:], nil) }
         let value: JSONValue
         do {
             value = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
         } catch {
             nativeLog("BackgroundLoops: loop state unreadable, starting with no run history: %@", "\(error)")
-            return ([:], [:], [:], [:], false)
+            return ([:], [:], [:], [:], "Loop run history unreadable: \(error.localizedDescription)")
         }
         return decodeLoopState(value)
     }
 
     package static func decodeLoopState(_ value: JSONValue) -> PersistedLoopState {
-        guard case .object(let root) = value else { return ([:], [:], [:], [:], false) }
+        guard case .object(let root) = value else {
+            return ([:], [:], [:], [:], "Loop run history is not a JSON object")
+        }
         let iso = ISO8601DateFormatter()
+        var damaged: [String] = []
         func stamps(_ key: String) -> [String: Date] {
-            guard case .object(let rows)? = root[key] else { return [:] }
+            guard let section = root[key] else { return [:] }
+            guard case .object(let rows) = section else { damaged.append(key); return [:] }
             var result: [String: Date] = [:]
             for (id, raw) in rows {
-                guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else { continue }
+                guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else {
+                    damaged.append("\(key).\(id)")
+                    continue
+                }
                 result[id] = date
             }
             return result
@@ -1030,7 +1052,7 @@ public actor SwiftNativeLoopScheduler {
                 guard case .object(let row) = raw,
                       case .string(let stamp)? = row["at"], let at = iso.date(from: stamp),
                       case .string(let word)? = row["outcome"], let outcome = OrganPulse.Outcome(rawValue: word)
-                else { continue }
+                else { damaged.append("pulses.\(organ)"); continue }
                 let note: String = if case .string(let text)? = row["note"] { text } else { "" }
                 let cadence: TimeInterval? = switch row["cadenceSeconds"] {
                 case .int(let seconds)?: TimeInterval(seconds)
@@ -1040,7 +1062,9 @@ public actor SwiftNativeLoopScheduler {
                 pulses[organ] = OrganPulse(organ: organ, at: at, outcome: outcome, note: note, cadence: cadence)
             }
         }
-        return (stamps("loops"), stamps("completions"), stamps("firstSeen"), pulses, true)
+        let runs = stamps("loops"), completions = stamps("completions"), firstSeen = stamps("firstSeen")
+        return (runs, completions, firstSeen, pulses,
+                damaged.isEmpty ? nil : "Loop run history has unreadable entries: " + damaged.sorted().joined(separator: ", "))
     }
 
     /// Serializes the whole (small — one entry per loop id ever registered)
@@ -1082,11 +1106,16 @@ public actor SwiftNativeLoopScheduler {
                 ]),
                 to: loopStatePath
             )
+            consecutiveFailures[Self.loopStateReceiptId] = 0
         } catch {
             lastDurableFlushAt = nil
             FileHandle.standardError.write(Data(
                 "BackgroundLoops: failed to persist loop run state: \(error)\n".utf8
             ))
+            // The attempt outlives this process as a receipt; repeats coalesce.
+            await appendFailureReceipt(loopId: Self.loopStateReceiptId,
+                error: "Loop run history could not be saved: \(error.localizedDescription)")
+            consecutiveFailures[Self.loopStateReceiptId, default: 0] += 1
         }
     }
 

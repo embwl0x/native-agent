@@ -58,7 +58,7 @@ public enum MoonshotModelCatalog {
             guard !id.isEmpty else { continue }
             let context = positiveInt(row["context_length"])
                 ?? FirstPartyModelCatalog.moonshotModels.first(where: { $0.id == id })?.contextLength
-                ?? 128_000
+                ?? 0
             byID[id] = ProviderModelDescriptor(
                 id: id,
                 name: displayName(for: id),
@@ -69,25 +69,24 @@ public enum MoonshotModelCatalog {
                 supportsJSONMode: true
             )
         }
+        // Declared rows first in their declared order, then the rest by name.
+        let declared = FirstPartyModelCatalog.moonshotModels.map(\.id)
         return byID.values.sorted { lhs, rhs in
-            if lhs.id == "kimi-k3" { return true }
-            if rhs.id == "kimi-k3" { return false }
+            let left = declared.firstIndex(of: lhs.id) ?? declared.count
+            let right = declared.firstIndex(of: rhs.id) ?? declared.count
+            if left != right { return left < right }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
         }
     }
 
+    /// The live catalog states no reasoning contract: a model's controls are
+    /// its declared row's, and an id with no row takes none.
     public static func defaultReasoningEffort(for modelID: String) -> String {
-        let id = modelID.lowercased()
-        if id == "kimi-k3" || id.hasPrefix("kimi-k2.7-code") { return "max" }
-        if id == "kimi-k2.6" || id == "kimi-k2.5" { return "high" }
-        return "none"
+        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.defaultReasoningEffort ?? "none"
     }
 
     public static func supportedReasoningEfforts(for modelID: String) -> [String] {
-        let id = modelID.lowercased()
-        if id == "kimi-k3" || id.hasPrefix("kimi-k2.7-code") { return ["max"] }
-        if id == "kimi-k2.6" || id == "kimi-k2.5" { return ["none", "high"] }
-        return ["none"]
+        FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.supportedReasoningEfforts ?? ["none"]
     }
 
     private static func fetchLiveModels(dataRoot: URL, session: URLSession) async throws -> [ProviderModelDescriptor] {
@@ -114,6 +113,10 @@ public enum MoonshotModelCatalog {
         dataRoot.appendingPathComponent("providers/moonshot-models-cache.json")
     }
 
+    static func cacheFault(dataRoot: URL) -> String? {
+        modelCatalogFault(at: cachePath(dataRoot: dataRoot), read: readCache(dataRoot: dataRoot) != nil, owner: "Moonshot")
+    }
+
     static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
         readDecodedCache(dataRoot: dataRoot)?.models
     }
@@ -132,7 +135,7 @@ public enum MoonshotModelCatalog {
             return ProviderModelDescriptor(
                 id: id,
                 name: (row["name"] as? String) ?? displayName(for: id),
-                contextLength: positiveInt(row["context_length"]) ?? 128_000,
+                contextLength: positiveInt(row["context_length"]) ?? 0,
                 supportsStreaming: (row["supports_streaming"] as? Bool) ?? true,
                 supportsVision: (row["supports_vision"] as? Bool) ?? false,
                 supportsTools: (row["supports_tools"] as? Bool) ?? true,

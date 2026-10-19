@@ -197,8 +197,11 @@ extension NativeAgentEngine {
             failures.append(error.localizedDescription)
         }
         AbilityFilesCheck.recordSeedFailures(failures, root: dataRoot)
+        // Doctor's reading publishes on its own; launch never waits for it.
         if !failures.isEmpty {
-            await DoctorStatusProjection.recordReadings([await AbilityFilesCheck(root: dataRoot).run()], dataRoot: dataRoot)
+            Task.detached(priority: .utility) {
+                await DoctorStatusProjection.recordReadings([await AbilityFilesCheck(root: dataRoot).run()], dataRoot: dataRoot)
+            }
         }
     }
 
@@ -276,6 +279,8 @@ extension NativeAgentEngine {
             }
         }
         Task.detached(priority: .utility) { await NativeAgentEngine.liveCognition.bootstrap() }
+        // Callbacks a peer is owed from before the relaunch go out now, not when the task is next read.
+        Task.detached(priority: .utility) { await NativeAgentEngine.live.agents.tasks.redeliverOwedCallbacks() }
         Task.detached(priority: .utility) {
             await reconcileTranscriptsAtLaunch(dataRoot: dataRoot)
             // Behind her: the first launch with the index builds it; later
@@ -742,9 +747,6 @@ extension NativeAgentEngine {
             // This avoids both unattended model spend and a dead 10-minute wake.
             // U2b wave 3 lane A: interval health heartbeat.
             makeHeartbeatLoop(dataRoot: dataRoot),
-            // U4 Wave C: autonomy-promotion PROPOSAL loop (cards only; applies
-            // human-approved promotions via a re-verifying reconcile).
-            AutonomyBackgroundWork.makeAutonomyPromotionLoop(dataRoot: dataRoot, events: EngineBackgroundWorkPort()),
             // Desk notify (2026-06-29): desk-side push when a direct/urgent
             // tracked item changes. A SEPARATE loop from the cognition manifest
             // above — it reads desk state and pings User, never touching the

@@ -206,22 +206,3 @@ func fourCharCode(_ string: String) -> FourCharCode {
     }
     return result
 }
-
-struct HotkeyControlView: View {
-    @AppStorage("globalHotkeyEnabled") private var enabled: Bool = true
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-            Toggle("Enable ⌘⇧J global hotkey", isOn: $enabled)
-                .onChange(of: enabled) { _, newValue in
-                    GlobalHotkeyManager.shared.setEnabled(newValue)
-                }
-            Text("⌘⇧J — Tap to bring NativeAgent forward. Hold to activate voice input.")
-                .font(NativeAgentFont.label)
-                .foregroundStyle(.secondary)
-            Text("Tap works without Accessibility access. Hold-to-talk needs Microphone and Speech Recognition permission.")
-                .font(NativeAgentFont.label)
-                .foregroundStyle(.secondary)
-        }
-    }
-}

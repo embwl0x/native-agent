@@ -38,7 +38,7 @@ extension NativeCognitionRuntime {
         // Claimed BEFORE the load so a burst of turns starts one read, not one
         // each. A failed read simply waits out the window.
         await substrate.noteExternalRuminationRefreshStarted(at: now)
-        await startPursuitRefresh(waitForCompletion: false)
+        await startPursuitRefresh()
     }
 
     /// Map canonical Desk rows to the payload-free shape the lane consumes, and

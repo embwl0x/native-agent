@@ -336,7 +336,38 @@ extension SwiftNativeMacControl {
         let started = now()
         let result: String
         do {
-            result = try await appleScriptAdapter.run(script: script)
+            // A script can drive the GUI, so it is her hands for its whole run:
+            // his taking the Mac back ends the osascript process (cancellation
+            // kills its process tree), exactly as it stops a hand mid-gesture.
+            enum Lifetime: Sendable { case finished(String), takenOver, unwatched }
+            let adapter = appleScriptAdapter, store = attentionStore, binding = MacDriverContext.binding
+            let finished: String? = try await ScriptedInputSources.during { try await withThrowingTaskGroup(of: Lifetime.self) { group in
+                group.addTask { .finished(try await adapter.run(script: script)) }
+                if let binding {
+                    group.addTask {
+                        for await _ in await store.driverChanges() where !binding.allowsAction { return .takenOver }
+                        return .unwatched
+                    }
+                }
+                while let next = try await group.next() {
+                    switch next {
+                    case .finished(let output): group.cancelAll(); return output
+                    case .takenOver: group.cancelAll(); return nil
+                    case .unwatched: continue
+                    }
+                }
+                return nil
+            } }
+            guard let finished else {
+                return MacControlResult(
+                    ok: false, action: "applescript",
+                    output: .object(["script": .string(String(script.prefix(200))), "status": .string("yielded_to_user"),
+                                     "effects": .string("unknown"),
+                                     "guidance": .string("The person took the Mac back while the script ran, so it was stopped; what it already did is unknown. Look before running it again.")]),
+                    error: MacAttentionSessionStore.driverRefusal,
+                    durationMs: Int(now().timeIntervalSince(started) * 1000), httpStatus: 409, verification: .unverified)
+            }
+            result = finished
         } catch {
             return MacControlResult(
                 ok: false,
@@ -671,9 +702,6 @@ extension SwiftNativeMacControl {
     func handleShell(_ body: [String: JSONValue]) async throws -> MacControlResult {
         guard let command = body.stringValue("command"), !command.isEmpty else {
             throw MacControlError.missingField("command")
-        }
-        if let reason = MacControlShellWhitelist.validate(command) {
-            throw MacControlError.shellNotWhitelisted(reason)
         }
         let timeout = max(1, min(Self.intValue(body, "timeout") ?? 60, 120))
         let started = now()

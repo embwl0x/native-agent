@@ -225,13 +225,12 @@ public actor BotRunner {
         let verdict = judgesCondition ? ConditionVerdict(sessionID: bot.sessionID) : nil
         do {
             let session = self.session
-            // Cancellation settles the ordinary client's transcript before the
-            // claim is released. Never abandon a still-writing session task.
+            // The claim is released only after the session has settled.
             let queue = self.queue
             outcome = try await BotRunnerDeadline.settled(seconds: bot.budget.seconds, onDeadline: {
                 do {
                     try queue.markDeadlineExceeded(bot: bot.id, requestID: requestID)
-                    await deadlineExceeded("\(bot.name) exceeded its run limit; cancellation is still settling.")
+                    await deadlineExceeded("\(bot.name) exceeded its run limit and is still finishing.")
                 } catch {
                     nativeLog("bot deadline claim unavailable: %@", String(describing: error))
                     await deadlineExceeded("\(bot.name) exceeded its run limit; its claim could not be updated: \(error)")

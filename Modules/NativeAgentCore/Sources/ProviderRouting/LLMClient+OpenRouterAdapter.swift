@@ -10,7 +10,7 @@ import PersistenceCore
 /// `meta-llama/...`, etc.) — those are OpenRouter routing targets, not
 /// first-party Anthropic / OpenAI calls.
 public final class OpenRouterAdapter: LLMAdapter {
-    public static let supportsTools = true
+    public static let toolWire = ProviderToolWire.native
     public let providerId: String = "openrouter"
     private let session: URLSession
     private let endpoint: URL
@@ -35,6 +35,12 @@ public final class OpenRouterAdapter: LLMAdapter {
         self.telemetry = LLMCallTraceRecorder(
             dataRootOverride: telemetryDataRootOverride ?? dataRootOverride
         )
+    }
+
+    /// A 404 is already the answer for this call; the catalog learns it on
+    /// its own task, so the failure never waits on a discovery request.
+    private static func refreshCatalog(dataRoot: URL, session: URLSession) {
+        Task.detached { _ = await OpenRouterModelCatalog.models(dataRoot: dataRoot, session: session, refresh: true) }
     }
 
     /// User, 2026-09-06: the model picker advertises low/medium/high/xhigh for
@@ -131,12 +137,7 @@ public final class OpenRouterAdapter: LLMAdapter {
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 404 {
-            let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            _ = await OpenRouterModelCatalog.models(
-                dataRoot: root,
-                session: session,
-                refresh: true
-            )
+            Self.refreshCatalog(dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(), session: session)
             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
         }
         try throwIfChatCompletionsError(status: status, data: data, response: response)
@@ -209,10 +210,7 @@ public final class OpenRouterAdapter: LLMAdapter {
                     if !(200..<300).contains(status) {
                         let errorBody = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
                         if status == 404 {
-                            _ = await OpenRouterModelCatalog.models(
-                                dataRoot: dataRoot, session: session, refresh: true
-                            )
-                            try Task.checkCancellation()
+                            Self.refreshCatalog(dataRoot: dataRoot, session: session)
                             throw LLMError.modelUnavailable(provider: "openrouter", model: model)
                         }
                         try throwIfChatCompletionsError(

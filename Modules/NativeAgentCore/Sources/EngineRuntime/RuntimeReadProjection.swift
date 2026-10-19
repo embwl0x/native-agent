@@ -62,19 +62,17 @@ public enum RuntimeReadProjection {
         let divisor: Double = resolvedModel.lowercased().contains("claude") ? 3.5 : 4.0
         let transcriptTokens = max(0, Int((Double(totalChars) / divisor).rounded()))
 
-        // Her window (`effectiveWindowTokens`): 60% of the selected model's,
-        // capped by a Custom size; an injected size is Custom. The ring is of
-        // it, the same window the composer card reads, and she compacts at it.
-        // An unknown model takes the same 60% of the catalog's gauge default.
+        // Her window (`effectiveWindowTokens`): 60% of the selected model's on
+        // the Chat route, capped by a Custom size; an injected size is Custom.
+        // The ring is of it, the same window the composer card reads, and she
+        // compacts at it. A window no catalog row states is 0: unknown.
         var windowConfig = ChatSessionAutocompactionConfig.productionDefault()
         if let configuredThresholdTokens, configuredThresholdTokens > 0 {
             windowConfig.thresholdTokens = configuredThresholdTokens
             windowConfig.contextWindowMode = .custom
         }
-        let gaugeWindow = ProviderRouting.contextLength(forModel: resolvedModel)
-        let budget = windowConfig.effectiveWindowTokens(forModel: resolvedModel)
-            ?? windowConfig.effectiveWindowTokens(nativeWindowTokens: gaugeWindow)
-            ?? gaugeWindow
+        let route = await SwiftNativeProviderRouting(dataRoot: root).chatRouteProvider()
+        let budget = windowConfig.effectiveWindowTokens(forModel: resolvedModel, providerID: route, dataRoot: root) ?? 0
 
         let providerUsagePath = root
             .appendingPathComponent("chat", isDirectory: true)
@@ -105,7 +103,7 @@ public enum RuntimeReadProjection {
         let usedTokens = providerReceipt?.lastRequestInputTokens ?? transcriptTokens
         let promptTokens = max(0, usedTokens - transcriptTokens)
 
-        let threshold = windowConfig.effectiveThresholdTokens(forModel: resolvedModel)
+        let threshold = windowConfig.effectiveThresholdTokens(forModel: resolvedModel, providerID: route, dataRoot: root)
 
         // A carried-over receipt counts tokens against the PREVIOUS model's
         // window, so an 800k figure over a fresh 128k budget would read 600%.

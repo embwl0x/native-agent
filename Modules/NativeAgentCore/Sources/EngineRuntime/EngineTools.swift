@@ -67,7 +67,7 @@ public final class ToolsFacade {
         self.ports = ports
     }
 
-    /// The MCP registry, consent ledger and live sessions for this data root.
+    /// The MCP registry and live sessions for this data root.
     public nonisolated var mcp: SwiftNativeMCPDispatcher { SwiftNativeMCPDispatcher(root: dataRoot) }
 
     /// Core session rows, including the subprocess pool's live state.

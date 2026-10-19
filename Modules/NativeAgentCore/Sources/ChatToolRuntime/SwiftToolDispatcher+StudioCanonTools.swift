@@ -101,8 +101,9 @@ public enum StudioCanonSeatGate {
         }
         // An identity to record. Task-locals only — never `__session_id`
         //    from the input, which a model can type.
+        // The turn's own run, from its execution; never a run pinned further up.
         let turnID = [
-            ChatPersistenceContext.pinnedTurnRunID,
+            ChatTurnExecution.current?.historyRunID,
             ChatToolSessionContext.verifiedSessionId,
         ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }

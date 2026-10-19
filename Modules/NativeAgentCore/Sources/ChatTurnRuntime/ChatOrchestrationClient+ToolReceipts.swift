@@ -59,7 +59,7 @@ extension SwiftNativeChatOrchestrationClient {
                 ),
                 source: writer.surface
             )
-            try await TurnCheckpointScope.current?.receiptWritten()
+            await TurnCheckpointScope.current?.receiptWritten()
         } catch {
             // M2 (2026-07-09): a swallowed failure here dropped the tool
             // receipt from the persisted transcript while the live pill still

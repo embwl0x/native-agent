@@ -165,7 +165,7 @@ struct ProviderSettingsView: View {
     }
 
     private var selectableProviders: [ProviderInfo] {
-        providers.filter { $0.auth_status.state == "ready" }
+        providers.filter { $0.auth_status.eligible }
     }
 
     private var defaultProviderID: String {
@@ -456,7 +456,7 @@ private enum ProviderDesignSample {
         ProviderInfo(
             provider_id: id, display_name: name, auth_modes: ["api_key"],
             auth_status: ProviderAuthStatus(provider_id: id, state: "ready", detail: "Connected and answering.",
-                                            user_info: ["plan": "Team"], last_checked_at: nil),
+                                            user_info: ["plan": "Team"], last_checked_at: nil, eligible: true),
             models: models.map {
                 ProviderModelInfo(id: $0.0, name: $0.1, context_length: 200_000, supports_streaming: true,
                                   supports_vision: $0.2, supports_tools: true, supports_json_mode: $0.2)
@@ -471,9 +471,11 @@ enum ProviderWords {
     static func state(_ raw: String) -> String {
         switch raw {
         case "ready": return "Ready"
+        case "saved": return "Saved, not yet checked"
+        case "failed": return "Could not check"
+        case "rejected": return "Key rejected"
         case "needs_key": return "Needs a key"
         case "needs_oauth": return "Needs sign-in"
-        case "error": return "Error"
         default: return AliveWords.humanized(raw)
         }
     }

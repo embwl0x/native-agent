@@ -327,6 +327,8 @@ public enum DreamBackgroundWork {
             "id": .string(approvalId),
             "created_at": .string(fmt.string(from: Date())),
             "source": .string("rem_cycle"),
+            "presentation": .object(["icon": .string("sparkles"), "badge": .string("REM"),
+                                     "words": .string("From my rest"), "act_label": .string("Go ahead")]),
             "severity": .string("actionable"),
             "title": .string("REM growth lesson"),
             "summary": .string(String(preview.prefix(220))),

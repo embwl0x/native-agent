@@ -25,7 +25,13 @@ extension CognitiveSubstrate {
         _ event: CognitiveEvent,
         defersPersistenceToMicrocycle: Bool
     ) async -> Bool {
-        await waitForMaintenanceTransition()
+        // Only a caller that commits inline must not interleave with the
+        // maintenance commit. Resident admission marks the state dirty, which
+        // tells a suspended maintenance pass not to revert over it, and the
+        // microcycle persists it after maintenance ends.
+        if !(defersPersistenceToMicrocycle && configuration.backgroundMicrocyclesEnabled) {
+            await waitForMaintenanceTransition()
+        }
         guard configuration.enabled else { return false }
         // D-2 (2026-08-02) — STAKES, not event class. A felt resolution about
         // machinery she holds no concern for is not a feeling; it is her own
@@ -220,17 +226,13 @@ extension CognitiveSubstrate {
             )
         }
         if configuration.persistenceEnabled {
-            if evicted > 0, let store {
-                try? await store.appendReceipt(
-                    kind: "workspace.verification_eviction",
-                    payload: .object([
-                        "evictedCount": .int(Int64(evicted)),
-                        "sessionId": event.sessionId.map(JSONValue.string) ?? .null,
-                    ]),
-                    at: now
-                )
+            if evicted > 0 {
+                await recordReceipt(kind: "workspace.verification_eviction", payload: .object([
+                    "evictedCount": .int(Int64(evicted)),
+                    "sessionId": event.sessionId.map(JSONValue.string) ?? .null,
+                ]))
             }
-            try? await persistSnapshot()
+            await notingPersistence("snapshot") { try await persistSnapshot() }
             await flushCapsulePresentationIfNeeded(at: now)
         }
         return true

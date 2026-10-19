@@ -511,8 +511,10 @@ final class ChatStore {
     }
     var pendingSendArgs: [String: PendingSendArgs] = [:]
     var retriedSignatureCorrelations: Set<String> = []
-    var canceledPendingIds: Set<String> = []
     var timedOutPendingIds: [String: UUID] = [:]
+    /// Queued messages the Mac's working turn has been offered (Steer): the
+    /// queue holds them until the Mac says the turn read them or gave them back.
+    var steeringQueuedIDs: Set<UUID> = []
     /// Requests the Mac signed a refusal for because they aged out unread:
     /// proven never started, so their retained text may be sent again — and
     /// only ever by the person, through `sendNow` (2026-09-13).

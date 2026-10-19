@@ -93,8 +93,9 @@ public struct MemoryPromotionTelemetry: Sendable, Equatable {
 public struct SharedAdaptiveMemoryPromoter: Sendable {
     public init() {}
 
-    public func pendingMomentCount() async -> Int {
-        await AdaptiveMemoryPromoter.shared.pendingMomentCount()
+    /// Throws when the count cannot be read: an unread count is not zero.
+    public func pendingMomentCount() async throws -> Int {
+        try await AdaptiveMemoryPromoter.shared.pendingMomentCount()
     }
 
     public func observeTurnWithTelemetry(
@@ -530,7 +531,6 @@ public struct TurnEngineResult: Sendable {
         public internal(set) var roundsAfterToolFailureCount = 0
         public internal(set) var protocolViolationRoundCount = 0
         public internal(set) var emptyReplyRoundCount = 0
-        public internal(set) var unfulfilledPromiseRoundCount = 0
     }
 
     public enum CompletionState: Sendable, Equatable {

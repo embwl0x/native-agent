@@ -749,18 +749,10 @@ extension PersonaCompiler {
 
         // growthWeek: the substrate's own seven-day readout. NOT derived from
         // GROWTH.md at all — the file's length was never the question.
-        let growthWeek: [String]
-        if let provider = growthWeekProvider {
-            growthWeek = (try? await provider()) ?? []
-        } else {
-            growthWeek = []
-        }
-        let feedbackCount: Int
-        if let provider = feedbackMemoryProvider {
-            feedbackCount = (try? await provider()) ?? 0
-        } else {
-            feedbackCount = 0
-        }
+        // A provider that cannot answer fails the readout with its cause;
+        // an unread week is never a week without growth.
+        let growthWeek = try await growthWeekProvider?() ?? []
+        let feedbackCount = try await feedbackMemoryProvider?() ?? 0
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return CompiledGrowthSummary(

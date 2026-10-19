@@ -66,33 +66,7 @@ enum TurnSettle {
         ])
     }
 
-    /// The terminal of a turn that ended waiting on a card: the prose the
-    /// person watched render, cut at the first marker, plus — on a route that
-    /// cannot draw the card — the card said out loud
-    /// (`ChatTurnExecution.waitingReply`). Suspended, not finished: the
-    /// continuation on the card completes it.
-    static func waitingOnCard(
-        visible: String,
-        modelUsed: String,
-        recalledIds: [String],
-        dispatches: [TurnEngineResult.ToolDispatchRecord],
-        startNs: UInt64,
-        rawLLMResponse: String,
-        providerCallCount: Int
-    ) -> TurnEngineResult {
-        TurnEngineResult(
-            reply: ChatTurnExecution.waitingReply(visible: visible),
-            modelUsed: modelUsed,
-            recalledIds: recalledIds,
-            toolDispatches: dispatches,
-            elapsedMs: Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000),
-            rawLLMResponse: rawLLMResponse,
-            providerCallCount: providerCallCount,
-            completionState: .incomplete
-        )
-    }
-
-    /// The card-lane sentence `waitingOnCard` added after the last delta,
+    /// The card-lane sentence `ChatTurnExecution.waitingReply` added after the last delta,
     /// taken once by the lane about to yield `.final`, which streams it
     /// first: a consumer that rebuilds the reply from deltas has to see it.
     static func takeStreamSuffix() -> String? {

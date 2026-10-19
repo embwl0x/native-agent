@@ -1,3 +1,4 @@
+import Experiences
 import Foundation
 import CryptoKit
 import NativeAgentCore
@@ -583,9 +584,8 @@ public actor SwiftNativeDispatcher {
         )
     }
 
-    /// Build + write a ledger entry. Failures are swallowed (matches Python's
-    /// `_record_trace` swallowing in the retired daemon) because a
-    /// trace failure must not break the call that produced the trace.
+    /// Build + write a ledger entry. A failed write never changes the call's
+    /// outcome; it owes its repair, so the missing row is known.
     private func tryWriteLedger(
         runId: String,
         tool: String,
@@ -650,7 +650,10 @@ public actor SwiftNativeDispatcher {
             )
             try await ledger.append(entry)
         } catch {
-            // Swallow — never let ledger IO break the dispatch path.
+            // The call keeps its own outcome; the lost row is owed, not hidden.
+            let path = await ledger.path
+            RepairOwed.owe(path.deletingLastPathComponent().deletingLastPathComponent(), id: UUID().uuidString, kind: .act, operation: "dispatch.ledger",
+                           owner: path.path, words: "\(path.path) did not record \(tool)'s \(status) row (\(error.localizedDescription)); the call itself kept its outcome.")
         }
     }
 }

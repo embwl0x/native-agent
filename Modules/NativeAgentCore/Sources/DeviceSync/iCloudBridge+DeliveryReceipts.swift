@@ -172,6 +172,17 @@ extension iCloudBridge {
         }
     }
 
+    /// The device-event ids the phone has signed as arrived (Mac → iOS): the
+    /// destination's acceptance. An unreadable ledger confirms nothing.
+    public nonisolated static func phoneConfirmedEventIDs(dataRoot: URL) -> Set<String> {
+        let rows = (try? loadChatDeliveryReceiptRows(path: chatDeliveryReceiptsURL(dataRoot: dataRoot))) ?? []
+        return Set(rows.compactMap { fields in
+            fields["direction"] == .string("mac_to_ios")
+                && fields["status"] == .string(ChatDeliveryReceiptStatus.confirmedByPeer.rawValue)
+                ? stringField(fields["eventId"]) : nil
+        })
+    }
+
     nonisolated static func chatDeliveryReceiptsURL(dataRoot: URL) -> URL {
         dataRoot
             .appendingPathComponent("icloud", isDirectory: true)

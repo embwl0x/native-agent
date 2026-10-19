@@ -81,10 +81,6 @@ enum AppScriptRunner {
             return .success(["action": .string(id), "args": given.first ?? .object([:]),
                              AppToolExecutor.doorScriptKey: .bool(true)])
         }
-        guard action.scriptable else {
-            return .failure(ScriptError(reason: "not_scriptable",
-                detail: "\(action.id) runs only as a single app action, not in a script; it was not run."))
-        }
         var input: [String: JSONValue] = ["action": .string(action.id)]
         if case .object(let named)? = given.first {
             input["args"] = .object(named)
@@ -162,9 +158,6 @@ enum AppScriptRunner {
                     return .failure(ScriptError(reason: "invalid_args", detail: "An authored dependency takes no arguments or one named argument object; two or more arguments or a non-object are not accepted."))
                 }
                 guard let action = resolved(id) else { return AppScriptRunner.doorInput(id: id, given: given, dataRoot: dataRoot) }
-                guard action.scriptable else {
-                    return .failure(ScriptError(reason: "not_scriptable", detail: "\(action.id) is a card button; answer it outside the script."))
-                }
                 if let refusal = AppScriptRunner.secretRefusal(action, named) { return .failure(refusal) }
                 return .success(["action": .string(action.id), "args": .object(named)])
             }

@@ -160,13 +160,10 @@ extension SwiftToolDispatcher {
         guard AgentConversationDelivery.lane(for: "codex", dataRoot: dataRoot, bridgeConfigRoot: agentBridgeConfigRoot) != nil else {
             throw ToolFailureError("No contact carries this inbox door.", effects: .none, owner: "Saved agent contacts", nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]))
         }
-        guard case .string(let text)? = input["text"], !text.isEmpty else {
-            return .object([
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "reason": .string("missing_text"),
-                "fix": .string("codex_message requires a non-empty 'text' parameter."),
-            ])
+        let text: String, priority: String
+        switch Self.bridgeMessageFields(input, tool: "codex_message") {
+        case .success(let fields): (text, priority) = fields
+        case .failure(let refusal): return refusal.value
         }
         let (deskHandle, droppedDeskItem) = try await delegationDeskHandleDroppingStale(input)
         let pairReviewer: Bool
@@ -174,13 +171,6 @@ extension SwiftToolDispatcher {
         case .success(let requested): pairReviewer = requested
         case .failure(let error): return error.value
         }
-        let priority: String = {
-            if case .string(let p)? = input["priority"] {
-                let lower = p.lowercased()
-                if ["info", "important", "urgent"].contains(lower) { return lower }
-            }
-            return "info"
-        }()
         let requestedTopic: String? = {
             guard case .string(let raw)? = input["topic"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -432,7 +422,7 @@ extension SwiftToolDispatcher {
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
-            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
+            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was queued without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
         }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let executionProfile {

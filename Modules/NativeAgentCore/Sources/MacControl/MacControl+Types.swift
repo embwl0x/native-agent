@@ -105,7 +105,6 @@ public enum MacControlError: Error, Sendable, Equatable, LocalizedError {
     case unknownAction(String)
     case missingField(String)
     case sensitivePathDenied(String)
-    case shellNotWhitelisted(String)
     case appControlFailed(String)
     case applescriptFailed(String)
     case notificationFailed(String)
@@ -118,7 +117,6 @@ public enum MacControlError: Error, Sendable, Equatable, LocalizedError {
         case .unknownAction(let a): return "unknown mac_control action: \(a)"
         case .missingField(let f): return "missing required field: \(f)"
         case .sensitivePathDenied(let p): return "sensitive_path_denied: \(p)"
-        case .shellNotWhitelisted(let c): return "shell command not in whitelist: \(c)"
         case .appControlFailed(let s): return "app control failed: \(s)"
         case .applescriptFailed(let s): return "applescript failed: \(s)"
         case .notificationFailed(let s): return "notification failed: \(s)"
@@ -380,6 +378,13 @@ public let macControlAccessibilityInjectionActions: Set<String> = [
 public let macControlAccessibilityNudgeActions: Set<String> = [
     "nudge",
 ]
+
+/// Every action that can move his cursor, keys, focus or screen: it yields to
+/// him at entry and on its result. A script is here because a script can
+/// drive the GUI; its whole run is tracked by `handleAppleScript`.
+public let macControlTakeoverActions: Set<String> = macControlAccessibilityInjectionActions
+    .union(macControlAccessibilityNudgeActions)
+    .union(["focus_app", "quit_app", "open_target", "applescript"])
 
 /// fable51 item 30 — THE CLIPBOARD ORGAN, in two sets because the two halves
 /// are two different contracts and folding them together would let the write
@@ -1039,52 +1044,14 @@ public protocol MacControlPolicyProvider: Sendable {
     /// case production callers fail closed before any side effect. Tests can
     /// omit the provider when they need to exercise a handler directly.
     func currentPolicy() async -> MacControlPolicy?
+    /// The one authorization decision for a raw dispatch: the permission
+    /// law's level (`auto`, `confirm`, `blocked`), reason and lever. Nil: the
+    /// door that built this provider already consumed that decision.
+    func authorize(tool: String, input: [String: JSONValue]) async -> (level: String, reason: String, remedy: JSONValue?)?
 }
 
-// MARK: - Shell whitelist
-
-/// Sub-action `shell` is the most dangerous surface in the entire module.
-/// Even when policy is permissive, the Swift path enforces a hard executable-prefix whitelist
-/// so a compromised LLM tool-call surface CAN NOT pivot from a Mac-app
-    /// permission slip to arbitrary code execution.
-public enum MacControlShellWhitelist {
-    /// First word (split on whitespace) MUST appear here. Absolute-path
-    /// commands have the basename checked. Empty / multi-statement chains
-    /// (`;`, `&&`, `||`, `|`, backticks, `$(...)`) are rejected outright
-    /// regardless of whitelist match — see `validate(_:)`.
-    public static let allowed: Set<String> = [
-        "echo", "true", "false", "pwd", "whoami", "uname", "date",
-        "hostname", "id", "uptime", "df", "uptime",
-    ]
-
-    /// Returns nil on accept, or a rejection reason string on deny.
-    public static func validate(_ command: String) -> String? {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "empty command" }
-        // Hard reject any shell-metachar that could chain or substitute.
-        let banned: [Character] = [";", "&", "|", "`", "$", ">", "<", "\n", "\r", "\\"]
-        for ch in trimmed {
-            if banned.contains(ch) {
-                return "disallowed metacharacter: \(ch)"
-            }
-        }
-        let firstWord = trimmed.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-            .first.map(String.init) ?? ""
-        if firstWord.isEmpty { return "no executable" }
-        // The whitelist is a NAME whitelist, not a basename whitelist —
-        // `/tmp/date` and `./date` MUST be rejected even though basename
-        // matches. Attacker-controlled executables on PATH are out of scope.
-        if firstWord.hasPrefix(".") {
-            return "executable relative path not allowed: \(firstWord)"
-        }
-        if firstWord.contains("/") {
-            return "executable path not allowed: \(firstWord)"
-        }
-        if !allowed.contains(firstWord) {
-            return "executable not whitelisted: \(firstWord)"
-        }
-        return nil
-    }
+public extension MacControlPolicyProvider {
+    func authorize(tool: String, input: [String: JSONValue]) async -> (level: String, reason: String, remedy: JSONValue?)? { nil }
 }
 
 // MARK: - Sensitive-path fence (parity subset)

@@ -68,7 +68,6 @@ enum MemoriesPageMetrics {
     static let titleSize: CGFloat = ShellType.bodySize
     static let lineSize: CGFloat = ShellType.labelSize
     static let metaSize: CGFloat = ShellType.labelSize
-    static let rowRadius: CGFloat = 10
     /// The first paint shows the newest sixty; the rest sit behind one fold.
     /// A page that lays four hundred rows out at once is a table, not a page.
     static let keptShown = 60

@@ -6,6 +6,8 @@ import ChatOrchestration
 import PersistenceCore
 import ProviderRouting
 import SlackConnector
+import Transcripts
+import TurnTrace
 
 /// One-way latch marking that a planned session recycle (not a failure)
 /// closed the socket. Same lock pattern as SlackPingContinuationGate below.
@@ -118,9 +120,6 @@ public struct SlackSocketModeLoop: LoopRunner {
     private let deliveryJournal: SlackInboundDeliveryJournal
     private let historyPollState = SlackHistoryPollState()
     private let conversationCache = SlackConversationCache()
-    // LOOPS-2: every spawned handling task is registered here so loop stop can
-    // cancel + await it instead of leaking detached work past the tick.
-    private let inFlight = SlackInFlightHandlers()
     // LOOPS-5: shared socket-liveness signal that gates history polling.
     private let socketHealth = SlackSocketHealth()
     private let feedRetention: SlackReceiptErrorFeed.Retention = .production
@@ -138,10 +137,6 @@ public struct SlackSocketModeLoop: LoopRunner {
         max(config.historyPollInterval * 10, 900)
     }
     static let shortLivedSessionFloor: TimeInterval = 30
-    /// Bounded window in which already-accepted work may finish before the
-    /// tick cancels it. Used after a socket-open failure and after a PLANNED
-    /// session teardown; see `teardownGrace`.
-    static let inFlightCompletionGrace: TimeInterval = 30
     /// How long a socket-mode ping may wait for its pong before the wait is
     /// abandoned. Well inside the 25 s ping interval, so a dead socket is
     /// declared dead on the tick that found it rather than at the next one.
@@ -178,29 +173,11 @@ public struct SlackSocketModeLoop: LoopRunner {
 
     public func tickOutcome() async -> LoopTickOutcome {
         guard config.enabled else { return .off("Socket Mode off") }
-        // Recovery and socket admission share the canonical tick owner, but
-        // neither waits for the other's chat generation. Register recovery in
-        // the existing child set before opening the socket; every return path
-        // below drains that set, including failure before receiveLoop starts.
-        let recoveryId = UUID()
-        let recovery = Task(priority: .userInitiated) {
-            do {
-                try await reconcileSavedReplies()
-            } catch is CancellationError {
-                // The canonical tick is stopping.
-            } catch {
-                await recordError(context: "inbound_recovery", error: error)
-            }
-            await inFlight.finish(recoveryId)
-        }
-        await inFlight.register(recovery, id: recoveryId)
-        let outcome = await socketTickOutcome()
-        // Socket-open failure must still give bot-token/prepared recovery a
-        // bounded opportunity to finish. A held chat turn cannot postpone the
-        // next connection attempt forever, and cancellation skips this grace.
-        _ = await inFlight.waitForCompletion(timeout: Self.inFlightCompletionGrace)
-        await inFlight.cancelAndWaitAll()
-        return outcome
+        // Recovery only hands each saved accepted message its own lifetime,
+        // as a new one gets; the socket session never waits on or cancels it.
+        do { try await reconcileSavedReplies() }
+        catch { await recordError(context: "inbound_recovery", error: error) }
+        return await socketTickOutcome()
     }
 
     private func socketTickOutcome() async -> LoopTickOutcome {
@@ -373,61 +350,23 @@ public struct SlackSocketModeLoop: LoopRunner {
         let historyPollTask = Task {
             await historyPollUntilCancelled()
         }
-        // LOOPS-2: handling used to be spawned into detached `Task {}` blocks
-        // that outlived the tick — nothing cancelled them, nothing awaited
-        // them, and their outcome never reached the loop's health accounting.
-        // Every exit path (return, throw, cancellation) now drains the child
-        // tasks AND the tracked handling set before the tick reports.
+        // Every exit path drains the session's own children (ping, history);
+        // accepted turns are not the session's and keep running.
         do {
             try await receiveLoopBody(socket: socket)
         } catch {
-            await drainSessionWork(
-                pingTask: pingTask,
-                historyPollTask: historyPollTask,
-                grace: Self.teardownGrace(closing: error, recyclePlanned: recycleFlag.didFire)
-            )
+            await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
             throw error
         }
-        await drainSessionWork(
-            pingTask: pingTask,
-            historyPollTask: historyPollTask,
-            grace: Self.teardownGrace(closing: nil, recyclePlanned: recycleFlag.didFire)
-        )
+        await drainSessionWork(pingTask: pingTask, historyPollTask: historyPollTask)
     }
 
-    /// A session that ends ON PURPOSE — the hourly recycle, or Slack's routine
-    /// `refresh_requested`/`warning` rotation — used to cancel in-flight chat
-    /// generation the instant the socket closed. That leaves the journal row in
-    /// `.generating`, which recovery parks as `outcome_unknown` and never
-    /// auto-retries (guarding against duplicated tool effects), so the user's
-    /// message silently never gets a reply. Give planned teardown a bounded
-    /// grace to finish the turn first. Unplanned failure keeps the prompt
-    /// cancel: reconnection must not wait on a session that is already broken,
-    /// and the crash/fatal-disconnect semantics stay exactly as they were.
-    static func teardownGrace(closing error: Error?, recyclePlanned: Bool) -> TimeInterval {
-        // Same precedence as `classifySessionClosure`: a fatal disconnect racing
-        // the recycle timer is a broken socket, not a planned teardown.
-        if let error, let closure = error as? SlackSocketSessionClosure,
-           case .disconnect(let reason) = closure {
-            return disconnectDisposition(forReason: reason) == .routine ? inFlightCompletionGrace : 0
-        }
-        return recyclePlanned ? inFlightCompletionGrace : 0
-    }
-
-    private func drainSessionWork(
-        pingTask: Task<Void, Never>,
-        historyPollTask: Task<Void, Never>,
-        grace: TimeInterval = 0
-    ) async {
+    private func drainSessionWork(pingTask: Task<Void, Never>, historyPollTask: Task<Void, Never>) async {
         pingTask.cancel()
         historyPollTask.cancel()
         await socketHealth.markDisconnected()
         await historyPollTask.value
         await pingTask.value
-        // Canonical loop cancellation short-circuits this wait, so stopping the
-        // loop stays prompt.
-        if grace > 0 { _ = await inFlight.waitForCompletion(timeout: grace) }
-        await inFlight.cancelAndWaitAll()
     }
 
     private func receiveLoopBody(socket: URLSessionWebSocketTask) async throws {
@@ -502,18 +441,12 @@ public struct SlackSocketModeLoop: LoopRunner {
         }
     }
 
-    /// Handling stays tracked while the journal owns admission and settlement.
+    /// An accepted human message is her turn, not the socket's: it runs
+    /// under its own lifetime (the journal owns admission and settlement), so
+    /// a closing or recycled socket changes only the reply's delivery. It
+    /// also never inherits the socket loop's utility priority.
     func spawnInboundHandling(_ inbound: SlackInboundMessage) async {
-        let id = UUID()
-        // Socket receipt is background transport work; handling an accepted
-        // human message is not. Keep the tracked cancellation/delivery owner,
-        // but do not let the chat turn inherit the utility-priority socket
-        // loop and starve behind unrelated local builds.
-        let task = Task(priority: .userInitiated) {
-            _ = await handleDurableInbound(inbound)
-            await inFlight.finish(id)
-        }
-        await inFlight.register(task, id: id)
+        Task(priority: .userInitiated) { _ = await handleDurableInbound(inbound) }
     }
 
     func claimInboundBeforeAcknowledging(
@@ -877,18 +810,14 @@ public struct SlackSocketModeLoop: LoopRunner {
                 "lastHistoryPollChannelId": .string(conversation.id),
                 "lastHistoryPollMessageTs": .string(inbound.ts),
             ])
-            let id = UUID()
             let (results, completion) = AsyncStream<Bool>.makeStream()
-            let handling = Task(priority: .userInitiated) {
-                let delivered = await handleDurableInbound(inbound)
-                completion.yield(delivered)
+            Task(priority: .userInitiated) {
+                completion.yield(await handleDurableInbound(inbound))
                 completion.finish()
-                await inFlight.finish(id)
             }
-            await inFlight.register(handling, id: id)
             var delivered = false
-            // Cancelling history collection stops this wait, while the accepted
-            // handler remains owned by the session's bounded completion drain.
+            // Cancelling history collection stops this wait; the accepted turn
+            // runs on under its own lifetime.
             for await result in results { delivered = result }
             try Task.checkCancellation()
             if delivered {
@@ -1231,9 +1160,8 @@ public struct SlackSocketModeLoop: LoopRunner {
                 )
                 continue
             }
-            _ = await handleDurableInbound(inbound)
+            await spawnInboundHandling(inbound)
         }
-        if Task.isCancelled { throw CancellationError() }
     }
 
     /// The production receive/history paths use this durable lifecycle. A
@@ -1336,13 +1264,20 @@ public struct SlackSocketModeLoop: LoopRunner {
                 guard !Task.isCancelled else { return false }
                 let sessionId = try await SlackSessionStore(dataRoot: dataRoot).activeSessionId(for: inbound)
                 let runId = UUID().uuidString
+                // Registered for Stop at admission, before any await: a Stop from
+                // here on names this run; the turn's acceptance is the same one.
+                let turnId = TurnTraceContext.mintTurnId()
+                let stopFlag = ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: sessionId, runId: runId, turnId: turnId)
+                defer { ChatCancelFlag.finish(stopFlag) }
                 record = try await deliveryJournal.beginGeneration(eventId: inbound.eventId, runId: runId, sessionId: sessionId)
                 handled = (sessionId, runId)
                 let reply: SlackSocketModeReply
                 var failedBeforeAnswer = false
                 do {
-                    reply = try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runId) {
-                        try await attachmentAwareReply(hydration, original: inbound)
+                    reply = try await TurnTraceContext.$turnId.withValue(turnId) {
+                        try await ChatPersistenceContext.$pinnedTurnRunID.withValue(runId) {
+                            try await attachmentAwareReply(hydration, original: inbound)
+                        }
                     }
                 } catch {
                     guard !Task.isCancelled else { return false }

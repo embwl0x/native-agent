@@ -177,12 +177,14 @@ extension ProvidersFacade {
                 if case .string(let value)? = extras[key] { return value }
                 return nil
             }
-            guard let authStatus = try? JSONDecoder.nativeAgent.decode(
+            guard var authStatus = try? JSONDecoder.nativeAgent.decode(
                     ProviderAuthStatus.self, from: JSONEncoder().encode(provider.oauthStatus)
                 ),
                 let models = try? JSONDecoder.nativeAgent.decode(
                     [ProviderModelInfo].self, from: JSONEncoder().encode(provider.modelCatalog)
                 ) else { return nil }
+            // Eligibility is ProviderRouting's own answer; the state word only says how far it is proven.
+            authStatus.eligible = provider.configured == true
             return ProviderInfo(
                 provider_id: provider.id, display_name: provider.displayName ?? provider.id,
                 auth_modes: modes, auth_status: authStatus, models: models,

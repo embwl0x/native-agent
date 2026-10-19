@@ -180,7 +180,7 @@ extension SwiftNativeChatOrchestrationClient {
         observation: ToolLoopTraceObservation? = nil
     ) -> TurnTraceEvent {
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-        var terminalReason: TurnEngineResult.TerminalReason
+        let terminalReason: TurnEngineResult.TerminalReason
         if [.authExpired, .codexCLISessionExpired, .routingUnavailable, .modelUnavailable].contains(ProviderFailure.classify(error)) {
             terminalReason = .providerRequired
         } else if case .streamInterrupted(let partial, _) = error as? TurnEngineError {
@@ -190,12 +190,6 @@ extension SwiftNativeChatOrchestrationClient {
         }
         var payload = observation?.tracePayload ?? [:]
         payload["reason"] = .string(String(reason.prefix(200)))
-        if let call = (error as? ToolFailureError)?.nextCall,
-           case .object(let fields)? = try? JSONValue.parse(Data(call.utf8)),
-           case .object(let input)? = fields["input"], input["action"] == .string("turn.reconcile") {
-            payload["repairPending"] = .bool(true)
-            terminalReason = .providerRequired
-        }
         payload["status"] = .string(terminalReason.state.rawValue)
         payload["terminalReason"] = .string(terminalReason.rawValue)
         return TurnTraceEvent(
@@ -451,12 +445,15 @@ extension SwiftNativeChatOrchestrationClient {
                 runId: runId,
                 progress: progress
             )
+        } catch is CancellationError {
+            terminal = turnCancelledEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
+                location: "structured_chat.\(#line)")
+            throw CancellationError()
         } catch {
-            terminal = error is CancellationError
-                ? turnCancelledEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
-                    location: "structured_chat.\(#line)")
-                : turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
-            throw error
+            // A compaction that did not finish is this message's input: she
+            // answers from the history that is there and holds the lever.
+            modelMessage += "\n\n[This conversation's compaction did not finish: \(error.localizedDescription)"
+                + ((error as? ToolFailureError)?.nextCall.map { " Repair: \($0)" } ?? "") + "]"
         }
 
         let gated = makeTracedGatedDispatcher(
@@ -476,6 +473,24 @@ extension SwiftNativeChatOrchestrationClient {
             turnId: boundTurnId,
             on: turnTraceBus
         )
+        // Acceptance owns its checkpoint before any context is built: a relaunch
+        // from here on finds this turn and answers it. A checkpoint that could
+        // not be written is this turn's fact, never its end: she answers knowing
+        // a relaunch before she finishes will not find it.
+        if TurnCheckpointScope.resuming == nil, let root = engine.remPinsDataRoot {
+            let saved: DeskContinuation?
+            do {
+                saved = try SwiftNativeTurnEngine.continuation(runId: runId, sessionId: resolvedSession, surface: surface,
+                    userMessage: message, fileAccess: fileAccess, capabilityProfile: continuationCapabilityProfile)
+            } catch {
+                terminal = turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
+                throw error
+            }
+            if let saved, let unwritten = TurnCheckpointWriter.persist(
+                SwiftNativeTurnEngine.checkpoint(saved, turnId: boundTurnId, sessionId: resolvedSession), dataRoot: root) {
+                modelMessage += "\n\n[" + unwritten + "]"
+            }
+        }
         async let residentPreparationTask = prepareResidentTurnInputs(
             message: message,
             surface: surface,
@@ -701,8 +716,6 @@ extension SwiftNativeChatOrchestrationClient {
             }
             }
             } catch {
-                let failed = await turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
-                if case .object(let payload) = failed.payload, payload["repairPending"] == .bool(true) { throw error }
                 let partial: String
                 let cancelled: Bool
                 switch error {
@@ -795,7 +808,6 @@ extension SwiftNativeChatOrchestrationClient {
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error,
                 observation: loopObservation
             )
-            if case .object(let payload)? = terminal?.payload, payload["repairPending"] == .bool(true) { throw error }
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
@@ -943,8 +955,12 @@ extension SwiftNativeChatOrchestrationClient {
         }
         var envelope = TurnEnvelope.current(surface: surface)
         envelope.answerExperienceID = heardID
-        return try await ChatToolSessionContext.$envelope.withValue(envelope) {
-            try await PeerDataTaint.$current.withValue(taint, operation: executeCarriedTurn)
+        // The run is this turn's, read once above: nothing it starts (a tool, a
+        // helper's chat) inherits it as its own.
+        return try await ChatPersistenceContext.$pinnedTurnRunID.withValue(nil) {
+            try await ChatToolSessionContext.$envelope.withValue(envelope) {
+                try await PeerDataTaint.$current.withValue(taint, operation: executeCarriedTurn)
+            }
         }
         } catch {
             // A run that ended before naming its own terminal (attachments,

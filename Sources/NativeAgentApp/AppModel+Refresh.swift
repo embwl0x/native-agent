@@ -153,7 +153,6 @@ extension AppModel {
         let fetchedInboxItems = await refreshPreserving("getInboxItems", current: engine.inbox.items) { try await engine.inbox.list() }
         let fetchedMCPServers = await refreshPreserving("getMCPServers", current: mcpServers) { try await engine.tools.mcp.listServers() }
         let fetchedMCPSessions = await refreshPreserving("getMCPSessions", current: engine.tools.mcpSessions) { try await engine.tools.listMCPSessions() }
-        let fetchedMCPConsent = await refreshPreserving("getMCPConsent", current: mcpConsent) { try await engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent) }
         // No `await` from here to the end of the block: one MainActor turn.
         setIfChanged(\.runs, fetchedRuns)
         setIfChanged(\.activityEvents, fetchedActivity)
@@ -170,7 +169,6 @@ extension AppModel {
         if engine.inbox.items != fetchedInboxItems { engine.inbox.items = fetchedInboxItems }
         setIfChanged(\.mcpServers, fetchedMCPServers)
         setIfChanged(\.engine.tools.mcpSessions, fetchedMCPSessions)
-        setIfChanged(\.mcpConsent, fetchedMCPConsent)
         // gpt-5.5 review-2 race-safety: late-arrival guard for tools/
         // resources here too. refreshAll is invoked by long-lived polling
         // and by post-mutation refreshes — both can interleave with a user

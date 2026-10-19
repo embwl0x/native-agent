@@ -2,7 +2,6 @@ import BackgroundWork
 import ApprovalTransactions
 // PATCH-2026-05-07: proactive-inbox-1 InboxView — proactive inbox card strip
 import SwiftUI
-import ApprovalTransactions
 import Observation
 import NativeAgentShared
 import NativeAgentCore
@@ -26,25 +25,9 @@ extension InboxItemRecord {
     /// card nobody has classified yet; putting it in front of User is the
     /// recoverable error, hiding it in a lane he does not open is not.
 
-    var sourceIcon: String {
-        if hasLinkedApproval { return "checkmark.shield.fill" }
-        if source.hasPrefix("proactive_autonomy") { return "lightbulb.fill" }
-        if source.hasPrefix("harness_learning") { return "wand.and.stars" }
-        if source == "dream_cycle"               { return "moon.stars.fill" }
-        if source == "rem_cycle"                 { return "sparkles" }
-        if source == "idle_checkin"               { return "clock.fill" }
-        if source.hasPrefix("trigger:morning_brief") { return "sun.horizon.fill" }
-        if source == "self_test"                  { return "testtube.2" }
-        return "bell.fill"
-    }
+    var sourceIcon: String { presentation.icon }
 
-    var sourceBadgeLabel: String {
-        InboxSourceBadgePresentation.label(
-            source: source,
-            readState: sourceReadState,
-            hasLinkedApproval: hasLinkedApproval
-        )
-    }
+    var sourceBadgeLabel: String { presentation.badge }
 
     /// The badge said as a word: "MORNING-BRIEF" is "Morning brief".
     var sourceWord: String {
@@ -61,62 +44,6 @@ extension InboxItemRecord {
         return "\(sourceWord) · \(AdvancedStatusWords.label(level))"
     }
 }
-
-/// Canonical, bounded source-to-badge projection used by every Inbox item.
-/// A category is assigned only for an exact known source/prefix; unknown but
-/// valid source vocabulary is shown as a safe humanized label, while missing
-/// and malformed wire values remain explicit adverse states.
-enum InboxSourceBadgePresentation {
-    static func label(
-        source: String,
-        readState: InboxSourceReadState,
-        hasLinkedApproval: Bool
-    ) -> String {
-        if hasLinkedApproval { return "APPROVAL" }
-        switch readState {
-        case .missing:
-            return "SOURCE MISSING"
-        case .malformed:
-            return "SOURCE INVALID"
-        case .present:
-            break
-        }
-
-        let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalized.isEmpty else { return "SOURCE UNKNOWN" }
-        guard isSafeSourceToken(normalized) else { return "SOURCE INVALID" }
-
-        if normalized.hasPrefix("proactive_autonomy:") { return "IDEA" }
-        if normalized.hasPrefix("harness_learning:") { return "LEARNING" }
-        if normalized == "dream_cycle" { return "DREAM" }
-        if normalized == "rem_cycle" { return "REM" }
-        if normalized.hasPrefix("trigger:morning_brief") { return "MORNING-BRIEF" }
-        if normalized == "idle_checkin" { return "IDLE-CHECKIN" }
-        if normalized == "scheduled_proactive_scan" { return "PROACTIVE SCAN" }
-        return boundedHumanizedLabel(normalized)
-    }
-
-    private static func isSafeSourceToken(_ value: String) -> Bool {
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_:-")
-        return value.unicodeScalars.allSatisfy { allowed.contains($0) }
-    }
-
-    private static func boundedHumanizedLabel(_ source: String) -> String {
-        let words = source
-            .split(whereSeparator: { $0 == "_" || $0 == ":" || $0 == "-" })
-            .map { $0.uppercased() }
-        guard !words.isEmpty else { return "SOURCE UNKNOWN" }
-
-        var label = ""
-        for word in words {
-            let candidate = label.isEmpty ? word : label + " " + word
-            if candidate.count > 16 { break }
-            label = candidate
-        }
-        return label.isEmpty ? "SOURCE UNKNOWN" : label
-    }
-}
-
 
 extension TriggerConfig: @retroactive Identifiable {
     public var id: String { name }

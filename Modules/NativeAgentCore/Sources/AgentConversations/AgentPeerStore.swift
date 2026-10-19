@@ -129,9 +129,6 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
             tap: repairable ? nil : "Agents > \(name) > connect again with the key \(name) gives you")
     }
 
-    public var usesShellEnvironment: Bool {
-        AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.format } == .shellEnvironment
-    }
     /// THE WHOLE PROOF, and the minimum that can carry it: when a real message
     /// last came IN through this connection, and when one last went OUT. Two
     /// timestamps, written only by `recordProof`. Configuration is not

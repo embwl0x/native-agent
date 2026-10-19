@@ -802,6 +802,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
             )
             : nil
         let fileAccess = if case .string(let mode)? = payload["fileAccess"] { mode } else { "auto" }
+        // A card the person decided on his paired iPhone (an action the router
+        // verified) authenticates its own follow-up: the persisted envelope never
+        // keeps the raising turn's signature, so his decision is the one it runs under.
+        let signedDecision: Bool? = if case .signedIOS? = rec.resolutionProvenance { true } else { nil }
         return ChatToolApprovalReplay(
             toolName: toolName,
             surface: surface,
@@ -816,6 +820,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 agent: Self.nonEmptyPayloadString(origin["agent"]),
                 verifiedChatId: chatId,
                 verifiedUserId: verifiedUserId,
+                commandSignatureVerified: signedDecision,
                 deliveryRoute: replyRoute,
                 declaredRemote: origin["declaredRemote"] == .bool(true) ? true : nil,
                 answerExperienceID: Self.nonEmptyPayloadString(origin["answerExperienceID"])
@@ -1024,23 +1029,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
         }
     }
 
-    /// Recover only the historical failure where a resolved persona approval
-    /// was rejected before the inner tool ran because replay asked the dynamic
-    /// persona guard for a second approval without a filer. Other failed side
-    /// effects remain terminal: blindly retrying those could duplicate work.
+    /// A failed side effect stays terminal: blindly retrying it could
+    /// duplicate work. Only an approval whose action never ran executes.
     private static func chatToolApprovalReplayNeedsExecution(_ rec: ApprovalRecord) -> Bool {
-        if rec.executedAction == nil { return true }
-        guard rec.status == "resolved",
-              rec.decision == "approved",
-              let replay = Self.chatToolApprovalReplay(from: rec),
-              replay.toolName == "persona_write" || replay.toolName == "persona_append_section",
-              case .object(let executed)? = rec.executedAction,
-              executed["op"] == .string("chat_tool_approval_replay"),
-              executed["status"] == .string("failed"),
-              case .string(let error)? = executed["error"]
-        else { return false }
-        return error.contains("approval required, no filer is available on this noninteractive surface")
-            && error.contains("source=\(PersonaWriteGuard.autonomySource)")
+        rec.executedAction == nil
     }
 
     public func applyResolvedChatToolApproval(

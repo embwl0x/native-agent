@@ -218,17 +218,23 @@ extension MacFourVerbs {
         saying source: String, destination: String?, before: Sighting, excluding excluded: [MacAXFrame] = [],
         seconds: Double?, holding: String?, button: String?, attention: BurstAttention?,
         physicalOnly: Bool = false, pointerTarget: String? = nil, receipt: [String: JSONValue] = [:],
-        secrets: [MacAXFrame]? = nil, confirm: Bool = true, pressed: ActTarget? = nil
+        secrets: [MacAXFrame]? = nil, confirm: Bool = true, pressed: ActTarget? = nil, described: String? = nil
     ) async -> MacFourVerbsReply {
+        // A refusal carries the receipt too: what already happened (a raise)
+        // stays on record when the pointer itself sends nothing.
+        func refused(_ reply: MacFourVerbsReply) -> MacFourVerbsReply {
+            MacFourVerbsReply(ok: false, text: reply.text, detail: reply.detail.merging(receipt) { current, _ in current })
+        }
         if let end, !MacRegionAim.pathIsClear(from: start, to: end, excluding: secrets ?? before.targets.filter(\.secret).compactMap(\.frame)) {
-            return MacFourVerbsReply(
+            return refused(MacFourVerbsReply(
                 ok: false,
-                text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: before.appName ?? "this window"),
+                text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: before.appName ?? "this window",
+                                                             raised: receipt["raised"] == .bool(true) ? before.appName : nil),
                 detail: ["error": .string(MacCrossAppDrag.secureCrossingReason)]
-            )
+            ))
         }
         guard MacRegionAim.pathIsClear(from: start, to: end ?? start, excluding: excluded + before.obstructions) else {
-            return Self.obstructedPointReply(screen: confirm ? before.render : "")
+            return refused(Self.obstructedPointReply(screen: confirm ? before.render : ""))
         }
         var body: [String: JSONValue] = [
             "gesture": .string(gesture),
@@ -245,7 +251,7 @@ extension MacFourVerbs {
         if let holding { body["holding"] = .string(holding) }
         if let button { body["button"] = .string(button) }
         let right = button == "right"
-        let description = switch gesture {
+        let generic = switch gesture {
         case "drag": "\(right ? "Right-dragged" : "Dragged") \(source) to \(destination ?? "there")."
         case "hover": "Hovered over \(source)."
         case "hold": right ? "Held the right button on \(source)." : "Held \(source)."
@@ -254,6 +260,7 @@ extension MacFourVerbs {
         case "click": (right ? "Right-clicked " : "Clicked ") + source + "."
         default: "Used \(source)."
         }
+        let description = described ?? generic
         let reply = await performHand(
             body: body,
             description: description,
@@ -651,7 +658,7 @@ extension MacFourVerbs {
                 return MacFourVerbsReply(
                     ok: false,
                     text: MacCrossAppDrag.destinationIsSecureWords(
-                        destination: Self.spokenName(rereadTarget, requestedAs: destination)
+                        destination: Self.spokenName(rereadTarget, requestedAs: destination), raised: destinationAppName
                     ),
                     detail: raiseDetail.merging([
                         "raised": .bool(true),
@@ -666,7 +673,7 @@ extension MacFourVerbs {
             ) else {
                 return MacFourVerbsReply(
                     ok: false,
-                    text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName),
+                    text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: destinationAppName, raised: destinationAppName),
                     detail: raiseDetail.merging([
                         "raised": .bool(true),
                         "raised_app": .string(destinationAppName),
@@ -683,17 +690,9 @@ extension MacFourVerbs {
         raiseDetail["raised"] = .bool(raise.needed)
         if raise.needed { raiseDetail["raised_app"] = .string(destinationAppName) }
 
-        // 4. ONE DRAG.
-        var body: [String: JSONValue] = [
-            "gesture": .string(PhysicalVerb.drag.rawValue),
-            "x": .double(start.x),
-            "y": .double(start.y),
-            "to_x": .double(dropPoint.x),
-            "to_y": .double(dropPoint.y),
-            "travel_seconds": .double(seconds ?? 0),
-        ]
-        if let holding { body["holding"] = .string(holding) }
-        if let button { body["button"] = .string(button) }
+        // 4. ONE DRAG, through the one pointer tail: the line checked against
+        //    the scene its events land in (the destination as raised, and
+        //    whatever covers the source), exactly as an ordinary drag is.
         let spokenDestination = Self.spokenName(dropTarget, requestedAs: destination)
         let description = "\(button == "right" ? "Right-dragged" : "Dragged") \(spokenSource) "
             + "into \(destinationAppName) — onto \(spokenDestination). \(raise.words)"
@@ -712,19 +711,17 @@ extension MacFourVerbs {
                 detail: raiseDetail.merging(["raised": .bool(true), "error": .string("front_unknown")]) { current, _ in current }
             )
         }
-        let reply = await Self.$requiredFrontPid.withValue(dragFront) {
-            await performHand(
-                body: body,
-                description: description,
-                attention: attention,
+        return await Self.$requiredFrontPid.withValue(dragFront) {
+            await performPointer(
+                PhysicalVerb.drag.rawValue, at: start, to: dropPoint, saying: spokenSource, destination: spokenDestination,
                 before: anchoredAfterRaise,
-                allowGenericScreenChangeVerification: !dropTarget.physicalOnly
+                excluding: source.excludedFrames + dropTarget.excludedFrames + before.obstructions,
+                seconds: seconds, holding: holding, button: button, attention: attention,
+                physicalOnly: dropTarget.physicalOnly, receipt: raiseDetail,
+                secrets: (before.targets + anchoredAfterRaise.targets).filter(\.secret).compactMap(\.frame),
+                described: description
             )
         }
-        var detail = reply.detail
-        for (key, value) in raiseDetail { detail[key] = value }
-        if let button { detail["button"] = .string(button) }
-        return MacFourVerbsReply(ok: reply.ok, text: reply.text, detail: detail)
     }
 
 }

@@ -7,7 +7,7 @@ import PersistenceCore
 /// preserves structured tool calls, vision inputs, SSE deltas, and Kimi's
 /// required reasoning state across K3/K2.7 tool loops.
 public final class MoonshotAdapter: LLMAdapter {
-    public static let supportsTools = true
+    public static let toolWire = ProviderToolWire.native
     public let providerId = "moonshot"
 
     public static let defaultEndpoint = URL(string: "https://api.moonshot.ai/v1/chat/completions")!
@@ -267,13 +267,17 @@ public final class MoonshotAdapter: LLMAdapter {
         return chatCompletionsMessages(from: message, reasoning: reasoning)
     }
 
+    /// The wire form is the model row's declaration; an id with no row sends none.
     private func applyReasoningControls(to body: inout [String: Any], model: String) {
-        let id = model.lowercased()
-        if id == "kimi-k3" || id.hasPrefix("kimi-k2.7-code") {
-            body["reasoning_effort"] = "max"
-        } else if id == "kimi-k2.6" || id == "kimi-k2.5" {
-            let effort = LLMCallContext.reasoningEffort?.lowercased()
-            body["thinking"] = ["type": effort == "none" ? "disabled" : "enabled"]
+        guard let row = FirstPartyModelCatalog.descriptor(for: model, providerID: "moonshot") else { return }
+        let requested = LLMCallContext.reasoningEffort?.lowercased()
+        switch row.reasoningWire {
+        case .thinkingSwitch:
+            body["thinking"] = ["type": requested == "none" ? "disabled" : "enabled"]
+        case .effort:
+            let effort = requested.flatMap { row.supportedReasoningEfforts.contains($0) ? $0 : nil }
+                ?? row.defaultReasoningEffort
+            if effort != "none" { body["reasoning_effort"] = effort }
         }
     }
 

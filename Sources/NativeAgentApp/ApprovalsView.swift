@@ -13,7 +13,6 @@ import ScreenVision
 import Speech
 import AVFoundation
 import UniformTypeIdentifiers
-import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 #if canImport(CoreSpotlight)

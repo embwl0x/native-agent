@@ -915,7 +915,7 @@ struct ChatView: View {
                 micButton
                     .disabled(store.isSwitchingSession)
 
-                if store.isLoading || (isChatSample && visibleMessages.last?.isStreaming == true) {
+                if !store.activeTurnRunIDs.isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true) {
                     Button {
                         guard !isChatSample else { return }
                         store.stop(client: bridgeClient)
@@ -1250,7 +1250,8 @@ struct ChatView: View {
 
     /// What the agent is doing, in the Mac's words.
     private var agentDoing: (text: String, dot: AliveStatusDot.State) {
-        if store.isLoading || (isChatSample && visibleMessages.last?.isStreaming == true) {
+        if let heard = store.activeTurnHeardByMac ?? (isChatSample && visibleMessages.last?.isStreaming == true ? true : nil) {
+            guard heard else { return ("Sending…", .working) }
             let replying = visibleMessages.last.map { $0.role == .assistant && $0.isStreaming && !$0.text.isEmpty } ?? false
             return (replying ? "Replying…" : "Thinking…", .working)
         }
@@ -1408,7 +1409,7 @@ struct ChatView: View {
 
     private var selectableProviders: [ProviderInfo] {
         sync.providers
-            .filter { $0.auth_status.state == "ready" }
+            .filter { $0.auth_status.eligible }
             .sorted { $0.display_name.localizedCaseInsensitiveCompare($1.display_name) == .orderedAscending }
     }
 
@@ -1435,7 +1436,8 @@ struct ChatView: View {
         let previousProvider = selectedProviderId
         selectedProviderId = providerID
         selectedModel = model
-        reconcileExecutionControlsForSelectedModel()
+        // The Mac decides what effort and speed this model takes; its signed
+        // receipt below is the tuple the phone shows.
         let requestedProvider = selectedProviderId
         let requestedEffort = selectedReasoningEffort
         let requestedFastMode = selectedFastMode
@@ -1562,7 +1564,6 @@ struct ChatView: View {
         selectedModel = resolution.selection.model
         selectedReasoningEffort = resolution.selection.reasoningEffort
         selectedFastMode = resolution.selection.fastMode
-        reconcileExecutionControlsForSelectedModel()
     }
 
     private func beginSurfaceSelectionUpdate() -> Int {
@@ -1615,17 +1616,6 @@ struct ChatView: View {
 
     private var selectedModelSupportsFast: Bool {
         selectedModelInfo?.supports_fast == true
-    }
-
-    private func reconcileExecutionControlsForSelectedModel() {
-        let reconciled = ChatRuntimeControlPresentation.reconciled(
-            model: selectedModel,
-            provider: sync.providers.first(where: { $0.provider_id == selectedProviderId }),
-            selectedEffort: selectedReasoningEffort,
-            selectedFastMode: selectedFastMode
-        )
-        selectedReasoningEffort = reconciled.effort
-        selectedFastMode = reconciled.fastMode
     }
 
     private var fileAccessOptions: [(id: String, label: String, icon: String)] {

@@ -292,10 +292,8 @@ public actor SwiftNativeTurnEngine {
                                sessionID: sessionID, queryUserMessage: queryMessage)
             : nil
         // Start the existing MiniLM query lane before the bounded attention
-        // read. The ticket is read after that already-required work, and the
-        // read is bounded by `queryEmbeddingWarmupWaitNanos` — so semantic
-        // recall can add at most that much turn wait, and only when the
-        // embedder is still cold.
+        // read. The ticket is read after that already-required work, as it
+        // stands: the turn never waits on the embedder.
         let semanticQuery = SessionHistoryPromptRenderer.semanticRecallQuery(
             userMessage: queryMessage, recentTurns: recentTurns
         )
@@ -313,24 +311,10 @@ public actor SwiftNativeTurnEngine {
         // Work context remains query-selectable without coloring unrelated turns.
         let suppressActiveIntent = ContextSurface(rawValue: surface) == .workshop
             || attention.residentWorkIntent
-        // Sweep R4 A5: this used to be a bare `valueIfReady` — a pure sample,
-        // never awaited. On the FIRST message after launch MiniLM is still
-        // warming, so the sample came back nil and the 1.2-weighted semantic
-        // term was zeroed for the whole turn: turn 1 was reliably dumber than
-        // turn 2. Wait a bounded interval instead. On timeout we land exactly
-        // where the old code landed (nil → lexical-only scoring), so the turn
-        // can never block indefinitely; when the embedder warms inside the
-        // window, turn 1 gets real semantic scoring. Skipped entirely when
-        // ContextFlow is off, where the vector has no consumer.
         let contextFlowMode = await contextFlow?.contextFlowMode() ?? .off
-        let readyQueryEmbedding: ContextQueryEmbeddingValue?
-        if contextFlowMode == .off {
-            readyQueryEmbedding = queryEmbeddingTicket?.valueIfReady
-        } else {
-            readyQueryEmbedding = await queryEmbeddingTicket?.value(
-                waitingUpTo: Self.queryEmbeddingWarmupWaitNanos
-            )
-        }
+        // The embedder is housekeeping: a vector not yet published leaves this
+        // turn lexical-only, and the trace flag says it was not there.
+        let readyQueryEmbedding = queryEmbeddingTicket?.valueIfReady
         trace.setFlag("contextFlow.semanticQueryReady", readyQueryEmbedding != nil)
         let packetBudget = ContextBudgetPolicy.resolve(
             model: LLMCallContext.admittedModel,
@@ -831,6 +815,11 @@ public actor SwiftNativeTurnEngine {
         try Task.checkCancellation()
         if contextFlowMode == .active {
             trace.setFlag("contextFlow.active", preparedContextTurn != nil)
+            // A query vector not yet published is a fact of this turn, not a quiet weaker one.
+            if queryEmbeddingTicket != nil, readyQueryEmbedding == nil {
+                finalContext = Self.contextByAppendingRuntimeContext(finalContext, runtimeContext:
+                    "Semantic recall was not available for this message: the query embedding was not published yet (the embedder publishes it on its own), so recall matched words only.")
+            }
         }
         if let contextFlowMemoryAtomCount {
             trace.setMemoryRecallOutcome(.contextFlow(hitCount: contextFlowMemoryAtomCount))
@@ -1440,14 +1429,9 @@ public actor SwiftNativeTurnEngine {
         return ticket
     }
 
-    /// The durable finish. Callers run this AFTER delivery has settled: it
-    /// STARTS the promotion named by `ticket` (chained behind any promotion
-    /// still running from an earlier turn) and then drains everything in flight,
-    /// so the append always precedes the promotion and nothing is dropped.
-    ///
-    /// `ticket` nil means START NOTHING and only drain — the shape a surface's
-    /// `drainDeferredMemoryPromotion()` needs, since it holds no turn of its
-    /// own and must never adopt a concurrent turn's pending work.
+    /// The drain a surface's `drainDeferredMemoryPromotion()` runs after its own
+    /// delivery has settled. It starts nothing: it holds no turn of its own and
+    /// must never adopt a concurrent turn's pending work.
     ///
     /// The handle is deliberately NOT cleared here. Clearing it would let the
     /// next turn read a nil predecessor while this promotion is still running
@@ -1458,8 +1442,7 @@ public actor SwiftNativeTurnEngine {
     /// A cancelled caller stops waiting at once: the promotion chain is
     /// unstructured, so `value` alone would hold a stopped chat until every
     /// earlier promotion ended. The started promotion still runs to its end.
-    public func awaitDeferredMemoryPromotion(ticket: UUID? = nil) async {
-        startDeferredMemoryPromotion(ticket: ticket)
+    public func awaitDeferredMemoryPromotion() async {
         guard let promotion = deferredMemoryPromotion else { return }
         let finished = ScopedWaiter()
         Task { await promotion.value; finished.resume() }
@@ -1587,7 +1570,7 @@ public actor SwiftNativeTurnEngine {
     /// read-only facts only, so a failed assembly loses nothing and a retry
     /// sees the same. Whatever consumes state is read at composition.
     typealias ReadOnlyTurnFacts = (
-        clock: String, momentCount: Int?, note: String?, directive: String?,
+        clock: String, momentCount: Result<Int, Error>?, note: String?, directive: String?,
         voiceStep: String?, place: String?, glance: String?
     )
 
@@ -1609,8 +1592,13 @@ public actor SwiftNativeTurnEngine {
         // iteration so the turn reads as one moment; nil = per-build clock()
         // (single-shot turns, unchanged).
         let clock = Self.renderClockContext(now: clockNowOverride ?? clock(), quietHours: quietHours)
-        let momentCount = await memoryPromoter?.pendingMomentCount()
-        let momentsRender = momentCount.flatMap { momentReviewNudge(count: $0, sessionID: sessionID, commit: false) } != nil
+        var momentCount: Result<Int, Error>?
+        if let memoryPromoter {
+            do { momentCount = .success(try await memoryPromoter.pendingMomentCount()) } catch { momentCount = .failure(error) }
+        }
+        let momentsRender = if case .success(let count)? = momentCount {
+            momentReviewNudge(count: count, sessionID: sessionID, commit: false) != nil
+        } else { false }
         // Her screen's glance (Phase 2): what changed since she last looked
         // and what needs her, plus live built/recent abilities. Dynamic segment,
         // never the cached prefix; helpers' own sessions do not get hers.
@@ -1654,7 +1642,12 @@ public actor SwiftNativeTurnEngine {
         sessionID: String?,
         clockNowOverride: Date?
     ) async -> TurnContext {
-        let moments = facts.momentCount.flatMap { momentReviewNudge(count: $0, sessionID: sessionID, commit: true) }
+        // Moments that could not be counted say so; an unread count is never zero.
+        let moments: String? = switch facts.momentCount {
+        case .success(let count)?: momentReviewNudge(count: count, sessionID: sessionID, commit: true)
+        case .failure(let error)?: "Moments waiting for your review could not be counted (\(error.localizedDescription)) — app memory.moments"
+        case nil: nil
+        }
         // One timeline across doors (Wave 2 #10): one line when User said
         // something on another of his doors since her last reply here, one
         // when a wake of hers concluded since, and on a turn he started one
@@ -1798,12 +1791,6 @@ public actor SwiftNativeTurnEngine {
         )
         return rosterIssue.map { runtime + "\n" + $0 } ?? runtime
     }
-
-    /// Bounded wait for a cold MiniLM to publish the query embedding (sweep R4
-    /// A5). Sized to cover a first-turn model load without being felt as
-    /// latency; on expiry the turn proceeds with no semantic term, exactly as
-    /// it did before this wait existed.
-    nonisolated static let queryEmbeddingWarmupWaitNanos: UInt64 = 700_000_000
 
     // MARK: - Recalled-memory prompt block (sweep R4, finding A4)
 

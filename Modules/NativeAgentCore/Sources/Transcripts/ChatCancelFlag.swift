@@ -29,14 +29,18 @@ public enum ChatCancelFlag {
     }
 
     /// Registers `runId` (trace turn `turnId`) as in flight on the session;
-    /// pair with `finish`.
+    /// pair with `finish`. A door registers its run at admission, before any
+    /// await, so a Stop always names the live run; the turn's own acceptance of
+    /// the same run is then the same registration.
     public static func accept(dataRoot: URL, sessionId: String, runId: String, turnId: String) -> URL {
         let file = path(dataRoot: dataRoot, sessionId: sessionId)
         let key = file.standardizedFileURL.path
         registry.withLock { runs in
             runs.completed.removeAll { $0 == key }
-            runs.inFlight[key, default: []].append(
-                InFlightTurn(runId: runId, sessionId: sessionId, turnId: turnId, acceptedAt: Date()))
+            if runs.inFlight[key]?.contains(where: { $0.runId == runId }) != true {
+                runs.inFlight[key, default: []].append(
+                    InFlightTurn(runId: runId, sessionId: sessionId, turnId: turnId, acceptedAt: Date()))
+            }
             runs.latest[key] = runId
         }
         NotificationCenter.default.post(name: inFlightDidChange, object: nil)

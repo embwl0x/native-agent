@@ -83,234 +83,6 @@ package enum ToolCallParser {
         return cut
     }
 
-    /// Strip `<tool_use ...>...</tool_use>` markers from a raw response so the
-    /// prose-only text can be persisted/surfaced. Both id-bearing and legacy
-    /// plain-name forms are matched. Shared by the structured tool loop and the
-    /// text-compatibility loop (C-L2, 2026-07-18 — formerly byte-identical twins).
-    /// Announce-without-act detector (2026-07-19, Kimi K3 Telegram incident):
-    /// weak-tool-discipline models end turns with an immediate-action promise
-    /// ("on it — checking now") and ZERO tool calls, so nothing happens until
-    /// the user prods. Deliberately CONSERVATIVE — short replies only, exact
-    /// present-tense phrases; a question to the user or a long substantive
-    /// answer never matches. False negatives cost one user nudge (status
-    /// quo); false positives burn one extra provider call, so tight wins.
-    static let unfulfilledPromisePhrases: [String] = [
-        "checking now", "checking that now", "checking it now",
-        "let me check", "let me look", "let me pull", "let me fetch",
-        "let me grab", "let me see what",
-        // Bare "on it." / "on it!" were raw-substring FPs ("I already acted on
-        // it.") — dropped here (F2-M2). The em-dash/hyphen continuation forms
-        // stay; the bare-acknowledgment case is handled by the final-sentence
-        // "on it" gate in looksLikeUnfulfilledActionPromise.
-        "on it —", "on it -",
-        "i'll check", "i'll look", "i'll pull", "i'll fetch", "i'll dig",
-        "looking now", "looking into it now", "pulling it up", "pulling that up",
-        "loading it now", "loading them now", "loading that now", "fetching now",
-        "give me a moment", "give me a sec", "one moment", "one sec",
-    ]
-
-    /// Shape rule (2026-07-19 round 2 — the phrase whitelist alone missed
-    /// "going through the actual files now" and "Reading the README now." in
-    /// the live incident): a progressive action verb followed within a clause
-    /// by "now"/"next", not preceded by a completion word. Completion words
-    /// ("just finished running now") stay valid stopping points.
-    private static let inProgressShapeRegex = try! NSRegularExpression(
-        pattern: #"(?<!finished\s)(?<!done\s)(?<!just\s)(?<!already\s)(?<!stopped\s)\b(reading|checking|looking|going\s+through|pulling|fetching|loading|opening|scanning|digging|reviewing|inspecting|working\s+(?:on|through)|diving\s+(?:in|into)|taking\s+a\s+look|starting\s+(?:on|with))\b[^.!?\n]{0,60}\b(now|next)\b"#,
-        options: [.caseInsensitive]
-    )
-
-    /// Round 4 (live incident: "Let me actually look at what's built." ended a
-    /// turn — an adverb between "let me" and the verb defeated the literal
-    /// phrase list). First-person immediate-intent with up to two intervening
-    /// words, as the reply's FINAL sentence.
-    /// F2-M3 (2026-07-23): go/take/see were REMOVED from the verb alternation —
-    /// they bounced decision idioms ("I'll go with option A.", "I'll take that
-    /// approach.", "let me see"). Their genuine action forms are already caught
-    /// elsewhere ("go through" / "take a look" by inProgressShapeRegex, "let me
-    /// see what" by the phrase list), so keeping them here only added FP risk.
-    private static let deferredIntentRegex = try! NSRegularExpression(
-        pattern: #"\b(let\s+me|i'll|i\s+will|going\s+to|about\s+to)(\s+\w+){0,2}\s+(check|look|pull|fetch|grab|read|dig|scan|open|run|start|load)\b"#,
-        options: [.caseInsensitive]
-    )
-
-    /// Completion-statement verbs: a final sentence containing one of these is
-    /// a report, not a forward reference ("now the tests are green").
-    private static let completionVerbTokens: Set<String> = [
-        "is", "are", "was", "were", "be", "been", "done", "passed", "green",
-        "complete", "completed", "finished", "works", "working", "ready",
-        "found", "fixed", "ran", "looks", "shows", "has", "have",
-    ]
-
-    /// F2-M1 + F2-L2 (2026-07-23): a final sentence with a PLAIN PAST-TENSE main
-    /// verb is a completed REPORT, never an in-progress promise — "Reviewing the
-    /// PR, I left 3 comments.", "Running the benchmark took 4 seconds.", "Then
-    /// the app crashed." The gerund-first and verbless-forward-reference rules
-    /// FP'd on these because completionVerbTokens carried no past-tense reporting
-    /// verbs. Detection: any `\w{3,}ed` form OR a curated set of common
-    /// irregulars. Deliberately NARROW — future/progressive forms ("I'll go
-    /// with") carry no past-tense token, so this exemption never fires on them
-    /// and the deferred-intent / gerund rules still bite.
-    private static let pastTenseIrregulars: Set<String> = [
-        "left", "took", "ran", "went", "got", "found", "made", "saw", "gave",
-        "sent", "wrote", "read", "built", "broke", "kept", "held", "came",
-        "put", "set", "told", "said", "did",
-    ]
-    private static let pastTenseEdRegex = try! NSRegularExpression(
-        pattern: #"\b\w{3,}ed\b"#,
-        options: [.caseInsensitive]
-    )
-    private static func finalSentenceIsPastTenseReport(_ finalSentence: String) -> Bool {
-        let tokens = finalSentence.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-            .map(String.init)
-        if tokens.contains(where: { pastTenseIrregulars.contains($0) }) { return true }
-        let range = NSRange(finalSentence.startIndex..., in: finalSentence)
-        return pastTenseEdRegex.firstMatch(in: finalSentence, options: [], range: range) != nil
-    }
-
-    /// R7 (live incident 2026-08-17, Telegram session B7ED3E77 msg #6): the
-    /// model announced a tool BY NAME as its whole reply — `**Tool: desk_read**`
-    /// — neither a promise sentence (R1–R6) nor a parseable marker, so it
-    /// shipped to the user as text and nothing ran until User prodded with "?".
-    /// Shape: a SHORT reply whose final line is nothing but an invocation
-    /// frame around a KNOWN tool name. Conservative on purpose: completed-work
-    /// narration ("I used desk_read earlier…") and questions never match.
-    package static func looksLikeNarratedToolInvocation(
-        _ raw: String,
-        knownToolNames: Set<String>
-    ) -> Bool {
-        guard !knownToolNames.isEmpty else { return false }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= 200 else { return false }
-        // A genuine question back to the user is a valid stopping point.
-        guard !trimmed.contains("?") else { return false }
-        guard let lastRaw = trimmed.split(separator: "\n").last else { return false }
-        // Strip markdown emphasis/quotes/bullets around the line.
-        let line = lastRaw
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "*_`>•- "))
-        var candidate = line.lowercased()
-        // Optional invocation frame ahead of the name.
-        var hasInvocationFrame = false
-        for prefix in ["tool call:", "tool:", "calling", "invoking", "running", "using", "call", "run"] {
-            if candidate.hasPrefix(prefix) {
-                candidate = String(candidate.dropFirst(prefix.count))
-                    .trimmingCharacters(in: .whitespaces)
-                hasInvocationFrame = true
-                break
-            }
-        }
-        let ident = candidate.prefix {
-            $0.isLetter || $0.isNumber || $0 == "_" || $0 == "."
-        }
-        guard !ident.isEmpty,
-              knownToolNames.contains(where: { $0.lowercased() == ident }) else {
-            return false
-        }
-        // The line must be ONLY frame + name (+ optional argument sketch) —
-        // a sentence continuing past the name is narration about work, not an
-        // attempted call.
-        let rest = candidate.dropFirst(ident.count)
-            .trimmingCharacters(in: .whitespaces)
-        guard rest.isEmpty || rest.hasPrefix("(") || rest.hasPrefix("with ") else {
-            return false
-        }
-        // A bare tool name with no frame and no call syntax is ambiguous — it
-        // can be a legitimate short answer ("Use:\ndesk_read"). Require either
-        // an invocation frame or explicit call shape (gpt-5.5 LOW, 2026-08-17).
-        return hasInvocationFrame || rest.hasPrefix("(")
-    }
-
-    package static func looksLikeUnfulfilledActionPromise(_ raw: String) -> Bool {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count < 600 else { return false }
-        // A genuine question back to the user is a valid stopping point.
-        guard !trimmed.contains("?") else { return false }
-        // F2-L1 (2026-07-23): fold curly apostrophes (U+2019, U+02BC) to ASCII
-        // so the phrase list and the i'll / let me regexes match the smart-quote
-        // variants weak models emit ("I’ll check", "let me…") identically.
-        let lower = trimmed.lowercased()
-            .replacingOccurrences(of: "\u{2019}", with: "'")
-            .replacingOccurrences(of: "\u{02BC}", with: "'")
-        // Final stopping sentence — HOISTED above the phrase check (F2-M2) so the
-        // phrase list anchors to the terminal clause rather than the whole reply
-        // (raw substring matched "on it." inside "I already acted on it.").
-        let finalSentence = lower
-            .split(whereSeparator: { ".!;\n".contains($0) })
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .last(where: { !$0.isEmpty }) ?? ""
-        guard finalSentence.count < 600 else { return false }
-        // Phrase check (F2-M2): anchored to the final sentence, with an `already`
-        // report exemption mirroring the regex lookbehinds — "I already acted on
-        // it." claims the work is done, so it is a report, not a promise.
-        if !finalSentence.contains("already") {
-            if unfulfilledPromisePhrases.contains(where: { finalSentence.contains($0) }) {
-                return true
-            }
-            // Bare "on it" only when it IS essentially the whole terminal clause
-            // (starts the sentence, ≤4 words) — never a trailing "...acted on it."
-            if finalSentence.hasPrefix("on it"),
-               finalSentence.split(separator: " ").count <= 4 {
-                return true
-            }
-        }
-        let range = NSRange(finalSentence.startIndex..., in: finalSentence)
-        if inProgressShapeRegex.firstMatch(in: finalSentence, options: [], range: range) != nil {
-            return true
-        }
-        // Round 5 — THE general announcement shape (live battery catch:
-        // "Checking the transcript for that exchange before I answer." ended
-        // a turn): a stopping sentence that BEGINS with a bare progressive
-        // verb is an announcement — complete answers don't start with a
-        // subjectless gerund. Subsumes most earlier shapes; completion-verb
-        // stoplist still exempts reports ("Checking finished — all green").
-        let gerundStarts: Set<String> = [
-            "checking", "reading", "looking", "pulling", "fetching", "loading",
-            "opening", "scanning", "digging", "reviewing", "inspecting",
-            "searching", "grabbing", "running", "starting", "diving", "going",
-        ]
-        let fsWords = finalSentence.split(separator: " ").map(String.init)
-        // Round 6 (live battery catch, 2026-07-20: "Now loading the
-        // file/git/telegram tools so I can finish the battery for real."
-        // ended a 20-call marathon turn at 11): a filler adverb in front of
-        // the gerund slipped past the gerund-FIRST rule. Strip leading
-        // filler tokens before the gerund check; the word-count bound
-        // applies to what remains.
-        let fillerLead: Set<String> = [
-            "now", "next", "then", "first", "so", "and", "ok", "okay", "alright",
-        ]
-        let leadPunctuation = CharacterSet(charactersIn: ",:;—–-")
-        let fsCore = Array(fsWords.drop(while: {
-            fillerLead.contains($0.trimmingCharacters(in: leadPunctuation))
-        }))
-        if let first = fsCore.first, gerundStarts.contains(first),
-           fsCore.count >= 2, fsCore.count <= 14,
-           !fsCore.contains(where: { completionVerbTokens.contains($0) }),
-           // F2-M1: "Running the benchmark took 4 seconds." / "Reviewing the PR,
-           // I left 3 comments." are past-tense REPORTS despite the gerund lead.
-           !finalSentenceIsPastTenseReport(finalSentence) {
-            return true
-        }
-        // Adverb-tolerant deferred intent in the STOPPING sentence ("let me
-        // actually look at what's built") — round 4.
-        let fsRange = NSRange(finalSentence.startIndex..., in: finalSentence)
-        if deferredIntentRegex.firstMatch(in: finalSentence, options: [], range: fsRange) != nil {
-            return true
-        }
-        // Verbless forward-reference fragment as the STOPPING sentence
-        // ("Now the issues and the code itself.") — round 3, live incident:
-        // no progressive verb, no promise phrase, still an announced next
-        // step with nothing delivered. Conservative: short final sentence,
-        // starts with a forward word + determiner, zero completion verbs.
-        let words = finalSentence.split(separator: " ").map(String.init)
-        guard words.count >= 2, words.count <= 8 else { return false }
-        let forwardStarts = ["now", "next", "then", "onto"]
-        let determiners = ["the", "those", "these", "that", "to", "onto", "for", "into"]
-        guard forwardStarts.contains(words[0]), determiners.contains(words[1]) else { return false }
-        // F2-L2: "Then the app crashed." is a past-tense report, not a promise.
-        if finalSentenceIsPastTenseReport(finalSentence) { return false }
-        return !words.contains(where: { completionVerbTokens.contains($0) })
-    }
-
     /// Wave 2 #7: work promised for a LATER turn, which MY QUEUE keeps (the
     /// in-turn shapes above still bounce first). Conservative
     /// on purpose: a sentence counts only with BOTH a first-person commitment
@@ -354,24 +126,6 @@ package enum ToolCallParser {
         return found
     }
 
-    /// A remaining tool step after a tool result, including
-    /// long progress reports ending with "Next are the ... calls."
-    package static func looksLikeAnnouncedNextToolStep(_ raw: String) -> Bool {
-        let tail = raw.lowercased()
-            .split(whereSeparator: { ".!;\n".contains($0) })
-            .last.map(String.init)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "*_`- ")) ?? ""
-        guard !tail.isEmpty, tail.count < 600, !tail.contains("?") else { return false }
-        let words = Set(tail.split(whereSeparator: { !$0.isLetter }).map(String.init))
-        guard words.isDisjoint(with: ["you", "could", "would", "should", "if", "tomorrow", "later",
-                                     "used", "completed", "finished", "already"]),
-              !words.isDisjoint(with: ["calls", "tools", "reads", "checks", "queries"]) else { return false }
-        return ["next are ", "next is ", "next up ", "up next ", "next:"].contains {
-            tail.hasPrefix($0)
-        }
-    }
-
     private static let toolUseMarkerRegexes = [
         #"<tool_use\s+id="[^"]*"\s+name="[^"]+"\s*>[\s\S]*?</tool_use>"#,
         #"<tool_use\s+name="[^"]+"\s*>[\s\S]*?</tool_use>"#,
@@ -379,6 +133,7 @@ package enum ToolCallParser {
         #"<invoke\s+name="[^"]+"\s*>[\s\S]*?</invoke>"#,
     ].map { try! NSRegularExpression(pattern: $0) }
 
+    /// The prose without its tool-use markers, id-bearing and legacy forms both.
     package static func stripToolUseMarkers(_ raw: String) -> String {
         var s = raw
         for rx in toolUseMarkerRegexes {
@@ -605,35 +360,37 @@ package enum ToolCallParser {
                     if case .string(let s) = tc["id"] ?? .null { return s }
                     return ""
                 }()
-                let input = extractArgumentsObject(fn["arguments"] ?? .null)
-                calls.append(ParsedToolCall(id: id, name: name, input: input))
+                calls.append(argumentsCall(id: id, name: name, fn["arguments"] ?? .null))
             }
             return calls
         }
         if case .object(let fn) = obj["function_call"] ?? .null,
            case .string(let name) = fn["name"] ?? .null {
-            let input = extractArgumentsObject(fn["arguments"] ?? .null)
             let id: String = {
                 if case .string(let s) = fn["call_id"] ?? .null { return s }
                 return ""
             }()
-            return [ParsedToolCall(id: id, name: name, input: input)]
+            return [argumentsCall(id: id, name: name, fn["arguments"] ?? .null)]
         }
         return nil
     }
 
-    static func extractArgumentsObject(_ v: JSONValue) -> [String: JSONValue] {
-        switch v {
-        case .object(let o): return o
+    /// A call's arguments as one object. Absent or empty arguments are none;
+    /// anything else that is not one JSON object is a body that never runs
+    /// (`undeclaredKeys` says why), never an empty call.
+    static func argumentsCall(id: String, name: String, _ arguments: JSONValue) -> ParsedToolCall {
+        let input: [String: JSONValue]?
+        switch arguments {
+        case .null: input = [:]
+        case .object(let o): input = o
+        case .string(let s) where s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty: input = [:]
         case .string(let s):
-            if let d = s.data(using: .utf8),
-               let parsed = try? JSONValue.parse(d),
-               case .object(let o) = parsed {
-                return o
-            }
-            return [:]
-        default: return [:]
+            if case .object(let o)? = try? JSONValue.parse(Data(s.utf8)) { input = o } else { input = nil }
+        default: input = nil
         }
+        var call = ParsedToolCall(id: id, name: name, input: input ?? [:])
+        if input == nil { call.undeclaredKeys = ["arguments that are not one JSON object"] }
+        return call
     }
 
     // <tool_use> marker (both OAuth-direct adapters emit) + bare JSON content
@@ -727,18 +484,14 @@ package enum ToolCallParser {
                        case .string("tool_use") = o["type"] ?? .null,
                        case .string(let name) = o["name"] ?? .null {
                         let id: String = { if case .string(let s) = o["id"] ?? .null { return s } else { return "" } }()
-                        var input: [String: JSONValue] = [:]
-                        if case .object(let inObj) = o["input"] ?? .null { input = inObj }
-                        calls.append(ParsedToolCall(id: id, name: name, input: input))
+                        calls.append(argumentsCall(id: id, name: name, o["input"] ?? .null))
                     }
                 }
             } else if case .object(let o) = parsed,
                       case .string("tool_use") = o["type"] ?? .null,
                       case .string(let name) = o["name"] ?? .null {
                 let id: String = { if case .string(let s) = o["id"] ?? .null { return s } else { return "" } }()
-                var input: [String: JSONValue] = [:]
-                if case .object(let inObj) = o["input"] ?? .null { input = inObj }
-                calls.append(ParsedToolCall(id: id, name: name, input: input))
+                calls.append(argumentsCall(id: id, name: name, o["input"] ?? .null))
             }
         }
         return calls

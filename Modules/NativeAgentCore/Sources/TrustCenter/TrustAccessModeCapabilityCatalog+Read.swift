@@ -6,10 +6,11 @@ extension TrustAccessModeCapabilityCatalog {
     }
 
     public static func fileChangeState(_ policy: TrustPolicy, accessMode: String) -> FileChangeState {
-        if policy.permissionLevel == "strict" || normalizedMode(accessMode) == "read_only" {
+        let posture = posture(policy)
+        if posture == .readOnly || normalizedMode(accessMode) == "read_only" {
             return .unavailable
         }
-        if fullMacGrantIsActive(policy) { return .fullMac }
+        if posture == .fullMac { return .fullMac }
         switch policy.autonomyDefault {
         case "workspace_autonomous": return .workspace
         case "app_data_autonomous": return .appData
@@ -73,12 +74,10 @@ extension TrustAccessModeCapabilityCatalog {
     }
 
     public static func agentAccessMode(from policy: TrustPolicy, fallback: String = "auto") -> String {
-        if (policy.permissionLevel == "full_mac_os" || policy.filePolicy?.outsideWorkspaceDefault == "allow"),
-           fullMacGrantIsActive(policy) {
-            return "full"
-        }
-        if policy.permissionLevel == "strict" {
-            return "read_only"
+        switch posture(policy) {
+        case .fullMac: return "full"
+        case .readOnly: return "read_only"
+        case .work: break
         }
         if policy.autonomyDefault == "workspace_autonomous" {
             return "workspace"
@@ -89,19 +88,16 @@ extension TrustAccessModeCapabilityCatalog {
         return normalizedMode(fallback)
     }
 
-    /// The ACTIVE verdict is the REAL gate's — `MacControlGate.fullMacActive`,
-    /// the same check `SwiftToolDispatcher.fullMacToolAccess` runs before
-    /// including the Full-Mac file-ops tool block in the agent's catalog.
-    /// 2026-09-10: Full Mac has no timer, so this is purely the saved policy.
+    /// The ACTIVE verdict is the law's (`PermissionLaw.posture`), the same
+    /// one every gate reads. Full Mac has no timer: it is the saved policy.
     public static func fullMacGrantIsActive(_ policy: TrustPolicy) -> Bool {
-        MacControlGate.fullMacActive(
-            MacControlTrustPolicy(
-                outsideWorkspaceDefault: policy.filePolicy?.outsideWorkspaceDefault ?? "deny",
-                permissionLevel: policy.permissionLevel.isEmpty ? "balanced" : policy.permissionLevel,
-                developerMode: policy.developerMode,
-                allowDestructiveActions: policy.filePolicy?.allowDestructiveActions ?? false
-            )
-        )
+        posture(policy) == .fullMac
+    }
+
+    /// The saved policy's posture, as every gate reads it.
+    public static func posture(_ policy: TrustPolicy) -> PermissionPosture {
+        PermissionLaw.posture(permissionLevel: policy.permissionLevel,
+                              outsideWorkspaceDefault: policy.filePolicy?.outsideWorkspaceDefault ?? "")
     }
 
     private static func macControlPolicyNeedsWorkspace(_ policy: TrustMacControlPolicy?) -> Bool {

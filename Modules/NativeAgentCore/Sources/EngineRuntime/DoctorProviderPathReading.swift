@@ -18,7 +18,7 @@ public enum DoctorProviderPathReading {
         }
         let needsSignIn = routing.activeProviders.values.filter { id in
             let state = providers.first { $0.provider_id == id }?.auth_status.state.lowercased()
-            return ["needs_oauth", "needs_key", "needs_credentials"].contains(state ?? "")
+            return ["needs_oauth", "needs_key", "needs_credentials", "rejected"].contains(state ?? "")
         }.sorted()
         if !needsSignIn.isEmpty {
             let controls = providers.filter { needsSignIn.contains($0.provider_id) }.map {
@@ -41,7 +41,7 @@ public enum DoctorProviderPathReading {
         guard let provider = providers.first(where: { $0.provider_id == providerID }) else {
             return .unavailable
         }
-        guard provider.auth_status.state.lowercased() == "ready" else {
+        guard provider.auth_status.eligible else {
             return .unhealthy("The active provider \(providerID) is not ready.")
         }
         let probe: DoctorProviderProbeReading

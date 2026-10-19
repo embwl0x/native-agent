@@ -235,7 +235,9 @@ public struct SwiftNativeCapabilityFoundryClient: Sendable {
             try InstalledSkillInventory.entries(dataRoot: root).map { .object($0.row) }
         }
         let toolEntries = try ToolRegistryActions.entries(dataRoot: root)
-        let workflowEntries = Self.arrayEntries(at: root.appendingPathComponent("workflows/registry.json"))
+        let workflowEntries = try Self.checkedEntries(store: "workflows/registry.json") {
+            try Self.arrayEntries(at: root.appendingPathComponent("workflows/registry.json"))
+        }
         let mcpEntries = try Self.checkedEntries(store: "mcp/servers.json") {
             try Self.mcpEntries(at: root.appendingPathComponent("mcp/servers.json"))
         }
@@ -347,14 +349,12 @@ public struct SwiftNativeCapabilityFoundryClient: Sendable {
         return entries
     }
 
-    /// Entries of a JSON-array store, or [] when the file is missing,
-    /// unreadable, or not an array. Read-only and best-effort — a Doctor-class
-    /// problem with a store must not break the Capabilities panel.
-    private static func arrayEntries(at url: URL) -> [JSONValue] {
-        guard let data = try? Data(contentsOf: url),
-              case .array(let items)? = try? JSONValue.parse(data) else {
-            return []
-        }
+    /// Entries of a JSON-array store: [] only when the file is missing; an
+    /// unreadable or non-array store is its own failure, never a zero count.
+    private static func arrayEntries(at url: URL) throws -> [JSONValue] {
+        let data: Data
+        do { data = try Data(contentsOf: url) } catch CocoaError.fileReadNoSuchFile { return [] }
+        guard case .array(let items) = try JSONValue.parse(data) else { throw CocoaError(.fileReadCorruptFile) }
         return items
     }
 

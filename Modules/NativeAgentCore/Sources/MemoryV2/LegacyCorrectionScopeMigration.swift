@@ -221,7 +221,6 @@ public enum LegacyCorrectionScopeMigration {
                 operation: .reconcile,
                 reason: "legacy_correction_scope_review"
             ))
-            await DerivedStateInvalidationCenter.shared.flush()
         }
 
         // The marker means DONE. A skip is an unresolved row, not a resolved one

@@ -426,16 +426,16 @@ extension SwiftToolDispatcher {
         return string
     }
 
-    struct BuilderReviewPairError: Error {
+    struct BridgeArgumentRefusal: Error {
         let value: JSONValue
     }
 
     static func pairReviewerRequested(
         in input: [String: JSONValue]
-    ) -> Result<Bool, BuilderReviewPairError> {
+    ) -> Result<Bool, BridgeArgumentRefusal> {
         guard let value = input["pair_reviewer"], value != .null else { return .success(false) }
         guard case .bool(let requested) = value else {
-            return .failure(BuilderReviewPairError(value: .object([
+            return .failure(BridgeArgumentRefusal(value: .object([
                 "status": .string("failed"),
                 "effects": .string("none"),
                 "reason": .string("invalid_pair_reviewer"),

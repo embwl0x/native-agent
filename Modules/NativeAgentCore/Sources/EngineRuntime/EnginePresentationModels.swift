@@ -938,7 +938,7 @@ public enum SidebarItem: String, CaseIterable, Identifiable, Sendable {
     case diagnostics = "Diagnostics"     // Doctor + Status + Runs Log
     case inboxPolicy = "Inbox Policy"
     case panels = "Panels"
-    case mcp = "MCP"                     // MCP server hub: registry, tools, consent, recent calls
+    case mcp = "MCP"                     // MCP server hub: registry, tools, recent calls
     case inspector = "Inspector"         // Turn Inspector: live per-turn readout + replay (W3)
 
     // ── Routed child surfaces (not listed as sidebar rows) ────────────────

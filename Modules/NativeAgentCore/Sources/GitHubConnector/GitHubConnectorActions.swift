@@ -576,7 +576,7 @@ public enum GitHubConnectorActions {
         )
     }
 
-    static func recordConnectionProof(statusCode: Int?, dataRoot: URL) async {
+    static func recordConnectionProof(statusCode: Int?, error: String = "transport_failed", dataRoot: URL) async {
         // A pasted or refreshed candidate says nothing about the installed account.
         guard !checkingCandidateToken else { return }
         let proof: JSONValue = .object([
@@ -586,7 +586,7 @@ public enum GitHubConnectorActions {
             "status": .string(statusCode.map { (200..<300).contains($0) } == true ? "completed" : "failed"),
             "dryRun": .bool(false),
             "output": .object(statusCode.map { ["statusCode": .int(Int64($0))] }
-                ?? ["error": .string("transport_failed")]),
+                ?? ["error": .string(error)]),
         ])
         do {
             try await appendJSONLCapped(proof, to: dataRoot.appendingPathComponent("connectors/actions/receipts.jsonl"),

@@ -7,6 +7,8 @@ public actor CognitiveSubstrate {
     let dependencies: CognitiveSubstrateDependencies
     let store: CognitiveSQLiteStore?
     var persistenceHealth: CognitivePersistenceHealth = .disabled
+    /// Stages whose last write failed; each has one owed repair.
+    var unsavedStages: Set<String> = []
     var persistenceWritesBlocked = false
     /// Once loaded or explicitly cleared, resident families own removals too.
     var residentRestoreIsAuthoritative = false

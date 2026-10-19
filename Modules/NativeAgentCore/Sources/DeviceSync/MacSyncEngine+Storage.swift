@@ -517,7 +517,7 @@ extension MacSyncEngine {
 
     /// True only for "no such file or directory" — the one error that means
     /// absence rather than an unknown outcome.
-    nonisolated static func isNoSuchFileError(_ error: Error) -> Bool {
+    public nonisolated static func isNoSuchFileError(_ error: Error) -> Bool {
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain,
            nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError {
@@ -671,71 +671,48 @@ extension MacSyncEngine {
             .appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
     }
 
-    func pruneOldArchiveFiles() {
-        // Capture the iCloud dirs on main, then do the listing + deletes OFF the
-        // main actor — contentsOfDirectory on an iCloud-resident dir can block,
-        // and this runs from a recurring timer. Fire-and-forget: best-effort
-        // cleanup with no state mutation and no ordering dependency.
-        // Include the malformed-file archive (inbox/_rejected/) in the sweep so
-        // rejected files get the same 7-day TTL + 50 MB cap as other archives —
-        // otherwise they accumulate unbounded. pruneArchiveDirs no-ops on a
-        // missing dir, so it's safe to list even before _rejected is created.
-        // Sweep R4 item 1: completion markers are state, so they get a cleanup
-        // path like every other add. They must outlive the pending files that
-        // could still re-present the same command (7-day archive TTL), so 30
-        // days is a deliberate multiple of that, not a guess.
-        let markerDir = ICloudSyncStatePaths.completedUnarchivedDirectory(
-            dataRoot: PersistenceCore.defaultDataRoot()
-        )
-        Task.detached(priority: .background) {
-            Self.pruneCompletedUnarchivedMarkers(in: markerDir)
-        }
+    /// One retention reconcile at a time, owned by this task: each request
+    /// cancels its predecessor and awaits its end before scanning, and every
+    /// scan and delete runs on the engine's storage executor. The loop prunes,
+    /// finds the next exact crossing from metadata, sleeps until it, repeats.
+    /// Directory events re-arm it without pruning; start prunes first.
+    /// Rejected files get the same 7-day TTL and 50 MB cap as other archives.
+    /// Completion markers must outlive any pending file that could re-present
+    /// the same command (7-day archive TTL), so they keep 30 days.
+    func reconcileArchiveRetention(pruneFirst: Bool) {
         let rejectedDir = inboxDir?.appendingPathComponent("_rejected")
         let dirs = [inboxDir, responsesDir, rejectedDir, incomingRejectedDirectory].compactMap { $0 }
         let transactionDirectories = retainedTransactionDirectories
-        guard !dirs.isEmpty else { return }
-        pruneDeadlineTask?.cancel()
-        // Deletions themselves trigger the watcher, which can replace this
-        // task before it returns. Keep that reschedule bounded too.
-        archiveRetentionRetryAfter = Date().addingTimeInterval(60)
-        pruneDeadlineTask = Task { [weak self] in
-            let failed = await Task.detached(priority: .background) {
-                Self.pruneArchiveDirs(dirs, transactionDirectories: transactionDirectories)
-            }.value
-            guard !Task.isCancelled else { return }
-            self?.archiveRetentionRetryAfter = failed ? Date().addingTimeInterval(60) : nil
-            self?.rescheduleArchiveRetentionDeadline()
-        }
-    }
-
-    /// Recompute the earliest exact seven-day crossing from canonical iCloud
-    /// file metadata. Directory events call this after new/renamed files; the
-    /// prune path calls it after deletes. A daily integrity fallback remains
-    /// only when the directories are empty or metadata is unreadable.
-    func rescheduleArchiveRetentionDeadline(now: Date = Date()) {
-        let rejectedDir = inboxDir?.appendingPathComponent("_rejected")
-        let dirs = [inboxDir, responsesDir, rejectedDir, incomingRejectedDirectory].compactMap { $0 }
-        let transactionDirectories = retainedTransactionDirectories
+        let markerDir = ICloudSyncStatePaths.completedUnarchivedDirectory(dataRoot: PersistenceCore.defaultDataRoot())
         guard isActive, !dirs.isEmpty else { return }
-        pruneDeadlineTask?.cancel()
+        let previous = pruneDeadlineTask
+        previous?.cancel()
         pruneDeadlineTask = Task { [weak self] in
-            let deadline = await Task.detached(priority: .background) {
-                Self.nextArchiveRetentionDeadline(in: dirs, after: now, transactionDirectories: transactionDirectories)
-            }.value
-            guard !Task.isCancelled, let self, self.isActive else { return }
-            let next = max(
-                deadline ?? now.addingTimeInterval(24 * 60 * 60),
-                self.archiveRetentionRetryAfter ?? .distantPast
-            )
-            let delay = max(0, next.timeIntervalSince(Date()))
-            if delay > 0 {
-                try? await Task.sleep(for: .seconds(delay))
+            await previous?.value
+            var prune = pruneFirst
+            while let self, !Task.isCancelled, self.isActive {
+                if prune {
+                    let failed = await self.sync.storage.perform {
+                        Self.pruneCompletedUnarchivedMarkers(in: markerDir)
+                        return Self.pruneArchiveDirs(dirs, transactionDirectories: transactionDirectories)
+                    }
+                    self.archiveRetentionRetryAfter = failed ? Date().addingTimeInterval(60) : nil
+                }
+                let now = Date()
+                let deadline = await self.sync.storage.perform {
+                    Self.nextArchiveRetentionDeadline(in: dirs, after: now, transactionDirectories: transactionDirectories)
+                }
+                guard !Task.isCancelled else { return }
+                let next = max(deadline ?? now.addingTimeInterval(24 * 60 * 60), self.archiveRetentionRetryAfter ?? .distantPast)
+                let delay = next.timeIntervalSince(Date())
+                if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+                prune = true
             }
-            guard !Task.isCancelled, self.isActive else { return }
-            self.pruneOldArchiveFiles()
         }
     }
 
+    /// Metadata only, never file contents. A row past its crossing was
+    /// decided by the prune that crossing armed and does not re-arm it.
     nonisolated static func nextArchiveRetentionDeadline(
         in dirs: [URL],
         after now: Date,
@@ -745,13 +722,13 @@ extension MacSyncEngine {
         let maxBytes = 50 * 1024 * 1024
         var deadlines: [Date] = []
         for dir in dirs {
-            guard let items = try? fm.contentsOfDirectory(
+            guard !Task.isCancelled, let items = try? fm.contentsOfDirectory(
                 at: dir,
                 includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey],
                 options: []
             ) else { continue }
             var totalBytes = 0
-            for item in items {
+            for item in items where !Task.isCancelled {
                 let values = try? item.resourceValues(forKeys: [
                     .creationDateKey, .fileSizeKey, .isDirectoryKey,
                 ])
@@ -765,26 +742,41 @@ extension MacSyncEngine {
             if totalBytes > maxBytes { deadlines.append(now) }
         }
         for transactionDirectory in transactionDirectories {
-            guard let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: nil) else { continue }
-            for item in items {
-                if let due = terminalTransactionRetentionDeadline(at: item) {
-                    deadlines.append(max(due, now))
+            guard !Task.isCancelled, let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for item in items where !Task.isCancelled {
+                if let due = transactionRetentionCrossing(at: item), due > now {
+                    deadlines.append(due)
                 }
             }
         }
         return deadlines.min()
     }
 
+    /// A row's clock is its last write, which is when its updatedAt was set.
+    nonisolated static func transactionRetentionCrossing(at url: URL) -> Date? {
+        guard url.pathExtension == "json",
+              let written = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        else { return nil }
+        return written.addingTimeInterval(30 * 24 * 60 * 60)
+    }
+
     /// Keep active, uncertain action and unreadable rows. Recovered chats are
     /// terminal even with an unknown outcome; thirty days exceed their window.
-    nonisolated static func terminalTransactionRetentionDeadline(at url: URL) -> Date? {
-        guard url.pathExtension == "json",
-              let data = try? Data(contentsOf: url),
-              let record = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data),
-              record.state == "completed" || record.state == "failed"
-                || (record.action == "chat" && record.state == "unknown"),
-              let updated = ISO8601DateFormatter().date(from: record.updatedAt) else { return nil }
-        return updated.addingTimeInterval(30 * 24 * 60 * 60)
+    /// Contents are read only for a local file or an iCloud item whose
+    /// metadata says it is current: a read of anything else blocks its thread
+    /// until iCloud answers. Unreadable metadata is not readable yet; an item
+    /// not yet current has its download asked for and the next prune decides it.
+    nonisolated static func isTerminalTransaction(at url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]),
+              let ubiquitous = values.isUbiquitousItem else { return false }
+        if ubiquitous, values.ubiquitousItemDownloadingStatus != .current {
+            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+            return false
+        }
+        guard let data = try? Data(contentsOf: url),
+              let record = try? JSONDecoder().decode(ICloudTransactionRecord.self, from: data) else { return false }
+        return record.state == "completed" || record.state == "failed"
+            || (record.action == "chat" && record.state == "unknown")
     }
 
     /// Drops completion markers older than the retention floor. A marker only
@@ -862,9 +854,9 @@ extension MacSyncEngine {
             }
         }
         for transactionDirectory in transactionDirectories {
-            guard let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: nil) else { continue }
+            guard let items = try? fm.contentsOfDirectory(at: transactionDirectory, includingPropertiesForKeys: [.contentModificationDateKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]) else { continue }
             for item in items {
-                if let due = terminalTransactionRetentionDeadline(at: item), due <= now {
+                if let due = transactionRetentionCrossing(at: item), due <= now, isTerminalTransaction(at: item) {
                     _ = remove(item)
                 }
             }

@@ -53,7 +53,7 @@ public enum DoctorProviderProbeReading: Sendable {
 /// Reads from the mounted runtime and platform listeners. Verdicts belong to Doctor.
 public protocol DoctorActionPort: Sendable {
     var dataRoot: URL { get }
-    func doctorProviderAuthStates() async throws -> [String]
+    func doctorProviderAuthStates() async throws -> [(state: String, eligible: Bool)]
     func doctorProviderRuntimeReading() async -> DoctorProviderRuntimeReading
     func doctorDataRootCheck() -> CheckResult
     func doctorTelegramSnapshot() async throws -> DoctorTelegramSnapshot
@@ -492,7 +492,8 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
             return CheckResult(source: "abilities/",
                 id: "live.tools", title: "Tool Registry", status: "fail",
                 detail: "Tool registry could not be read: \(safeDoctorDetail(error.localizedDescription))",
-                harm: "She cannot use her self-built tools.", repair: nil
+                harm: "She cannot use her self-built tools.",
+                human_action: "Trust → Backups → select a verified backup → Restore → Restore backup.", ask: .permission
             )
         }
     }
@@ -520,12 +521,14 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         Self.safeDetail(value, redact: port.redactDoctorDetail)
     }
 
-    private func providerDoctorCoverageCheck(_ providers: [String]) -> CheckResult {
-        let ready = providers.filter { $0.lowercased() == "ready" }
-        if ready.isEmpty {
+    /// Usable is ProviderRouting's eligibility; the detail gives each usable
+    /// path's own receipt word, so a saved or failed key never reads as ready.
+    private func providerDoctorCoverageCheck(_ providers: [(state: String, eligible: Bool)]) -> CheckResult {
+        let usable = providers.filter(\.eligible)
+        if usable.isEmpty {
             return CheckResult(source: "Providers > Chat",
                 id: "live.providers", title: "Providers and OAuth", status: "warn",
-                detail: "Provider registry is readable, but no provider currently reports ready authentication.",
+                detail: "Provider registry is readable, but no provider currently has usable authentication.",
                 harm: "She has no authenticated provider to answer through.",
                 human_action: "Providers → Sign in, reconnect or add an account → choose your provider → Sign in.",
                 ask: .signIn
@@ -533,7 +536,9 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
         }
         return CheckResult(source: "Providers > Chat",
             id: "live.providers", title: "Providers and OAuth", status: "ok",
-            detail: "\(ready.count) of \(providers.count) provider paths report ready authentication.", repair: nil
+            detail: "\(usable.count) of \(providers.count) provider paths can answer ("
+                + Dictionary(grouping: usable, by: \.state).sorted { $0.key < $1.key }
+                    .map { "\($0.value.count) \($0.key)" }.joined(separator: ", ") + ").", repair: nil
         )
     }
 

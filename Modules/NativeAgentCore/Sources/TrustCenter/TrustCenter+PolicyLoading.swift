@@ -15,12 +15,11 @@ public enum TrustPolicySecurityValueProvenance: Sendable, Equatable {
     case unreadable
 }
 
-/// One checked authority generation for a SecurityCenter decision. The
-/// normalized policy and raw user-only autonomy overrides are derived from the
-/// same saved bytes so an effect-time gate cannot splice concurrent policies.
+/// One checked authority generation for a SecurityCenter decision, read from
+/// one set of saved bytes so an effect-time gate cannot splice concurrent
+/// policies.
 public struct TrustPolicyAuthorizationSnapshot: Sendable, Equatable {
     public let policy: [String: JSONValue]
-    public let userConfiguredAutonomyOverrides: [String: JSONValue]
     /// Per-key origin for the effective `securityPolicy` block in `policy`.
     /// Every known default key is represented; `.unreadable` means this is a
     /// deliberately fail-closed projection, never valid checked authority.
@@ -28,11 +27,9 @@ public struct TrustPolicyAuthorizationSnapshot: Sendable, Equatable {
 
     init(
         policy: [String: JSONValue],
-        userConfiguredAutonomyOverrides: [String: JSONValue],
         securityPolicyProvenance: [String: TrustPolicySecurityValueProvenance]
     ) {
         self.policy = policy
-        self.userConfiguredAutonomyOverrides = userConfiguredAutonomyOverrides
         self.securityPolicyProvenance = securityPolicyProvenance
     }
 }
@@ -121,7 +118,6 @@ extension SwiftNativeTrustCenter {
             // held to the same must-be-an-object rule, so a scalar under either
             // key fails the same way instead of only the wire one.
             [WorkshopPolicyBlockVocabulary.futureKey],
-            ["toolAutonomy"],
             ["toolPolicy"],
             ["filePolicy"],
             ["connectorPolicy"],
@@ -231,18 +227,6 @@ extension SwiftNativeTrustCenter {
         let saved = WorkshopPolicyBlockVocabulary.foldToWireKey(
             try Self.loadRawPolicyChecked(at: path))
         try Self.validateKnownAuthorityPolicyTypes(saved, against: defaults)
-        // Every saved autonomy entry is a level Trust knows, checked on its own:
-        // the code no longer lists per-tool defaults to type-check it against.
-        switch saved["toolAutonomy"] {
-        case nil: break
-        case .object(let value)?:
-            for (tool, level) in value {
-                guard case .string(let name) = level, Self.unifiedPolicyAutonomyLevels.contains(name) else {
-                    throw TrustCenterError.underlying("saved trust policy field toolAutonomy.\(tool) is not an autonomy level")
-                }
-            }
-        default: throw TrustCenterError.underlying("saved trust policy field toolAutonomy has the wrong JSON type")
-        }
         return saved
     }
 
@@ -251,12 +235,10 @@ extension SwiftNativeTrustCenter {
         let sourcePresent = FileManager.default.fileExists(atPath: trustPolicyURL.path)
         let defaults = defaultTrustPolicy()
         let saved = try Self.loadSavedPolicyChecked(at: trustPolicyURL, defaults: defaults)
-        let overrides: [String: JSONValue] = if case .object(let value)? = saved["toolAutonomy"] { value } else { [:] }
         return TrustPolicyAuthorizationSnapshot(
             // An empty policy file (setup writes `{}` before the person has
             // chosen anything) is a fresh install too.
             policy: normalizedTrustPolicy(saved: saved, defaults: defaults, freshInstall: !sourcePresent || saved.isEmpty),
-            userConfiguredAutonomyOverrides: overrides,
             securityPolicyProvenance: Self.securityPolicyProvenance(
                 saved: saved,
                 defaults: defaults,
@@ -277,7 +259,6 @@ extension SwiftNativeTrustCenter {
             let provenance = Self.securityPolicyUnreadableProvenance(defaults: closed)
             return TrustPolicyAuthorizationSnapshot(
                 policy: closed,
-                userConfiguredAutonomyOverrides: [:],
                 securityPolicyProvenance: provenance
             )
         }
@@ -313,34 +294,6 @@ extension SwiftNativeTrustCenter {
     ) -> [String: TrustPolicySecurityValueProvenance] {
         guard case .object(let defaultSecurity)? = defaults["securityPolicy"] else { return [:] }
         return Dictionary(uniqueKeysWithValues: defaultSecurity.keys.map { ($0, .unreadable) })
-    }
-
-    /// 2026-07-21 audit fix support: the USER-FILE-ONLY toolAutonomy
-    /// overrides (raw saved policy, no code defaults merged). The yolo /
-    /// full-Mac broad posture must consult THIS — not the merged view — when
-    /// deciding whether a deliberate user override exists to outrank it;
-    /// merged defaults would make every catalogued tool look "explicitly
-    /// configured" and silently disable the posture (the first version of
-    /// the audit fix did exactly that and tripped the characterization net).
-    /// Fail-soft: a missing/corrupt file reads as no user overrides (the
-    /// merged loadTrustPolicy path fail-closes separately).
-    public func userConfiguredAutonomyOverrides() async -> [String: JSONValue] {
-        guard let saved = try? Self.loadRawPolicyChecked(at: trustPolicyURL),
-              case .object(let ta)? = saved["toolAutonomy"] else {
-            return [:]
-        }
-        return ta
-    }
-
-    /// Read one raw user-configured tier through the checked authority seam.
-    /// Missing means no explicit override; corrupt authority throws rather than
-    /// looking like a fresh/default policy.
-    public func userConfiguredAutonomyLevel(for tool: String) async throws -> String? {
-        let snapshot = try await loadAuthorizationSnapshotChecked()
-        guard case .string(let tier)? = snapshot.userConfiguredAutonomyOverrides[tool] else {
-            return nil
-        }
-        return tier
     }
 
     private var trustPolicyURL: URL {
@@ -421,7 +374,6 @@ extension SwiftNativeTrustCenter {
         policy["permissionLevel"] = .string("balanced")
         policy["autonomyDefault"] = .string("supervised")
         policy["enableAutonomy"] = .bool(false)
-        policy["toolAutonomy"] = .object(["default": .string("blocked")])
         policy["toolPolicy"] = .object([
             "autoPromoteSafeTools": .bool(false),
             "autoRunSafeTools": .bool(false),
@@ -509,11 +461,7 @@ extension SwiftNativeTrustCenter {
     ///   1. `autonomyDefault` ∈ {supervised, app_data_autonomous,
     ///      workspace_autonomous}; else → "supervised".
     ///   2. `filePolicy.outsideWorkspaceDefault` backfilled to "deny".
-    ///   3. Full-Mac detection from `permissionLevel` +
-    ///      `filePolicy.outsideWorkspaceDefault`. When Full-Mac:
-    ///      - `developerMode` backfilled to false when absent or malformed;
-    ///        an explicit operator-enabled true is preserved as the separate
-    ///        destructive/system-level escalation.
+    ///   3. `filePolicy.allowDestructiveActions` follows `developerMode`.
     ///   4. `providerPolicy.active_per_surface` merged: default ∪ saved
     ///      (saved wins).
     ///   5. `personalityPolicy.completion_guard_max_repairs`:
@@ -540,44 +488,13 @@ extension SwiftNativeTrustCenter {
             out["autonomyDefault"] = .string("supervised")
         }
 
-        // 2. filePolicy.outsideWorkspaceDefault backfill + Full-Mac detection.
-        let permissionLevel: String = {
-            if case .string(let s)? = out["permissionLevel"] { return s }
-            return ""
-        }()
+        // 2. filePolicy.outsideWorkspaceDefault backfill.
         var filePolicy: [String: JSONValue] = [:]
         if case .object(let fp)? = out["filePolicy"] { filePolicy = fp }
-        let outsideDefault: String = {
-            if case .string(let s)? = filePolicy["outsideWorkspaceDefault"] {
-                return s
-            }
-            return "deny"
-        }()
         if filePolicy["outsideWorkspaceDefault"] == nil {
             filePolicy["outsideWorkspaceDefault"] = .string("deny")
         }
         out["filePolicy"] = .object(filePolicy)
-
-        let isFullMac =
-            permissionLevel == "full_mac_os"
-            || (permissionLevel == "wide_open_receipts" && outsideDefault == "allow")
-
-        // 3. Full Mac developer-mode default. Full Mac itself has no timer
-        // (2026-09-10, User): any fullMacExpiresAt / fullMacNeverExpires /
-        // fullMacConfirmedAt / fullMacMaxDurationHours left on disk by an
-        // older install is neither read nor rewritten here.
-        if isFullMac {
-            // Full Mac and Developer Mode are separate controls in the
-            // Swift-native app. Full Mac gets a default false; an explicit true
-            // from the operator is preserved.
-            let devModeIsExplicitBool: Bool = {
-                if case .bool(_)? = out["developerMode"] { return true }
-                return false
-            }()
-            if !devModeIsExplicitBool {
-                out["developerMode"] = .bool(false)
-            }
-        }
 
         let developerModeEnabled: Bool = {
             if case .bool(let b)? = out["developerMode"] { return b }

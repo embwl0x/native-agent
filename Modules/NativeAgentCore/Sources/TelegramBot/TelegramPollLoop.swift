@@ -8,6 +8,7 @@ import PersistenceCore
 import BackgroundLoops
 import ProviderRouting
 import TurnTrace
+import Transcripts
 import ChatOrchestration
 import Experiences
 
@@ -344,7 +345,10 @@ public struct TelegramPollLoop: LoopRunner {
         var delivery = try await retainedAssistantDelivery(for: claim)
         if delivery == nil {
             if let session = claim.assistantSessionId, let run = claim.assistantRunId,
-               try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: session).contains(where: { $0.runId == run }) {
+               try TurnCheckpoint.turnIds(dataRoot: dataRoot, sessionId: session).contains(where: { turn in
+                   // This run's own file decides; a damaged one may be it, so it is owed.
+                   (try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: session, turnId: turn)).map { $0?.runId == run } ?? true
+               }) {
                 return "owed"
             }
             delivery = try await inbox.recordAssistantDelivery(updateId: claim.updateId,
@@ -1158,14 +1162,20 @@ public struct TelegramPollLoop: LoopRunner {
                 }
                 break updateProcessing
             }
-            // Where User was when his "take over" arrived, before any queue.
-            let takeover = await MacWorkContinuation.admit(handoffText)
             // Queued behind a working turn in this conversation, it is addressed to
             // that turn under the run it would have as its own. Once that turn
             // reserved it, the claim keeps that run, so after a restart too its row
             // may already be written; this run then finds it rather than writing it again.
             let reserved = claim.phase == .queued ? claim.assistantRunId.flatMap(UUID.init(uuidString:)) : nil
             let queuedTurnId = reserved ?? UUID()
+            // Registered for Stop at admission, before any await: a Stop from here
+            // on names this run, queued or running; the turn's own acceptance is the
+            // same registration. It ends with the turn operation that holds it.
+            let traceTurnId = TurnTraceContext.mintTurnId()
+            let runStop = TelegramRunStop(ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: turnSessionId,
+                                                                runId: queuedTurnId.uuidString, turnId: traceTurnId))
+            // Where User was when his "take over" arrived, before any queue.
+            let takeover = await MacWorkContinuation.admit(handoffText)
             let steered = OSAllocatedUnfairLock(initialState: reserved != nil)
             let steeringText = TelegramReplyPromptRenderer.messageWithReplyContext(text: text, replyTo: msg.replyTo)
             let signalArrival: @Sendable (String) -> Void = { turnId in
@@ -1355,7 +1365,10 @@ public struct TelegramPollLoop: LoopRunner {
                 signalArrival(turnId.uuidString)
             }
             let turnOperation: @Sendable (UUID) async -> Void = { turnId in
-                await MacWorkContinuation.$current.withValue(takeover) { await turnBody(turnId) }
+                await TurnTraceContext.$turnId.withValue(traceTurnId) {
+                    await MacWorkContinuation.$current.withValue(takeover) { await turnBody(turnId) }
+                }
+                withExtendedLifetime(runStop) {}
             }
             if await turnCoordinator.startTrackedTurn(
                 id: queuedTurnId,
@@ -1530,4 +1543,13 @@ public struct TelegramPollLoop: LoopRunner {
         await turnCardRestartRepairer.scheduleRepair { await repairInterruptedTurnCardsIfNeeded() }
         return .completed(result: "Telegram poll processed \(updates.count) update(s)")
     }
+}
+
+/// A door's Stop registration for one run, finished when the turn operation
+/// holding it is released: run to its end, dropped from the queue, or never
+/// queued at all.
+final class TelegramRunStop: Sendable {
+    private let flag: URL
+    init(_ flag: URL) { self.flag = flag }
+    deinit { ChatCancelFlag.finish(flag) }
 }

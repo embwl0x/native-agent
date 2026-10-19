@@ -25,6 +25,9 @@ public struct NAProviderCatalogProvider: Codable, Equatable, Sendable {
     public var providerID: String
     public var displayName: String
     public var authState: String
+    /// ProviderRouting's published eligibility; nil from an older Mac, whose
+    /// "ready" authState meant eligible.
+    public var eligible: Bool?
     public var authModes: [String]
     public var models: [NAProviderCatalogModel]
 
@@ -32,12 +35,14 @@ public struct NAProviderCatalogProvider: Codable, Equatable, Sendable {
         providerID: String,
         displayName: String,
         authState: String,
+        eligible: Bool,
         authModes: [String],
         models: [NAProviderCatalogModel]
     ) {
         self.providerID = providerID
         self.displayName = displayName
         self.authState = authState
+        self.eligible = eligible
         self.authModes = authModes
         self.models = models
     }

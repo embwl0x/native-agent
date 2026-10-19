@@ -12,7 +12,6 @@ import ApprovalInbox
 import ChatOrchestration
 import TrustCenter
 import WorkshopExecution
-import EngineRuntime
 
 extension ApprovalTransactionCoordinator {
     /// The approval coordinator over this app's effects, for one root.

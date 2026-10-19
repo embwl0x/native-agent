@@ -56,6 +56,10 @@ enum InteractionCardDelivery {
 /// Binds Core verification to the same live owners and macOS probes as the UI.
 @MainActor
 struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
+    func interactionControls() -> (any InlineInteractionControlPort)? {
+        NativeAgentAppCoordinator.shared.appModel.map(AppInlineInteractionControlPort.init)
+    }
+
     func probeAppleEventApp(_ name: String) async -> String {
         await SystemAppleScriptAdapter.automationStatus(app: name, ask: false)
     }
@@ -84,7 +88,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
     func providers() async throws -> [InlineInteractionProviderStatus] {
         try await NativeAgentEngine.live.providers.list().map {
             (providerID: $0.provider_id, displayName: $0.display_name,
-             authState: $0.auth_status.state, defaultModel: $0.default_model,
+             authState: $0.auth_status.state, eligible: $0.auth_status.eligible, defaultModel: $0.default_model,
              firstModel: $0.models.first?.id)
         }
     }

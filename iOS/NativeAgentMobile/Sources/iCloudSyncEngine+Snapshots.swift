@@ -237,7 +237,8 @@ extension iCloudSyncEngine {
                         state: provider.authState,
                         detail: "",
                         user_info: nil,
-                        last_checked_at: nil
+                        last_checked_at: nil,
+                        eligible: provider.eligible ?? (provider.authState == "ready")
                     ),
                     models: provider.models.map { model in
                         ProviderModelInfo(
@@ -397,9 +398,8 @@ extension iCloudSyncEngine {
                 memoryProposalsSnapshotLoaded = true
                 memoryProposals = v.filter(\.isPending)
             }
-            if let v = bundle.trainingProposals { trainingProposals = v }
-            if let v = bundle.promotionCandidates { promotionCandidates = v }
-            if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
+            if let v = bundle.trainingProposals {
+                trainingProposals = v
                 selfImprovementSnapshotPublishedAt = Date()
             }
             if let v = bundle.inboxItems {
@@ -453,7 +453,7 @@ extension iCloudSyncEngine {
                bundle.deskItems != nil, bundle.deskBounds != nil, bundle.workOverview != nil { delivered.insert(.desk) }
             if activityGeneration == targetedRefreshGeneration,
                bundle.workshopTasks != nil, bundle.memories != nil, bundle.memoryProposals != nil,
-               bundle.trainingProposals != nil, bundle.promotionCandidates != nil, bundle.inboxItems != nil {
+               bundle.trainingProposals != nil, bundle.inboxItems != nil {
                 delivered.insert(.activity)
             }
             let stale = Set(staleSnapshotGroups.keys)
@@ -619,9 +619,8 @@ extension iCloudSyncEngine {
             memoryProposalsSnapshotLoaded = true
             memoryProposals = v.filter(\.isPending)
         }
-        if let v = bundle.trainingProposals { trainingProposals = v }
-        if let v = bundle.promotionCandidates { promotionCandidates = v }
-        if bundle.trainingProposals != nil, bundle.promotionCandidates != nil {
+        if let v = bundle.trainingProposals {
+            trainingProposals = v
             selfImprovementSnapshotPublishedAt = Date()
         }
         if bundle.loadedAllSnapshots {
@@ -977,7 +976,6 @@ extension iCloudSyncEngine {
         var memories: [MemoryRecord]?
         var memoryProposals: [MemoryProposalRecord]?
         var trainingProposals: [TrainingProposalSummary]?
-        var promotionCandidates: [PromotionCandidateSummary]?
         var trustPolicy: TrustPolicy?
         var personality: PersonalityProfile?
         var health: RuntimeHealth?
@@ -1005,7 +1003,6 @@ extension iCloudSyncEngine {
                 memories != nil ||
                 memoryProposals != nil ||
                 trainingProposals != nil ||
-                promotionCandidates != nil ||
                 trustPolicy != nil ||
                 personality != nil ||
                 health != nil ||
@@ -1023,7 +1020,7 @@ extension iCloudSyncEngine {
 
         var loadedAllSnapshots: Bool {
             workshopTasks != nil && deskItems != nil && skills != nil && memories != nil && memoryProposals != nil
-                && trainingProposals != nil && promotionCandidates != nil && trustPolicy != nil
+                && trainingProposals != nil && trustPolicy != nil
                 && personality != nil && health != nil && organismLivingStatus != nil
                 && sessions != nil && pinnedChatSessions != nil && chatTranscripts != nil
                 && connectors != nil && providers != nil && surfaceModels != nil
@@ -1037,21 +1034,18 @@ extension iCloudSyncEngine {
         var inboxItems: [InboxItemRecord]?
         var memoryProposals: [MemoryProposalRecord]?
         var trainingProposals: [TrainingProposalSummary]?
-        var promotionCandidates: [PromotionCandidateSummary]?
 
         var loadedAnySnapshot: Bool {
             workshopTasks != nil ||
                 memories != nil ||
                 inboxItems != nil ||
                 memoryProposals != nil ||
-                trainingProposals != nil ||
-                promotionCandidates != nil
+                trainingProposals != nil
         }
 
         var loadedAllSnapshots: Bool {
             workshopTasks != nil && memories != nil && inboxItems != nil
                 && memoryProposals != nil && trainingProposals != nil
-                && promotionCandidates != nil
         }
     }
 
@@ -1101,7 +1095,6 @@ extension iCloudSyncEngine {
         async let memories: [MemoryRecord]? = loadSnapshotArrayOnly(named: "memories.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
         async let trainingProposals: [TrainingProposalSummary]? = loadSnapshotArrayOnly(named: "training_proposals.json", in: snapshotDir)
-        async let promotionCandidates: [PromotionCandidateSummary]? = loadSnapshotArrayOnly(named: "promotion_candidates.json", in: snapshotDir)
         async let trustPolicy: TrustPolicy? = loadSnapshotObjectOnly(named: "trust_policy.json", in: snapshotDir)
         async let personality: PersonalityProfile? = loadSnapshotObjectOnly(named: "personality.json", in: snapshotDir)
         async let health: RuntimeHealth? = loadSnapshotObjectOnly(named: "health.json", in: snapshotDir)
@@ -1127,7 +1120,6 @@ extension iCloudSyncEngine {
             memories: memories,
             memoryProposals: memoryProposals,
             trainingProposals: trainingProposals,
-            promotionCandidates: promotionCandidates,
             trustPolicy: trustPolicy,
             personality: personality,
             health: health,
@@ -1206,14 +1198,12 @@ extension iCloudSyncEngine {
         async let inboxItems: [InboxItemRecord]? = loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
         async let memoryProposals: [MemoryProposalRecord]? = loadSnapshotArrayOnly(named: "memory_proposals.json", in: snapshotDir)
         async let trainingProposals: [TrainingProposalSummary]? = loadSnapshotArrayOnly(named: "training_proposals.json", in: snapshotDir)
-        async let promotionCandidates: [PromotionCandidateSummary]? = loadSnapshotArrayOnly(named: "promotion_candidates.json", in: snapshotDir)
         return await ActivitySnapshotBundle(
             workshopTasks: workshopTasks,
             memories: memories,
             inboxItems: inboxItems,
             memoryProposals: memoryProposals,
-            trainingProposals: trainingProposals,
-            promotionCandidates: promotionCandidates
+            trainingProposals: trainingProposals
         )
     }
 

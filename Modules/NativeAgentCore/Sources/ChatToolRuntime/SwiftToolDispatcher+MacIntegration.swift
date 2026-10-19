@@ -164,23 +164,6 @@ extension SwiftToolDispatcher {
         return .object(result)
     }
 
-    func sendInstructionRefusal(tool: String, input: [String: JSONValue]) -> JSONValue? {
-        guard let text = ChatToolSessionContext.userText, ChatToolSessionContext.forbidsSending(text),
-              SwiftNativeSecurityCenter.sendsExternally(tool: tool, input: input, dataRoot: dataRoot) else { return nil }
-        let mail = ["mail_send", "mail_reply"].contains(tool)
-        let args = mail ? input.filter { ["to", "subject", "body", "cc", "bcc", "message_id", "expected_message_id", "expected_account", "position", "sender", "reply_all"].contains($0.key) }
-            : ["value": input["body"] ?? input["message"] ?? input["text"] ?? input["value"] ?? .string("")]
-        let call = JSONValue.object(["action": .string(mail ? "mail.draft" : "chat.draft"), "args": .object(args)])
-        do {
-            return .object(["status": .string("refused"), "effects": .string("none"), "reason": .string("user_requested_no_send"),
-                "message": .string("You were asked not to send. Save it as a draft instead: \(try call.serialize(pretty: false))."),
-                "draft_call": call])
-        } catch {
-            return .object(["status": .string("refused"), "effects": .string("none"),
-                "message": .string("You were asked not to send. Draft arguments could not be encoded: \(error.localizedDescription)")])
-        }
-    }
-
     // MARK: - Mac integration dispatch helper
     //
     // Shared shape for Mac integration tools:

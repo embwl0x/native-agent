@@ -46,10 +46,6 @@ package enum ChatWorkspaceBinding {
             }
         }
         func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue {
-            let snapshot = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
-            guard !SwiftNativeTrustCenter.hasExplicitBlockOverride("chat_conversations", overrides: snapshot.userConfiguredAutonomyOverrides) else {
-                throw AutonomyGateError.toolDenied(reason: "Conversation access is blocked in Trust. Nothing was read.")
-            }
             let result = await HumanConversationReader.open(sessionID: sessionID, limit: limit, dataRoot: dataRoot)
             if case .object(let row) = result, row["untrusted_remote_data"] == .bool(true), case .string(let peer)? = row["agent"] {
                 PeerDataTaint.markConsumed(peer: peer)

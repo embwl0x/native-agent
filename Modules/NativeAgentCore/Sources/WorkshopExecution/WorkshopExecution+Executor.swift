@@ -222,66 +222,75 @@ public actor WorkshopExecutorLoop {
 
     // MARK: drain
 
+    /// One drain pass's receipt: how many executions it claimed and ran, and
+    /// every fault it met on the way. A fault is never folded into the count,
+    /// so broken queue access or recovery cannot read as "nothing queued".
+    public struct DrainPass: Sendable {
+        public var ran = 0
+        public var faults: [String] = []
+    }
+
     /// One drain pass: claim + run queued or approved Workshop executions, oldest first, one at a
     /// time. Per-Workshop execution failures are contained (logged + that Workshop execution goes
     /// `failed`); the pass moves on. Safe to call from a LoopRunner tick.
-    ///
-    /// Returns how many queued executions this pass actually claimed and ran.
-    /// The loop owner reports 0 as `.skipped`, not `.completed` — a drain that
-    /// found nothing to drain is not successful work, and stamping it as such
-    /// is what made an idle `mission_executor` indistinguishable from a
-    /// working one to the dormancy rule.
-    @discardableResult
-    public func drainOnce() async -> Int {
-        // Crash/restart orphan recovery — completes BEFORE this drain claims
-        // anything (the shared barrier; see reconcileTask).
+    public func drainOnce() async -> DrainPass {
+        var pass = DrainPass()
         do {
+            // Crash/restart orphan recovery — completes BEFORE this drain claims
+            // anything (the shared barrier; see reconcileTask).
             try await ensureOrphansReconciled()
+            // Terminal execution state is canonical; its Desk projection and
+            // unified receipt are retryable derived settlement. Reconcile every
+            // terminal record before admitting new work so a crash between the
+            // terminal CAS and the event sink cannot leave a zombie Desk item.
+            try await reconcileTerminalDeskSettlements()
+            // Disabling autonomous execution blocks new claims, not durable
+            // zero-effect repair of work that was already admitted.
+            guard await isEnabled() else { return pass }
+            // Fail approvals nobody is coming to answer (no-op unless the
+            // approval-wait deadline is configured). Runs each drain tick so the
+            // timeout granularity is the drain interval — fine for a multi-hour
+            // approval wait.
+            try await reconcileTimedOutApprovals()
         } catch {
-            Self.logger.error("Workshop startup reconciliation unavailable: \(error.localizedDescription, privacy: .public)")
-            return 0
+            Self.logger.error("Workshop drain unavailable: \(error.localizedDescription, privacy: .public)")
+            pass.faults.append("Desk queue unavailable: \(error.localizedDescription)")
+            return pass
         }
-        // Terminal execution state is canonical; its Desk projection and
-        // unified receipt are retryable derived settlement. Reconcile every
-        // terminal record before admitting new work so a crash between the
-        // terminal CAS and the event sink cannot leave a zombie Desk item.
-        await reconcileTerminalDeskSettlements()
-        // Disabling autonomous execution blocks new claims, not durable
-        // zero-effect repair of work that was already admitted.
-        guard await isEnabled() else { return 0 }
-        // Fail approvals nobody is coming to answer (no-op unless the
-        // approval-wait deadline is configured). Runs each drain tick so the
-        // timeout granularity is the drain interval — fine for a multi-hour
-        // approval wait.
-        await reconcileTimedOutApprovals()
-        let queued = await scanQueue()
-            .filter { $0.status == "queued" || $0.status == "blocked_on_approval" }
-            .sorted { $0.createdAt < $1.createdAt }   // submit order
-        var ran = 0
+        let queued: [WorkshopExecutionRecord]
+        do {
+            queued = try await scanQueue()
+                .filter { $0.status == "queued" || $0.status == "blocked_on_approval" }
+                .sorted { $0.createdAt < $1.createdAt }   // submit order
+        } catch {
+            pass.faults.append("Desk queue unavailable: \(error.localizedDescription)")
+            return pass
+        }
         for record in queued {
-            if Task.isCancelled { return ran }
+            if Task.isCancelled { return pass }
             do {
                 if record.status == "blocked_on_approval" {
                     guard let approval = try await resolvedStepApproval(record) else { continue }
                     _ = try await resumeAfterApproval(
                         executionId: record.id, stepId: record.currentStepId,
                         approved: true, approvalId: approval.id)
-                    ran += 1
+                    pass.ran += 1
                     continue
                 }
                 guard let claimed = try await claim(record.id) else { continue }
                 await runClaimedWorkshopExecution(claimed)
-                ran += 1
+                pass.ran += 1
             } catch WorkshopExecutionError.approvalDeferred {
                 // The approval and blocked step remain intact for the next capacity edge.
                 continue
             } catch is CancellationError {
-                return ran
+                return pass
             } catch {
                 Self.logger.error("drain claim failed for \(record.id, privacy: .public): \(String(describing: error), privacy: .public)")
+                pass.faults.append("Desk execution \(record.id) could not be claimed or resumed: \(error.localizedDescription)")
             }
         }
-        return ran
+        return pass
     }
 
     private func resolvedStepApproval(_ execution: WorkshopExecutionRecord) async throws -> ApprovalRecord? {
@@ -298,8 +307,8 @@ public actor WorkshopExecutorLoop {
         return approval
     }
 
-    private func reconcileTerminalDeskSettlements() async {
-        for record in await scanQueue()
+    private func reconcileTerminalDeskSettlements() async throws {
+        for record in try await scanQueue()
         where ["completed", "failed", "cancelled", "canceled"].contains(record.status.lowercased()) {
             await WorkshopDeskReceiptBridge.recordTerminal(record, reason: record.terminalReason, dataRoot: root)
         }
@@ -311,7 +320,8 @@ public actor WorkshopExecutorLoop {
     public func nextMeaningfulDeadline(after date: Date) async -> Date? {
         guard approvalTimeoutNanos > 0 else { return nil }
         let timeout = TimeInterval(approvalTimeoutNanos) / 1_000_000_000
-        return await scanQueue().compactMap { execution -> Date? in
+        // An unreadable queue has no known crossing; the drain reports it.
+        return ((try? await scanQueue()) ?? []).compactMap { execution -> Date? in
             guard execution.status == "blocked_on_approval" else { return nil }
             let raw = Self.latestBlockedStepExecutedAt(execution) ?? execution.updatedAt
             guard let blockedAt = WorkshopOutcomeScoreboard.parseTimestamp(raw) else {
@@ -334,10 +344,7 @@ public actor WorkshopExecutorLoop {
     /// receipt at a step boundary; that one resumes from its next step.
     /// CAS require:running → never clobbers an execution that has moved on.
     private func reconcileOrphanedRunning() async throws {
-        let queue = try await scanQueueChecked()
-        if let corrupt = queue.first(where: { ["corrupt", "unavailable"].contains($0.status) }) {
-            throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
-        }
+        let queue = try await scanQueue()
         let orphans = queue.filter { $0.status == "running" }
         for orphan in orphans {
             if let handle = orphan.deskHandle {
@@ -419,11 +426,11 @@ public actor WorkshopExecutorLoop {
     /// and the drain that runs this sweep share ONE executor instance via
     /// WorkshopExecutorRef.shared, so the once-only orphan-reclaim barrier spans
     /// both — see applyResolvedWorkshopStep.)
-    private func reconcileTimedOutApprovals() async {
+    private func reconcileTimedOutApprovals() async throws {
         guard approvalTimeoutNanos > 0 else { return }
         let deadlineSecs = TimeInterval(approvalTimeoutNanos) / 1_000_000_000
         let nowDate = now()
-        let blocked = await scanQueue().filter { $0.status == "blocked_on_approval" }
+        let blocked = try await scanQueue().filter { $0.status == "blocked_on_approval" }
         for execution in blocked {
             // An answered approval waiting for capacity is no longer an approval wait.
             do {
@@ -587,10 +594,7 @@ public actor WorkshopExecutorLoop {
             // enclosing queue-level flock serializes claimers across
             // Workshop executions (blocker #4), so this count cannot be concurrently
             // stale-read by another claimer.
-            let queue = try await self.scanQueueChecked()
-            if let corrupt = queue.first(where: { $0.status == "corrupt" }) {
-                throw WorkshopExecutionError.persistenceFailure(String(describing: corrupt.result))
-            }
+            let queue = try await self.scanQueue()
             let runningCount = queue
                 .filter { $0.status == "running" && $0.id != executionId }
                 .count
@@ -1619,7 +1623,7 @@ public actor WorkshopExecutorLoop {
     }
 
     private func getRecord(_ executionId: String) async throws -> WorkshopExecutionRecord? {
-        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard SwiftNativeWorkshopRunner.isSafeExecutionID(executionId) else { return nil }
         let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
         guard case .object(let obj) = raw,
@@ -1632,25 +1636,14 @@ public actor WorkshopExecutorLoop {
         await terminalEventSink?(record, record.terminalReason ?? reason)
     }
 
-    private func scanQueue() async -> [WorkshopExecutionRecord] {
-        do {
-            return try await scanQueueChecked()
-        } catch {
-            Self.logger.error("Workshop queue unavailable: \(error.localizedDescription, privacy: .public)")
-            return [SwiftNativeWorkshopRunner.recordFromJSON([
-                "id": .string("queue-unavailable"),
-                "title": .string("Workshop queue unavailable"),
-                "status": .string("unavailable"),
-                "result": .object(["error": .string(error.localizedDescription)]),
-            ])]
-        }
-    }
-
-    private func scanQueueChecked() async throws -> [WorkshopExecutionRecord] {
+    private func scanQueue() async throws -> [WorkshopExecutionRecord] {
         try await SwiftNativeWorkshopRunner.readQueueRecords(dataRoot: root, persistence: persistence).map { id, raw in
+            // The shared reader keeps a damaged record visible as a `corrupt`
+            // row; here that row is the pass's fault, never a record filtered away.
             guard case .object(let obj) = raw,
-                  case .string(let gotId)? = obj["id"], gotId == id else {
-                throw WorkshopExecutionError.persistenceFailure("Workshop queue record \(id) is malformed; restore its saved execution record before admitting work")
+                  case .string(let gotId)? = obj["id"], gotId == id,
+                  !["corrupt", "unavailable"].contains(obj["status"].flatMap { if case .string(let s) = $0 { s } else { nil } } ?? "") else {
+                throw WorkshopExecutionError.persistenceFailure("Workshop queue record \(id) is unreadable or malformed; restore its saved execution record before admitting work")
             }
             return SwiftNativeWorkshopRunner.recordFromJSON(obj)
         }

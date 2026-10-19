@@ -84,7 +84,7 @@ public extension MacChatTurnPresentationPort {
                 occurredAt: Date()
             ))
             do {
-                regeneratedTurnCompleted = try await macChatTurns.runAdmittedTurn(sessionID: sessionId) {
+                regeneratedTurnCompleted = try await macChatTurns.runAdmittedTurn(sessionID: sessionId, turnID: lifecycleIdentity.turnId) {
                     await operation()
                 }
             } catch {

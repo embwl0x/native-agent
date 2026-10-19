@@ -175,7 +175,9 @@ public struct TurnRequest: Sendable {
         mechanicalRow: CognitiveMechanicalRowKind? = nil,
         awaitingConsumption: Bool = true
     ) async throws -> EnqueuedUserMessage {
-        try await bind {
+        // The row's run is this request's own pin, never one inherited from an
+        // enclosing turn: a door that registered Stop at admission pins it here.
+        try await bind { try await ChatPersistenceContext.$pinnedTurnRunID.withValue(pinnedRunID ?? nil) {
             try await client.enqueueUserMessage(
                 message: message,
                 sessionId: sessionID,
@@ -185,7 +187,7 @@ public struct TurnRequest: Sendable {
                 mechanicalRow: mechanicalRow,
                 awaitingConsumption: awaitingConsumption
             )
-        }
+        } }
     }
 
     /// Run the turn under this request's bindings.

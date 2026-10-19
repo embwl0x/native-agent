@@ -12,7 +12,6 @@ public struct SensesContextProjection: ContextCompiledProjectionProvider, Sendab
     public init() {}
     public var projectionIdentifier: String { Self.owner }
     public var invalidationNamespaces: Set<String> { ["sense-news"] }
-    public var refreshesBeforeTurn: Bool { true }
 
     private static func sourceID(_ item: SenseNews) -> ContextSourceID {
         ContextStableID.source(owner: owner, locator: "senses/news/" + item.id.uuidString)
@@ -21,9 +20,12 @@ public struct SensesContextProjection: ContextCompiledProjectionProvider, Sendab
         ContextStableID.atom(sourceID: sourceID(item), kind: .news, headingPath: [], blockAnchor: "news")
     }
 
-    public func excludedAtomIDs(in generation: ContextStoredGeneration) async -> Set<ContextAtomID> {
+    public func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
+                       surface: ContextSurface) async -> ContextTurnExclusion {
         let unread = Set(await SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity).map(Self.atomID))
-        return Set(generation.atoms.filter { $0.draft.kind == .news && !unread.contains($0.draft.id) }.map(\.draft.id))
+        return ContextTurnExclusion(atomIDs: Set(chosen.filter {
+            $0.draft.kind == .news && !unread.contains($0.draft.id)
+        }.map(\.draft.id)))
     }
 
     public func didDeliver(_ items: [ContextPacketItem]) async {

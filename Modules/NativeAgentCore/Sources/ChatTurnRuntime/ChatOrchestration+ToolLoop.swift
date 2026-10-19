@@ -195,8 +195,14 @@ extension SwiftNativeTurnEngine {
         }
     }
 
-    /// A dispatch round continues or waits for the person.
-    enum ToolDispatchRoundOutcome { case continueLoop, waiting(TurnEngineResult.TerminalReason) }
+    /// The card a result waits on and what it waits for, when it waits on a person.
+    nonisolated static func waitingOn(_ result: JSONValue) -> JSONValue? {
+        if let need = InlineInteractionNeed.interaction(in: result), InlineInteractionNeed.blocksTurn(need) {
+            return .object(["card": .string(need.id), "on": .string(need.title)])
+        }
+        guard ChatToolOutcome.isWaitingApproval(result), case .object(let fields) = result else { return nil }
+        return .object(["card": fields["approvalId"] ?? fields["approval_id"] ?? .null, "on": .string("the person's approval of this call")])
+    }
 
     /// Post-provider-call round of the structured loop: mint the
     /// assistant message (prose + tool_use blocks, synthesizing collision-free
@@ -221,7 +227,7 @@ extension SwiftNativeTurnEngine {
         /// text and its results come back as one text message (8b carrier).
         markerCodec: TextMarkerCodec? = nil,
         toolBoundaryReason: LLMToolBoundaryReason? = nil
-    ) async -> ToolDispatchRoundOutcome {
+    ) async {
         // Append the assistant turn that contained the tool calls. Strip any
         // <tool_use> markers from the surfaced text so the assistant text block
         // carries only the model's prose (the structured toolUse blocks below
@@ -339,19 +345,18 @@ extension SwiftNativeTurnEngine {
                 _ = await group.next()
                 group.cancelAll()
             }
-            if Self.dispatchCancelSignalled(cancelFlagPath) { return .continueLoop }
+            if Self.dispatchCancelSignalled(cancelFlagPath) { return }
             Self.appendStructuredUserNudge("Mac control has returned; continue from the recorded results.", to: &conversation)
         }
         if StandingBotContinuity.isHelperTurn, iterationRecords.contains(where: { ChatToolOutcome.isWaitingApproval($0.result) }) {
             ChatTurnExecution.current?.waitForApproval()
         }
-        // Automation waits for the owner's system grant; other setup lets
-        // the turn finish its remaining work.
+        // A blocking need (a macOS grant, her own question) is the one the turn
+        // ends waiting on; the round's results still reach her first.
         if let waiting = iterationRecords.lazy
             .compactMap({ InlineInteractionNeed.interaction(in: $0.result) })
             .first(where: InlineInteractionNeed.blocksTurn) {
             ChatTurnExecution.current?.waitForInteraction(waiting)
-            return .waiting(.interactionRequired)
         }
         switch noProgressGuard.observe(iterationRecords) {
         case .none:
@@ -361,36 +366,7 @@ extension SwiftNativeTurnEngine {
                 await progress?(.notice(kind: "tool_loop_recovery", text: visible))
             }
             Self.appendStructuredUserNudge(feedback, to: &conversation)
-        case .wait(let count):
-            let question = "I've done the same thing \(count) times in a row without getting further — keep going, or change course?"
-            let input: [String: JSONValue] = [
-                "kind": .string("choose"), "title": .string(question),
-                "why": .string(question),
-                "decline_consequence": .string("I'll wait for your direction before carrying on."),
-                "options": .array([
-                    .object(["id": .string("keep_going"), "label": .string("Keep going")]),
-                    .object(["id": .string("change_course"), "label": .string("Change course")]),
-                ]),
-            ]
-            // The existing receipt path stamps and persists the same-turn continuation.
-            let need = InlineInteraction(kind: .choose, target: "", title: question,
-                why: question, primaryActionLabel: "Choose",
-                declineConsequence: "I'll wait for your direction before carrying on.",
-                cardProse: question, options: [
-                    .init(id: "keep_going", label: "Keep going"),
-                    .init(id: "change_course", label: "Change course"),
-                ])
-            let result = InlineInteractionNeed.envelope(need)
-            ChatTurnExecution.current?.waitForInteraction(need)
-            let record = TurnEngineResult.ToolDispatchRecord(name: InlineInteractionWire.toolName,
-                input: input, ranCall: (InlineInteractionWire.toolName, input), result: result)
-            dispatches.append(record)
-            ChatTurnExecution.current?.keepTools([record])
-            await progress?(.toolUse(name: record.name, input: .object(input)))
-            await progress?(.toolResult(name: record.name, output: result))
-            return .waiting(.interactionRequired)
         }
-        return .continueLoop
     }
 
     private static func driverTakeoverReceipt(_ value: JSONValue, depth: Int = 0) -> [String: JSONValue]? {
@@ -405,39 +381,6 @@ extension SwiftNativeTurnEngine {
             }
         }
         return nil
-    }
-
-    /// The turn's OWN terminal for "waiting on you".
-    ///
-    /// A raised need is not exhaustion, not a protocol violation, and not a
-    /// cancellation, and it must not borrow any of their endings: the generic
-    /// "I ran out of iterations" line would sit above the card contradicting
-    /// it, and `.abandoned` would tell the context ledger that the selection
-    /// failed when what actually happened is that the work reached a person.
-    ///
-    /// So: keep exactly the prose the person already watched render, add
-    /// nothing, and record the turn as a deliberate stop. The card beneath it
-    /// is the rest of the message, and resolving it resumes the request.
-    func waitingOnInteractionResult(
-        ctx: TurnContext,
-        visible: String,
-        lastRawResponse: String,
-        dispatches: [TurnEngineResult.ToolDispatchRecord],
-        startNs: UInt64,
-        providerCallCount: Int
-    ) -> TurnEngineResult {
-        Task { [weak turn = ctx.fluidContextTurn] in
-            await turn?.recordOutcome(.completed)
-        }
-        return TurnSettle.waitingOnCard(
-            visible: visible,
-            modelUsed: ctx.modelId,
-            recalledIds: ctx.resolvedRecalledIds,
-            dispatches: dispatches,
-            startNs: startNs,
-            rawLLMResponse: lastRawResponse,
-            providerCallCount: providerCallCount
-        )
     }
 
 }

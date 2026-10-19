@@ -288,20 +288,4 @@ let selected = ProcessInfo.processInfo.environment["SNAPSHOT_ONLY"].map { only i
 let rows = try await snapshot(selected)
 for row in rows { print(row) }
 
-/// A saved autonomy entry that is not a level is a malformed policy: Trust
-/// rejects the snapshot and the call refuses, even under Full Mac.
-func checkSavedOverrides() async throws {
-    var policy = Posture.full_mac.policy
-    policy["toolAutonomy"] = ["browser.chrome_click": false]
-    try JSONSerialization.data(withJSONObject: policy, options: [.sortedKeys])
-        .write(to: root.appendingPathComponent("trust/policy.json"))
-    let rejected = (try? await SwiftNativeTrustCenter(dataRoot: root).loadAuthorizationSnapshotChecked()) == nil
-    precondition(rejected, "saved overrides: a non-level entry passed validation")
-    register()
-    let outcome = await decide("browser.chrome_click", [:], surface: surfaces[0], posture: .full_mac, steer: .person,
-                               root: root, store: MacIntegrationPermissionStore(dataRoot: root))
-    precondition(outcome == .refuse, "saved overrides: a malformed policy let browser.chrome_click \(outcome.rawValue)")
-    fputs("saved overrides: a malformed entry is rejected\n", stderr)
-}
-try await checkSavedOverrides()
 try? FileManager.default.removeItem(at: scratch)

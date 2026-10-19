@@ -62,7 +62,7 @@ extension NativeAgentEngine {
             let modelPinned = edit.modelPinned ?? ((!edit.provider.isEmpty && !edit.model.isEmpty) || bot.modelPinned == true)
             if modelPinned {
                 let providers = try await self.providers.list()
-                guard let provider = providers.first(where: { $0.provider_id == edit.provider && $0.auth_status.state == "ready" }),
+                guard let provider = providers.first(where: { $0.provider_id == edit.provider && $0.auth_status.eligible }),
                       let model = provider.models.first(where: { $0.id == edit.model }),
                       (model.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"]).contains(edit.think),
                       !edit.fast || model.supports_fast == true else { throw HelperRemoteError.model }

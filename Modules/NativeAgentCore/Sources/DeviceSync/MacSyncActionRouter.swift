@@ -1,4 +1,6 @@
 import Foundation
+import ChatOrchestration
+import os
 import ApprovalInbox
 import Cognition
 import CognitiveSubstrate
@@ -9,6 +11,7 @@ import MemoryV2
 import PersistenceCore
 import Desk
 import ProviderRouting
+import Transcripts
 
 @MainActor
 struct MacSyncActionRouter {
@@ -183,7 +186,7 @@ struct MacSyncActionRouter {
         let requiresDevice = action.action.hasPrefix("approve") || action.action.hasPrefix("reject")
             || ["create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job", "cancel_scheduler_job"].contains(action.action)
             || ["cancelApproval", "inboxAction", "app_settings", "app_setting_set", "chat_history_page", "set_trust_policy", "pairDevice", "disconnect_telegram", "set_telegram_settings", "set_mac_integration_permission"].contains(action.action)
-            || ["get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message"].contains(action.action)
+            || ["get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message", "steerChat"].contains(action.action)
             || ["configure_provider_secret", "start_provider_sign_in", "interaction_action", "registerPushToken"].contains(action.action)
         if let message = await sync.pairedPhones.authorize(action, requiresPairing: requiresDevice) {
             sync.engine.syncError = message
@@ -549,8 +552,13 @@ struct MacSyncActionRouter {
                             eventID: eventID,
                             channel: channel
                         )
+                        // The phone's receipt is what settles an owed result.
+                        await sync.host.retryRequestedResults()
                     }
                 ))
+
+            case "steerChat":
+                return observed(await steerChat(payload))
 
             case "cancelChat":
                 var sessionId = payload["sessionId"] ?? payload["session_id"] ?? ""
@@ -569,35 +577,31 @@ struct MacSyncActionRouter {
                             "message": "cancelChat rejected an invalid sessionId.",
                         ])
                     }
-                    // 2026-09-06: a Stop may name the run it is stopping.
-                    // When it does and a DIFFERENT run holds the session, the
-                    // stopped turn is already over: cancel nothing and write
-                    // no cancel marker, or the phone's next message dies in
-                    // place of the turn the user actually stopped.
+                    // A Stop that names its runs is the Mac's own Stop when one
+                    // of them is in flight here, from whichever door started it:
+                    // the shared turn owner stops the runs in flight on the
+                    // session (never a later one). A named run not yet here is
+                    // held against its id — registration cancels it — and that
+                    // is said as pending, never as a stop that happened.
                     let runIDs = Self.cancelChatRunIDs(from: payload)
                     let cancelOutcome = cancelChatTask(safeSessionId, runIDs)
-                    // 2026-09-06: the session-wide cancelled.flag belongs only
-                    // to a Stop that named no run. A scoped Stop that found no
-                    // task is held against its run id instead: turn acceptance
-                    // deletes this flag before the stream starts, so writing it
-                    // during the handoff cancelled nothing and left an unscoped
-                    // marker that could kill the NEXT turn instead.
-                    // 2026-09-06: a scoped Stop never writes it either, even
-                    // when it did cancel the task. The write is asynchronous
-                    // and session-wide: if the stopped run finishes and the
-                    // next one starts before it lands, the marker kills the
-                    // wrong turn. Cancelling the named task is the whole
-                    // action.
-                    if runIDs.isEmpty, cancelOutcome == .cancelled || cancelOutcome == .noActiveTask {
-                        _ = try await api.cancelChatSession(sessionId: safeSessionId)
+                    let stopsHere = runIDs.isEmpty
+                        ? cancelOutcome == .cancelled || cancelOutcome == .noActiveTask
+                        : !ChatCancelFlag.inFlightRunIDs().isDisjoint(with: runIDs)
+                    if stopsHere { _ = try await api.cancelChatSession(sessionId: safeSessionId) }
+                    guard stopsHere || cancelOutcome == .cancelled || runIDs.isEmpty else {
+                        return observed([
+                            "status": "pending",
+                            "ok": "false",
+                            "sessionId": safeSessionId,
+                            "message": "The Mac has not received that request yet; it stops the moment it arrives.",
+                        ])
                     }
-                    let held = cancelOutcome == .stopRecorded || cancelOutcome == .runMismatch
                     return observed([
                         "status": "ok",
                         "ok": "true",
                         "sessionId": safeSessionId,
-                        "taskCancelled": cancelOutcome == .cancelled ? "true" : "false",
-                        "stopPending": held ? "true" : "false",
+                        "taskCancelled": "true",
                     ])
                 }
                 return observed([
@@ -883,4 +887,48 @@ struct MacSyncActionRouter {
         return out
     }
 
+}
+
+extension MacSyncActionRouter {
+    /// The phone's Steer, admitted on the control lane so it reaches the turn
+    /// already working in that chat while it runs: she reads it at her next
+    /// step, as on the Mac and Telegram. The phone hears "steered" once a
+    /// round has read it, or "steer_returned" when the turn ended first (with
+    /// whether its row is already written), and then sends it as its own
+    /// message. No working turn for this door: not taken, said so at once.
+    func steerChat(_ payload: [String: String]) async -> [String: String] {
+        guard let sessionId = payload["sessionId"].flatMap(NativeAgentChatSessionID.normalizedPathComponent),
+              let runId = payload["runId"], UUID(uuidString: runId) != nil,
+              let text = payload["text"], !text.isEmpty, text.utf8.count <= 64_000 else {
+            return ["status": "error", "ok": "false", "message": "steerChat needs a chat, a run id and its words."]
+        }
+        let routeKey = payload["routeKey"] ?? ""
+        let route = ChatToolSessionContext.ReplyRoute(surface: "ios", sourceKey: routeKey, replyTo: "iphone", correlationId: runId)
+        let bridge = sync.bridge
+        func tell(_ kind: String, _ words: String, _ extra: [String: String] = [:]) async {
+            _ = try? await bridge.sendChatMessage(text: words, sessionID: sessionId, correlationID: runId,
+                metadata: ["kind": kind, "transport": "icloud", "source": "mac", "replyTo": "iphone",
+                           "targetSourceKey": routeKey].merging(extra) { $1 })
+        }
+        // 0 offered, 1 reserved (its row written), 2 read.
+        let phase = OSAllocatedUnfairLock(initialState: 0)
+        let taken = await ChatTurnSteering.shared.offer(ChatTurnSteering.Offer(id: "ios-steer:" + runId, text: text,
+            envelope: TurnEnvelope(surface: "ios", deliveryRoute: route), origin: nil, runID: runId),
+            sessionId: sessionId, onDelivered: { offer, committed in
+                let read = !committed && offer.receivingTurnID != nil
+                let next = phase.withLock { phase -> Bool in
+                    switch (phase, committed, read) {
+                    case (0, false, false): phase = 1; return true
+                    case (1, false, true): phase = 2; return true
+                    case (2, true, _): return true
+                    default: return false
+                    }
+                }
+                if next, read { await tell("steered", "Read in the reply in progress") }
+                return next
+            }, onReturned: { _ in
+                await tell("steer_returned", "Sending it as its own message", ["rowWritten": phase.withLock { $0 } == 1 ? "true" : "false"])
+            })
+        return ["status": "ok", "ok": "true", "steered": taken ? "true" : "false"]
+    }
 }

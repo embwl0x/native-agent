@@ -174,10 +174,7 @@ public actor SwiftNativeMacControl: MacControlClient {
     }
 
     private func driverCheckedResult(_ reply: MacControlResult, action: String) -> MacControlResult {
-        let motor = macControlAccessibilityInjectionActions.contains(action)
-            || macControlAccessibilityNudgeActions.contains(action)
-            || ["focus_app", "quit_app", "open_target"].contains(action)
-        guard motor, MacDriverContext.binding?.yieldedToPerson == true else { return reply }
+        guard macControlTakeoverActions.contains(action), MacDriverContext.binding?.yieldedToPerson == true else { return reply }
         var output: [String: JSONValue] = [:]
         if case .object(let existing) = reply.output { output = existing }
         output["status"] = .string("yielded_to_user")
@@ -539,9 +536,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         // arriving after this line still stops the action.
         // Document reads check this boundary only before their scroll effects,
         // so reading the visible text remains available while the person drives.
-        if macControlAccessibilityInjectionActions.contains(normalized)
-            || macControlAccessibilityNudgeActions.contains(normalized)
-            || ["focus_app", "quit_app", "open_target"].contains(normalized),
+        if macControlTakeoverActions.contains(normalized),
            let refusal = await attentionActionRefusal(action: normalized, body: body) {
             return refusal
         }
@@ -838,13 +833,6 @@ public actor SwiftNativeMacControl: MacControlClient {
         case proceed
     }
 
-    private static let developerModeOnlyActions: Set<String> = [
-        "file/move",
-        "file/trash",
-        "shell",
-        "system",
-    ]
-
     /// Check master, remote, and category gates before the file-policy layer.
     /// Execution, approval, and operation receipts remain with their owners.
     private func gatePreflightOutcome(
@@ -896,6 +884,15 @@ public actor SwiftNativeMacControl: MacControlClient {
         // refusal before the workspace policy refusal. For other paths, run
         // the workspace-root and Full Mac checks here.
         let pathKeys = macControlFilePolicyPathKeys(forAction: action)
+        // A command line is a write on his side whatever it says: it runs only
+        // on the one authorization decision (posture × that declared class),
+        // never on its text. Full Mac runs, Work asks, Safe refuses.
+        if action == "shell", let answer = await provider.authorize(tool: "shell", input: body), answer.level != "auto" {
+            let reason = (answer.level == "confirm" ? "needs_approval: " : "blocked: ") + answer.reason
+            let result = Self.refusalResult(action: action, reason: reason, now: now, remedy: answer.remedy)
+            await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
+            return .refuse(result)
+        }
         if !pathKeys.isEmpty {
             let paths: [String] = pathKeys.compactMap { key in
                 guard let v = body.stringValue(key), !v.isEmpty else { return nil }
@@ -908,13 +905,6 @@ public actor SwiftNativeMacControl: MacControlClient {
                 await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
                 return .refuse(result)
             }
-        }
-        if Self.developerModeOnlyActions.contains(action),
-           !MacControlGate.destructiveActionsAllowed(policy.trustPolicy) {
-            let reason = "developer_mode_required: \(action) requires Developer Mode"
-            let result = Self.refusalResult(action: action, reason: reason, now: now)
-            await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
-            return .refuse(result)
         }
         return .proceed
     }

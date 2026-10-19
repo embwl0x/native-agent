@@ -275,25 +275,17 @@ enum TrustGuardrailSummary {
                 systemImage: "paperplane.fill", tone: .danger
             )
         }
-        // NEVER claim "sends without asking" from this one flag: email and
-        // message sends carry their own per-tool send_approval defaults that
-        // still stop and ask even when the connector-level flag is off
-        // (gpt-5.5 review 2026-08-06, blocking #1 — TrustCenter+Defaults
-        // gmail.send/agentmail.send/email.send/slack.post_message default to
-        // send_approval, and SecurityCenter maps that to ask). The summary
-        // must understate, not overstate.
-        let asks = policy.connectorPolicy?.sendExternalMessagesRequiresApproval ?? true
+        // A send is a write on the person's side: Work asks, Safe sends nothing.
+        let safe = TrustAccessModeCapabilityCatalog.posture(policy) == .readOnly
         return TrustGuardrailRow(
             id: "external_send",
             title: "Sending things to other people",
-            value: asks ? "Asks before sending" : "Mostly asks first",
-            detail: asks
-                ? "Email, messages, and posts wait for your approval before they leave this Mac."
-                : "Connector posts skip the blanket confirmation, but email and "
-                  + "message sends still ask first unless you change each "
-                  + "tool's own setting.",
-            systemImage: asks ? "paperplane" : "paperplane.fill",
-            tone: asks ? .ok : .caution
+            value: safe ? "Doesn't send" : "Asks before sending",
+            detail: safe
+                ? "Safe sends nothing to other people."
+                : "Email, messages, and posts wait for your approval before they leave this Mac.",
+            systemImage: "paperplane",
+            tone: .ok
         )
     }
 }

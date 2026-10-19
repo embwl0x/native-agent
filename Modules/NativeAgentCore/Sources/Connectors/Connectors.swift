@@ -32,10 +32,11 @@ public final class SwiftNativeConnectorsClient: Sendable {
     }
 
     public func listWorkspaces() async throws -> [JSONValue] {
-        // Python: read_json(workspaces_path, []); if not list -> [].
         let raw = try await persistence.readJSON(workspacesPath, ifMissing: .array([]))
-        if case .array(let arr) = raw { return arr }
-        return []
+        guard case .array(let arr) = raw else {
+            throw PersistenceCoreError.ioFailure("\(workspacesPath.path) is not a list of workspaces; repair it before searching")
+        }
+        return arr
     }
 
     public func searchWorkspaces(query rawQuery: String) async throws -> JSONValue? {
@@ -46,17 +47,20 @@ public final class SwiftNativeConnectorsClient: Sendable {
         if query.isEmpty { return nil }
 
         var results: [JSONValue] = []
+        // Scope the search could not examine, "path: why": a miss there is
+        // not a searched-and-absent miss.
+        var unexamined: [JSONValue] = []
         let workspaces = try await listWorkspaces()
 
         for workspace in workspaces {
-            guard case .object(let ws) = workspace else { continue }
-            let rootStr = Self.stringField(ws["path"])
-            if rootStr.isEmpty { continue }
-            let wsRoot = URL(fileURLWithPath: rootStr)
-            // Python: if not root.exists(): continue. (os.walk over a file path
-            // yields nothing, so requiring a directory matches Python behavior.)
+            guard case .object(let ws) = workspace, !Self.stringField(ws["path"]).isEmpty else {
+                unexamined.append(.string("a workspace entry has no path"))
+                continue
+            }
+            let wsRoot = URL(fileURLWithPath: Self.stringField(ws["path"]))
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: wsRoot.path, isDirectory: &isDir), isDir.boolValue else {
+                unexamined.append(.string("\(wsRoot.path): workspace folder is missing or not a folder"))
                 continue
             }
 
@@ -68,8 +72,11 @@ public final class SwiftNativeConnectorsClient: Sendable {
             // walkDir returns false when the WORKSPACE walk must stop (either
             // cap hit). Whether to continue to the NEXT workspace is decided by
             // the global results cap below, mirroring Python.
-            _ = walkDirectory(wsRoot, root: wsRoot, ws: ws, query: query,
-                              results: &results, scanned: &scanned)
+            if !walkDirectory(wsRoot, root: wsRoot, ws: ws, query: query,
+                              results: &results, scanned: &scanned, unexamined: &unexamined),
+               results.count < maxResults {
+                unexamined.append(.string("\(wsRoot.path): stopped after \(maxScanned) files; the rest of this workspace was not searched"))
+            }
 
             // Python outer loop: `if len(results) >= 50 or scanned > 2000: break`.
             // scanned>2000 here would NOT actually skip later workspaces in
@@ -85,11 +92,11 @@ public final class SwiftNativeConnectorsClient: Sendable {
         // above (matches the daemon, which passes its lowercased `query`).
         try await recordSearchActivity(query: query, resultCount: results.count)
 
-        return .object([
-            "query": .string(query),
-            "results": .array(results),
-        ])
+        var envelope: [String: JSONValue] = ["query": .string(query), "results": .array(results)]
+        if !unexamined.isEmpty { envelope["unexamined"] = .array(unexamined) }
+        return .object(envelope)
     }
+
 
     // MARK: - Activity event parity (FLIP PREREQ — wave 32 W20)
 
@@ -152,7 +159,8 @@ public final class SwiftNativeConnectorsClient: Sendable {
         ws: [String: JSONValue],
         query: String,
         results: inout [JSONValue],
-        scanned: inout Int
+        scanned: inout Int,
+        unexamined: inout [JSONValue]
     ) -> Bool {
         let skipDirs: Set<String> = [".git", ".build", "node_modules", "__pycache__"]
         let wsId = ws["id"]
@@ -166,15 +174,19 @@ public final class SwiftNativeConnectorsClient: Sendable {
                 options: []
             )
         } catch {
-            // os.walk silently skips dirs it can't list (onerror=None default).
+            unexamined.append(.string("\(dir.path): folder could not be listed: \(error.localizedDescription)"))
             return true
         }
 
         var files: [URL] = []
         var subdirs: [URL] = []
         for entry in entries {
-            let rv = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
-            if rv?.isDirectory == true {
+            let rv: URLResourceValues
+            do { rv = try entry.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey]) } catch {
+                unexamined.append(.string("\(entry.path): could not be inspected: \(error.localizedDescription)"))
+                continue
+            }
+            if rv.isDirectory == true {
                 // os.walk prunes by DIRECTORY NAME only (the `dirs[:]` filter),
                 // not by absolute path — so a workspace nested under an ancestor
                 // literally named `node_modules` is NOT skipped, and a regular
@@ -182,7 +194,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
                 if !skipDirs.contains(entry.lastPathComponent) {
                     subdirs.append(entry)
                 }
-            } else if rv?.isRegularFile == true {
+            } else if rv.isRegularFile == true {
                 files.append(entry)
             }
         }
@@ -203,18 +215,22 @@ public final class SwiftNativeConnectorsClient: Sendable {
             if lowerName.contains(query) || lowerRel.contains(query) {
                 matchReason = "filename"
             } else {
-                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? Int.max
-                if size <= maxContentBytes {
+                // Sizes came with the listing; a file too large to read is
+                // searched by name only, which is its ordinary scope.
+                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize
+                if let size, size <= maxContentBytes {
                     // file_path.read_text(errors="ignore"): best-effort lossy
                     // decode; isoLatin1 never fails so it mirrors errors="ignore"
                     // tolerance for non-UTF8 bytes.
-                    if let data = try? Data(contentsOf: file),
-                       let text = String(data: data, encoding: .utf8)
-                            ?? String(data: data, encoding: .isoLatin1) {
-                        if text.lowercased().contains(query) {
-                            matchReason = "content"
-                        }
+                    do {
+                        let data = try Data(contentsOf: file)
+                        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+                        if text.lowercased().contains(query) { matchReason = "content" }
+                    } catch {
+                        unexamined.append(.string("\(file.path): contents could not be read: \(error.localizedDescription)"))
                     }
+                } else if size == nil {
+                    unexamined.append(.string("\(file.path): size could not be read, so its contents were not searched"))
                 }
             }
             if !matchReason.isEmpty {
@@ -232,7 +248,7 @@ public final class SwiftNativeConnectorsClient: Sendable {
         // OS-dependent, but a stable order keeps the cap-truncation reproducible).
         for sub in subdirs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             if !walkDirectory(sub, root: root, ws: ws, query: query,
-                              results: &results, scanned: &scanned) {
+                              results: &results, scanned: &scanned, unexamined: &unexamined) {
                 return false
             }
         }

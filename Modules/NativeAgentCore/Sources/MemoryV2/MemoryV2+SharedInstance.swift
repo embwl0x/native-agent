@@ -45,6 +45,10 @@ public actor MemoryStorageBridge {
         return Self.toMemoryRecord(stored)
     }
 
+    public func lookupMemoryRecords(ids: [String]) async throws -> [MemoryRecord] {
+        try await storage.memories(ids: ids).map(Self.toMemoryRecord)
+    }
+
     public func listMemory(kind: String?) async throws -> [MemoryRecord] {
         // R13 (review HIGH): status:nil deliberately includes archived rows,
         // but lifecycle-TERMINAL rows (corrected/contradicted/deleted) must
@@ -469,7 +473,6 @@ extension SwiftNativeMemoryV2 {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let corrected = try await storage.markCorrected(id: id, by: newerId, reason: reason)
-        await flushDerivedMemoryChanges()
         return corrected
     }
 

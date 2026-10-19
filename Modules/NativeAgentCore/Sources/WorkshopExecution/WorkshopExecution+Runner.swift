@@ -981,7 +981,7 @@ public actor SwiftNativeWorkshopRunner {
     /// <queue>/<id>/mission.json, returns nil when absent, malformed, or
     /// carrying an id that does not match its containing directory.
     public func getWorkshopExecution(_ executionId: String) async throws -> WorkshopExecutionRecord? {
-        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard Self.isSafeExecutionID(executionId) else { return nil }
         let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
         guard case .object(let obj) = raw,
@@ -997,7 +997,7 @@ public actor SwiftNativeWorkshopRunner {
     /// gpt-5.5 finding #1: use this (not getMission(...)?.toJSON()) so `plan`
     /// is emitted verbatim.
     public func getWorkshopExecutionWireJSON(_ executionId: String) async throws -> JSONValue? {
-        guard (try? await WorkshopStorageMigrator.prepareForReading(dataRoot: root)) != nil else { return nil }
+        _ = try await WorkshopStorageMigrator.prepareForReading(dataRoot: root)
         guard Self.isSafeExecutionID(executionId) else { return nil }
         let raw = try await persistence.readJSON(executionRecordPath(executionId), ifMissing: .null)
         guard case .object(let obj) = raw,

@@ -77,12 +77,13 @@ public struct AbilityOverviewEntry: Sendable, Equatable {
 
 public struct OnboardingStartResult: Sendable, Equatable {
     public enum Disposition: Sendable, Equatable {
-        case resume, repairProfile, reset, alreadyOnboarded, blockedNeedsReset, fresh
+        case resume, repairProfile, profileUnreadable, reset, alreadyOnboarded, blockedNeedsReset, fresh
     }
 
     public func disposition(buildFailed: Bool) -> Disposition {
         if pendingRecovery { return .resume }
         if profileRepairRequired { return .repairProfile }
+        if profileUnreadable != nil { return .profileUnreadable }
         if resetRequired { return .reset }
         if hasExisting { return buildFailed ? .blockedNeedsReset : .alreadyOnboarded }
         return .fresh
@@ -122,9 +123,13 @@ public struct OnboardingStartResult: Sendable, Equatable {
     /// Deliberately absence-only — a profile that exists but is malformed
     /// carries bytes that must not be destroyed, and Doctor still names it.
     public let profileRepairRequired: Bool
+    /// A completed install whose profile.json is there but cannot be read: the
+    /// receipt (path, reason, lever). Neither repair nor reset may touch those
+    /// bytes; moving the file aside turns this into the absence repair lane.
+    public let profileUnreadable: String?
 
     public var requiresPresentation: Bool {
-        pendingRecovery || resetRequired || profileRepairRequired || !hasExisting
+        pendingRecovery || resetRequired || profileRepairRequired || profileUnreadable != nil || !hasExisting
     }
 
     public init(
@@ -133,7 +138,8 @@ public struct OnboardingStartResult: Sendable, Equatable {
         abilityOverview: [AbilityOverviewEntry],
         pendingRecovery: Bool = false,
         resetRequired: Bool = false,
-        profileRepairRequired: Bool = false
+        profileRepairRequired: Bool = false,
+        profileUnreadable: String? = nil
     ) {
         self.hasExisting = hasExisting
         self.currentPersonaName = currentPersonaName
@@ -141,6 +147,7 @@ public struct OnboardingStartResult: Sendable, Equatable {
         self.pendingRecovery = pendingRecovery
         self.resetRequired = resetRequired
         self.profileRepairRequired = profileRepairRequired
+        self.profileUnreadable = profileUnreadable
     }
 }
 
@@ -381,15 +388,22 @@ public struct SwiftNativeOnboardingClient: Sendable {
             let profileRepairRequired = pending == nil
                 && hasCompletionAnchor
                 && !fm.fileExists(atPath: profileJSONPath.path)
-            let rawName = pending?.agentName ?? Self.readPersonaName(at: profileJSONPath)
-            let currentName: String? = hasExisting ? rawName : nil
+            var currentName: String?
+            var profileUnreadable: String?
+            if hasExisting {
+                do { currentName = try pending?.agentName ?? Self.readPersonaName(at: profileJSONPath) }
+                catch OnboardingError.ioFailure(let why) where pending == nil && hasCompletionAnchor {
+                    profileUnreadable = "Setup could not read the saved names: \(why). The persona documents are intact. Move \(profileJSONPath.path) aside on the Mac, then reopen setup to enter the two names again."
+                }
+            }
             return OnboardingStartResult(
                 hasExisting: hasExisting,
                 currentPersonaName: currentName,
                 abilityOverview: Self.abilityOverview,
                 pendingRecovery: pending != nil,
                 resetRequired: pending == nil && hasPartialPersonaState,
-                profileRepairRequired: profileRepairRequired
+                profileRepairRequired: profileRepairRequired,
+                profileUnreadable: profileUnreadable
             )
         }
     }
@@ -460,7 +474,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
                     dataRoot: dataRoot
                 )
                 let userPath = allTargets["user"]!
-                let userShape = Self.classifyUserDoc(at: userPath)
+                let userShape = try Self.classifyUserDoc(at: userPath)
                 let preexisting = allTargets
                     .filter { $0.key != "profile" && $0.key != "user" }
                     .contains { FileManager.default.fileExists(atPath: $0.value.path) }
@@ -959,7 +973,7 @@ public struct SwiftNativeOnboardingClient: Sendable {
     /// wrote it last — never that onboarding completed. See the `startOnboarding`
     /// comment for why no gate treats it as proof.
     enum UserDocShape: Equatable {
-        /// No file, or unreadable bytes. Nothing to protect, nothing to prove.
+        /// No file. Nothing to protect, nothing to prove.
         case absent
         /// Everything present is explicable as `UserMDGenerator` output: the
         /// autogen body region, autogen/preamble markers, headings, blank
@@ -976,8 +990,12 @@ public struct SwiftNativeOnboardingClient: Sendable {
     /// could plausibly have emitted classifies as `.generatorProjection`, so
     /// the only files that block onboarding are ones with genuinely foreign
     /// bytes in them.
-    static func classifyUserDoc(at path: URL) -> UserDocShape {
-        guard let text = try? String(contentsOf: path, encoding: .utf8) else { return .absent }
+    /// A file that is there but cannot be read throws: unreadable is not absent.
+    static func classifyUserDoc(at path: URL) throws -> UserDocShape {
+        guard FileManager.default.fileExists(atPath: path.path) else { return .absent }
+        let text: String
+        do { text = try String(contentsOf: path, encoding: .utf8) }
+        catch { throw OnboardingError.ioFailure("read \(path.path) failed: \(error.localizedDescription)") }
         // Strip the generator's own body region wholesale. Its contents —
         // heading, memory bullets, blank lines — are a projection of SQLite and
         // say nothing about who onboarded.
@@ -1457,17 +1475,21 @@ public struct SwiftNativeOnboardingClient: Sendable {
         return ProfileUpdatePlan(content: text, baseSHA256: baseSHA256)
     }
 
-    /// Best-effort read of `<dataRoot>/memory/profile.json` → `name` field.
-    /// Mirrors the (now-retired, wave 37 W18) Python `NativeAgentRuntime.onboarding_start`,
-    /// which read `self.root / 'memory' / 'profile.json'` (the daemon data root,
-    /// NOT the persona root). Any IO/parse failure collapses to empty string,
-    /// matching Python's `str(profile.get('name') or '')`.
-    private static func readPersonaName(at path: URL) -> String {
-        guard let data = try? Data(contentsOf: path) else { return "" }
-        guard let any = try? JSONSerialization.jsonObject(with: data),
-              let obj = any as? [String: Any] else { return "" }
-        if let s = obj["name"] as? String { return s }
-        return ""
+    /// `<dataRoot>/memory/profile.json` → `name` (the daemon data root, NOT
+    /// the persona root). No file or no name is empty; a file that cannot be
+    /// read or parsed throws, so the wizard shows why instead of a blank name.
+    private static func readPersonaName(at path: URL) throws -> String {
+        guard FileManager.default.fileExists(atPath: path.path) else { return "" }
+        do {
+            guard let obj = try JSONSerialization.jsonObject(with: Data(contentsOf: path)) as? [String: Any] else {
+                throw OnboardingError.ioFailure("\(path.path) is not a JSON object")
+            }
+            return obj["name"] as? String ?? ""
+        } catch let error as OnboardingError {
+            throw error
+        } catch {
+            throw OnboardingError.ioFailure("read \(path.path) failed: \(error.localizedDescription)")
+        }
     }
 
     /// Byte-for-byte port of the (now-retired, wave 37 W18) Python

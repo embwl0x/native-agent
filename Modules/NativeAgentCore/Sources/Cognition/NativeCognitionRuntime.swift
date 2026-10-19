@@ -436,21 +436,20 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         limit: Int,
         surface: String,
         dataRoot: URL
-    ) async -> [CognitiveRecalledMoment] {
+    ) async -> CognitiveCueRead<[CognitiveRecalledMoment]> {
         let query = feltLine.trimmingCharacters(in: .whitespacesAndNewlines)
         let surface = surface.trimmingCharacters(in: .whitespacesAndNewlines)
         // No surface means no disclosure boundary to check against, and an
         // unchecked recall is precisely what this must never do.
-        guard !query.isEmpty, !surface.isEmpty, limit > 0 else { return [] }
-        let response: MemoryV2RecallResponse
+        guard !query.isEmpty, !surface.isEmpty, limit > 0 else { return CognitiveCueRead([]) }
         do {
-            response = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).recall(
+            let response = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).recall(
                 MemoryV2RecallRequest(
                     text: query, topK: limit, persona: nil, surface: surface))
+            return CognitiveCueRead(response.scored.compactMap { moment(from: $0.record, score: $0.score) })
         } catch {
-            return []
+            return CognitiveCueRead([], unreadable: ["your saved moments (\(error.localizedDescription))"])
         }
-        return response.scored.compactMap { moment(from: $0.record, score: $0.score) }
     }
 
     /// The one mapper, shared by the recall lane and the served-moment lane, so
@@ -585,14 +584,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         await restoreOrganismContinuityIfAvailable()
         await restoreProviderVitalsSnapshot()
         await startApprovalLifecycleObservationIfNeeded()
-        await reconcilePendingApprovalExpectationsAtBootstrap()
-        await restoreProviderLifecycleEvidence()
-        await retireProviderVitalsNotices()
-        await host.archiveSupersededMorningBriefs(dataRoot: dataRoot)
-        // The only awaited Desk replay is launch/bootstrap work, performed in
-        // a detached task so its synchronous JSONL parse never occupies this
-        // actor. All later turns consume the resident projection.
-        await startPursuitRefresh(waitForCompletion: true)
         let wakeAt = now()
         let wakeEvent = CognitiveEvent(
             id: "app-wake:\(Int(wakeAt.timeIntervalSince1970))",
@@ -606,12 +597,24 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         await substrate.observe(wakeEvent)
         await somaticSignalBus.observe(wakeEvent)
         scheduleDirtyMicrocycle(reason: "app_wake_reconciliation")
+        // Bootstrap is her restored state, which every reader joins. The
+        // launch chores publish into that state on their own; no turn waits
+        // for a Desk replay, an inbox sweep or a trace read.
+        Task { await self.bootstrapChores() }
+        // (memoized via bootstrapTask — audit C4)
+    }
+
+    private func bootstrapChores() async {
+        await reconcilePendingApprovalExpectationsAtBootstrap()
+        await restoreProviderLifecycleEvidence()
+        await retireProviderVitalsNotices()
+        await host.archiveSupersededMorningBriefs(dataRoot: dataRoot)
+        await startPursuitRefresh()
         await refreshOrganismBodySchema(reason: "bootstrap")
         await persistOrganismContinuity(reason: "bootstrap")
         await rescheduleResidualRepairDeadline()
         await rescheduleCognitionMaintenanceDeadline()
         publishRuntimeChange(reason: "bootstrap")
-        // (memoized via bootstrapTask — audit C4)
     }
 
     public func changes() -> AsyncStream<NativeCognitionRuntimeChange> {

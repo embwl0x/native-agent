@@ -209,7 +209,6 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if admitted, let diagnostic = error as? Diagnostic {
             return Diagnostic(cause: diagnostic.cause, detail: diagnostic.detail,
                               deadlineExpired: diagnostic.deadlineExpired, admitted: true,
-                              liveFirstOutputCut: diagnostic.liveFirstOutputCut,
                               repair: diagnostic.repair)
         }
         if error is any ProviderFailureWrapping { return error }
@@ -237,15 +236,13 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         public let deadlineExpired: Bool
         /// The provider began a response for this request.
         public let admitted: Bool
-        public let liveFirstOutputCut: Bool
         public let repair: ToolFailureError?
         public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false,
-                    liveFirstOutputCut: Bool = false, repair: ToolFailureError? = nil) {
+                    repair: ToolFailureError? = nil) {
             self.cause = cause
             self.detail = String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
             self.deadlineExpired = deadlineExpired
             self.admitted = admitted
-            self.liveFirstOutputCut = liveFirstOutputCut
             self.repair = repair
         }
         public var errorDescription: String? { repair?.message ?? cause.errorDescription }
@@ -281,7 +278,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
     /// it: it names that owner and its lever and owes repair. An outage, a
     /// limit, a timeout, an empty or unreadable reply or a refusal is the
     /// provider's answer to this request: it owes nothing, and its next call
-    /// shows the model choice. A failure already carrying its repair keeps it.
+    /// shows the model choice. Nothing here proves the Mac healthy, so nothing
+    /// says so. A failure already carrying its repair keeps it.
     public static func repair(_ error: Error, provider: String, model: String, surface: String,
                               dataRoot: URL, id: String, evidence: [Experience.Ref] = []) -> ToolFailureError {
         if let carried = (error as? Diagnostic)?.repair { return carried }
@@ -305,9 +303,15 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                     "\(provider) · \(model): \(detail). \(setting) chooses what \(surface) runs; set it to one this Mac can serve (setting.get \(setting) lists the choices).",
                     effects: .none, owner: "setting " + setting,
                     nextCall: ToolFailureError.call("app", ["action": .string("setting.set"), "args": .object(["setting": .string(setting)])]))
+            case .contextTooLong?:
+                // Full is not a passing outage: asking again sends the same context.
+                return ToolFailureError(
+                    "\(provider) · \(model): the context is full (\(detail)). Asking again sends the same context. Compact this conversation (chat.context_window_mode and chat.compaction_threshold_tokens set where you compact), start a new chat (app chat.new), or choose a model with a larger window in \(group)_model.",
+                    effects: .none,
+                    nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]))
             default:
                 return ToolFailureError(
-                    "\(provider) · \(model) did not answer: \(detail). Nothing on this Mac is broken and nothing is owed: ask again in a moment, or choose another model in \(group)_model.",
+                    "\(provider) · \(model) did not answer: \(detail). Nothing is owed: ask again in a moment, or choose another model in \(group)_model.",
                     effects: .none,
                     nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]))
             }
@@ -317,6 +321,13 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
                 owner: owner, words: failure.message, lever: lever, nextCall: failure.nextCall, tap: failure.tap)
         }
         return failure
+    }
+
+    /// The cause as a string, for a receipt whose wire cannot carry the type.
+    public var encoded: String? { (try? JSONEncoder().encode(self)).map { String(decoding: $0, as: UTF8.self) } }
+
+    public static func decoded(_ encoded: String) -> Self? {
+        try? JSONDecoder().decode(Self.self, from: Data(encoded.utf8))
     }
 
     static func wireError(_ object: [String: Any]) -> Diagnostic {

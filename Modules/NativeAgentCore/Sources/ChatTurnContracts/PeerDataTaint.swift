@@ -31,7 +31,7 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     public convenience init(restoring sources: [String]) {
         self.init()
-        let peers = Array(Set(sources)).sorted()
+        let peers = Array(Set(sources.map(Self.principal))).sorted()
         for peer in peers {
             if Self.ownerTrusts(peer) { self.elevated.append(peer) }
             else { self.sources.append(peer) }
@@ -185,11 +185,22 @@ public final class PeerDataTaint: @unchecked Sendable {
         $0.lowercased().hasPrefix("peer:") || ["another agent", "a remote peer", unrecorded].contains($0.lowercased())
     }
 
+    /// A latch names a who, never a label: whatever locator the body wrote
+    /// (an attested id, a lane, a contact's name) is resolved to the one
+    /// contact it names before it is kept, so the same who read under two
+    /// labels is one principal and the person's grant on it decides.
+    /// Installed by the engine (`PeerTrust`); until then a locator stands.
+    public static var principal: @Sendable (String) -> String {
+        get { hookLock.withLock { principalHook } }
+        set { hookLock.withLock { principalHook = newValue } }
+    }
+    nonisolated(unsafe) private static var principalHook: @Sendable (String) -> String = { $0 }
+
     /// A peer the person elevated retains its identity without taint.
     public func mark(peer: String, line: String = "") {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        let name = trimmed
+        let name = Self.principal(trimmed)
         guard Self.isAgent(name) else { return }
         keep(line: line)
         let trusted = Self.ownerTrusts(name)

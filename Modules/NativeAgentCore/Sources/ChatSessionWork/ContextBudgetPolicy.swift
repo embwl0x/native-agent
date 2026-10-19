@@ -6,7 +6,7 @@ import ProviderRouting
 ///
 /// Sweep R4 lane-A finding #2: every context budget in the assembler was a
 /// hardcoded literal — history 22k chars, memory 5 rows × 1,200, capsule 4k,
-/// ranked packet 6k/24k — while `ProviderRouting.contextLength(forModel:)`
+/// ranked packet 6k/24k — while the provider catalog
 /// already knew the real window (kimi-k3 = 1,048,576 tokens) and had NO
 /// prompt-assembly caller. Net effect: under 1% window utilization on a
 /// million-token model.
@@ -231,10 +231,9 @@ public enum ContextBudgetPolicy {
     /// HER window for a model id — `ChatSessionAutocompactionConfig
     /// .effectiveWindowTokens`, never the model's raw window (User 2026-09-24:
     /// sizing from a 1M window burns tokens for nothing). nil when the id is
-    /// blank or NOT a model this build knows: `ProviderRouting.contextLength`
-    /// answers 128,000 for anything unrecognized — a pessimistic gauge
-    /// default, not a measurement — so an unknown id lands in the floor regime
-    /// rather than be scaled against a guess.
+    /// blank or no catalog row on its route states a window
+    /// (`ProviderRouting.verifiedContextLength`), so an unknown id lands in
+    /// the floor regime rather than be scaled against a guess.
     public static func windowTokens(
         forModel modelID: String?,
         providerID: String? = nil,

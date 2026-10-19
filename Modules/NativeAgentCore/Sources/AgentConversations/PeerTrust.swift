@@ -11,6 +11,7 @@ public enum PeerTrust {
     public static func install(dataRoot: URL) {
         PeerDataTaint.ownerTrusts = { ownerTrusts($0, dataRoot: dataRoot) }
         PeerDataTaint.isAgent = { isAgent($0, dataRoot: dataRoot) }
+        PeerDataTaint.principal = { principal($0, dataRoot: dataRoot) }
         CapabilityLifecycle.turnWriteCheck = { PeerDataTaint.abilityWriteFailure }
         PeerDataTaint.sourceName = { source in
             guard !["another agent", "a remote peer", PeerDataTaint.unrecorded].contains(source) else { return nil }
@@ -35,6 +36,24 @@ public enum PeerTrust {
         if ConversationSurfaceProfile(key).isAgentBridge { return true }
         guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return false }
         return contact(forLane: key, among: peers) != nil || peers.contains { $0.id == key || $0.name.lowercased() == key }
+    }
+
+    /// The one contact a locator names, as its attested id: a peer handle
+    /// stands; a lane or a contact's exact name that the address book resolves
+    /// to exactly one contact becomes `peer:<id>`; anything else stands as
+    /// written and so carries no grant.
+    public static func principal(_ source: String, dataRoot: URL) -> String {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        var key = trimmed.lowercased()
+        guard !key.isEmpty, !key.hasPrefix("peer:"),
+              !["another agent", "a remote peer", PeerDataTaint.unrecorded].contains(key),
+              let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return trimmed }
+        if ConversationSurfaceProfile(key).isAgentBridge {
+            for suffix in ["-bridge", "_bridge"] where key.hasSuffix(suffix) { key = String(key.dropLast(suffix.count)) }
+        }
+        if let door = contact(forLane: key, among: peers) { return "peer:" + door.id }
+        let named = peers.filter { $0.id == key || $0.name.lowercased() == key }
+        return named.count == 1 ? "peer:" + named[0].id : trimmed
     }
 
     /// Names and handles locate a who; only an attested door id carries its grant.

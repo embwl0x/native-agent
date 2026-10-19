@@ -913,6 +913,26 @@ public enum ProcedureCompilationError: Error, Equatable {
     case unsupportedDomain
 }
 
+/// The one domain contract that compilation and stored-artifact validation
+/// both read, so an artifact one boundary accepts the other accepts too.
+struct ProcedureDomainContract {
+    let oracle: ProcedureCanonicalOracle
+    let fallback: ProcedureFallbackRoute
+    let capability: String
+
+    static func named(_ domain: String) -> ProcedureDomainContract? {
+        switch domain {
+        case "github_command":
+            ProcedureDomainContract(oracle: .githubCommandReducer, fallback: .githubCanonicalReducer,
+                                    capability: "github_connector")
+        case "workshop_execution":
+            ProcedureDomainContract(oracle: .workshopRecordAndTimeline, fallback: .ordinaryWorkshopPlannerExecutor,
+                                    capability: "workshop_execution")
+        default: nil
+        }
+    }
+}
+
 public enum DeclarativeProcedureCompiler {
     public static func compile(_ candidate: ProcedureCandidate) throws -> DeclarativeProcedureArtifact {
         guard candidate.manualInvocationEligible else { throw ProcedureCompilationError.candidateNotEligible }
@@ -920,19 +940,7 @@ public enum DeclarativeProcedureCompiler {
               review.candidateEvidenceDigest == candidate.reviewBindingDigest else {
             throw ProcedureCompilationError.missingReviewerApproval
         }
-        let oracle: ProcedureCanonicalOracle
-        let fallback: ProcedureFallbackRoute
-        let trustCapability: String
-        switch candidate.canonicalTrajectory.domain {
-        case "github_command":
-            oracle = .githubCommandReducer
-            fallback = .githubCanonicalReducer
-            trustCapability = "github_connector"
-        case "workshop_execution":
-            oracle = .workshopRecordAndTimeline
-            fallback = .ordinaryWorkshopPlannerExecutor
-            trustCapability = "workshop_execution"
-        default:
+        guard let domain = ProcedureDomainContract.named(candidate.canonicalTrajectory.domain) else {
             throw ProcedureCompilationError.unsupportedDomain
         }
         let trajectory = candidate.canonicalTrajectory
@@ -955,7 +963,7 @@ public enum DeclarativeProcedureCompiler {
         let effects = Array(Set(candidate.sourceTrajectories.flatMap(\.externalEffectClasses))).sorted()
         let approvalOwner = trajectory.authorityClass == "confirm_required" ? "approval_inbox" : nil
         let safety = ProcedureSafetyDeclaration(
-            trustCenterCapability: trustCapability,
+            trustCenterCapability: domain.capability,
             requiredPreconditions: [
                 "authority_class_matches",
                 "canonical_executor_available",
@@ -983,11 +991,11 @@ public enum DeclarativeProcedureCompiler {
                 allowedExternalEffectClasses: effects
             ),
             authorityClass: trajectory.authorityClass,
-            canonicalOracle: oracle,
+            canonicalOracle: domain.oracle,
             transitionTable: table,
             safety: safety,
             deterministicAbandonConditions: candidate.deterministicAbandonConditions,
-            deterministicFallback: fallback,
+            deterministicFallback: domain.fallback,
             rollbackDeclaration: "delete_artifact_restore_fallback_no_data_migration",
             reviewerDecision: review,
             manualInvocationEligible: true,

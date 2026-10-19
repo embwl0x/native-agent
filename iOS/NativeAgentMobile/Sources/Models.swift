@@ -549,45 +549,6 @@ struct TrainingProposalSummary: Decodable, Identifiable, Sendable {
     }
 }
 
-struct PromotionCandidateSummary: Decodable, Identifiable, Sendable {
-    var id: String
-    var title: String
-    var status: String
-    var decision: String?
-    var source: String?
-    var score: Double?
-    var createdAt: String?
-
-    var isHumanActionable: Bool {
-        let normalizedDecision = (decision ?? "").trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        let normalizedSource = (source ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return normalizedDecision == "STAGE_FOR_HUMAN" && normalizedSource != "self_test"
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id, title, status, decision, source, score, createdAt
-        case candidateId = "candidate_id"
-        case summary
-        case createdAtSnake = "created_at"
-    }
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = (try? container.decode(String.self, forKey: .id))
-            ?? (try? container.decode(String.self, forKey: .candidateId))
-            ?? UUID().uuidString
-        title = (try? container.decode(String.self, forKey: .title))
-            ?? (try? container.decode(String.self, forKey: .summary))
-            ?? "Promotion candidate"
-        status = (try? container.decode(String.self, forKey: .status)) ?? "pending"
-        decision = try? container.decode(String.self, forKey: .decision)
-        source = try? container.decode(String.self, forKey: .source)
-        score = try? container.decode(Double.self, forKey: .score)
-        createdAt = (try? container.decode(String.self, forKey: .createdAt))
-            ?? (try? container.decode(String.self, forKey: .createdAtSnake))
-    }
-}
-
 // PATCH-2026-05-07: leftover-1 iOS provider models — mirror of Mac ProviderInfo types
 
 typealias ProviderAuthStatus = NativeAgentShared.ProviderAuthStatus

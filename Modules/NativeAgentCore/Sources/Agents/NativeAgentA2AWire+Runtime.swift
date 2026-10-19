@@ -115,12 +115,17 @@ enum AgentContactRuntime {
         let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
         // One turn at a time in this conversation: a second message waits for
         // the first reply to finish instead of interleaving with it.
+        // The run is minted and registered for Stop here, before the session
+        // queue, and the request pins it, so the enqueued row is that same run.
+        let runID = acceptedMessage?.runId ?? UUID().uuidString
         do {
-            return try await TurnAdmission.shared.run(sessionID: session, waitForCapacity: acceptedMessage != nil) {
+            return try await TurnAdmission.admittedRun(dataRoot: dataRoot, sessionID: session, runID: runID,
+                                                       waitForCapacity: acceptedMessage != nil) {
                 try Task.checkCancellation()
                 let admitted = try revalidated(principal, dataRoot: dataRoot)
-                let acceptedRequest = admitted.turnRequest(context: turn.context, plain: plain,
+                var acceptedRequest = admitted.turnRequest(context: turn.context, plain: plain,
                     attachments: attachments, messageID: turn.requestID)
+                acceptedRequest.pinnedRunID = .some(runID)
                 let enqueued: EnqueuedUserMessage
                 if let accepted = acceptedMessage { enqueued = accepted }
                 else { enqueued = try await acceptedRequest.enqueue(on: client) }
@@ -164,7 +169,8 @@ enum AgentContactRuntime {
                                 }
                             }
                         } catch {
-                            execution.cancel()
+                            // Stop is the turn's one cancel link: the run's flag.
+                            if Task.isCancelled { try? await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session) }
                             await execution.waitForProducerTermination()
                             throw ProviderFailure.report(error, work: ranPartly ? .ranPartly : nil) ?? error
                         }
@@ -181,11 +187,12 @@ enum AgentContactRuntime {
                         let state: AgentContactTaskState = waiting ? .inputRequired : (final.completionState == .incomplete ? .failed : .completed)
                         return AgentContactOutcome(state: state, parts: parts,
                             detail: state == .failed ? "The work did not finish" : nil)
-                    } onCancel: { execution.cancel() }
+                    } onCancel: { Task { try? await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session) } }
                     await MainActor.run {
                         NotificationCenter.default.post(name: .chatTurnCompleted, object: session)
                     }
-                    await client.drainDeferredMemoryPromotion()
+                    // A started memory promotion finishes on its own; the reply
+                    // and the session's next turn never wait for it.
                     return outcome
                 }
             }

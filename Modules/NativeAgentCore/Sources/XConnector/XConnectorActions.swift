@@ -895,6 +895,57 @@ public enum XConnectorActions {
         return trimmed.isEmpty ? nil : (trimmed, nonblank(root["client_secret"] as? String))
     }
 
+    /// Where the connector's route is declared: `auth_route` in its saved app
+    /// configuration, "oauth1" or "oauth2" (absent means oauth2).
+    public static func authRouteConfigPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
+        dataRoot.appendingPathComponent("connectors/x/oauth_app.json")
+    }
+
+    /// The declared route. A configuration that declares none is migrated
+    /// once from the saved credentials (OAuth1 credentials and no OAuth2
+    /// token: oauth1; otherwise oauth2) and the answer is written in as the
+    /// declaration. A value that is neither route, an OAuth1 file that is there
+    /// but cannot be read, or a failed write, throws: a damaged credential is
+    /// never an absent one that declares oauth2.
+    public static func declaredAuthRoute(dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> String {
+        let path = authRouteConfigPath(dataRoot: dataRoot)
+        var config: [String: Any] = [:]
+        if FileManager.default.fileExists(atPath: path.path) {
+            guard let saved = try JSONSerialization.jsonObject(with: ConnectorCredentialFile.read(at: path)) as? [String: Any] else {
+                throw XActionError("invalid_auth_route", detail: "\(path.path) is not a JSON object.")
+            }
+            config = saved
+        }
+        if let route = config["auth_route"] {
+            guard let route = route as? String, ["oauth1", "oauth2"].contains(route) else {
+                throw XActionError("invalid_auth_route", detail: "\(path.path) declares an auth_route that is neither oauth1 nor oauth2.")
+            }
+            return route
+        }
+        // Only a confirmed not-found is absent: a credential that cannot be
+        // looked at refuses here and declares nothing.
+        func present(_ file: URL) throws -> Bool {
+            do { _ = try FileManager.default.attributesOfItem(atPath: file.path); return true }
+            catch let error as CocoaError where error.code == .fileReadNoSuchFile { return false }
+            catch {
+                throw XActionError("unreadable_x_credentials", detail: "\(file.path) could not be looked at "
+                    + "(\(error.localizedDescription)), so no auth_route was declared.")
+            }
+        }
+        let hasOAuth2 = try present(oauth2TokenPath(dataRoot: dataRoot))
+        let hasOAuth1 = try present(oauth1SecretsPath())
+        if hasOAuth1 && !hasOAuth2 {
+            do { _ = try loadOAuth1Credentials() } catch {
+                throw XActionError("invalid_oauth1_credentials", detail: "\(oauth1SecretsPath().path) could not be read "
+                    + "(\(error.localizedDescription)), so no auth_route was declared.")
+            }
+        }
+        let route = hasOAuth1 && !hasOAuth2 ? "oauth1" : "oauth2"
+        config["auth_route"] = route
+        try ConnectorCredentialFile.write(JSONSerialization.data(withJSONObject: config, options: [.sortedKeys]), to: path)
+        return route
+    }
+
     /// Shared by the authorization-code exchange and refresh. Public clients
     /// omit this header; confidential clients authenticate the same way on both.
     public static func oauthClientAuthorization(clientID: String, clientSecret: String?) -> String? {

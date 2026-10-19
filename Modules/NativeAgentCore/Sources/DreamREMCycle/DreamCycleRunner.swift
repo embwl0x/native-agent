@@ -165,12 +165,19 @@ public actor DreamCycleRunner {
         // a 150-message day reflects on exactly those 150 and never re-reads what
         // a prior dream already covered. First-ever run (no mark) — and every
         // `force` run — falls back to `now - recencyWindow` (the last day) rather
-        // than all of history.
-        let mark: Date = force
-            ? now().addingTimeInterval(-recencyWindow)
-            : (readDreamMark() ?? now().addingTimeInterval(-recencyWindow))
-
+        // than all of history. An unreadable mark is not a first run: the
+        // dream stops and names the file instead of re-reading or skipping.
         var report = DreamReport(trigger: trigger)
+        let mark: Date
+        do {
+            mark = force
+                ? now().addingTimeInterval(-recencyWindow)
+                : (try readDreamMark() ?? now().addingTimeInterval(-recencyWindow))
+        } catch {
+            report.errors.append("dream high-water mark \(dreamMarkPath().path) is unreadable (\(error)); "
+                + "repair its lastDreamedAt or remove it to restart from the last day")
+            return report
+        }
         let feltOrigins: [DreamFeltOrigin]
         do {
             feltOrigins = try await feltOriginProvider()
@@ -369,27 +376,30 @@ public actor DreamCycleRunner {
         // was spent without ever being felt, and no retry could ever reclaim
         // it. The dream's own date key goes to the sink so the residue is
         // claimed against THIS night rather than whichever marker sorts last.
-        await integrateMoodIfClaimed(
+        await integrateMood(
             affect: payload.affect, in: diaryDir, dateKey: dateKey)
         return report
     }
 
-    /// Take the day's claim and deliver the mood, releasing the claim when the
-    /// sink says the integration is not durable. One place, because the
-    /// `already_dreamt` path below retries through it too.
-    private func integrateMoodIfClaimed(
+    /// The marker records a confirmed integration only: the substrate's own
+    /// per-night claims make a repeated delivery harmless, so a crash before
+    /// the effect leaves the night retryable. The `already_dreamt` path retries here too.
+    private func integrateMood(
         affect: Double?,
         in diaryDir: URL,
         dateKey: String
     ) async {
-        guard let affect, let datedMoodSink,
-              claimMoodIntegration(in: diaryDir, dateKey: dateKey) else { return }
-        if await datedMoodSink(affect, dateKey) { return }
-        releaseMoodIntegrationClaim(in: diaryDir, dateKey: dateKey)
-        FileHandle.standardError.write(Data(
-            ("DreamCycleRunner: mood integration for \(dateKey) did not persist; "
-             + "claim released so a later run can retry it\n").utf8
-        ))
+        let integrated = diaryDir.appendingPathComponent(".mood_integrated_\(dateKey)")
+        guard let affect, let datedMoodSink, !fm.fileExists(atPath: integrated.path) else { return }
+        guard await datedMoodSink(affect, dateKey) else {
+            FileHandle.standardError.write(Data(
+                "DreamCycleRunner: mood integration for \(dateKey) did not persist; a later run retries it\n".utf8))
+            return
+        }
+        do { try Data().write(to: integrated, options: .atomic) } catch {
+            FileHandle.standardError.write(Data(
+                "DreamCycleRunner: mood for \(dateKey) integrated, marker not written (\(error)); a later run re-delivers it harmlessly\n".utf8))
+        }
     }
 
     /// Retry an unclaimed night from the entry already on disk. Claiming is
@@ -402,7 +412,7 @@ public actor DreamCycleRunner {
     ) async {
         guard let markdown = try? String(contentsOf: entry, encoding: .utf8),
               let affect = Self.affectJudgment(inDiaryMarkdown: markdown) else { return }
-        await integrateMoodIfClaimed(affect: affect, in: diaryDir, dateKey: dateKey)
+        await integrateMood(affect: affect, in: diaryDir, dateKey: dateKey)
     }
 
     /// Retry only a recorded judgment; older prose is never reinterpreted.
@@ -416,24 +426,6 @@ public actor DreamCycleRunner {
             return value
         }
         return nil
-    }
-
-    /// Exclusive-create claim marker beside the diary entry. Returns true for
-    /// exactly one caller per date; `.withoutOverwriting` makes the create
-    /// atomic so concurrent runners cannot both win.
-    private func claimMoodIntegration(in diaryDir: URL, dateKey: String) -> Bool {
-        let claim = diaryDir.appendingPathComponent(".mood_integrated_\(dateKey)")
-        do {
-            try Data().write(to: claim, options: [.withoutOverwriting])
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    /// Undo the claim above when the integration it guarded did not land.
-    private func releaseMoodIntegrationClaim(in diaryDir: URL, dateKey: String) {
-        try? fm.removeItem(at: diaryDir.appendingPathComponent(".mood_integrated_\(dateKey)"))
     }
 
     // MARK: - Helpers
@@ -456,13 +448,16 @@ public actor DreamCycleRunner {
     }
 
     /// The createdAt of the newest message the last dream consumed. nil → no
-    /// dream has run yet (caller falls back to `now - recencyWindow`).
-    private func readDreamMark() -> Date? {
-        guard let data = try? Data(contentsOf: dreamMarkPath()),
-              let parsed = try? JSONValue.parse(data),
-              case .object(let o) = parsed,
-              case .string(let s)? = o["lastDreamedAt"] else { return nil }
-        return Self.parseDaemonISO(s)
+    /// dream has run yet (caller falls back to `now - recencyWindow`); a mark
+    /// that exists but cannot be read throws.
+    private func readDreamMark() throws -> Date? {
+        guard fm.fileExists(atPath: dreamMarkPath().path) else { return nil }
+        guard case .object(let o) = try JSONValue.parse(Data(contentsOf: dreamMarkPath())),
+              case .string(let s)? = o["lastDreamedAt"],
+              let mark = Self.parseDaemonISO(s) else {
+            throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: dreamMarkPath().path])
+        }
+        return mark
     }
 
     /// Never regress the mark, so a re-run/force cannot return already-dreamed
@@ -470,7 +465,7 @@ public actor DreamCycleRunner {
     private func advanceDreamMark(to date: Date) throws {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let existing = readDreamMark()
+        let existing = try readDreamMark()
         let mark = (existing.map { max($0, date) }) ?? date
         let body = JSONValue.object([
             "lastDreamedAt": .string(iso.string(from: mark)),

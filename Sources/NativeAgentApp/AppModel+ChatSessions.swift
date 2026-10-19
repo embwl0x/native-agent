@@ -276,11 +276,10 @@ extension AppModel: MacChatSessionSelectionPort {
             async let nextWorkflows = try? SwiftNativeWorkflowOrchestrationClient(root: engine.dataRoot).listWorkflowRecords()
             async let nextMCPServers = try? engine.tools.mcp.listServers()
             // The compact MCP Builder is mounted in Capabilities too. Its
-            // server controls render live session and consent evidence, so
-            // refresh all three authorities together rather than leaving
-            // those rows stale/empty until someone opens the separate MCP tab.
+            // server controls render live session evidence, so refresh both
+            // together rather than leaving those rows stale/empty until
+            // someone opens the separate MCP tab.
             async let nextMCPSessions = try? engine.tools.listMCPSessions()
-            async let nextMCPConsent = try? engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)
             // Native macOS Power is part of the Capabilities hardening view.
             // Refresh each live tile and action registry here so that view
             // never inherits a stale launch snapshot from another surface.
@@ -308,7 +307,6 @@ extension AppModel: MacChatSessionSelectionPort {
                 workflowRows,
                 mcpRows,
                 mcpSessionRows,
-                mcpConsentRows,
                 notificationStatusRow,
                 browserRuntimeStatusRow,
                 memoryVectorStatusRow,
@@ -330,7 +328,6 @@ extension AppModel: MacChatSessionSelectionPort {
                 nextWorkflows,
                 nextMCPServers,
                 nextMCPSessions,
-                nextMCPConsent,
                 nextNotificationStatus,
                 nextBrowserRuntimeStatus,
                 nextMemoryVectorStatus,
@@ -352,7 +349,6 @@ extension AppModel: MacChatSessionSelectionPort {
             workflows = fresh("workflows", workflowRows) ?? workflows
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
             engine.tools.mcpSessions = fresh("mcp sessions", mcpSessionRows) ?? engine.tools.mcpSessions
-            mcpConsent = fresh("mcp consent", mcpConsentRows) ?? mcpConsent
             notificationStatus = fresh("notification status", notificationStatusRow) ?? notificationStatus
             browserRuntimeStatus = fresh("browser status", browserRuntimeStatusRow) ?? browserRuntimeStatus
             memoryVectorStatus = fresh("memory vector status", memoryVectorStatusRow) ?? memoryVectorStatus
@@ -494,11 +490,9 @@ extension AppModel: MacChatSessionSelectionPort {
         case .mcp:
             async let nextMCPServers = try? engine.tools.mcp.listServers()
             async let nextMCPSessions = try? engine.tools.listMCPSessions()
-            async let nextMCPConsent = try? engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent)
-            let (mcpRows, sessionRows, consentRows) = await (nextMCPServers, nextMCPSessions, nextMCPConsent)
+            let (mcpRows, sessionRows) = await (nextMCPServers, nextMCPSessions)
             mcpServers = fresh("mcp servers", mcpRows) ?? mcpServers
             engine.tools.mcpSessions = fresh("mcp sessions", sessionRows) ?? engine.tools.mcpSessions
-            mcpConsent = fresh("mcp consent", consentRows) ?? mcpConsent
             // gpt-5.5 review: clear stale inventories when selection becomes
             // invalid OR the server list is empty. Without this, the UI shows
             // the old server's tools under the new server's name after the

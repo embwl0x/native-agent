@@ -14,7 +14,6 @@ import MemoryV2
 import Cognition
 import SwiftUI
 import Context
-import MemoryV2
 import TrustCenter
 
 struct SetupFeatureRows<InnerLife: View>: View {

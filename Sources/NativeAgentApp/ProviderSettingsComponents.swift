@@ -26,7 +26,7 @@ struct ProviderRowView: View {
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
             Spacer(minLength: 8)
-            if let status = statusWord(provider.auth_status.state) {
+            if let status = ProviderStatusWord.word(for: provider.auth_status.state) {
                 ProviderStatusWord(text: status.text, kind: status.kind)
             }
             Button("Set up") {
@@ -50,15 +50,6 @@ struct ProviderRowView: View {
         case "kimi-code":         return "curlybraces"
         case "openai":            return "cpu"
         default:                  return "server.rack"
-        }
-    }
-
-    /// A row nobody has set up yet just offers Set up — no warning word.
-    private func statusWord(_ state: String) -> (text: String, kind: String)? {
-        switch state {
-        case "ready": return ("Ready", "ok")
-        case "error": return ("Not working", "error")
-        default:      return nil
         }
     }
 }
@@ -212,7 +203,7 @@ struct ProviderConfigSheet: View {
         ProvidersFacade.authModePickerState(
             advertisedModes: savedProvider.auth_modes,
             savedMode: savedProvider.auth_mode,
-            providerIsReady: savedProvider.auth_status.state == "ready"
+            providerIsReady: savedProvider.auth_status.eligible
         )
     }
 
@@ -252,10 +243,8 @@ struct ProviderConfigSheet: View {
                     if let badge = verification.badge {
                         ProviderStatusWord(text: badge.text, kind: badge.status)
                     } else {
-                        ProviderStatusWord(
-                            text: provider.auth_status.state == "ready" ? "Ready" : "Not set up",
-                            kind: provider.auth_status.state == "ready" ? "ok" : "warn"
-                        )
+                        let word = ProviderStatusWord.word(for: provider.auth_status.state) ?? ("Not set up", "warn")
+                        ProviderStatusWord(text: word.text, kind: word.kind)
                     }
                 }
                 Spacer(minLength: 8)
@@ -869,6 +858,18 @@ struct ProviderStatusWord: View {
             .font(ShellType.captionSemibold)
             .foregroundStyle(color)
             .lineLimit(1)
+    }
+
+    /// The account's state word: checked, saved, could not check, rejected. A
+    /// row nobody has set up yet has none and just offers Set up.
+    static func word(for state: String) -> (text: String, kind: String)? {
+        switch state {
+        case "ready": ("Ready", "ok")
+        case "saved": ("Saved, not yet checked", "warn")
+        case "failed": ("Could not check", "warn")
+        case "rejected": ("Key rejected", "error")
+        default: nil
+        }
     }
 
     private var color: Color {

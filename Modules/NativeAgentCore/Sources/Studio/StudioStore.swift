@@ -735,6 +735,9 @@ public struct StudioRecallResult: Sendable, Equatable {
     /// The corrections file was damaged on this read, so an entry here may be
     /// showing a claim that has already been corrected. Never false by omission.
     public var correctionsUnreadable: Bool = false
+    /// Journal history this read could not see (unreadable archives, damaged
+    /// or undecodable lines). Matches and counts cover only what was read.
+    public var historyUnreadable: [String] = []
 }
 
 // MARK: - Encounter intake
@@ -1149,13 +1152,18 @@ public struct SwiftNativeStudioStore: Sendable {
     /// — a few entries a week, not telemetry — so reading it whole is honest and
     /// cheap; `recall` is what bounds what a caller sees.
     public func readJournal() async throws -> [StudioJournalEntry] {
-        await applyAmendments(try await rawJournalEntries())
+        await applyAmendments(try await rawJournalEntries(path: journalPath).entries)
     }
 
-    private func rawJournalEntries() async throws -> [StudioJournalEntry] {
-        guard FileManager.default.fileExists(atPath: journalPath.path) else { return [] }
-        let rows = try await persistence.readJSONL(journalPath)
-        return rows.compactMap { StudioJournalEntry.fromJSON($0) }
+    /// Usable entries and the holes beside them: damaged lines and rows this
+    /// build cannot decode are counted, never silently absent.
+    private func rawJournalEntries(path: URL) async throws -> (entries: [StudioJournalEntry], holes: [String]) {
+        let (rows, report) = try await persistence.readJSONLReporting(path)
+        let entries = rows.compactMap { StudioJournalEntry.fromJSON($0) }
+        let lost = report.malformedLineCount + rows.count - entries.count
+        var holes = lost > 0 ? ["\(path.lastPathComponent): \(lost) line(s) could not be read as entries"] : []
+        if report.trailingPartialLine { holes.append("\(path.lastPathComponent): its last line is torn (a write that had not landed whole)") }
+        return (entries, holes)
     }
 
     // MARK: Amendments (0.4.14)
@@ -1325,20 +1333,24 @@ public struct SwiftNativeStudioStore: Sendable {
     /// happened. The combined reader projects corrections after deduplication.
     ///
     /// A shelf file this build cannot read is skipped rather than thrown: the
-    /// shelf deliberately holds bytes a future build may not decode, and the
-    /// cost of skipping is a re-offer, never a loss.
-    private func archivedJournalEntries() async -> [StudioJournalEntry] {
-        guard let paths = try? journalArchivePaths(), !paths.isEmpty else { return [] }
-        var out: [StudioJournalEntry] = []
-        for path in paths {
-            guard let rows = try? await persistence.readJSONL(path) else {
-                nativeLog("%@: journal archive %@ could not be read — skipped",
-                      Self.logLabel, path.lastPathComponent)
-                continue
-            }
-            out.append(contentsOf: rows.compactMap { StudioJournalEntry.fromJSON($0) })
+    /// shelf deliberately holds bytes a future build may not decode. Skipping
+    /// is named as a hole, so the read never claims history it did not see.
+    private func archivedJournalEntries() async -> (entries: [StudioJournalEntry], holes: [String]) {
+        let paths: [URL]
+        do { paths = try journalArchivePaths() } catch {
+            return ([], ["journal archive could not be listed: \(error.localizedDescription)"])
         }
-        return out
+        var out: [StudioJournalEntry] = [], holes: [String] = []
+        for path in paths {
+            do {
+                let read = try await rawJournalEntries(path: path)
+                out += read.entries
+                holes += read.holes
+            } catch {
+                holes.append("\(path.lastPathComponent) could not be read: \(error.localizedDescription)")
+            }
+        }
+        return (out, holes)
     }
 
     /// Every journal entry that still exists — the shelf in age order, then the
@@ -1353,13 +1365,31 @@ public struct SwiftNativeStudioStore: Sendable {
     /// trimmed lines in neither half — the exact entries the shelf exists to
     /// keep readable.
     public func journalEntriesIncludingArchive() async throws -> [StudioJournalEntry] {
+        try await journalHistory().entries
+    }
+
+    /// The whole history with its holes. Anything that concludes absence
+    /// ("never answered", "no match") reads this, not the entries alone.
+    public func journalHistory() async throws -> (entries: [StudioJournalEntry], holes: [String]) {
         try await persistence.withFileLock(journalPath) {
-            let entries = await self.archivedJournalEntries() + (try await self.rawJournalEntries())
+            let archive = await self.archivedJournalEntries()
+            let hot = try await self.rawJournalEntries(path: self.journalPath)
             // A crash after archiving but before trimming leaves the same entry
             // in both files. It is still one encounter, with one correction view.
             var seen = Set<String>()
-            return await self.applyAmendments(entries.filter { seen.insert($0.id).inserted })
+            let entries = await self.applyAmendments((archive.entries + hot.entries).filter { seen.insert($0.id).inserted })
+            return (entries, archive.holes + hot.holes)
         }
+    }
+
+    /// Absence cannot be concluded over holes in the history.
+    private func completeJournalHistory(for claim: String) async throws -> [StudioJournalEntry] {
+        let history = try await journalHistory()
+        guard history.holes.isEmpty else {
+            throw PersistenceCoreError.ioFailure("\(claim) needs the whole journal, and part of it is unreadable: "
+                + history.holes.joined(separator: "; "))
+        }
+        return history.entries
     }
 
     // MARK: Encounter intake
@@ -1379,7 +1409,7 @@ public struct SwiftNativeStudioStore: Sendable {
         // 2026-09-06: hot PLUS shelf — an archived entry answered its consult
         // just as much as a hot one, and reading only the hot file re-offered
         // encounters that had already been had.
-        let entries = try await journalEntriesIncludingArchive()
+        let entries = try await completeJournalHistory(for: "Which consults were never answered")
         let answeredConsultIDs = Set(entries.compactMap { $0.origin.ref })
         let journaledRefs = Set(entries.flatMap(\.artifactRefs))
 
@@ -1413,7 +1443,7 @@ public struct SwiftNativeStudioStore: Sendable {
     /// because a DIFFERENT work by a different creator happened to share its
     /// title, so the encounter she had never had was never offered.
     public func journaledWorkIdentities() async throws -> Set<String> {
-        Set(try await journalEntriesIncludingArchive().map {
+        Set(try await completeJournalHistory(for: "Which works were never journaled").map {
             Self.journaledWorkIdentity(title: $0.work.title, creator: $0.work.creator)
         })
     }
@@ -1447,14 +1477,15 @@ public struct SwiftNativeStudioStore: Sendable {
         // 2026-09-06: the shelf is read too. `query.limit` still bounds what
         // comes back, and the hot entries are newer so they still come first —
         // an entry that overflowed simply stops being unfindable.
-        let entries = try await journalEntriesIncludingArchive()
+        let (entries, holes) = try await journalHistory()
         let matches = entries.reversed().filter { Self.matches($0, query) }
         let bounded = Array(matches.prefix(query.limit))
         return StudioRecallResult(
             entries: bounded,
             matchedCount: matches.count,
             hasMore: matches.count > bounded.count,
-            correctionsUnreadable: entries.contains(where: \.correctionsUnreadable)
+            correctionsUnreadable: entries.contains(where: \.correctionsUnreadable),
+            historyUnreadable: holes
         )
     }
 

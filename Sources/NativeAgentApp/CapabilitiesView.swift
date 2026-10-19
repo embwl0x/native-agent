@@ -3,7 +3,6 @@ import SelfImprovement
 import Foundation
 import SystemOps
 import ToolRegistry
-import EngineRuntime
 import Research
 import SwiftUI
 import TrustCenter

@@ -51,6 +51,11 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
     /// to the judgment she actually wrote instead of standing as an unsourced
     /// assertion in the graph.
     public let journalEntryIDs: [String]
+    /// The memory that last asserted this edge (`last_memory_id`); nil for an
+    /// edge no memory wrote. The projection checks its disclosure and tracks it.
+    public let memoryID: String?
+    /// That memory's version (`updated_at`) when the edge was read.
+    public let memoryVersion: String?
 
     public init(
         subjectID: String,
@@ -62,7 +67,9 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
         mentionCount: Int,
         lastSeen: String?,
         provenance: String? = nil,
-        journalEntryIDs: [String] = []
+        journalEntryIDs: [String] = [],
+        memoryID: String? = nil,
+        memoryVersion: String? = nil
     ) {
         self.subjectID = subjectID
         self.subject = subject
@@ -74,6 +81,8 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
         self.lastSeen = lastSeen
         self.provenance = provenance
         self.journalEntryIDs = journalEntryIDs
+        self.memoryID = memoryID
+        self.memoryVersion = memoryVersion
     }
 }
 
@@ -120,7 +129,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     ef.name AS from_name, et.name AS to_name,
                     ef.last_seen AS from_seen, et.last_seen AS to_seen,
                     r.provenance AS provenance,
-                    json_extract(r.metadata_json, '$.studio_entry_ids') AS studio_entry_ids
+                    json_extract(r.metadata_json, '$.studio_entry_ids') AS studio_entry_ids,
+                    json_extract(r.metadata_json, '$.last_memory_id') AS memory_id,
+                    (SELECT COALESCE(m.updated_at, m.created_at) FROM memories m
+                     WHERE m.id = json_extract(r.metadata_json, '$.last_memory_id')) AS memory_version
                 FROM kg_relationships r
                 JOIN kg_entities ef ON ef.id = r.from_id
                 JOIN kg_entities et ON et.id = r.to_id
@@ -169,7 +181,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
                         let value = Self.trimmed(row["provenance"])
                         return value.isEmpty ? nil : value
                     }(),
-                    journalEntryIDs: Array(Self.studioEntryIDs(row["studio_entry_ids"]).prefix(24))
+                    journalEntryIDs: Array(Self.studioEntryIDs(row["studio_entry_ids"]).prefix(24)),
+                    memoryID: {
+                        let value = Self.trimmed(row["memory_id"])
+                        return value.isEmpty ? nil : value
+                    }(),
+                    memoryVersion: row["memory_version"]
                 ))
             }
             return result

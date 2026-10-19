@@ -16,13 +16,10 @@ extension SecurityToolEnvelope {
             "autonomy_level": .string(autonomyLevel),
             "autonomy_reason": autonomyReason.map(JSONValue.string) ?? .null,
             "remedy": remedy ?? .null,
-            "signed_tool_known": .bool(signedToolKnown),
-            "rollback_required": .bool(rollbackRequired),
             "decision": .string(decision.rawValue),
             "allowed": .bool(allowed),
             "requires_approval": .bool(requiresApproval),
             "reasons": .array(reasons.map { .string($0.persistedValue) }),
-            "untrusted_input_keys": .array(untrustedInputKeys.map { .string($0) }),
             "input_preview": redactedInputPreview,
         ])
     }

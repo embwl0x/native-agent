@@ -100,18 +100,64 @@ public struct MemoryEmbeddingBatch: Sendable, Equatable {
 extension SwiftNativeMemoryV2 {
     @discardableResult
     public func reconcileEmbeddingEpochAtLaunch() async -> Bool {
+        await requestEmbeddingEpochReconcile().value
+    }
+
+    /// One housekeeping flight converges the corpus for launch, model install
+    /// and recall (which never waits); a request mid-pass earns one more pass.
+    @discardableResult
+    func requestEmbeddingEpochReconcile() -> Task<Bool, Never> {
+        embeddingEpochDirty = true
+        if let flight = embeddingEpochReconcile { return flight }
+        let flight = Task(priority: .utility) { () -> Bool in
+            defer { embeddingEpochReconcile = nil }
+            var converged = false
+            while embeddingEpochDirty {
+                embeddingEpochDirty = false
+                converged = await convergeEmbeddingEpoch()
+            }
+            return converged
+        }
+        embeddingEpochReconcile = flight
+        return flight
+    }
+
+    /// Rows written while the model was cold get their vectors here, each
+    /// through the checks a warm write passes (`landOwedVector`).
+    private func fillOwedMemoryVectors() async throws {
+        guard let embedder, let bridge = storage else { throw MemoryV2Error.storageUnavailable }
+        let disk = await bridge.underlyingStorage()
+        while true {
+            let owed = try await disk.memoriesOwingVectors(limit: 32)
+            guard !owed.isEmpty else { return }
+            let batch = try await embedder.embedWithEpoch(owed.map(\.content))
+            guard batch.vectors.count == owed.count else {
+                throw MemoryV2Error.underlying("embedder returned \(batch.vectors.count)/\(owed.count) owed vectors")
+            }
+            var moved = 0
+            for (row, vector) in zip(owed, batch.vectors) where !vector.isEmpty {
+                let outcome = try await disk.landOwedVector(id: row.id, content: row.content, vector: vector, epoch: batch.epoch)
+                if case .archived(let reason) = outcome { nativeLog("[memory-epoch] archived %@: %@", row.id, reason) }
+                if case .superseded = outcome { continue }
+                moved += 1
+            }
+            // Nothing moved: newer writes own these rows; their own request fills them.
+            guard moved > 0 else { return }
+        }
+    }
+
+    private func convergeEmbeddingEpoch() async -> Bool {
         do {
+            try await warmUpEmbedder()
             let state = try await memoryEmbeddingEpochState()
             guard let providerEpoch = embeddingEpoch() else {
                 return false
             }
-            guard state.activeEpoch != providerEpoch.rawValue else {
-                return true
+            if state.activeEpoch != providerEpoch.rawValue,
+               let report = try await reconcileMemoryEmbeddingEpoch() {
+                nativeLog("[memory-epoch] activated %@ across %d canonical rows", report.epoch, report.total)
             }
-            guard let report = try await reconcileMemoryEmbeddingEpoch() else {
-                return true
-            }
-            nativeLog("[memory-epoch] activated %@ across %d canonical rows", report.epoch, report.total)
+            try await fillOwedMemoryVectors()
             return true
         } catch {
             nativeLog("[memory-epoch] activation failed; prior corpus retained: %@", String(describing: error))

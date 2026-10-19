@@ -97,16 +97,6 @@ public actor MemoryStorage {
         }
     }
 
-    /// Wait through every projection scheduled before this call. New canonical
-    /// mutations may enqueue later work while the actor is suspended; those
-    /// belong to a later flush boundary.
-    func flushProjectionHooks() async {
-        let spotlight = spotlightProjectionTail
-        let knowledgeGraph = knowledgeGraphProjectionTail
-        await spotlight?.value
-        await knowledgeGraph?.value
-    }
-
     private func pokeDerivedState(_ stored: StoredMemory, deleted: Bool) async {
         let change = DerivedSourceChange(
             namespace: "memory-v2",
@@ -342,83 +332,14 @@ public actor MemoryStorage {
         let memory = stamped
         let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory]) in
             try Self.requireNotTombstoned(memory, in: db)
-            let incoming = MemoryRecord(stored: memory)
-            let scope = MemoryRecordDisclosurePolicy.classify(incoming)
             let rows = try Row.fetchAll(db, sql: """
                 SELECT * FROM memories WHERE status = 'active'
                     AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
                     AND (? = 0 OR id = ?)
                 ORDER BY rowid
             """, arguments: [preserveID, memory.id]).map(Self.decodeMemory)
-            let key = MemoryConsolidator.normalizedContentKey(memory.content)
-            var duplicate = rows.sorted { $0.createdAt > $1.createdAt }.first {
-                scope != nil && MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0)) == scope
-                    && MemoryConsolidator.normalizedContentKey($0.content) == key
-            }
-            if duplicate == nil, MemoryRecallScoring.kind(of: memory.metadata) != "correction",
-               let vector = memory.embedding, let epoch = memory.embeddingEpoch, !epoch.isEmpty {
-                let activeEpoch = try Self.embeddingEpochState(in: db).activeEpoch
-                if activeEpoch == nil || activeEpoch == epoch {
-                    let nearest = rows.filter { $0.embeddingEpoch == epoch && $0.embedding != nil }
-                        .map { (row: $0, cosine: VectorMath.cosine(vector, $0.embedding)) }
-                        .max { $0.cosine < $1.cosine }
-                    if let nearest, nearest.cosine >= MemoryManagerLane.duplicateSimilarity,
-                       MemoryRecallScoring.kind(of: nearest.row.metadata) != "correction",
-                       scope != nil,
-                       MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: nearest.row)) == scope,
-                       MemorySemanticDuplicateGuard.sameQuantityAndNegation(nearest.row.content, memory.content),
-                       let created = MemoryRecallScoring.parseTimestamp(nearest.row.createdAt),
-                       Date().timeIntervalSince(created) < 24 * 3600 {
-                        duplicate = nearest.row
-                    }
-                }
-            }
-            if var row = duplicate {
-                if memory.embedding == nil {
-                    try Self.requireNotTombstoned(row, in: db)
-                }
-                var metadata: [String: JSONValue] = [:]
-                if case .object(let existing)? = row.metadata { metadata = existing }
-                var count: Int64 = 0
-                if case .int(let value)? = metadata["recall_count"] { count = value }
-                if case .double(let value)? = metadata["recall_count"] {
-                    guard let value = Int64(exactly: value.rounded(.towardZero)) else {
-                        throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count is outside Int64 range")
-                    }
-                    count = value
-                }
-                let (next, overflow) = count.addingReportingOverflow(1)
-                guard !overflow else {
-                    throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count overflow")
-                }
-                var patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
-                    existing: MemoryRecord(stored: row), newSource: memory.source, newMetadata: memory.metadata)
-                // Explicit scope replaces scope only on the same text, never
-                // on a merely similar record. Omission retains the old scope.
-                if MemoryConsolidator.normalizedContentKey(row.content) == key,
-                   case .object(let incoming)? = memory.metadata,
-                   case .array(let topics)? = incoming["context_topics"], !topics.isEmpty {
-                    patch["context_topics"] = .array(topics)
-                }
-                for (key, value) in patch {
-                    if key == "observed_at", case .string(let observed) = value {
-                        row.observedAt = observed
-                    } else {
-                        metadata[key] = value
-                    }
-                }
-                metadata["recall_count"] = .int(next)
-                row.metadata = MemoryDataProvenance.preserving(
-                    existing: memory.metadata, incoming: .object(metadata))
-                row.updatedAt = Self.nowISO8601()
-                try Self.validateTemporalEvidence(row)
-                try db.execute(sql: """
-                    UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?
-                """, arguments: [Self.encodeMetadata(row.metadata), row.observedAt, row.updatedAt, row.id])
-                guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [row.id]).map(Self.decodeMemory) else {
-                    throw MemoryStorageError.databaseUnavailable("committed memory is missing")
-                }
-                return (saved, [])
+            if let row = try Self.admissionDuplicate(of: memory, among: rows, in: db) {
+                return (try Self.foldDuplicate(memory, into: row, in: db), [])
             }
             guard insertIfMissing else { return (nil, []) }
             try Self.validateTemporalEvidence(memory)
@@ -437,6 +358,120 @@ public actor MemoryStorage {
         }
         await handleBoundEvictions(result.1, reason: "insert")
         return result.0
+    }
+
+    /// Admission's duplicate rule, shared by a warm write and an owed vector
+    /// landing: the same text in the same scope, or (with a vector) a recent
+    /// near-paraphrase in the same scope that is not a correction.
+    static func admissionDuplicate(of memory: StoredMemory, among rows: [StoredMemory],
+                                   in db: Database) throws -> StoredMemory? {
+        let incoming = MemoryRecord(stored: memory)
+        let scope = MemoryRecordDisclosurePolicy.classify(incoming)
+        let key = MemoryConsolidator.normalizedContentKey(memory.content)
+        var duplicate = rows.sorted { $0.createdAt > $1.createdAt }.first {
+            scope != nil && MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0)) == scope
+                && MemoryConsolidator.normalizedContentKey($0.content) == key
+        }
+        if duplicate == nil, MemoryRecallScoring.kind(of: memory.metadata) != "correction",
+           let vector = memory.embedding, let epoch = memory.embeddingEpoch, !epoch.isEmpty {
+            let activeEpoch = try Self.embeddingEpochState(in: db).activeEpoch
+            if activeEpoch == nil || activeEpoch == epoch {
+                let nearest = rows.filter { $0.embeddingEpoch == epoch && $0.embedding != nil }
+                    .map { (row: $0, cosine: VectorMath.cosine(vector, $0.embedding)) }
+                    .max { $0.cosine < $1.cosine }
+                if let nearest, nearest.cosine >= MemoryManagerLane.duplicateSimilarity,
+                   MemoryRecallScoring.kind(of: nearest.row.metadata) != "correction",
+                   scope != nil,
+                   MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: nearest.row)) == scope,
+                   MemorySemanticDuplicateGuard.sameQuantityAndNegation(nearest.row.content, memory.content),
+                   let created = MemoryRecallScoring.parseTimestamp(nearest.row.createdAt),
+                   Date().timeIntervalSince(created) < 24 * 3600 {
+                    duplicate = nearest.row
+                }
+            }
+        }
+        return duplicate
+    }
+
+    /// Marks a vector-less row written with a caller-owned id until it lands.
+    static let preservesIDKey = "admission_preserves_id"
+    /// A cold write is saved but not admitted until its vector lands and
+    /// passes the checks; a turn withholds it until then.
+    public static let pendingAdmissionKey = "admission_pending"
+
+    static func owingAdmission(_ metadata: JSONValue?, preservingID: Bool) -> JSONValue {
+        var object: [String: JSONValue] = [:]
+        if case .object(let current)? = metadata { object = current }
+        object[pendingAdmissionKey] = .bool(true)
+        if preservingID { object[preservesIDKey] = .bool(true) }
+        return .object(object)
+    }
+
+    static func metadataFlag(_ metadata: JSONValue?, _ key: String) -> Bool {
+        if case .object(let object)? = metadata, object[key] == .bool(true) { return true }
+        return false
+    }
+
+    /// The incoming write becomes evidence on the row it duplicates. An owed
+    /// row folding late also carries its own lineage and occurrences across.
+    static func foldDuplicate(_ memory: StoredMemory, into existing: StoredMemory, in db: Database,
+                              carryingHistory: Bool = false) throws -> StoredMemory {
+        var row = existing
+        let key = MemoryConsolidator.normalizedContentKey(memory.content)
+        if memory.embedding == nil {
+            try Self.requireNotTombstoned(row, in: db)
+        }
+        var metadata: [String: JSONValue] = [:]
+        if case .object(let existing)? = row.metadata { metadata = existing }
+        var count: Int64 = 0
+        if case .int(let value)? = metadata["recall_count"] { count = value }
+        if case .double(let value)? = metadata["recall_count"] {
+            guard let value = Int64(exactly: value.rounded(.towardZero)) else {
+                throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count is outside Int64 range")
+            }
+            count = value
+        }
+        let (next, overflow) = count.addingReportingOverflow(1)
+        guard !overflow else {
+            throw MemoryStorageError.databaseUnavailable("duplicate write: recall_count overflow")
+        }
+        var patch = SwiftNativeMemoryV2.duplicateProvenancePatch(
+            existing: MemoryRecord(stored: row), newSource: memory.source, newMetadata: memory.metadata)
+        // Explicit scope replaces scope only on the same text, never
+        // on a merely similar record. Omission retains the old scope.
+        if MemoryConsolidator.normalizedContentKey(row.content) == key,
+           case .object(let incoming)? = memory.metadata,
+           case .array(let topics)? = incoming["context_topics"], !topics.isEmpty {
+            patch["context_topics"] = .array(topics)
+        }
+        for (key, value) in patch {
+            if key == "observed_at", case .string(let observed) = value {
+                row.observedAt = observed
+            } else {
+                metadata[key] = value
+            }
+        }
+        metadata["recall_count"] = .int(next)
+        if carryingHistory, case .object(let own)? = memory.metadata {
+            for key in ["source_history", "duplicate_occurrences"] {
+                guard case .array(let carried)? = own[key] else { continue }
+                var merged: [JSONValue] = []
+                if case .array(let kept)? = metadata[key] { merged = kept }
+                for value in carried where !merged.contains(value) { merged.append(value) }
+                metadata[key] = .array(Array(merged.suffix(SwiftNativeMemoryV2.duplicateProvenanceCap)))
+            }
+        }
+        row.metadata = MemoryDataProvenance.preserving(
+            existing: memory.metadata, incoming: .object(metadata))
+        row.updatedAt = Self.nowISO8601()
+        try Self.validateTemporalEvidence(row)
+        try db.execute(sql: """
+            UPDATE memories SET metadata_json = ?, observed_at = ?, updated_at = ? WHERE id = ?
+        """, arguments: [Self.encodeMetadata(row.metadata), row.observedAt, row.updatedAt, row.id])
+        guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [row.id]).map(Self.decodeMemory) else {
+            throw MemoryStorageError.databaseUnavailable("committed memory is missing")
+        }
+        return saved
     }
 
     @discardableResult
@@ -504,16 +539,83 @@ public actor MemoryStorage {
         ])
     }
 
-    static func normalizingPeerMomentOrigin(_ metadata: JSONValue?, source: String?) -> JSONValue? {
-        guard let source,
-              ["moment-promoter:agent-", "moment-promoter:bot-"].contains(where: {
-                  source.hasPrefix($0) && source.count > $0.count
-              }),
-              case .object(var object)? = metadata,
-              object["author"] == .string("user"),
-              object["lane"] == .string("moment") || object["kind"] == .string("moment") else { return metadata }
-        object["author"] = .string("peer")
-        return .object(object)
+    /// Active rows whose vector is owed, oldest first.
+    public func memoriesOwingVectors(limit: Int) async throws -> [(id: String, content: String)] {
+        try await dbPool.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT id, content FROM memories
+                WHERE embedding IS NULL AND status = 'active' AND TRIM(COALESCE(content, '')) <> ''
+                ORDER BY rowid LIMIT ?
+                """, arguments: [max(1, limit)]).map { ($0["id"], $0["content"]) }
+        }
+    }
+
+    enum OwedVectorLanding { case landed, archived(reason: String), superseded }
+
+    /// An owed vector lands through the same checks a warm write passes, in
+    /// one transaction on the row's exact words (a newer write always wins):
+    /// a paraphrase of a rejected claim, or a duplicate admission would have
+    /// collapsed, is archived with its reason in the row instead of landing.
+    func landOwedVector(id: String, content: String, vector: [Float],
+                        epoch: MemoryEmbeddingEpoch) async throws -> OwedVectorLanding {
+        let (outcome, changed) = try await dbPool.write { db -> (OwedVectorLanding, [StoredMemory]) in
+            guard var owed = try Row.fetchOne(db, sql: """
+                SELECT * FROM memories WHERE id = ? AND embedding IS NULL AND content = ? AND status = 'active'
+                """, arguments: [id, content]).map(Self.decodeMemory) else { return (.superseded, []) }
+            try Self.requireWritableEpoch(in: db, vector: vector, epoch: epoch.rawValue)
+            owed.embedding = vector
+            owed.embeddingEpoch = epoch.rawValue
+            var reason: String?
+            var folded: StoredMemory?
+            // A caller-owned id (one lesson origin per proposal) is admitted
+            // as itself, never folded into another row, as its warm write was.
+            let preservesID = Self.metadataFlag(owed.metadata, Self.preservesIDKey)
+            if try Self.tombstoneMatch(db: db, query: vector, queryEpoch: epoch.rawValue,
+                                       threshold: memoryTombstoneMatchThreshold) {
+                reason = "a paraphrase of a rejected claim, found when its owed vector landed"
+            } else if !preservesID {
+                let others = try Row.fetchAll(db, sql: """
+                    SELECT * FROM memories WHERE status = 'active' AND id <> ?
+                        AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL) ORDER BY rowid
+                    """, arguments: [id]).map(Self.decodeMemory)
+                if let duplicate = try Self.admissionDuplicate(of: owed, among: others, in: db) {
+                    folded = try Self.foldDuplicate(owed, into: duplicate, in: db, carryingHistory: true)
+                    reason = "folded into \(duplicate.id), a duplicate found when its owed vector landed"
+                }
+            }
+            guard let reason else {
+                try db.execute(sql: """
+                    UPDATE memories SET embedding = ?, embedding_epoch = ?,
+                        metadata_json = json_remove(metadata_json, '$.\(Self.preservesIDKey)', '$.\(Self.pendingAdmissionKey)')
+                    WHERE id = ?
+                    """, arguments: [Self.encodeEmbedding(vector), epoch.rawValue, id])
+                return (.landed, [])
+            }
+            var metadata: [String: JSONValue] = [:]
+            if case .object(let current)? = owed.metadata { metadata = current }
+            metadata["archived_reason"] = .string(reason)
+            try db.execute(sql: """
+                UPDATE memories SET status = 'archived', updated_at = ?, metadata_json = ? WHERE id = ?
+                """, arguments: [Self.nowISO8601(), Self.encodeMetadata(.object(metadata)), id])
+            let archived = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
+                .map(Self.decodeMemory)
+            return (.archived(reason: reason), [archived, folded].compactMap { $0 })
+        }
+        invalidateRecallCache()
+        for row in changed {
+            pokeUserMDRegen(persona: row.personaId)
+            await pokeProjectionHooks(row)
+        }
+        return outcome
+    }
+
+    /// One primary-key lookup of exactly these rows, unfiltered.
+    public func memories(ids: [String]) async throws -> [StoredMemory] {
+        guard !ids.isEmpty else { return [] }
+        return try await dbPool.read { db in
+            try Row.fetchAll(db, sql: "SELECT * FROM memories WHERE id IN (\(Array(repeating: "?", count: ids.count).joined(separator: ",")))",
+                             arguments: StatementArguments(ids)).map(Self.decodeMemory)
+        }
     }
 
     public func memory(id: String) async throws -> StoredMemory? {
@@ -533,6 +635,7 @@ public actor MemoryStorage {
                 return nil
             }
             let priorMetadata = existing.metadata
+            let owesVector = patch.content.map { $0 != existing.content } == true && patch.embedding == nil
             if let c = patch.content { existing.content = c }
             if let s = patch.source { existing.source = s }
             if let conf = patch.confidence { existing.confidence = conf }
@@ -572,6 +675,14 @@ public actor MemoryStorage {
                 if case .object(let current)? = existing.metadata { metadata = current }
                 metadata.merge(provenance) { _, incoming in incoming }
                 existing.metadata = .object(metadata)
+            }
+            if owesVector {
+                // New words without a vector owe one (the old vector described
+                // the old words) and wait for admission as a cold insert does,
+                // under this row's own id.
+                existing.embedding = nil
+                existing.embeddingEpoch = nil
+                existing.metadata = Self.owingAdmission(existing.metadata, preservingID: true)
             }
             existing.updatedAt = Self.nowISO8601()
             if patch.content != nil || patch.embedding != nil {

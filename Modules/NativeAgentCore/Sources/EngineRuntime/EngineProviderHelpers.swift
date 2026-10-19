@@ -52,8 +52,6 @@ extension ProvidersFacade {
         public let rowSet: ProviderSurfaceRowSet
         public let activeProviders: [String: String]
         public let preferences: [String: SurfacePreference]
-        /// Accounts whose own last test failed, by id (`LLMProviderStatusFeed.failedTest`).
-        public var failedTests: [String: String] = [:]
     }
 
     public enum SettingsRefreshOutcome {
@@ -74,13 +72,8 @@ extension ProvidersFacade {
                 catch { catalogError = cause(error, "refresh the model list") }
             }
             let snapshot = try await facade.routing.checkedProviderSnapshot()
-            // Off the main actor: the conversion, and one status-file read whose
-            // failed rows each check the account's key in Keychain.
-            let dataRoot = self.dataRoot
-            let (providers, failedTests) = try await Task.detached(priority: .userInitiated) {
-                let providers = try ProvidersFacade.connections(from: snapshot)
-                return (providers, LLMProviderStatusFeed.failedTests(
-                    providerIDs: providers.map(\.provider_id), dataRoot: dataRoot))
+            let providers = try await Task.detached(priority: .userInitiated) {
+                try ProvidersFacade.connections(from: snapshot)
             }.value
             if catalog == nil {
                 do {
@@ -97,8 +90,7 @@ extension ProvidersFacade {
                 catalogError: catalogError,
                 rowSet: snapshot.rowSet,
                 activeProviders: snapshot.routing.activeProviders,
-                preferences: snapshot.routing.preferences,
-                failedTests: failedTests
+                preferences: snapshot.routing.preferences
             ))
         } catch {
             return .failed(cause(error, "read the accounts"))
@@ -107,25 +99,13 @@ extension ProvidersFacade {
 }
 
 extension ProvidersFacade {
-    public nonisolated static func accountIsReady(_ state: String) -> Bool { state.lowercased() == "ready" }
-
-    public var hasReadyConnection: Bool { connections.contains { $0.auth_status.state == "ready" } }
+    public var hasReadyConnection: Bool { connections.contains { $0.auth_status.eligible } }
 
     public nonisolated static func chatModelIsReady(providers: [ProviderInfo], providerID: String, model: String) -> Bool {
-        providers.contains { $0.provider_id == providerID && $0.auth_status.state == "ready"
+        providers.contains { $0.provider_id == providerID && $0.auth_status.eligible
             && $0.models.contains { $0.id == model && !$0.id.isEmpty } }
     }
 
-    /// The Providers page read's `state — detail`. Ready only means eligible
-    /// to dispatch, so a rejected key or expired access leads with that.
-    public nonisolated static func accountStatusLine(state: String, detail: String, failedTest: String?) -> String {
-        guard state.lowercased() == "ready" else { return "\(state) — \(detail)" }
-        if let failedTest {
-            return failedTest == "key rejected" ? "needs reconnect — Key rejected" : "last test failed — \(failedTest)"
-        }
-        return detail.lowercased().contains("expired")
-            ? "ready — signed in; the access token renews itself on the next chat (nothing to do)" : "\(state) — \(detail)"
-    }
 }
 
 extension ProvidersFacade {
@@ -298,7 +278,7 @@ extension ProvidersFacade {
 
     public nonisolated static func pickerProviders(_ providers: [ProviderInfo], activeProviders: [String: String]) -> [ProviderInfo] {
         let activeIds = Set(activeProviders.values)
-        return providers.filter { $0.provider_id == "codex" || $0.auth_status.state == "ready"
+        return providers.filter { $0.provider_id == "codex" || $0.auth_status.eligible
             || activeIds.contains($0.provider_id) }
     }
 }
@@ -439,7 +419,7 @@ public struct ChatComposerModelGroup: Identifiable {
         let groups: [ChatComposerModelGroup] = connections
             .filter {
                 $0.provider_id == "codex"
-                    || $0.auth_status.state == "ready"
+                    || $0.auth_status.eligible
                     || $0.provider_id == providerID
             }
             .sorted { lhs, rhs in
@@ -549,7 +529,7 @@ extension ProvidersFacade {
             return .object([
                 "status": .string("ok"),
                 "detail": .string("Fetched every account's model list again, as the page's Refresh does."),
-                "accounts": .array(refreshed.accounts.map { quietProviderRow($0, dataRoot: dataRoot) }),
+                "accounts": .array(refreshed.accounts.map { quietProviderRow($0) }),
             ])
         }
         let accounts: [ProviderInfo]
@@ -557,7 +537,7 @@ extension ProvidersFacade {
             return AppToolExecutor.failure("providers_unreadable", "The accounts didn't read (\(error.localizedDescription))." + retry)
         }
         if verb == "list" {
-            return .object(["status": .string("ok"), "accounts": .array(accounts.map { quietProviderRow($0, dataRoot: dataRoot) })])
+            return .object(["status": .string("ok"), "accounts": .array(accounts.map { quietProviderRow($0) })])
         }
         let id = AppToolExecutor.inputString(input["provider"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard let account = accounts.first(where: { $0.provider_id == id }) else {
@@ -588,7 +568,7 @@ extension ProvidersFacade {
             if let model = result.model_used { body["model_used"] = .string(model) }
             return .object(body)
         case "set_default_model":
-            guard account.auth_status.state == "ready" else {
+            guard account.auth_status.eligible else {
                 return AppToolExecutor.failure(
                     "not_connected",
                     "\(name) is not connected, so it has no fallback model to set. Connecting it is the owner's: ask them to sign in on Providers.")
@@ -644,20 +624,19 @@ extension ProvidersFacade {
         }
     }
 
-    /// An account whose last test failed for the key it has now (a rejected
-    /// key) is not connected, as its line on the page says.
-    private static func quietProviderRow(_ account: ProviderInfo, dataRoot: URL) -> JSONValue {
-        let failed = LLMProviderStatusFeed.failedTest(providerID: account.provider_id,
-                                                      dataRoot: dataRoot)
+    /// The account as its line on the page reads: eligible, and the row's own
+    /// words for how far its key is proven (saved, checked, rejected, could not check).
+    private static func quietProviderRow(_ account: ProviderInfo) -> JSONValue {
         var row: [String: JSONValue] = [
             "id": .string(account.provider_id),
             "name": .string(account.display_name),
-            "connected": .bool(account.auth_status.state == "ready" && failed != "key rejected"),
+            "connected": .bool(account.auth_status.eligible),
+            "state": .string(account.auth_status.state),
+            "detail": .string(account.auth_status.detail),
             "fallback_model": .string(account.default_model ?? ""),
             "models": .array(account.models.map { .string($0.id) }),
         ]
         if let note = account.models_note { row["models_note"] = .string(note) }
-        if let failed { row["last_test_failed"] = .string(failed) }
         return .object(row)
     }
 }

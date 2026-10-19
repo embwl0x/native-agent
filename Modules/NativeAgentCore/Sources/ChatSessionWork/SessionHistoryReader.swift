@@ -230,19 +230,25 @@ public actor SessionHistoryReader {
         let mode: String
         if let limit, limit > 0, !strictEvidence {
             // A bounded tail: only the bytes the selection needs, from the end.
+            // A file that will not open, seek or read whole is read_failed,
+            // never an empty tail.
             let handle = try? FileHandle(forReadingFrom: path)
+            let size = (try? handle?.seekToEnd()).map(Int.init)
+            var unread = size == nil
             let result = Self.tailLinesResult(
-                size: (try? handle?.seekToEnd()).map(Int.init) ?? 0,
+                size: size ?? 0,
                 minimumLineCount: max(64, limit * 3),
                 maximumBytes: maximumBytes
             ) { offset, count in
-                (try? handle?.seek(toOffset: UInt64(offset))).flatMap { _ in try? handle?.read(upToCount: count) }
+                let chunk = (try? handle?.seek(toOffset: UInt64(offset))).flatMap { _ in try? handle?.read(upToCount: count) }
+                if chunk?.count != count { unread = true }
+                return chunk
             }
             lines = result.lines
             sourceBytes = result.sourceBytes
             bytesRead = result.bytesRead
             truncatedRead = result.truncated
-            mode = "tail"
+            mode = unread ? "read_failed" : "tail"
         } else {
             let data: Data
             do {

@@ -21,8 +21,7 @@ public final class ProviderSignInHandoff {
         do {
             try NativeOAuthFlow.validateSignInDestination(providerId: id, dataRoot: PersistenceCore.defaultDataRoot())
         } catch {
-            return ["status": "error", "ok": "false", "provider_id": id,
-                    "message": "Saved sign-in settings are damaged or unreadable. Repair them on the Mac before signing in."]
+            return ["status": "error", "ok": "false", "provider_id": id, "message": error.localizedDescription]
         }
         states[id] = ["request_id": requestID, "state": "pending"]
         tasks[id] = Task {

@@ -28,6 +28,8 @@ public enum LLMProviderStatusFeed {
         public let providerID: String?
         public let model: String?
         public let tested: Bool
+        /// The typed cause of a failed check, as the probe encoded it.
+        public var cause: String? = nil
     }
 
     public enum Reading: Sendable, Equatable {
@@ -36,6 +38,9 @@ public enum LLMProviderStatusFeed {
         case unavailable(String)
         case failed(String)
     }
+
+    /// The probe's verdict on a key the provider refused (401, Anthropic's 403).
+    public static let keyRejected = "key rejected"
 
     public static func path(in dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent(relativePath)
@@ -67,7 +72,8 @@ public enum LLMProviderStatusFeed {
             detail: bounded(result.error ?? result.detail, maximum: 240) ?? fallbackDetail,
             providerID: bounded(result.provider_id, maximum: 120),
             model: bounded(result.model_used, maximum: 160),
-            tested: result.tested
+            tested: result.tested,
+            cause: result.cause
         )
     }
 
@@ -76,16 +82,72 @@ public enum LLMProviderStatusFeed {
         dataRoot: URL,
         checkedAt: Date = Date()
     ) async throws {
-        try await write(record(for: result, checkedAt: checkedAt), to: path(in: dataRoot),
-                        credential: credentialFingerprint(providerID: result.provider_id, dataRoot: dataRoot))
+        // The key the check sent, hashed before it was sent: a key saved while
+        // the check ran is never bound to that check's verdict.
+        try await write(record(for: result, checkedAt: checkedAt), to: path(in: dataRoot), credential: result.credential)
     }
 
-    /// A short hash of the key a test ran against, so only a new key clears
-    /// that test's failure, never another save of the account's file.
+    /// A short hash of the credential a test ran against (a sign-in's access
+    /// token, else the saved key), so only a new credential clears that test's
+    /// failure, never another save of the account's file.
     public static func credentialFingerprint(providerID: String, dataRoot: URL) -> String? {
-        guard let key = LLMCredentialResolver.resolveAPIKey(providerConfigFile: "\(providerID).json", dataRoot: dataRoot),
+        guard let key = SwiftNativeProviderRouting.signedInAccessToken(providerID: providerID, dataRoot: dataRoot)
+                ?? LLMCredentialResolver.resolveAPIKey(providerConfigFile: "\(providerID).json", dataRoot: dataRoot),
               !key.isEmpty else { return nil }
-        return SHA256.hash(data: Data(key.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return fingerprint(key)
+    }
+
+    public static func fingerprint(_ key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// One checked read of the checks file, made once per routing snapshot;
+    /// every readiness branch asks it, never the file.
+    public struct Receipts: Sendable {
+        let rows: [String: [String: JSONValue]]
+        /// Why the file could not be read; nil when it was read or is absent.
+        public let unreadable: String?
+
+        public enum Verdict: Equatable, Sendable {
+            case unchecked
+            case proven(Date)
+            case rejected
+            case failed(String)
+        }
+
+        /// What this provider's last check found for exactly `key`. A row
+        /// that kept no key hash, or hashed another key, proves nothing here.
+        public func verdict(providerID: String, key: String) -> Verdict {
+            guard let row = rows[providerID], row["tested"] == .bool(true),
+                  row["credential"] == .string(fingerprint(key)),
+                  case .string(let raw)? = row["checkedAt"], let checkedAt = parseTimestamp(raw)
+            else { return .unchecked }
+            switch row["status"] {
+            case .string(Status.ok.rawValue)?:
+                return Date().timeIntervalSince(checkedAt) > staleAfter ? .unchecked : .proven(checkedAt)
+            case .string(Status.error.rawValue)?:
+                let cause = row["cause"].flatMap { if case .string(let value) = $0 { ProviderFailure.decoded(value) } else { nil } }
+                // A receipt from before typed causes kept only this exact marker.
+                if cause == .authExpired || (row["cause"] == nil && row["detail"] == .string(keyRejected)) { return .rejected }
+                if case .string(let detail)? = row["detail"] { return .failed(detail) }
+                return .failed("the check failed")
+            default:
+                return .unchecked
+            }
+        }
+    }
+
+    public static func receipts(dataRoot: URL) -> Receipts {
+        let url = path(in: dataRoot)
+        guard FileManager.default.fileExists(atPath: url.path) else { return Receipts(rows: [:], unreadable: nil) }
+        guard let data = try? Data(contentsOf: url), case .object(let file)? = try? JSONValue.parse(data) else {
+            return Receipts(rows: [:], unreadable: "\(url.path) could not be read")
+        }
+        var rows: [String: [String: JSONValue]] = [:]
+        if case .object(let byProvider)? = file["byProvider"] {
+            for (id, value) in byProvider { if case .object(let row) = value { rows[id] = row } }
+        }
+        return Receipts(rows: rows, unreadable: nil)
     }
 
     public static func write(_ record: Record, to url: URL, credential: String? = nil) async throws {
@@ -102,6 +164,7 @@ public enum LLMProviderStatusFeed {
                 "tested": .bool(record.tested),
             ]
             if let credential { object["credential"] = .string(credential) }
+            if let cause = record.cause { object["cause"] = .string(cause) }
             // Each provider's own last check too, so a failed one stays on its
             // row after another provider is checked.
             var byProvider: [String: JSONValue] = [:]
@@ -113,39 +176,6 @@ public enum LLMProviderStatusFeed {
             object["byProvider"] = .object(byProvider)
             try await persistence.writeJSON(.object(object), to: url)
         }
-    }
-
-    /// What this provider's own last test found, when the test ran and failed
-    /// ("key rejected", "HTTP 500"). Nil once a test passes, or once its key
-    /// is not the one that test ran against: a reconnect is a new key.
-    public static func failedTest(providerID: String, dataRoot: URL) -> String? {
-        failedTests(providerIDs: [providerID], dataRoot: dataRoot)[providerID]
-    }
-
-    /// `failedTest` for each account, from one read of the status file.
-    public static func failedTests(providerIDs: [String], dataRoot: URL) -> [String: String] {
-        guard case .object(let file)? = (try? Data(contentsOf: path(in: dataRoot))).flatMap({ try? JSONValue.parse($0) })
-        else { return [:] }
-        var failed: [String: String] = [:]
-        for id in providerIDs {
-            if let detail = failedTest(providerID: id, file: file, dataRoot: dataRoot) { failed[id] = detail }
-        }
-        return failed
-    }
-
-    private static func failedTest(providerID: String, file: [String: JSONValue], dataRoot: URL) -> String? {
-        // Its own row, or the file's last check when that was this provider's
-        // and was written before rows were kept, so a launch keeps it.
-        let own: [String: JSONValue]? = if case .object(let rows)? = file["byProvider"], case .object(let row)? = rows[providerID] {
-            row
-        } else if file["providerId"] == .string(providerID) { file } else { nil }
-        guard let row = own,
-              row["status"] == .string(Status.error.rawValue), row["tested"] == .bool(true),
-              case .string(let detail)? = row["detail"],
-              case .string(let rawCheckedAt)? = row["checkedAt"], let checkedAt = parseTimestamp(rawCheckedAt)
-        else { return nil }
-        let tested = row["credential"].flatMap { if case .string(let value) = $0 { value } else { nil } }
-        return credentialMatches(providerID: providerID, tested: tested, checkedAt: checkedAt, dataRoot: dataRoot) ? detail : nil
     }
 
     private static func credentialMatches(providerID: String, tested: String?, checkedAt: Date, dataRoot: URL) -> Bool {

@@ -190,6 +190,14 @@ extension ChatStore {
         let macMessages = regeneratedAwayAssistantIDs.isEmpty
             ? macMessages
             : macMessages.filter { !regeneratedAwayAssistantIDs.contains($0.id) }
+        // A live turn whose run the Mac's transcript holds as terminal is over,
+        // whatever event was lost on the way: Stop and the header stop
+        // following it.
+        for run in liveTurnBubbles.keys where macMessages.contains(where: {
+            $0.runId == run && ($0.isTerminalReply || $0.completionState == "failed")
+        }) {
+            liveTurnBubbles.removeValue(forKey: run)
+        }
         let pendingPlaceholderIds = Set(pendingICloudPlaceholders.values)
         let pendingUserIds = Set(pendingSendArgs.keys.compactMap { pendingUserMessage(for: $0)?.id })
         let preserveFloor = Date().addingTimeInterval(-Self.resolvedPreserveWindowSeconds)

@@ -612,42 +612,42 @@ public actor AdaptiveMemoryPromoter {
             skipped.noveltySkipReason = noveltySkip
             return skipped
         }
-        var existing: [MemoryManagerExistingMemory] = await {
-            guard factsEnabled else { return [] }
-            guard let response = try? await memory.recall(
-                MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK),
-                recordingUsage: false
-            ) else { return [] }
-            return response.scored.map {
-                MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
-                    correctionSubject: MemoryMoments.metadataString($0.record.extras, "correction_subject"),
-                    kind: $0.record.memoryKind)
-            }
-        }()
-        if factsEnabled, let corrections = try? await memory.listMemory(kind: "correction") {
-            for record in corrections.filter({ ($0.status ?? "active") == "active" })
-                .sorted(by: { ($0.createdAt ?? "") > ($1.createdAt ?? "") }).prefix(24) {
-                let subject = MemoryMoments.metadataString(record.extras, "correction_subject")
-                let known = MemoryManagerExistingMemory(id: record.id, content: record.text,
-                                                        correctionSubject: subject, kind: record.memoryKind)
-                if let index = existing.firstIndex(where: { $0.id == record.id }) { existing[index] = known }
-                else { existing.append(known) }
+        // What is known and what waits on the person (pending rows WITH ids,
+        // 2026-09-11, so an update naming one retires it; moments are another
+        // lane). An unreadable past is never an empty one: the fact lane sits
+        // this pass out and the turn is held until the store answers.
+        var existing: [MemoryManagerExistingMemory] = []
+        var pendingRows: [ProposalRecord] = []
+        var factsReadable = true
+        if factsEnabled {
+            do {
+                existing = try await memory.recall(
+                    MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK),
+                    recordingUsage: false
+                ).scored.map {
+                    MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
+                        correctionSubject: MemoryMoments.metadataString($0.record.extras, "correction_subject"),
+                        kind: $0.record.memoryKind)
+                }
+                for record in try await memory.listMemory(kind: "correction")
+                    .filter({ ($0.status ?? "active") == "active" })
+                    .sorted(by: { ($0.createdAt ?? "") > ($1.createdAt ?? "") }).prefix(24) {
+                    let subject = MemoryMoments.metadataString(record.extras, "correction_subject")
+                    let known = MemoryManagerExistingMemory(id: record.id, content: record.text,
+                                                            correctionSubject: subject, kind: record.memoryKind)
+                    if let index = existing.firstIndex(where: { $0.id == record.id }) { existing[index] = known }
+                    else { existing.append(known) }
+                }
+                pendingRows = Array(try await memory.listProposals(status: "pending")
+                    .filter { !MemoryMoments.isMoment($0.metadata) }
+                    .sorted { $0.createdAt > $1.createdAt }
+                    .prefix(MemoryManagerLane.pendingCap))
+            } catch {
+                factsReadable = false
+                existing = []
+                nativeLog("MemoryV2: fact lane held this turn, the memory store could not be read: \(error.localizedDescription)")
             }
         }
-        // What is already waiting on the person. Moments are a different lane
-        // and a different card; they are not facts to dedupe against.
-        // Shown WITH their ids (2026-09-11, found driving it: a correction of a
-        // statement that was itself still pending stacked up as a second pending
-        // row instead of replacing the first). An update naming a pending id
-        // retires that row and stages the correction in its place.
-        let pendingRows: [ProposalRecord] = await {
-            guard factsEnabled else { return [] }
-            guard let all = try? await memory.listProposals(status: "pending") else { return [] }
-            return Array(all
-                .filter { !MemoryMoments.isMoment($0.metadata) }
-                .sorted { $0.createdAt > $1.createdAt }
-                .prefix(MemoryManagerLane.pendingCap))
-        }()
         // The PROMPT sees ids; every COMPARISON sees content only (Astra comb
         // finding 2: "[id] text" was being screened against "text", so a
         // correction's own target never left its duplicate screen).
@@ -664,7 +664,7 @@ public actor AdaptiveMemoryPromoter {
                 pending: pendingPrompt,
                 personName: author == "app" ? "NativeAgent" : speaker ?? originalHumanName,
                 standingAgent: standingAgent, appAuthored: author == "app"
-            ), context: context, factsEnabled: factsEnabled, momentsEnabled: keepsMoments)
+            ), context: context, factsEnabled: factsEnabled && factsReadable, momentsEnabled: keepsMoments)
             }
         } catch {
             if let context { await finishInterpretation?(context, nil, false) }
@@ -701,7 +701,7 @@ public actor AdaptiveMemoryPromoter {
                 semanticStatus: .failed, failure: failure), rejectedCount: 0,
                 moment: Task.isCancelled ? .cancelled : .failed, peerAuthority: isPeer, humanName: originalHumanName)
         }
-        let factsProcessed = factsEnabled && (adaptivePromotionEnabled?() ?? true)
+        let factsProcessed = factsEnabled && factsReadable && (adaptivePromotionEnabled?() ?? true)
         let decisions = factsProcessed ? interpretation.memories : []
 
         var staged: [ProposalRecord] = []
@@ -772,6 +772,7 @@ public actor AdaptiveMemoryPromoter {
                             newMetadata: .object(MemoryMoments.turnMetadata(turnId: turnId, origin: origin)))))
                     }
                 } catch {
+                    stagingFailed = true
                     nativeLog("MemoryV2: repeated standing correction's turn not kept: \(error)")
                 }
                 continue
@@ -784,14 +785,14 @@ public actor AdaptiveMemoryPromoter {
             let screened: [String] = replacedContent.map { target in
                 comparisons.filter { $0 != target }
             } ?? comparisons
-            if !isCorrection, await Self.nearDuplicate(
-                decision.statement, of: screened, memory: memory
-            ) != nil {
-                rejected += 1
-                continue
-            }
             do {
                 try Task.checkCancellation()
+                if !isCorrection, try await Self.nearDuplicate(
+                    decision.statement, of: screened, memory: memory
+                ) != nil {
+                    rejected += 1
+                    continue
+                }
                 if try await memory.isRejected(content: decision.statement) {
                     rejected += 1
                     continue
@@ -812,7 +813,15 @@ public actor AdaptiveMemoryPromoter {
                 staged.append(proposal)
                 comparisons.append(decision.statement)
                 if let old = supersededPending, old.id != proposal.id {
-                    _ = try? await memory.supersedeProposal(id: old.id, by: proposal.id)
+                    // Both rows stay pending until this lands; the held turn retries it.
+                    do {
+                        guard try await memory.supersedeProposal(id: old.id, by: proposal.id) else {
+                            throw MemoryV2Error.recordNotFound
+                        }
+                    } catch {
+                        stagingFailed = true
+                        nativeLog("MemoryV2: pending statement \(old.id) not retired by its correction: \(error)")
+                    }
                 }
                 let candidate = AdaptiveCandidate(
                     content: decision.statement,
@@ -842,7 +851,7 @@ public actor AdaptiveMemoryPromoter {
             savedCorrectionCount: 0,
             pendingCorrectionCount: pendingCorrections,
             failedCorrectionCount: failedCorrections,
-            stagingFailed: stagingFailed,
+            stagingFailed: stagingFailed || !factsReadable,
             factsProcessed: factsProcessed,
             peerAuthority: isPeer,
             humanName: originalHumanName
@@ -852,23 +861,21 @@ public actor AdaptiveMemoryPromoter {
     /// The index of the first of `others` that says what `statement` says, by
     /// embedding cosine. The store's own embedder answers, so "already in there"
     /// means the same thing here as it does at recall time. An embedder that
-    /// cannot answer (cold, mock, fail-closed) degrades to exact normalized
-    /// equality rather than matching everything or nothing.
+    /// cannot answer throws: a check that did not run is not "no duplicate".
     static func nearDuplicate(
         _ statement: String,
         of others: [String],
         memory: SwiftNativeMemoryV2
-    ) async -> Int? {
+    ) async throws -> Int? {
         guard !others.isEmpty else { return nil }
         let fold: (String) -> String = { MemoryMoments.wordFold($0) }
         let needle = fold(statement)
         if let exact = others.firstIndex(where: {
             fold($0) == needle && MemorySemanticDuplicateGuard.sameQuantityAndNegation(statement, $0)
         }) { return exact }
-        guard let vectors = try? await memory.embedForDerivedContext([statement] + others),
-              vectors.count == others.count + 1,
-              let query = vectors.first, !query.isEmpty else {
-            return nil
+        let vectors = try await memory.embedForDerivedContext([statement] + others)
+        guard vectors.count == others.count + 1, let query = vectors.first, !query.isEmpty else {
+            throw MemoryV2Error.underlying("the duplicate check received \(vectors.count) of \(others.count + 1) vectors")
         }
         for (index, (other, vector)) in zip(others, vectors.dropFirst()).enumerated() {
             guard vector.count == query.count,
@@ -980,7 +987,7 @@ public actor AdaptiveMemoryPromoter {
             let kept = try await memory.listMemory(kind: MemoryMoments.kind).filter { ($0.status ?? "active") == "active" }
             let rows = kept + (try await memory.listProposals(status: "pending")).filter { MemoryMoments.isMoment($0.metadata) }
                 .map { MemoryRecord(id: $0.id, text: $0.content, createdAt: $0.createdAt, sourceRunId: $0.source, extras: $0.metadata) }
-            if let index = await Self.nearDuplicate(content, of: rows.map(\.text), memory: memory) {
+            if let index = try await Self.nearDuplicate(content, of: rows.map(\.text), memory: memory) {
                 try await memory.recordRetelling(of: rows[index], pending: index >= kept.count, source: source, metadata: metadata)
                 lastMomentOutcome = "retold"
                 return nil
@@ -1005,7 +1012,8 @@ public actor AdaptiveMemoryPromoter {
             lastMomentOutcome = "staged"
             return proposal
         } catch {
-            // Best-effort, same contract as the fact lane.
+            // Held like the fact lane: an unanswered read or check is retried.
+            lastMomentOutcome = "failed"
             return nil
         }
     }
@@ -1028,6 +1036,11 @@ public actor AdaptiveMemoryPromoter {
             momentDayScanInFlight = true
             let scanned = await Self.stagedMomentsToday(memory: memory, dayKey: key)
             momentDayScanInFlight = false
+            // An unread day keeps its quota closed and is read again next turn.
+            guard let scanned else {
+                if momentDayKey == key { momentDayKey = nil }
+                return false
+            }
             // Another turn may have rolled the day over while the scan ran; only
             // apply the result if it still describes today.
             if momentDayKey == key {
@@ -1058,8 +1071,8 @@ public actor AdaptiveMemoryPromoter {
         momentDayCount = max(0, momentDayCount - 1)
     }
 
-    static func stagedMomentsToday(memory: SwiftNativeMemoryV2, dayKey: String) async -> [ProposalRecord] {
-        guard let all = try? await memory.listProposals(status: nil) else { return [] }
+    static func stagedMomentsToday(memory: SwiftNativeMemoryV2, dayKey: String) async -> [ProposalRecord]? {
+        guard let all = try? await memory.listProposals(status: nil) else { return nil }
         return all.filter { proposal in
             guard MemoryMoments.isMoment(proposal.metadata) else { return false }
             guard let staged = MemoryMoments.parseTimestamp(proposal.createdAt) else { return false }
@@ -1069,9 +1082,10 @@ public actor AdaptiveMemoryPromoter {
 
     /// How many moments are waiting on her. The nudge line's whole read, and it
     /// runs on the turn path — so it is a storage-level COUNT, never a listing.
-    public func pendingMomentCount() async -> Int {
-        guard let memory else { return 0 }
-        return (try? await memory.countMomentProposals(status: "pending")) ?? 0
+    /// A count it could not read throws: an unread count is never zero.
+    public func pendingMomentCount() async throws -> Int {
+        guard let memory else { throw MemoryV2Error.storageUnavailable }
+        return try await memory.countMomentProposals(status: "pending")
     }
 
     /// True when the turn's user-seat text was machine-tagged as coming from

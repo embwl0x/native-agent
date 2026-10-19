@@ -4,7 +4,7 @@ import PersistenceCore
 
 /// Anthropic Messages API adapter. URLSession is injectable for tests.
 public final class AnthropicAdapter: LLMAdapter {
-    public static let supportsTools = true
+    public static let toolWire = ProviderToolWire.native
     public let providerId: String
     /// Request timeout for the API-key lane. Same resolved value the OAuth
     /// direct adapters use (240s), so both lanes fail a stalled request the
@@ -360,7 +360,7 @@ public final class AnthropicAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        // NATIVE TOOL LANE (kimi-code only — see NativeToolCapability). The
+        // NATIVE TOOL LANE (this adapter's declared `toolWire`). The
         // String return can't carry tool calls, so a native call that produced
         // them renders each as the exact id-bearing marker ToolCallParser
         // already understands. That keeps this path honest for String callers

@@ -7,21 +7,31 @@ import PersistenceCore
 extension SwiftToolDispatcher {
     // MARK: - OMP asynchronous bridge
 
-    func runOMPMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+    /// The message contract the three bridge tools share: a non-empty text,
+    /// and a priority of info, important or urgent (info when omitted).
+    static func bridgeMessageFields(_ input: [String: JSONValue], tool: String)
+        -> Result<(text: String, priority: String), BridgeArgumentRefusal> {
+        func refuse(_ reason: String, _ fix: String) -> Result<(text: String, priority: String), BridgeArgumentRefusal> {
+            .failure(BridgeArgumentRefusal(value: .object(["status": .string("failed"), "effects": .string("none"),
+                                                 "reason": .string(reason), "fix": .string(fix)])))
+        }
         guard case .string(let text)? = input["text"], !text.isEmpty else {
-            return .object([
-                "status": .string("failed"),
-                "effects": .string("none"),
-                "reason": .string("missing_text"),
-                "fix": .string("omp_message requires a non-empty 'text' parameter."),
-            ])
+            return refuse("missing_text", "\(tool) requires a non-empty 'text' parameter.")
+        }
+        guard let given = input["priority"], given != .null else { return .success((text, "info")) }
+        guard case .string(let raw) = given, ["info", "important", "urgent"].contains(raw.lowercased()) else {
+            return refuse("invalid_priority", "\(tool) priority is info, important or urgent; nothing was sent.")
+        }
+        return .success((text, raw.lowercased()))
+    }
+
+    func runOMPMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        let text: String, priority: String
+        switch Self.bridgeMessageFields(input, tool: "omp_message") {
+        case .success(let fields): (text, priority) = fields
+        case .failure(let refusal): return refusal.value
         }
         let (deskHandle, droppedDeskItem) = try await delegationDeskHandleDroppingStale(input)
-        let priority: String = {
-            guard case .string(let raw)? = input["priority"] else { return "info" }
-            let value = raw.lowercased()
-            return ["info", "important", "urgent"].contains(value) ? value : "info"
-        }()
         let requestedTopic: String? = {
             guard case .string(let raw)? = input["topic"] else { return nil }
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -181,7 +191,7 @@ extension SwiftToolDispatcher {
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
-            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
+            response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was queued without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
         }
         if appendResult.status == "duplicate" && !appendResult.retryWake {
             response["wakeup"] = .object(["status": .string("deduplicated")])

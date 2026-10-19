@@ -501,25 +501,6 @@ enum InboxListPresentation {
 
 // MARK: - Card row
 
-extension InboxItemRecord {
-    /// Where a card came from, in plain words (the badge label is plumbing).
-    var sourceWords: String {
-        if hasLinkedApproval { return "Asking first" }
-        if source.hasPrefix("proactive_autonomy") { return "An idea" }
-        if source.hasPrefix("harness_learning") { return "Something I learned" }
-        if source == "dream_cycle" { return "A dream" }
-        if source == "rem_cycle" { return "From my rest" }
-        if source.hasPrefix("trigger:file_watch") { return "A file changed" }
-        if source.hasPrefix("trigger:morning_brief") { return "Your morning brief" }
-        if source.hasPrefix("trigger:stuck_pattern") { return "A pattern I noticed" }
-        if source == "idle_checkin" { return "Checking in" }
-        if source.hasPrefix("execution_complete") || source.hasPrefix("mission_complete") { return "Work finished" }
-        if source == "self_test" { return "A self-check" }
-        if source == "desk" { return "From the Desk" }
-        return "A note from me"
-    }
-}
-
 struct InboxCardRow: View {
     let item: InboxItemRecord
     let onAction: (String) -> Void
@@ -612,8 +593,7 @@ struct InboxCardRow: View {
                     }
 
                     if let action = item.presentableActions.first(where: { $0.id == "act" }) {
-                        Button(item.source == "interaction" ? action.label
-                               : item.source.hasPrefix("trigger:file_watch") ? "Open file" : "Go ahead") {
+                        Button(item.presentation?.act_label ?? action.label) {
                             onAction("act")
                         }
                         .aliveSecondaryButton()

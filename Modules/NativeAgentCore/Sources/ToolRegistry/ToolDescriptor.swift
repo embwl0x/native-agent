@@ -97,7 +97,6 @@ public struct AppActionBinding: Sendable {
     public let readWhen: [String: JSONValue]
     public let secretArgs: [String]
     public let lifecycle: CapabilityLifecycle.Action?
-    public let savedTrustKeys: [String]
     /// What the action is when it does not read (`read`/`readWhen` say when it does).
     public let toolClass: ToolClass
     /// For one of her parts: whether it reaches User's side, from the same
@@ -105,14 +104,13 @@ public struct AppActionBinding: Sendable {
     public let reachesHim: Bool?
 
     public init(isHis: Bool, irreversible: Bool, read: Bool, secretArgs: [String], readWhen: [String: JSONValue] = [:],
-                lifecycle: CapabilityLifecycle.Action? = nil, savedTrustKeys: [String] = [],
+                lifecycle: CapabilityLifecycle.Action? = nil,
                 tool: String = "", fixedInput: [String: JSONValue] = [:], rename: [String: String] = [:],
                 folded: Bool = false, descriptor: ToolDescriptor? = nil, toolClass: ToolClass = .write, reachesHim: Bool? = nil) {
         self.tool = tool; self.fixedInput = fixedInput; self.rename = rename; self.folded = folded; self.descriptor = descriptor
         self.isHis = isHis; self.irreversible = irreversible; self.read = read
         self.secretArgs = secretArgs; self.readWhen = readWhen
         self.lifecycle = lifecycle
-        self.savedTrustKeys = savedTrustKeys
         self.toolClass = toolClass
         self.reachesHim = reachesHim
     }

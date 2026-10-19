@@ -123,6 +123,27 @@ extension ChatStore {
         }
     }
 
+    // MARK: - The Mac's turn here
+
+    /// Every run of the Mac's in this conversation that has not ended, from
+    /// whichever door it came: a request this phone handed over (silent or
+    /// not), one still crossing, or a live turn another door started. Stop
+    /// and the header follow this, never the composer's own flag.
+    var activeTurnRunIDs: Set<String> {
+        let session = Self.cleanSessionID(selectedSessionID)
+        let handedOver = pendingExchanges.values.filter { $0.sessionID == session && !$0.isExpired }.map(\.correlationID)
+        let live = liveTurnBubbles.filter { entry in messages.contains { $0.id == entry.value } }.keys
+        return Set(handedOver).union(pendingICloudPlaceholders.keys).union(inFlightSendIDs).union(live)
+    }
+
+    /// Nil when no turn is open; false while the Mac has not yet signed any
+    /// event for the phone's request.
+    var activeTurnHeardByMac: Bool? {
+        let runs = activeTurnRunIDs
+        guard !runs.isEmpty else { return nil }
+        return runs.contains { liveTurnBubbles[$0] != nil || pendingExchanges[$0]?.acknowledged == true }
+    }
+
     // MARK: - Lifecycle
 
     /// Opens the durable record the moment a request leaves the composer.

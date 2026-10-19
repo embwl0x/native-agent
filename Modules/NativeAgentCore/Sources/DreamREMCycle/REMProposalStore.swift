@@ -203,10 +203,22 @@ public struct REMProposalStore: Sendable {
     /// terminal row in the full feed OR the just-written base — never neither.
     /// Feed wins on an id collision (in steady state feed and base ids are
     /// disjoint; a collision means the feed holds the newer copy).
-    public func loadAll() -> [REMProposalRow] {
-        let feedRows = Self.readLines(proposalsURL).compactMap(Self.decodeRow)
-        let baseRows = loadBaseRows()
-        return Self.fold(feedRows: feedRows, baseRows: baseRows)
+    public func loadAll() -> [REMProposalRow] { loadAllChecked().rows }
+
+    /// The tolerant read, with what it could not read named beside the rows.
+    public func loadAllChecked() -> (rows: [REMProposalRow], unreadable: [String]) {
+        var unreadable: [String] = []
+        let lines: [Data]
+        do { lines = try Data(contentsOf: proposalsURL).split(separator: 0x0A).map { Data($0) } }
+        catch CocoaError.fileReadNoSuchFile { lines = [] }
+        catch { lines = []; unreadable.append("\(proposalsURL.lastPathComponent): \(error.localizedDescription)") }
+        let feedRows = lines.compactMap(Self.decodeRow)
+        if feedRows.count < lines.count {
+            unreadable.append("\(proposalsURL.lastPathComponent): \(lines.count - feedRows.count) malformed row(s)")
+        }
+        let baseRows = readBaseRows()
+        if baseRows == nil { unreadable.append("\(basePath.lastPathComponent): did not decode; feed folded alone") }
+        return (Self.fold(feedRows: feedRows, baseRows: baseRows ?? []), unreadable)
     }
 
     /// Every row, or a throw: GROWTH eviction and a GROWTH rewrite cannot

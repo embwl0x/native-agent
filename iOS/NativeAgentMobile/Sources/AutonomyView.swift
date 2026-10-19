@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Training changes are applied on the Mac; learned behavior can be decided here.
+/// Training changes are applied on the Mac.
 enum AutonomyMacOnlyNoticePresentation {
     static let message = "Applying training changes happens only on your Mac."
     static let systemImage = "lock.circle"
@@ -31,9 +31,9 @@ enum AutonomyScreenPresentation {
         var detail: String {
             switch self {
             case .awaitingPublication:
-                return "Training and promotion projections have not both published to this iPhone yet."
+                return "Training proposals have not published to this iPhone yet."
             case .clear:
-                return "The Mac published both self-improvement projections, and neither has a human action waiting."
+                return "The Mac published its training proposals, and none has a human action waiting."
             case .awaitingReview:
                 return "These are the same proposals shown in Activity and synced from the Mac's canonical stores."
             }
@@ -52,26 +52,17 @@ enum AutonomyScreenPresentation {
 /// The old screen owned a second store and polled three snapshot files the
 /// Mac never produced, so Activity linked to a permanently empty projection.
 /// Activity and the tab badge already use iCloudSyncEngine's canonical
-/// training/promotion projections; this view now reads that same resident
+/// training projection; this view now reads that same resident
 /// state and relies on the engine's KVS/push/foreground refresh owner.
 struct AutonomyView: View {
-    @EnvironmentObject private var pairingStore: PairingStore
     private let sync = iCloudSyncEngine.shared
 
     private var trainingProposals: [TrainingProposalSummary] {
         MobileDesignSamples.rows(sync.trainingProposals)
     }
 
-    private var promotionCandidates: [PromotionCandidateSummary] {
-        #if DEBUG
-        if MobileDesignSamples.screen != nil, sync.promotionCandidates.isEmpty { return AutonomyDesignSample.candidates }
-        #endif
-        return sync.promotionCandidates
-    }
-
     private var actionableCount: Int {
         trainingProposals.filter(\.isHumanActionable).count
-            + promotionCandidates.filter(\.isHumanActionable).count
     }
 
     private var screenState: AutonomyScreenPresentation.State {
@@ -87,10 +78,10 @@ struct AutonomyView: View {
             switch screenState {
             case .awaitingPublication:
                 AliveCalmState(title: "Waiting for the Mac", line: screenState.detail)
-            case .clear where trainingProposals.isEmpty && promotionCandidates.isEmpty:
+            case .clear where trainingProposals.isEmpty:
                 AliveCalmState(
                     title: "Nothing to review",
-                    line: "When I propose a change to how I work, or want to keep something I learned, it shows up here."
+                    line: "When I propose a change to how I work, it shows up here."
                 )
             default:
                 if case .awaitingReview(let count) = screenState {
@@ -114,15 +105,6 @@ struct AutonomyView: View {
                     }
                 }
 
-                if !promotionCandidates.isEmpty {
-                    AliveSection("Things I learned",
-                                 footer: pairingStore.isPaired ? nil : AliveConnection.pairToChange + ".") {
-                        ForEach(Array(promotionCandidates.enumerated()), id: \.element.id) { index, candidate in
-                            if index > 0 { AliveDivider() }
-                            PromotionCandidateRow(candidate: candidate)
-                        }
-                    }
-                }
             }
 
             AliveFootnote(
@@ -133,22 +115,6 @@ struct AutonomyView: View {
         .macSyncErrorBanner()
         .refreshable { await sync.refreshActivitySnapshot() }
         .task { await sync.refreshActivitySnapshot() }
-    }
-}
-
-#if DEBUG
-/// `-designScreen autonomy`: one learned behaviour waiting on a decision.
-private enum AutonomyDesignSample {
-    static let candidates: [PromotionCandidateSummary] = try! JSONDecoder().decode(
-        [PromotionCandidateSummary].self,
-        from: Data(#"[{"id":"design-promotion","title":"Offer a short recap after long research threads","status":"pending","decision":"STAGE_FOR_HUMAN","source":"conversation_review","score":0.82}]"#.utf8)
-    )
-}
-#endif
-
-enum PromotionCandidateDecisionPresentation {
-    static func controlsAllowed(isHumanActionable: Bool) -> Bool {
-        isHumanActionable
     }
 }
 
@@ -187,76 +153,5 @@ private struct TrainingProposalRow: View {
                 .padding(.top, 2)
         }
         .aliveRow()
-    }
-}
-
-private struct PromotionCandidateRow: View {
-    @EnvironmentObject private var pairingStore: PairingStore
-    let candidate: PromotionCandidateSummary
-    @State private var isDeciding = false
-    @State private var decisionError: String?
-
-    /// Status, where it came from and how sure I am, as one line of words.
-    private var statusLine: String {
-        var parts = [AliveWords.humanized(candidate.status.lowercased())]
-        if let source = candidate.source, !source.isEmpty { parts.append("from \(AliveWords.humanized(source).lowercased())") }
-        if let score = candidate.score { parts.append("\(Int((score * 100).rounded()))% sure") }
-        return parts.joined(separator: " · ")
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(candidate.title)
-                .font(.body.weight(.medium))
-                .foregroundStyle(AlivePalette.text)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(statusLine)
-                .font(.footnote)
-                .foregroundStyle(AlivePalette.secondary)
-            if PromotionCandidateDecisionPresentation.controlsAllowed(
-                isHumanActionable: candidate.isHumanActionable
-            ) {
-                HStack(spacing: 10) {
-                    Button("Approve") {
-                        decide(approve: true)
-                    }
-                    .alivePrimaryButton()
-                    .disabled(isDeciding)
-                    Button("Reject") {
-                        decide(approve: false)
-                    }
-                    .aliveSecondaryButton()
-                    .disabled(isDeciding)
-                    if isDeciding { ProgressView().controlSize(.small) }
-                }
-                .aliveUnavailable(!pairingStore.isPaired)
-                .padding(.top, 6)
-                if let decisionError {
-                    Text(decisionError)
-                        .font(.footnote)
-                        .foregroundStyle(NativeAgentMobileTheme.Colors.trouble)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
-        .aliveRow()
-    }
-
-    private func decide(approve: Bool) {
-        isDeciding = true
-        decisionError = nil
-        Task {
-            do {
-                if approve {
-                    _ = try await iCloudSyncEngine.shared.approvePromotion(candidateId: candidate.id)
-                } else {
-                    _ = try await iCloudSyncEngine.shared.rejectPromotion(candidateId: candidate.id)
-                }
-                await iCloudSyncEngine.shared.refreshActivitySnapshot()
-            } catch {
-                decisionError = error.localizedDescription
-            }
-            isDeciding = false
-        }
     }
 }

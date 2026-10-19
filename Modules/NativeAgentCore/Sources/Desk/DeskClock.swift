@@ -2,7 +2,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Shared UTC formatting for Desk and TaskLedger; monotonic issuance belongs to Desk.
+// Shared formatting for Desk and TaskLedger: instants are UTC stamps, calendar
+// days are the Mac's current zone (law 7); monotonic issuance belongs to Desk.
 
 public enum DeskClock {
     private final class FormatterCache: @unchecked Sendable {
@@ -12,7 +13,7 @@ public enum DeskClock {
         init() {
             let day = DateFormatter()
             day.locale = Locale(identifier: "en_US_POSIX")
-            day.timeZone = TimeZone(identifier: "UTC")
+            day.timeZone = .autoupdatingCurrent
             day.dateFormat = "yyyy-MM-dd"
             dayFormatter = day
         }
@@ -93,7 +94,7 @@ public enum DeskClock {
         NativeTimestampFormat.parseISO8601FractionalFirst(s)
     }
 
-    /// Parse a bare `yyyy-MM-dd` UTC day stamp (its midnight).
+    /// Parse a bare `yyyy-MM-dd` day stamp: its midnight in the Mac's zone.
     public static func parseDay(_ s: String) -> Date? {
         formatters.dayDate(from: s)
     }
@@ -109,12 +110,12 @@ public enum DeskClock {
         return parseISO(t) != nil
     }
 
-    /// Collapse a parseable date/timestamp string to its `yyyy-MM-dd` UTC day, so
+    /// Collapse a parseable date/timestamp string to its `yyyy-MM-dd` local day, so
     /// distinct-DAY counting can't be fooled by two timestamps on one day or a
     /// bare day vs its midnight ISO form. nil for an unparseable string.
     public static func normalizedDay(_ s: String) -> String? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if formatters.dayDate(from: t) != nil { return t }   // already a bare UTC day
+        if formatters.dayDate(from: t) != nil { return t }   // already a bare day
         if let d = parseISO(t) { return dayStamp(d) }
         return nil
     }
@@ -135,7 +136,7 @@ public enum DeskClock {
         "wattempt_\(lane.rawValue)_\(reservationId(handle: handle, day: day, slot: slot).dropFirst(5))"
     }
 
-    /// The `yyyy-MM-dd` UTC day for a timestamp — the reservation/day bucket.
+    /// The `yyyy-MM-dd` day, in the Mac's zone, for a timestamp — the reservation/day bucket.
     public static func dayStamp(_ date: Date) -> String {
         formatters.day(from: date)
     }

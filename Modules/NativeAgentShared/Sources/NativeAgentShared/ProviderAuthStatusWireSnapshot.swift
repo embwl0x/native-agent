@@ -8,9 +8,10 @@ public struct ProviderAuthStatusWireSnapshot: Decodable, Sendable {
     public let detail: String
     public let user_info: [String: String]?
     public let last_checked_at: String?
+    public let eligible: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case provider_id, state, detail, user_info, last_checked_at
+        case provider_id, state, detail, user_info, last_checked_at, eligible
     }
 
     public init(from decoder: Decoder) throws {
@@ -19,6 +20,8 @@ public struct ProviderAuthStatusWireSnapshot: Decodable, Sendable {
         self.state       = try c.decode(String.self, forKey: .state)
         self.detail      = try c.decodeIfPresent(String.self, forKey: .detail) ?? ""
         self.last_checked_at = try c.decodeIfPresent(String.self, forKey: .last_checked_at)
+        // A Mac from before `eligible` was published meant exactly "ready" by eligible.
+        self.eligible = try c.decodeIfPresent(Bool.self, forKey: .eligible) ?? (self.state == "ready")
         // Coerce any nested JSON value into a string. Drop nulls.
         if c.contains(.user_info), try !c.decodeNil(forKey: .user_info) {
             let nested = try? c.decode([String: AnyJSONValue].self, forKey: .user_info)

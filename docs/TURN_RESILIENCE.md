@@ -26,10 +26,18 @@ contract is in [Tool loading](TOOL_LOADING.md).
 ### 1. One clean exit
 
 `ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` continues until
-the model answers with no calls or pending work. Stop interrupts; approvals,
-questions and a Mac takeover wait for the person. There is no iteration or
+the model answers with no calls or pending work. Stop interrupts; a Mac
+takeover waits for the person. A result waiting on an approval or a question
+reaches their part like any other, with the card it waits on: they says what they
+says and the turn ends waiting, the card still gating the effect and its
+answer resuming the request. The card is the effect's one execution claim:
+while it is undecided, the same call (tool and arguments) proposed again runs
+nothing and gets the card's waiting receipt; after the decision, one
+re-proposal gets the card's receipt, and an identical call after that is a
+fresh invocation through the gate. There is no iteration or
 whole-turn clock limit. Helper owners can still request a per-run token budget;
-that owner's exhaustion returns the kept reply as incomplete.
+when it is spent their part reads a `provider_failure` receipt naming the cap and
+its control, and ends the turn, incomplete, on what was written.
 Mac takeover suspends the same conversation on `MacAttentionSessionStore`'s
 driver-change stream. Returning control continues from the recorded results;
 task cancellation or the run-tagged Stop flag releases the wait. A waiting turn
@@ -37,12 +45,10 @@ keeps the return-control action reachable under Full Mac.
 
 ### 2. Progress and the circling question
 
-`ToolLoopNoProgressGuard` keeps its evidence: a warning after eight identical
-tool rounds, or four identical failures even when arguments change. Sixteen
-identical rounds or eight identical failures raise one choice card:
-“I've done the same thing N times in a row without getting further — keep going,
-or change course?” The existing receipt and interaction continuation own its
-persistence and resume.
+`ToolLoopNoProgressGuard` keeps its evidence and hands it to them: from eight
+identical tool rounds, or four identical failures even when arguments change,
+every round of the streak carries a note with the count. It never stops or
+suspends the turn; whether to go on is theirs.
 
 ### 3. Tool dispatch deadline
 
@@ -70,11 +76,11 @@ bounded to 0–86,400 seconds, with zero disabling that timeout. Background
 calls use the same settings. Idle time is wire activity (headers, SSE
 comments, events); a cut is the typed `ProviderFailure.noReply`, and every
 stream failure's `Diagnostic` records whether the provider admitted the request.
-Until the adapter yields the provider's first output (text, tool, reasoning),
-wire keep-alives and a buffered adapter's own heartbeat hold the connection
-open but are not a reply: the guard also cuts at the provider's first-output
-deadline, the slowest adapter `ttftMs` of its retained calls on that model and
-stream kind (`ProviderVitalsSensor`: read from the trace's `llm.call` rows at
+Until anything arrives on the wire (headers, comments, events), the guard
+also cuts at the provider's first-output deadline: a connection that never
+opened or hung before headers. A live wire is a provider thinking, bounded by
+idle and wall. The deadline is the slowest adapter `ttftMs` of its retained
+calls on that model and stream kind (`ProviderVitalsSensor`: read from the trace's `llm.call` rows at
 launch, joined by each live call's `ttftMs`, nothing written). Under 100 calls
 it is unmeasured and only the wall stands; buffered kinds record no `ttftMs`,
 so idle and wall bound them.
@@ -82,25 +88,27 @@ The cut text says the seconds waited, what arrived, and that evidence.
 
 `ProviderRouting/LLMClient+Real.swift` wraps streams with the configured
 per-call guard and uses `withCompletionWall` for buffered calls. A guard cut
-is input to recovery, never a whole-turn deadline.
+is input to recovery, never a whole-turn deadline: their turn part asks again
+once when nothing ran and no repair is owed, and says the failure if the same
+cut follows.
 
-### 5. In-loop provider recovery (the reconnect ladder)
+### 5. In-loop provider recovery
 
 `ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` owns the loop,
 including native-tool and text-marker protocols. One `TurnObservation` owns
 the model's next-round feedback for a limit, stream cut, correctness boundary,
-malformed call, empty reply, announced work without a call, refusal, or full
-context. It preserves kept prose and appends a user text block alongside the
+malformed call, empty reply, refusal, unwritten working notes, or full context.
+No vocabulary of sentences decides that a reply is unfinished. It preserves kept prose and appends a user text block alongside the
 round's tool results, or a standalone user message when there were no results.
 `turn.observation` records the same feedback on both protocols.
 
-Network, no-reply, overload and rate-limit failures retry with backoff until
-the provider answers or the person stops: 1, 2, 4, 8, 15, then 30 seconds;
-a longer provider `Retry-After` wins. A cut with no kept prose replays the
-identical conversation and records an observation only in the trace. After
-prose, the observation tells the provider to continue after it. No calls from
-an incomplete stream dispatch; previously completed results remain.
-`provider.retry` and `provider_retry` carry uncapped reconnect status.
+The learned first-output deadline bounds only a wire with nothing on it; a
+live wire is bounded by idle silence and the wall. A recoverable cut after they
+said something or called a tool is the round's `interrupted` boundary: complete
+calls run, their words stay, and they continues after them. A cut where nothing
+ran or nothing was sent, with no repair owed, is their turn part's next input
+once (the stem's `provider_failure` notice is the nudge); the same cut again
+becomes their words to the person.
 
 Streaming adapters report max-token limits as `toolBoundary(.outputLimit)`;
 buffered adapters carry the answer prefix in `outputLengthLimit(partial:)`.
@@ -129,6 +137,10 @@ existing meaning. Streaming surfaces keep editing the same reply after cuts.
 `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift` records
 `turn.cancelled` with a `where` field and persists the visible partial.
 `EngineRuntime/EngineTurns.swift` delegates Mac Stop to `MacChatTurnRuntime`.
+Stop (the run's cancel flag) is the one cancel link: it cancels the turn's
+work at once, wherever it waits. The Mac registers the run at admission,
+before any await, so a Stop always names the live run. A door that stops listening only detaches;
+the accepted turn runs on and lands in its transcript.
 
 At dispatch, a call stopped before it starts has a skipped result; an already
 started call carries `effects_unknown: true`. A late tool result cannot replace
@@ -141,25 +153,36 @@ and current state before trying it again.
 conversation: it stubs older tool-result bodies and folds earlier rounds into
 working notes. It can run proactively before a provider call or reactively
 after a context-overflow refusal. Reactive compaction has no attempt cap.
-When nothing remains to fold, the turn finishes incomplete with its retained
-prose and the existing context-full notice to the person; no provider call
-follows. After a successful trim, a `contextFull` observation asks the model
-to finish from what it has. The seeded prefix remains protected.
+When nothing remains to fold, the refusal is their turn part's
+`provider_failure` input like any other. After a successful trim, a
+`contextFull` observation asks the model to finish from what it has. Working
+notes that cannot be written leave their span as it was and nothing else is
+trimmed in their place; the receipt (a route that is wrong owes its repair
+through `ProviderFailure`) is their input: a note in the conversation, or, when
+an overflow has nothing else to trim, their part's `provider_failure`. The seeded prefix remains
+protected.
 Trace `context.intraTurnCompaction` records the mode, trigger and size change;
 the status notice is `context_compaction`.
 
 Persisted history has a separate owner:
 `ChatSessionWork/ChatSessionAutocompactor.swift`. It creates and verifies a
 backup before replacing older rows with a recollection, retains pending cards
-and recent rows, and writes durably. `ChatCompactionDistiller.swift` can improve
-the mechanical recollection; a failed distillation leaves the fallback.
+and recent rows, and writes durably. `ChatCompactionDistiller.swift` writes the
+recollection; one that fails leaves its summary pending, unrendered, with the
+original turns in the backup and its repair owed. A turn
+whose pre-turn compaction did not finish answers from the history that is
+there, and its message carries the failure and its repair call.
 Compaction is bounded summarization, not lossless retention.
 
 ### 9. Process continuation
 
 `TurnTrace/AbandonedTurnReconciler.swift` owns the small atomic checkpoint at
-`chat/session_state/<session>/turn-<turnId>.json`. The shared loop writes it
-before each provider iteration and before dispatch; durable tool receipts
+`chat/session_state/<session>/turn-<turnId>.json` (a worker, which has no
+conversation, owns `chat/session_state/worker-<runId>/` and removes it when it
+ends). Acceptance writes it before
+any context is built; the shared loop writes it again before each provider
+iteration and before dispatch, its part log carrying their final words for a
+resume to settle with; durable tool receipts
 advance its step count and peer sources in the same checkpoint write. Receipts
 also retain their latched sources, which recovery consumes without weakening
 saved taint when peer trust changes. It keeps identity, input, envelope and reply
@@ -169,6 +192,8 @@ their existing transcript metadata supplies the saved paths.
 
 At launch, the reconciliation hook discovers checkpoints independently of the
 legacy trace window and excludes the in-flight registry and claimed resumes.
+An unreadable trace day or checkpoint owes its own repair; every readable
+checkpoint still resumes.
 `EngineRuntime/EngineTurnContinuation.swift` restores the original admission,
 surface capabilities, peer provenance, helper ownership and delivery route.
 `ChatOrchestration+Continuation.swift` re-enters the shared loop under the old
@@ -178,7 +203,11 @@ restores working notes and kept prose, and applies `TurnObservation.restarted`.
 Saved dispatch receipts also rebuild delivery artifacts; generated-image paths
 survive transcript body clipping. Mac recovery connects the existing stream
 adapter and lifecycle intake under the saved identity.
-An unrecorded effect is unknown, not permission to repeat it. Oversize-result
+An unrecorded effect is unknown, not permission to repeat it; the restart
+observation names each call their part's log shows started without a receipt
+(tool and redacted arguments), and an attached Desk journal admits the same
+call proposed again (tool and argument digest) as that unresolved step, so its
+receipt settles it instead of a fresh step beside it. Oversize-result
 pages cannot survive the process; the observation says they are unavailable.
 
 Terminal settlement retains a completed restart-resume checkpoint only when

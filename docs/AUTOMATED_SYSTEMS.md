@@ -114,7 +114,6 @@ event deadlines, backoff and saved configuration determine actual work.
 | `cognition_replay` | Daily | Episodic replay. |
 | `cognition_reflection` | Daily | Budgeted cognitive reflection. |
 | `heartbeat` | 12h | Assess health; surface stable anomaly cards. Clean assessments skip the model. |
-| `autonomy_promotion_proposals` | Events/deadlines; daily repair | Propose promotions and reconcile approved decisions. |
 | `desk_notify` | Events/deadlines; daily repair | Notify about eligible tracked Desk changes. |
 | `delegation_outcome` | Events/deadlines; 6h repair | Reconcile terminal delegation jobs and their notifications. |
 | `github_tracking` | Events/deadlines; 6h repair | Refresh configured tracking and reconcile its consumers. |

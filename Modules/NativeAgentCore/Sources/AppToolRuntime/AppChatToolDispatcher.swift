@@ -311,8 +311,9 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         return origin
     }
 
+    /// The refusal keeps SecurityCenter's checker, reason and the owner's lever.
     private static func securityGateResponse(_ envelope: SecurityToolEnvelope) -> JSONValue {
-        ChatToolOutcome.refusedBeforeRunning(.object([
+        var refusal: [String: JSONValue] = [
             "status": .string(envelope.requiresApproval ? "pending_approval" : "blocked"),
             "runtime": .string("swift-native"),
             "tool": .string(envelope.tool),
@@ -326,6 +327,8 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             "reasons": .array(envelope.reasons.map { .string($0.persistedValue) }),
             "capabilities": .array(envelope.capabilities.map { .string($0) }),
             "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this tool." : "Security Center blocked this tool before execution."),
-        ]))
+        ]
+        refusal["remedy"] = envelope.remedy
+        return ChatToolOutcome.refusedBeforeRunning(.object(refusal))
     }
 }

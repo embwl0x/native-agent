@@ -11,7 +11,7 @@
 // Counts come from:
 //   • WorkOverview   — owner attention, before list bounds
 //   • iCloudSyncEngine.memoryProposals
-//   • iCloudSyncEngine.trainingProposals + .promotionCandidates
+//   • iCloudSyncEngine.trainingProposals
 import SwiftUI
 import NativeAgentShared
 
@@ -190,10 +190,6 @@ struct ActivityView: View {
         MobileDesignSamples.rows(sync.trainingProposals).filter(\.isHumanActionable)
     }
 
-    private var pendingPromotionCandidates: [PromotionCandidateSummary] {
-        sync.promotionCandidates.filter(\.isHumanActionable)
-    }
-
     /// Empty arrays before the first completed snapshot are an absence of
     /// evidence, not proof that a section is clear. The engine's shared
     /// `lastSyncAt` is not that evidence: a provider-catalog update alone sets
@@ -220,16 +216,14 @@ struct ActivityView: View {
 
     private var pendingSelfImprovementCount: Int? {
         (sync.selfImprovementSnapshotPublishedAt != nil || isDesignSample)
-            ? pendingTrainingProposals.count + pendingPromotionCandidates.count : nil
+            ? pendingTrainingProposals.count : nil
     }
 
     /// The first two of each queue, in one list, so the landing can answer
     /// them in place. Each queue's full list is one row further down.
     private var waitingItems: [ActivityWaitingItem] {
         var items: [ActivityWaitingItem] = pendingMemoryProposals.prefix(2).map { .memory($0) }
-        let trainings = pendingTrainingProposals.prefix(2)
-        items += trainings.map { .training($0) }
-        items += pendingPromotionCandidates.prefix(2 - trainings.count).map { .promotion($0) }
+        items += pendingTrainingProposals.prefix(2).map { .training($0) }
         return items
     }
 
@@ -366,14 +360,6 @@ struct ActivityView: View {
             ) {
                 path.append(ActivitySection.selfImprovement)
             }
-        case .promotion(let candidate):
-            InlineSelfImprovementPreviewCard(
-                title: candidate.title,
-                summary: "Something I learned that I'd like to make part of how I work.",
-                note: "Approve or reject this learned behavior in Self-Improvement."
-            ) {
-                path.append(ActivitySection.selfImprovement)
-            }
         }
     }
 
@@ -398,7 +384,6 @@ private enum ActivityWaitingItem: Identifiable {
     case inbox(InboxItemRecord)
     case memory(MemoryProposalRecord)
     case training(TrainingProposalSummary)
-    case promotion(PromotionCandidateSummary)
 
     var id: String {
         switch self {
@@ -406,7 +391,6 @@ private enum ActivityWaitingItem: Identifiable {
         case .inbox(let value): return "inbox-\(value.id)"
         case .memory(let value): return "memory-\(value.id)"
         case .training(let value): return "training-\(value.id)"
-        case .promotion(let value): return "promotion-\(value.id)"
         }
     }
 }
@@ -675,9 +659,7 @@ private struct InlineMemoryProposalPreviewCard: View {
     }
 }
 
-/// Self-improvement proposal. View-only — approve/reject lives in the
-/// Autonomy view because the proposal types fan out into multiple buckets
-/// (training, promotion candidates).
+/// Self-improvement proposal. View-only: the change is decided on the Mac.
 private struct InlineSelfImprovementPreviewCard: View {
     let title: String
     let summary: String
