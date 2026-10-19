@@ -3,6 +3,7 @@ import AgentConversations
 import AgentWorkspace
 import ChatSessionWork
 import ChatTurnContracts
+import Experiences
 import ProviderRouting
 import Foundation
 import CryptoKit
@@ -15,6 +16,7 @@ import TurnTrace
 import TrustCenter
 import ChromeControl
 import Skills
+import Senses
 
 // MARK: - Tool-output failure-shape heuristic
 
@@ -51,7 +53,9 @@ extension ChatToolOutcome {
             }
         }
         let oldReason = text("reason")
-        let code = [text("error_code"), text("errorCode"), oldReason].compactMap { $0 }.first {
+        // The tool's own code, wherever it says one (a Mac verb's detail.error).
+        let inner: String? = if case .object(let detail)? = object["detail"], case .string(let error)? = detail["error"] { error } else { nil }
+        let code = [text("error_code"), text("errorCode"), oldReason, text("error"), inner].compactMap { $0 }.first {
             isCode($0) && !["failed", "error"].contains($0)
         } ?? "tool_failed"
         let candidates = ["message", "spoken", "text", "detail", "output", "error", "content", "result", "fix", "recovery_hint", "hint"].flatMap { explanations(object[$0]) }
@@ -81,8 +85,9 @@ extension ChatToolOutcome {
         let message = explained ?? processFailure ?? worded
         // Receipt readers own the meaning of reason/message, including refusal
         // classification. Enrichment must never replace the tool's own fields.
+        // An added reason is the code, never a second copy of the message.
         if object["failure_code"] == nil { object["failure_code"] = .string(code) }
-        if object["reason"] == nil { object["reason"] = .string(message) }
+        if object["reason"] == nil { object["reason"] = .string(code) }
         if object["message"] == nil { object["message"] = .string(message) }
         if object["argument_path"] == nil { object["argument_path"] = .null }
         if object["accepted"] == nil { object["accepted"] = .null }
@@ -126,7 +131,32 @@ extension ChatToolOutcome {
         return .object(object)
     }
 
-    public static func failure(error: any Error, tool: String? = nil) -> JSONValue {
+    /// The operation a call is for repair: its action, and for a setting the
+    /// setting it sets, so one setting working again settles only its own debt.
+    static func repairOperation(_ action: String, _ input: [String: JSONValue]) -> String {
+        let args = if case .object(let args)? = input["args"] { args } else { input }
+        if action == "setting.set", case .string(let setting)? = args["setting"] { return action + ":" + setting }
+        if action == "permissions.request", case .string(let capability)? = args["capability"] {
+            return action + ":" + capability + (capability == "calendars" && args["mode"] == .string("write") ? ":write" : "")
+        }
+        return action
+    }
+
+    /// The operation a remedy's lever performs, named as acts name theirs. A
+    /// read or a restart inspects or retries; it changes no owner, so it is no
+    /// lever and its success settles nothing.
+    static func leverOperation(_ remedy: JSONValue?) -> String? {
+        guard case .object(let fields)? = remedy, case .object(let call)? = fields["next_call"],
+              case .string(let tool)? = call["tool"] else { return nil }
+        let input: [String: JSONValue] = if case .object(let given)? = call["input"] { given } else { [:] }
+        guard case .string(let action)? = input["action"], !action.isEmpty else {
+            return tool == "app" ? nil : ToolNameAliases.appAction(tool) ?? tool
+        }
+        guard !action.hasSuffix(".restart"), AppActionBinding.action(input: input)?.read != true else { return nil }
+        return repairOperation(action, input)
+    }
+
+    public static func failure(error: any Error, tool: String? = nil, effects: ToolFailureError.Effects? = nil) -> JSONValue {
         if let back = error as? SkillRunContext.HandBack { return SkillRunContext.handBack(back.why) }
         var object: [String: JSONValue] = [
             "status": .string("failed"),
@@ -134,13 +164,27 @@ extension ChatToolOutcome {
             "reason": .string(errorMessage(error)),
             "error": .string(errorMessage(error)),
         ]
+        if let effects { object["effects"] = .string(effects.rawValue) }
         if let evidence = error as? ToolFailureError {
             object["argument_path"] = evidence.argumentPath.map(JSONValue.string) ?? .null
             object["accepted"] = evidence.accepted.map { .string(ChatSecretRedactor.redactText($0)) } ?? .null
             object["effects"] = .string(evidence.effects.rawValue)
             if evidence.argumentPath != nil { object["failure_code"] = .string("invalid_arguments") }
+            if let owner = evidence.owner, evidence.nextCall != nil || evidence.tap != nil {
+                let call = evidence.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+                object["remedy"] = if evidence.personDecides, let tap = evidence.tap {
+                    Repair.why(owner: owner, tap: tap)
+                } else { Repair.remedy(owner: owner, nextCall: call, tap: evidence.tap) }
+            } else if let call = evidence.nextCall.flatMap({ try? JSONValue.parse(Data($0.utf8)) }) {
+                // A correction: the call that works next, no owner and no debt.
+                object["remedy"] = .object([
+                    "kind": .string(evidence.argumentPath != nil ? "correct_arguments" : "inspect"),
+                    "instruction": .string(evidence.message), "next_call": call,
+                ])
+            }
         }
         if let refusal = error as? AgentConversationStore.Failure { object["effects"] = .string(refusal.effects.rawValue) }
+        if let failure = error as? SenseFailure { object["remedy"] = failure.remedy }
         if error is AgentWorkspaceFailure { object["effects"] = .string("none") }
         // A skill's save, read or enable refused for its shape or state wrote nothing.
         if let refusal = error as? SkillsError {
@@ -155,22 +199,16 @@ extension ChatToolOutcome {
         }
         if let chrome = error as? ChromeControlRuntimeError {
             if let effects = chrome.failureEffects { object["effects"] = .string(effects.rawValue) }
+            if let remedy = chrome.remedy { object["remedy"] = remedy }
             if case .outcomeUnknown = chrome { object["effects_unknown"] = .bool(true) }
-            if case .extensionReconnecting(_, let retryAfter) = chrome {
-                object["remedy"] = .object([
-                    "kind": .string("wait"),
-                    "instruction": .string(chrome.recoverySuggestion!),
-                    "retry_after": .string(ISO8601DateFormatter().string(from: retryAfter)),
-                    "next_call": .null,
-                ])
-            }
         }
         if let recovery = (error as? LocalizedError)?.recoverySuggestion,
            !recovery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             object["hint"] = .string(ChatSecretRedactor.redactText(recovery))
         }
         if let gate = error as? AutonomyGateError {
-            if case .toolDenied(let reason) = gate {
+            if case .toolDenied(let reason, let remedy) = gate {
+                if let remedy { object["remedy"] = remedy }
                 object["gate_reason"] = .string(ChatSecretRedactor.redactText(reason))
                 if let tool, reason.hasPrefix("autonomy=") || reason.hasPrefix("fileAccess=") {
                     let sentence = ToolNotRunStatus.blockedSentence(reason: reason, tool: tool)
@@ -221,6 +259,8 @@ extension ChatToolOutcome {
             // yet — the same shape as the re-asked CONFIRM above.
             if s == "needs_input" { return false }
         }
+        // A command's exit code is its answer once the tool says its call completed.
+        if case .string(let status)? = obj["status"], successStatuses.contains(status.lowercased()) { return true }
         if case .int(let code)? = obj["exit_code"], code != 0 { return false }
         if case .double(let code)? = obj["exit_code"], code != 0 { return false }
         return true
@@ -471,6 +511,24 @@ extension ChatToolOutcome {
 /// CapabilityPackInstall.appendCapabilityPackTrace):
 ///   {id, kind, title, status, payload, createdAt} with ISO8601 createdAt.
 package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Sendable {
+    /// An owned no met inside a call surfaces with the call's own failure: a
+    /// batch or part that fails without an owner of its own owes its steps'.
+    struct OwedNo: Sendable { let operation, owner: String; let lever, nextCall, tap: String? }
+    final class SurfacedNos: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [OwedNo] = []
+        let parent: SurfacedNos?
+        init(parent: SurfacedNos?) { self.parent = parent }
+        func add(_ more: [OwedNo]) { lock.withLock { items += more } }
+        var all: [OwedNo] { lock.withLock { items } }
+        /// A later success of the operation or its lever answers an earlier no, at every level.
+        func worked(_ operation: String) {
+            lock.withLock { items.removeAll { $0.operation == operation || $0.lever == operation } }
+            parent?.worked(operation)
+        }
+    }
+    @TaskLocal static var surfacedNos: SurfacedNos?
+
     private let inner: any ToolDispatchClient
     private let dataRoot: URL
     private let tracesPath: URL
@@ -487,14 +545,11 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             .appendingPathComponent("events.jsonl")
     }
 
-    /// The dispatch a call runs inside (a script's or a list's own app call,
-    /// home's reads); nil on a call the model made.
-    @TaskLocal private static var parent: String?
-
     package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let startNs = DispatchTime.now().uptimeNanoseconds
         let receiptID = UUID().uuidString.lowercased()
-        let parent = Self.parent
+        let parent = Experience.currentAct
+        let enclosing = Self.surfacedNos, inside = SurfacedNos(parent: enclosing)
         // The begin event lets Inspector show an in-flight dispatch.
         Self.fireBusEvent(
             tool: tool, input: input, surface: surface,
@@ -508,9 +563,11 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             let driver = ChatToolSessionContext.verifiedSessionId.flatMap { session in
                 TurnTraceContext.turnId.map { PersonOnlyWindows.Driver(session: session, turn: $0) }
             }
-            result = ChatToolOutcome.normalizedFailure(try await Self.$parent.withValue(receiptID) {
-                try await PersonOnlyWindows.$driver.withValue(driver) {
-                    try await inner.dispatch(tool: tool, input: input, surface: surface)
+            result = ChatToolOutcome.normalizedFailure(try await Experience.$currentAct.withValue(receiptID) {
+                try await Self.$surfacedNos.withValue(inside) {
+                    try await PersonOnlyWindows.$driver.withValue(driver) {
+                        try await inner.dispatch(tool: tool, input: input, surface: surface)
+                    }
                 }
             }, tool: tool)
         } catch {
@@ -520,7 +577,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
                 tool: tool, input: input, surface: surface,
                 status: "failed", startNs: startNs,
                 receiptID: receiptID, evidence: evidence,
-                result: failure, parent: parent,
+                result: failure, parent: parent, nos: (inside, enclosing),
                 errorClass: "dispatch_threw",
                 errorDetail: ChatToolOutcome.failureDetail(error: error)
             )
@@ -539,7 +596,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
             tool: tool, input: input, surface: surface,
             status: status, startNs: startNs,
             receiptID: receiptID, evidence: evidence,
-            result: result, parent: parent,
+            result: result, parent: parent, nos: (inside, enclosing),
             errorClass: failureShaped ? ChatToolOutcome.receiptFailureClass(result) : nil,
             // Failure-shaped envelope only: an ok or waiting row carries none.
             errorDetail: failureShaped ? ChatToolOutcome.failureDetail(result) : nil
@@ -746,7 +803,8 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         case .object(let object):
             var fields: [String: JSONValue] = [:]
             for key in ["id", "receipt_id", "run_id", "runId", "job_id", "message_id", "session_id", "handle",
-                        "status", "outcome", "final_status", "preview", "effects", "execution", "would_card", "approver", "preview_scope", "verified", "verification",
+                        "status", "outcome", "final_status", "preview", "effects", "execution", "read_only", "skill", "would_card", "approver", "preview_scope", "verified", "verification",
+                        "exit_code", "timed_out",
                         "result_handle", "result_ref", "read_ref", "digest", "sha256", "has_more", "next", "runsPath", "report_id", "index",
                         "model", "model_id", "reasoning_effort", "reasoningEffort", "provider"] {
                 guard let field = object[key] else { continue }
@@ -839,6 +897,7 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         evidence: [String: JSONValue],
         result: JSONValue,
         parent: String?,
+        nos: (inside: SurfacedNos, enclosing: SurfacedNos?),
         errorClass: String? = nil,
         errorDetail: String? = nil
     ) async {
@@ -865,12 +924,64 @@ package final class ChatToolDispatchTracer: ToolDispatchClient, @unchecked Senda
         guard case .object(let receiptFields) = receipt.toJSONValue() else { return }
         var receiptEvidence = receiptFields.merging(evidence) { _, evidence in evidence }
         receiptEvidence["source"] = .string(tracePath)
-        if TurnTraceContext.turnId != nil {
+        if let turn = TurnTraceContext.turnId {
             Self.fireBusEvent(
                 tool: tool, input: input, surface: surface, phase: "end",
                 status: status, durationMs: durationMs, result: result,
                 evidence: receiptEvidence, parent: parent, recordedAt: recordedAt
             )
+            // The act is the turn's, or its enclosing call's; its receipt is the evidence.
+            guard case .string(let action)? = evidence["action"] else { return }
+            let effects: Experience.Effects? = if case .object(let fields) = result, case .string(let raw)? = fields["effects"] {
+                Experience.Effects(rawValue: raw)
+            } else { nil }
+            var act = Experience(id: receiptID, kind: .act, cause: [parent ?? turn],
+                                 evidence: [.init(source: tracePath, id: receiptID)],
+                                 outcome: .init(domain: action, status: status, effects: effects))
+            // An owned no on the act she meant owes repair until that operation,
+            // or its lever, works again, or she lets it go (User 10-18).
+            let remedy: JSONValue? = if case .object(let fields) = result { fields["remedy"] } else { nil }
+            let operation = ChatToolOutcome.repairOperation(action, input)
+            var own: OwedNo?
+            if case .object(let fix)? = remedy, fix["kind"] == .string("repair"), case .string(let owner)? = fix["owner"] {
+                let tap: String? = if case .string(let tap)? = fix["tap"] { tap } else { nil }
+                let call = fix["next_call"].flatMap { $0 == .null ? nil : try? $0.serialize(pretty: false) }
+                own = OwedNo(operation: operation, owner: owner, lever: ChatToolOutcome.leverOperation(remedy),
+                             nextCall: call.map(ChatSecretRedactor.redactText), tap: tap)
+            }
+            // A no inside a call is owed by the call that surfaced it; a call that
+            // failed with no owner of its own surfaces its steps' owned nos.
+            let surfaced = own.map { [$0] } ?? (status == "failed" ? nos.inside.all : [])
+            // A preview shows what a call would do; it proves nothing works.
+            let worked = status == "ok" && input["preview"] != .bool(true)
+            if parent != nil {
+                if status == "failed" { nos.enclosing?.add(surfaced) } else if worked { nos.enclosing?.worked(operation) }
+            } else if let own {
+                act.owes["repair"] = .init(to: own.tap == nil ? "self" : "person")
+                act.claims = RepairOwed.claims(owner: own.owner, operation: own.operation, lever: own.lever,
+                                               nextCall: own.nextCall, tap: own.tap)
+            } else {
+                for (index, no) in surfaced.enumerated() {
+                    RepairOwed.owe(dataRoot, id: receiptID + ":" + String(index), kind: .act, cause: [receiptID],
+                                   evidence: [.init(source: tracePath, id: receiptID)], operation: no.operation,
+                                   owner: no.owner, words: errorDetail ?? "", lever: no.lever, nextCall: no.nextCall, tap: no.tap)
+                }
+            }
+            // Debts and settlements of one operation share its queue, so neither overtakes the other.
+            let queue = act.owes["repair"] != nil || worked ? "repair:" + operation : receiptID
+            ExperienceStore.record(dataRoot, queue) { [act] store in
+                var act = act
+                // A repeat of a debt still open is evidence on it, not a second line.
+                if act.owes["repair"] != nil, let owner = act.claims.first(where: { $0.claim.hasPrefix("owner: ") }),
+                   let open = try await RepairOwed.openDebt(store, operation: operation, owner: String(owner.claim.dropFirst(7))) {
+                    act.owes["repair"] = nil
+                    try await store.begin(act)
+                    try await store.append([.evidence(.init(source: "act", id: receiptID))], to: open.id)
+                    return
+                }
+                try await store.begin(act)
+                if worked { try await RepairOwed.settle(store, operation: operation, evidence: .init(source: "act", id: receiptID)) }
+            }
             return
         }
         let row: JSONValue = .object([

@@ -106,7 +106,8 @@ private struct EngineClaudeBridgePort: ClaudeBridgeRuntimePort {
     }
     func completionSender(dataRoot: URL) -> any AgentBridgeCompletionSending { engine().ports.completionSender(dataRoot) }
     func receiveGrok(_ reply: GrokReplyInput, principal: AgentBridgePrincipal, dataRoot: URL) async throws {
-        try await engine().agents.grok.receive(reply, principal: principal, dataRoot: dataRoot)
+        try await engine().agents.grok.receive(reply, principal: principal, dataRoot: dataRoot,
+                                              continuation: engine().agents.continuation)
     }
     func publishChatTurnCompleted(sessionID: String?) async {
         await MainActor.run { NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID) }

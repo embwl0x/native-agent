@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import ChatOrchestration
 
 public struct AgentContactRow: Identifiable, Sendable {
@@ -7,7 +8,6 @@ public struct AgentContactRow: Identifiable, Sendable {
     public let contact: AgentPeerContact?
     public var candidate: AgentDiscoveryCandidate? = nil
     public var builtIn = false
-    public var sharesBuiltInName = false
     /// The newest retained exchange with this contact, from any chat.
     public var lastExchange: String?
     /// Home's own word for this contact (AgentContactHealth): one source, so
@@ -15,6 +15,7 @@ public struct AgentContactRow: Identifiable, Sendable {
     public var health: AgentLocalHealth?
     /// Read once when the row is built (a Keychain read), not on every redraw.
     public var credentialAvailable = true
+    public var elevationFailure: ToolFailureError?
     public var state: AgentPeerContactState?
 
     public var repliesOnly: Bool {
@@ -22,12 +23,9 @@ public struct AgentContactRow: Identifiable, Sendable {
         return AgentHostDirectory.row(named: hostID)?.format == .shellEnvironment
     }
 
-    public var displayName: String {
-        builtIn ? name + " (built-in connection)" : sharesBuiltInName ? name + " (agent contact)" : name
-    }
+    public var displayName: String { name }
 
     public var route: String {
-        if builtIn { return "Built-in connection on this Mac" }
         if let contact, contact.transport == .acp {
             return "Route: ACP\nStarts in folder: \(contact.acpWorkingDirectory ?? "Not set")"
                 + "\nProgram: \(contact.approvedExecutablePath ?? "Not approved")"
@@ -60,43 +58,44 @@ public struct AgentContactRow: Identifiable, Sendable {
         }
     }
 
-    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>) -> [Self] {
+    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>, everyDoor: Bool = false) -> [Self] {
         let hosts = candidates.filter(\.connectable).compactMap { candidate in
             candidate.hostID.flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
         }
         let discovered = candidates.filter { candidate in
             candidate.cardURL != nil && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
         }.map { Self(id: $0.id, name: $0.name, contact: nil, candidate: $0) }
-        // Each lane under its own name, the one the bridge signs its turns
-        // with ("[from: claude, via bridge]"), not the app behind it.
-        let names = [("codex", "Codex"), ("claude", "Claude"), ("omp", "OMP")]
-        let liveLanes = names.filter { usable.contains($0.0) }
-        let contacts = (rows(peers: peers, installed: hosts) + discovered).map { row in
+        let contacts = (rows(peers: peers, installed: hosts, everyDoor: everyDoor) + discovered).map { row in
             var row = row
-            row.sharesBuiltInName = liveLanes.contains { row.name.caseInsensitiveCompare($0.1) == .orderedSame }
+            let hostID = row.contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? row.id
+            row.candidate = row.candidate ?? candidates.first { $0.hostID == hostID }
             return row
         }
-        return contacts + liveLanes.map { Self(id: "builtin:" + $0.0, name: $0.1, contact: nil, builtIn: true) }
+        return contacts
     }
 
     /// The same canonical contact identities as People, preferring a built-in lane.
-    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>, dataRoot: URL) -> [Self] {
+    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>, dataRoot: URL, everyDoor: Bool = false) -> [Self] {
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         let identity = AgentContactIdentity(dataRoot: dataRoot)
         let health = AgentContactHealth.read(dataRoot: dataRoot)
-        let all = rows(peers: peers, candidates: candidates, usable: usable).map { row in
+        let all = rows(peers: peers, candidates: candidates, usable: usable, everyDoor: true).map { row in
             var row = row
             row.health = health[row.key]
             return row
         }
         func brain(_ row: Self) -> String {
-            ["claude-code", "claude-desktop"].contains(row.id) ? "claude" : identity.canonical(row.key)
+            identity.canonical(row.key)
         }
         var seen: Set<String> = []
-        return all.sorted { $0.builtIn && !$1.builtIn }.compactMap { row in
+        return all.compactMap { row in
+            // Fold the same evidence before choosing which doors to display.
+            if !everyDoor, let who = row.contact?.who, peers.contains(where: { $0.id == who }) { return nil }
             let canonical = brain(row)
-            guard seen.insert(canonical).inserted else { return nil }
+            guard everyDoor || seen.insert(canonical).inserted else { return nil }
             var row = row
+            row.candidate = all.filter { brain($0) == canonical }.compactMap(\.candidate).first { $0.setupFailure != nil }
+                ?? row.candidate
             row.health = all.filter { brain($0) == canonical }.compactMap(\.health)
                 .filter { $0.problem != nil }
                 .sorted { $0.isBroken != $1.isBroken ? $0.isBroken : $0.checkedAt > $1.checkedAt }
@@ -106,14 +105,18 @@ public struct AgentContactRow: Identifiable, Sendable {
     }
 
     /// The id home and the health file know it by: a lane's name, a contact's `peer:` id.
-    public var key: String { builtIn ? String(id.dropFirst("builtin:".count)) : id }
+    public var key: String { id }
 
-    public static func rows(peers: [AgentPeerContact], installed: [AgentHostRow]) -> [Self] {
+    /// One row per who; `everyDoor` (Trust: each door keeps its own grant) lists
+    /// each associated door too, under its who's name.
+    public static func rows(peers: [AgentPeerContact], installed: [AgentHostRow], everyDoor: Bool = false) -> [Self] {
         let configured = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
-        return peers.map { peer in
+        return peers.filter { peer in everyDoor || !peers.contains { $0.id == peer.who } }.map { peer in
             let available = AgentPeerCredentials.isAvailable(peer, peers: peers)
-            return Self(id: "peer:" + peer.id, name: peer.name, contact: peer,
-                        credentialAvailable: available, state: available ? peer.state : .unavailable)
+            let who = peers.first { $0.id == peer.who }
+            return Self(id: "peer:" + peer.id, name: who.map { $0.name + " · " + peer.name } ?? peer.name, contact: peer,
+                        credentialAvailable: available, elevationFailure: peer.elevationUnavailable(peers: peers, available: available),
+                        state: available ? peer.state : .unavailable)
         }
             + installed.filter { !configured.contains($0.id) }
                 .map { Self(id: $0.id, name: $0.displayName, contact: nil) }
@@ -125,11 +128,11 @@ public struct AgentContactRow: Identifiable, Sendable {
 
     /// The one word the row's pill carries; the full status stays below it.
     public var pillWord: String {
+        if candidate?.setupFailure != nil { return "Unavailable" }
         if let word = health?.problemWord { return word }
         if let health, AgentLocalHealth.presenceStatuses.contains(health.status) { return health.word ?? "Not checked" }
         if contact != nil && (!credentialAvailable || state == .unavailable || contact?.unavailableAt != nil) { return "Unavailable" }
         if let word = health?.word, contact == nil || health?.problem != nil || unproven { return word }
-        if builtIn { return "Not checked" }
         guard contact != nil else { return "Not set up" }
         switch state {
         case .connected: return "Connected"
@@ -141,14 +144,11 @@ public struct AgentContactRow: Identifiable, Sendable {
     }
 
     public var status: String {
+        if let failure = candidate?.setupFailure { return failure }
         if let health, let problem = health.problem { return problem + (health.presenceDetail.map { " · " + $0 } ?? "") }
         if let health, AgentLocalHealth.presenceStatuses.contains(health.status) { return health.detail }
         if credentialAvailable, state != .unavailable, contact?.unavailableAt == nil,
            let said = health?.problem ?? (unproven ? health?.detail : nil) { return said }
-        if builtIn {
-            return health?.word.map { $0 + (health?.lastGoodAt == nil ? " · No reply proven yet" : " · Reply proven") }
-                ?? "Reply not checked"
-        }
         guard let contact else { return "On this Mac · Not set up" }
         if repliesOnly {
             return !credentialAvailable ? AgentPeerCredentials.unavailableDetail
@@ -209,16 +209,17 @@ public struct AgentContactRow: Identifiable, Sendable {
 }
 
 extension AgentContactRow {
-    public static func read(dataRoot root: URL, candidates discovery: [AgentDiscoveryCandidate]) throws -> [Self] {
-        let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
-        let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-        let peers = try AgentPeerStore(dataRoot: root).list()
-        let lasts = AgentConversationStore.lastExchanges(peers: peers,
-            records: (try? AgentConversationStore(dataRoot: root).records()) ?? [], dataRoot: root).mapValues(\.summary)
-        return AgentContactRow.rows(peers: peers, candidates: discovery, usable: usable, dataRoot: root).map { row in
-            var row = row
-            row.lastExchange = row.contact.flatMap { lasts[$0.id] }
-            return row
+    public static func read(dataRoot root: URL, everyDoor: Bool = false) async -> Result<[Self], Error> {
+        let discovery = await AgentDiscoverySession.shared.candidates(dataRoot: root)
+        return Result {
+            let peers = try AgentPeerStore(dataRoot: root).list()
+            let lasts = AgentConversationStore.lastExchanges(peers: peers,
+                records: (try? AgentConversationStore(dataRoot: root).records()) ?? [], dataRoot: root).mapValues(\.summary)
+            return AgentContactRow.rows(peers: peers, candidates: discovery, usable: [], dataRoot: root, everyDoor: everyDoor).map { row in
+                var row = row
+                row.lastExchange = row.contact.flatMap { lasts[$0.id] }
+                return row
+            }
         }
     }
 }

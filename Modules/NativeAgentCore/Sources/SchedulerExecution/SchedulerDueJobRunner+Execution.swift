@@ -283,7 +283,6 @@ extension SchedulerDueJobRunner {
         let disabled = Self.anyBool(response["disabled"])
         let errors = Self.anyStringArray(response["errors"])
         let failedWithoutEntry = entries <= 0 && !errors.isEmpty
-        let retryableFailure = failedWithoutEntry && Self.dreamErrorsAreRetryable(errors)
         let output = Self.jsonValue(from: response)
 
         if disabled {
@@ -294,19 +293,12 @@ extension SchedulerDueJobRunner {
             )
         }
 
-        // 2026-09-06: a lost reservation is a retry-soon outcome, not a
-        // completed skip. Scheduled and pressure runs target different diary
-        // dates (the 03:30 job writes the day that just ended, a pressure run
-        // writes today), so a pressure run holding the lock at 03:30 would
-        // otherwise send the job straight to its next natural run and leave the
-        // previous day undreamt forever. Ask for a short retry; the per-day
-        // retry cap in update(job:) bounds it.
+        // The in-flight pass owns its work; this occurrence remains owed.
         if (response["skipReason"] as? String) == "already_running" {
-            var retryObj = Self.object(output)
-            retryObj["retryAfterSeconds"] = .int(10 * 60)
+            let retryObj = Self.object(output)
             return JobResult(
                 status: "skipped",
-                detail: "another dream run holds the reservation; retry scheduled",
+                detail: "another dream run holds the reservation; its work is still running",
                 output: .object(retryObj)
             )
         }
@@ -323,7 +315,7 @@ extension SchedulerDueJobRunner {
         let entriesForToday = Self.dreamEntriesForToday(dataRoot: root, dateKey: dateKey)
         let paths = entriesForToday.map { $0.path }
         let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
-        let title = failedWithoutEntry ? "\(agentName) dream needs retry" : "\(agentName) dreamed"
+        let title = failedWithoutEntry ? "\(agentName) dream needs repair" : "\(agentName) dreamed"
         let message = Self.dreamInboxMessage(
             entriesWritten: entries,
             sessionsProcessed: sessions,
@@ -353,17 +345,11 @@ extension SchedulerDueJobRunner {
         outputObj["delivery"] = delivery
         if failedWithoutEntry {
             outputObj["failureKind"] = .string("dream_failed_before_write")
-            outputObj["retryable"] = .bool(retryableFailure)
-            if retryableFailure {
-                outputObj["retryAfterSeconds"] = .int(15 * 60)
-            }
         }
         return JobResult(
             status: failedWithoutEntry ? "error" : (errors.isEmpty ? "completed" : "warn"),
             detail: failedWithoutEntry
-                ? (retryableFailure
-                    ? "dream pass failed before writing; retry scheduled in 15 minutes"
-                    : "dream pass failed before writing; attention needed")
+                ? "dream pass failed before writing; repair remains owed"
                 : detail,
             output: .object(outputObj)
         )
@@ -395,17 +381,12 @@ extension SchedulerDueJobRunner {
         let evicted = Self.anyBool(response["growthMDEvicted"])
         let output = Self.jsonValue(from: response)
 
-        // 2026-09-06: a pass that lost the run reservation to a concurrent one
-        // is a retry-soon outcome, not a quiet week. It used to report zero
-        // proposals and "completed", so the weekly job went to its next natural
-        // run and that week's dreams were never consolidated. Same shape the
-        // dream job uses for its own reservation loss.
+        // Reservation loss is not a completed pass.
         if (response["skipReason"] as? String) == "already_running" {
-            var retryObj = Self.object(output)
-            retryObj["retryAfterSeconds"] = .int(30 * 60)
+            let retryObj = Self.object(output)
             return JobResult(
                 status: "skipped",
-                detail: "another REM pass holds the reservation; retry scheduled",
+                detail: "another REM pass holds the reservation; its work is still running",
                 output: .object(retryObj)
             )
         }

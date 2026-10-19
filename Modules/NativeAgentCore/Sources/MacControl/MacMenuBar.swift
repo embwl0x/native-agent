@@ -47,6 +47,8 @@ public enum MacMenuBar {
     /// Characters of one item's title. Menu titles are short by design; a
     /// longer one is a document name that wandered into a Window menu.
     public static let maxTitleChars = 80
+    /// A path's allowance: every title whole, and the " › " between them.
+    public static func pathChars(_ depth: Int) -> Int { maxTitleChars * depth + 3 * (depth - 1) }
 
     /// The separators a person or a model might type between levels. `›` is
     /// what this organ PRINTS; the rest are accepted because refusing a path
@@ -335,7 +337,7 @@ public enum MacMenuBar {
     public static func words(for resolution: Resolution, requested raw: String) -> String? {
         func safe(_ title: String) -> String {
             if case .string(let text) = MacScreenViewTextRedaction.redactedLegendString(
-                title, valueChars: maxTitleChars * maxPathDepth
+                title, valueChars: pathChars(maxPathDepth)
             ) { return text }
             return "[redacted]"
         }
@@ -362,11 +364,11 @@ public enum MacMenuBar {
     /// and a document can be called anything.
     /// `statesKnown` false (the app is not in front): enabled states are not
     /// claimed — a background app's menus report stale ones.
-    public static func json(_ reading: Reading, statesKnown: Bool = true) -> JSONValue {
+    public static func json(_ reading: Reading, statesKnown: Bool = true, depth: Int = maxPathDepth) -> JSONValue {
         var out: [String: JSONValue] = [
             "count": .int(Int64(reading.items.count)),
             "truncated": .bool(reading.truncated),
-            "max_depth": .int(Int64(maxPathDepth)),
+            "max_depth": .int(Int64(depth)),
         ]
         if let unavailable = reading.unavailable {
             out["available"] = .bool(false)
@@ -379,7 +381,7 @@ public enum MacMenuBar {
             var row: [String: JSONValue] = [
                 "path": MacScreenViewTextRedaction.redactedLegendString(
                     item.display,
-                    valueChars: maxTitleChars * maxPathDepth
+                    valueChars: pathChars(depth)
                 ),
             ]
             if statesKnown { row["enabled"] = .bool(item.enabled) }

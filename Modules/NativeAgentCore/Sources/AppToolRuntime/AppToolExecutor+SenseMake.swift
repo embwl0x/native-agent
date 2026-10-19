@@ -98,7 +98,7 @@ extension AppToolExecutor {
             } catch let error as NSError where error.domain == "CapabilityLifecycle" {
                 return Self.failure("owners_call", error.localizedDescription)
             } catch {
-                return Self.failure("trial_unavailable", "The trial could not be kept. Read the place and run a fresh sense.make trial; nothing was kept. " + error.localizedDescription)
+                return Self.failure("trial_unavailable", "The trial could not be kept. Read the place and run a fresh sense.make trial; nothing was kept. " + error.localizedDescription, extra: ["effects": .string("unknown")])
             }
         }
         guard showMaterial || !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -162,7 +162,7 @@ extension AppToolExecutor {
             guard case .page(let page, let provenance) = outcome else {
                 let detail: String = if case .failed(let failure) = outcome { failure.message } else { "read() returned no page." }
                 try registry.programs.discard(candidate)
-                return Self.failure("sense_failed", detail, extra: ["place": .string(corner.key), "kit": .string(kit)])
+                return Self.failure("sense_failed", detail, extra: ["place": .string(corner.key), "kit": .string(kit), "effects": .string("unknown")])
             }
             let shown = SenseDoor.render(page, provenance: provenance)
             let key = try await SwiftNativeManifestSigner(dataRoot: registry.root.deletingLastPathComponent()).loadOrCreateSigningKey()
@@ -187,7 +187,7 @@ extension AppToolExecutor {
         } catch let error as NSError where error.domain == "CapabilityLifecycle" {
             return Self.failure("owners_call", error.localizedDescription)
         } catch {
-            return Self.failure("sense_failed", error.localizedDescription, extra: ["place": .string(corner.key)])
+            return Self.failure("sense_failed", error.localizedDescription, extra: ["place": .string(corner.key), "effects": .string("unknown")])
         }
     }
 

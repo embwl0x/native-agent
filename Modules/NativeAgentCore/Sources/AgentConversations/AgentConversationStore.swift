@@ -5,6 +5,7 @@ import NativeAgentCore
 import PersistenceCore
 import ApprovalInbox
 import ChatTurnContracts
+import Experiences
 
 
 
@@ -38,6 +39,14 @@ public enum AgentConversationDelivery: String, Sendable {
 
     /// `read`: the recipient's inbox marked this send read.
     public static func of(_ row: AgentConversationRecord, read: Bool) -> Self {
+        if row.phase == "sending" { return .sending }
+        if claudeInbox(row),
+           row.exchanges?.last(where: { $0.id == row.operationID })?.reply == nil,
+           case .object(let receipt)? = row.receipt,
+           (["delivered", "queued", "read"].contains(receipt["status"].flatMap { if case .string(let s) = $0 { s } else { nil } } ?? "")
+            || AgentConversationSession.liveHandOff(row)) {
+            return read || receipt["read"] == .bool(true) ? (row.awaitsReply ? .waiting : .read) : .waiting
+        }
         if row.phase != "sending", case .object(let receipt)? = row.receipt, receipt["reply_state"] == .string("no_reply_expired") { return .failed }
         if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) { return .notDelivered }
         if row.phase == "ready", row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return .answered }
@@ -46,26 +55,83 @@ public enum AgentConversationDelivery: String, Sendable {
         case "attention":
             if case .object(let receipt)? = row.receipt, receipt["sent"] == .bool(false) || receipt["error"] != nil
                 || receipt["status"] == .string("outcome_unknown") { return .notDelivered }
-            return row.awaitsReply ? .failed : (read ? .read : .delivered)
+            return row.awaitsReply ? .failed : (accepted(row, read: read) ? .delivered : .waiting)
         case "waiting":
             // Still with the lane (queued, running, a peer's task at work): the
             // lane itself brings the answer. Handed into a live session and done
             // there (Claude): an answer is owed only if one was asked for.
             guard AgentConversationSession.liveHandOff(row), !row.awaitsReply else { return .waiting }
-            return read ? .read : .delivered
-        default: return read ? .read : .delivered
+            return accepted(row, read: read) ? .delivered : .waiting
+        default: return accepted(row, read: read) ? (read ? .read : .delivered) : .waiting
         }
+    }
+
+    public struct InboxDoor: Sendable {
+        public let agent: String
+        public let handle: String
+        public let inbox: URL
+        public let tool: String
+        public let options: Set<String>
+        public let tap: String?
+        public var liveReader: Bool { tap != nil }
+        public func remedy() -> JSONValue {
+            Repair.remedy(owner: "\(handle) inbox reader", nextCall: nil, tap: tap)
+        }
+    }
+
+    private static let inboxRecipes: [String: (path: String, tool: String, options: Set<String>, tap: String?)] = [
+        "claude": ("claude-bridge/claude-inbox.jsonl", "claude_message", ["pair_reviewer"], "Claude Code → open a Claude Code session, which reads its inbox"),
+        "claude": ("claude-bridge/claude-inbox.jsonl", "claude_message", ["pair_reviewer"], "Claude Code → open a Claude Code session, which reads its inbox"),
+        "codex": ("codex-nativeagent-bridge/codex-inbox.jsonl", "codex_message", ["model", "reasoning_effort", "fast", "pair_reviewer", "completion_mode", "repository"], nil),
+        "omp": ("omp-bridge/omp-inbox.jsonl", "omp_message", ["timeout_seconds"], nil),
+    ]
+
+    /// A live reader, rather than a launched run, owns acceptance for this door.
+    public static func claudeInbox(_ row: AgentConversationRecord) -> Bool {
+        guard case .object(let receipt)? = row.receipt, case .string(let path)? = receipt["filePath"] else { return false }
+        return inboxRecipes.values.contains { $0.tap != nil && path.hasSuffix("/" + $0.path) }
     }
 
     /// A built-in lane's inbox, where the recipient marks a message read.
     public static func inbox(agent: String, bridgeConfigRoot root: URL) -> URL? {
-        switch agent {
-        case "claude": root.appendingPathComponent("claude-bridge/claude-inbox.jsonl")
-        case "codex": root.appendingPathComponent("codex-nativeagent-bridge/codex-inbox.jsonl")
-        case "omp": root.appendingPathComponent("omp-bridge/omp-inbox.jsonl")
-        default: nil
-        }
+        inboxRecipes[agent].map { root.appendingPathComponent($0.path) }
     }
+
+    /// Only a saved who can carry an inbox door. A directory or installed
+    /// program alone never establishes a recipient.
+    public static func lane(for agent: String, dataRoot: URL, bridgeConfigRoot: URL? = nil) -> String? {
+        door(for: agent, dataRoot: dataRoot, bridgeConfigRoot: bridgeConfigRoot)?.handle
+    }
+
+    public static func door(for agent: String, dataRoot: URL, bridgeConfigRoot: URL? = nil) -> InboxDoor? {
+        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        guard let peer = peers.first(where: { "peer:" + $0.id == agent || ($0.handles ?? []).contains(agent) }) else { return nil }
+        // An explicitly addressed associated door keeps its own recipe.
+        guard !peers.contains(where: { $0.id == peer.who }) else { return nil }
+        let root = bridgeConfigRoot ?? InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        let handles = (peer.handles ?? []).filter { agent.hasPrefix("peer:") || $0 == agent }
+        for handle in handles {
+            guard let recipe = inboxRecipes[handle], peers.filter({ ($0.handles ?? []).contains(handle) }).count == 1 else { continue }
+            let inbox = root.appendingPathComponent(recipe.path)
+            guard FileManager.default.fileExists(atPath: inbox.path) else { continue }
+            return InboxDoor(agent: "peer:" + peer.id, handle: handle, inbox: inbox, tool: recipe.tool,
+                options: recipe.options.union(["working_directory", "topic", "priority", "desk_item"]), tap: recipe.tap)
+        }
+        return nil
+    }
+
+    public static func accepted(_ row: AgentConversationRecord, read: Bool = false) -> Bool {
+        if read || row.exchanges?.last(where: { $0.id == row.operationID })?.reply != nil { return true }
+        guard case .object(let root)? = row.receipt else { return false }
+        let value: [String: JSONValue] = if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { job } else { root }
+        if let message = row.readInput?["message_id"], case .array(let ids)? = value["accepted_message_ids"], ids.contains(message),
+           case .string(let state)? = value["run_status"] ?? value["status"] ?? value["state"],
+           ["running", "working", "completed", "succeeded", "done", "answered", "replied"].contains(state) { return true }
+        return value["read"] == .bool(true) || value["accepted"] == .bool(true)
+            || ["reply", "answer"].contains { if case .string(let text)? = value[$0] { !text.isEmpty } else { false } }
+            || AgentConversationView.codingReply(value).text != nil
+    }
+
 }
 
 public enum AgentConversationContext {
@@ -91,6 +157,18 @@ public struct AgentConversationStore: Sendable {
         try locked {
             var rows = try load()
             if try reconcileDeniedApprovals(&rows) { try save(rows) }
+            recordExperiences(rows)
+            let archive = fileURL.deletingLastPathComponent().appendingPathComponent("conversations-dropped.jsonl")
+            if FileManager.default.fileExists(atPath: archive.path) {
+                do {
+                    let dropped = try Data(contentsOf: archive).split(separator: 10).map {
+                        try JSONDecoder().decode(AgentConversationRecord.self, from: Data($0))
+                    }
+                    recordExperiences(dropped.filter { old in !rows.contains { $0.id == old.id } }, dropped: true)
+                } catch {
+                    ExperienceStore.record(fileURL.deletingLastPathComponent().deletingLastPathComponent(), "agent-conversations") { _ in throw error }
+                }
+            }
             try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([], records: rows)
             return rows
         }
@@ -323,6 +401,7 @@ public struct AgentConversationStore: Sendable {
             try handle.synchronize()
             let ids = Set(dropped.map(\.id))
             try save(rows.filter { !ids.contains($0.id) })
+            recordExperiences(dropped, dropped: true)
             return dropped.count
         }
     }
@@ -376,15 +455,14 @@ public struct AgentConversationStore: Sendable {
     /// handed over by a turn already). There it is an arrival for her too
     /// (ResidentWake), unless it came as a turn or is the person's own send.
     private func noteReplies(was before: AgentConversationRecord, now row: AgentConversationRecord, wake: Bool = true) {
-        let lane = ["codex", "claude", "omp"].contains(row.agent)
-        guard lane || row.agent.hasPrefix("peer:") else { return }
+        guard row.agent.hasPrefix("peer:") else { return }
         let earlier = Dictionary((before.exchanges ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         for exchange in row.exchanges ?? [] {
             guard let reply = exchange.reply, let at = exchange.settledAt,
                   earlier[exchange.id].map({ $0.reply == nil || $0.settledAt == nil }) ?? true,
                   exchange.id != row.operationID || (row.deliveryState != "delivering" && row.deliveryRunID == nil) else { continue }
-            let entry = ContactThread.Entry.reply(owner: lane ? row.agent : String(row.agent.dropFirst(5)), name: row.name,
+            let entry = ContactThread.Entry.reply(owner: String(row.agent.dropFirst(5)), name: row.name,
                                                   text: reply, replyID: "agent-conversation:" + exchange.id, at: at)
             // Its own task, carrying none of the writer's turn with it.
             Task.detached { await ContactThread.write(entry, dataRoot: root) }
@@ -398,23 +476,25 @@ public struct AgentConversationStore: Sendable {
     /// The accepted message id of the send waiting in exactly this
     /// conversation, for an answer that names the conversation, not the message.
     public func waitingMessage(agent: String, conversationID: String) throws -> String? {
-        try records().filter { $0.agent == agent && $0.phase == "waiting" && $0.conversationID == conversationID }
+        let identity = AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
+        return try records().filter { identity.canonical($0.agent) == identity.canonical(agent) && $0.phase == "waiting" && $0.conversationID == conversationID }
             .max { ($0.operationStartedAt ?? $0.updatedAt) < ($1.operationStartedAt ?? $1.updatedAt) }
             .flatMap { if case .string(let id)? = $0.readInput?["message_id"], !id.isEmpty { id } else { nil } }
     }
 
     /// A contact's answer that came as a message of its own (Claude over the
     /// bridge) settles the send it names by its exact accepted message id, and
-    /// only that one; an answer naming nothing settles nothing. Returns whether
-    /// a waiting send was settled.
+    /// only that one, through whichever of her doors it went; an answer naming
+    /// nothing settles nothing. Returns whether a waiting send was settled.
     /// `landedIn`: the chat the answer itself arrived in; in the contact's own
     /// session it is already there.
     @discardableResult public func settleReply(agent: String, messageID: String, text: String,
                                                landedIn: String? = nil) throws -> Bool {
-        try locked {
+        let identity = AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
+        return try locked {
             var rows = try load()
             guard !messageID.isEmpty, let index = rows.firstIndex(where: {
-                $0.agent == agent && $0.phase == "waiting" && $0.readInput?["message_id"] == .string(messageID)
+                identity.canonical($0.agent) == identity.canonical(agent) && $0.phase == "waiting" && $0.readInput?["message_id"] == .string(messageID)
             }) else { return false }
             let before = rows[index]
             let limit = AgentConversationExchange.textLimit
@@ -449,14 +529,14 @@ public struct AgentConversationStore: Sendable {
             for index in rows.indices {
                 let row = rows[index]
                 guard ["waiting", "attention"].contains(row.phase), !row.automaticRead,
-                      ["codex", "claude", "omp"].contains(row.agent),
+                      let lane = AgentConversationDelivery.lane(for: row.agent, dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()),
                       row.readInput?["agent"] == .string(row.agent),
                       case .string(let messageID)? = row.readInput?["message_id"],
                       !messageID.isEmpty else { continue }
                 // Match the accepted message, never an internal job ID, topic
                 // or newest record. Ambiguous retained/delivery evidence stays
                 // with its owner for an explicit read.
-                let matches = jobs.filter { $0.agent == row.agent && $0.acceptedMessageIDs.contains(messageID) }
+                let matches = jobs.filter { $0.agent == lane && $0.acceptedMessageIDs.contains(messageID) }
                 guard matches.count == 1, let job = matches.first,
                       job.stallBasis == .terminal,
                       case .object(var result) = job.toJSON(includeReplyText: true) else { continue }
@@ -604,12 +684,39 @@ public struct AgentConversationStore: Sendable {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return [] }
         let data = try Data(contentsOf: fileURL)
         guard data.count <= 50 * 1024 * 1024 else { throw Failure(message: "Saved conversations are too large to read safely.") }
-        let rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
+        var rows = try JSONDecoder().decode([AgentConversationRecord].self, from: data)
         guard rows.count <= 512, Set(rows.map(\.id)).count == rows.count,
               rows.allSatisfy({ UUID(uuidString: $0.id) != nil && UUID(uuidString: $0.operationID) != nil && !$0.scopeSessionID.isEmpty }) else {
             throw Failure(message: "Saved conversations are unavailable; existing records were preserved.")
         }
         for row in rows { try AgentConversationExchange.validate(row.exchanges) }
+        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        guard let peers = try? AgentPeerStore(dataRoot: root).list() else { return rows }
+        for index in rows.indices where AgentConversationDelivery.inbox(agent: rows[index].agent,
+            bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root)) != nil {
+            let owners = peers.filter { ($0.handles ?? []).contains(rows[index].agent) }
+            if owners.count == 1, let who = owners.first {
+                rows[index].agent = "peer:" + who.id
+                rows[index].name = who.name
+                rows[index].peerRouteFingerprint = Self.routeFingerprint(who)
+                rows[index].readInput?["agent"] = .string("peer:" + who.id)
+            } else {
+                rows[index].phase = "attention"
+                let lane = rows[index].agent
+                rows[index].deliveryState = "\(lane) had no reader on this Mac; this saved message is owed to no one. Its record is preserved."
+            }
+        }
+        for index in rows.indices where rows[index].phase == "waiting" && AgentConversationDelivery.claudeInbox(rows[index]) {
+            guard case .object(var receipt)? = rows[index].receipt, receipt["read"] != .bool(true),
+                  case .string(let path)? = receipt["filePath"], case .string(let message)? = rows[index].readInput?["message_id"],
+                  let peer = peers.first(where: { "peer:" + $0.id == rows[index].agent }) else { continue }
+            guard let door = (peer.handles ?? []).compactMap({ AgentConversationDelivery.door(for: $0, dataRoot: root) })
+                .first(where: { $0.inbox.path == path }) else { continue }
+            receipt["remedy"] = door.remedy()
+            if DelegationStatusProjector.requestTexts(inbox: door.inbox, ids: [message], field: "read")[message] == "true" { receipt["read"] = .bool(true) }
+            AgentConversationSession.absorb(.object(receipt), into: &rows[index])
+            try Self.absorbExchange(into: &rows[index])
+        }
         return try reconcilingExpiredReplies(rows)
     }
 
@@ -634,12 +741,37 @@ public struct AgentConversationStore: Sendable {
         return rows
     }
     private func save(_ rows: [AgentConversationRecord]) throws {
+        let previous = try load()
+        var rows = rows
+        for index in rows.indices {
+            guard let old = previous.first(where: { $0.id == rows[index].id }) else { continue }
+            func settle(_ id: String, key: String, accepted: Bool, reason: ObligationPhase.LetGo) {
+                var obligation = Experience.Obligation(to: "conversation:" + old.id)
+                obligation.phase = accepted ? .accepted : .letGo
+                if accepted { obligation.evidence = .init(source: "agents/conversations", id: old.id) }
+                else { obligation.reason = reason }
+                var settled = rows[index].settledObligations ?? [:]
+                settled[id, default: [:]][key] = obligation
+                rows[index].settledObligations = settled
+            }
+            if old.operationID != rows[index].operationID {
+                settle(old.operationID, key: "answer", accepted: false, reason: .abandoned)
+            }
+            for item in old.queued ?? [] where rows[index].queued?.contains(where: { $0.id == item.id }) != true {
+                let promoted = old.queueReservation == item.id && old.operationID != rows[index].operationID
+                settle(item.id, key: "deliver", accepted: promoted, reason: .cancelled)
+                if !promoted {
+                    for key in ["accept", "answer"] { settle(item.id, key: key, accepted: false, reason: .cancelled) }
+                }
+            }
+        }
         for row in rows { try AgentConversationExchange.validate(row.exchanges) }
         let data = try JSONEncoder().encode(rows)
         guard data.count <= 50 * 1024 * 1024 else {
             throw Failure(message: "Saved conversations exceed their storage limit; existing records were preserved.")
         }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: fileURL)
+        recordExperiences(rows)
         if rows.contains(where: { row in
             if row.phase == "attention" { return true }
             if case .object(let receipt)? = row.receipt { return receipt["reply_state"] == .string("no_reply_expired") }
@@ -650,6 +782,87 @@ public struct AgentConversationStore: Sendable {
         }
         try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([], records: rows)
         AgentConversationRunning.shared.changed() // wakes queued follow-ups
+    }
+
+    /// The conversation owner publishes its identities, including held sends.
+    /// Reading after relaunch replays the durable owner's current records.
+    private func recordExperiences(_ rows: [AgentConversationRecord], dropped: Bool = false) {
+        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        for row in rows where row.agent.hasPrefix("peer:") && row.phase != "sending" && !dropped {
+            let operation = "agent.accept:" + row.operationID
+            if AgentConversationDelivery.accepted(row) {
+                RepairOwed.settle(root, operation: operation, evidence: .init(source: "agents/conversations", id: row.id))
+            } else if row.phase == "waiting", AgentConversationDelivery.claudeInbox(row),
+                      case .object(let receipt)? = row.receipt, case .object(let remedy)? = receipt["remedy"], remedy["kind"] == .string("repair"),
+                      case .string(let owner)? = remedy["owner"] {
+                let tap: String? = if case .string(let tap)? = remedy["tap"] { tap } else { nil }
+                let next = remedy["next_call"].flatMap { $0 == .null ? nil : try? $0.serialize(pretty: false) }
+                RepairOwed.owe(root, id: row.operationID + ":accept", kind: .message, cause: [row.operationID],
+                    operation: operation, owner: owner, words: "Waiting for \(row.name) to accept this message.", nextCall: next, tap: tap)
+            }
+        }
+        // Every row's in one write, ordered with this owner's other writes.
+        ExperienceStore.record(root, "agent-conversations") { store in
+            for row in rows {
+                var settled = row.settledObligations ?? [:]
+                if dropped {
+                    for (id, key) in [(row.operationID, "answer"), (row.operationID, "accept")] + (row.queued ?? []).flatMap({ item in ["deliver", "accept", "answer"].map { (item.id, $0) } }) {
+                        var obligation = Experience.Obligation(to: "conversation:" + row.id)
+                        obligation.phase = .letGo
+                        obligation.reason = .abandoned
+                        settled[id, default: [:]][key] = obligation
+                    }
+                }
+                for (id, obligations) in settled {
+                    guard let experience = try await store.experience(id) else { continue }
+                    for (key, obligation) in obligations where experience.owes[key]?.phase.isSettled == false {
+                        let change: ExperienceStore.Change = if let reason = obligation.reason {
+                            .letGo(key: key, reason: reason)
+                        } else { .obligation(key: key, phase: obligation.phase, evidence: obligation.evidence) }
+                        try await store.append([change], to: id)
+                    }
+                }
+                if dropped { continue }
+                if !row.agent.hasPrefix("peer:"), !row.agent.hasPrefix("bot:") {
+                    for id in [row.operationID] + (row.queued ?? []).map(\.id) {
+                        guard let old = try await store.experience(id) else { continue }
+                        for (key, obligation) in old.owes where !obligation.phase.isSettled {
+                            try await store.append([.letGo(key: key, reason: .abandoned)], to: old.id)
+                        }
+                    }
+                    continue
+                }
+                let destination = "agent:" + row.agent
+                for item in row.queued ?? [] {
+                    let experience = Experience(id: item.id, kind: .message,
+                        evidence: [.init(source: "agents/conversations", id: row.id)],
+                        addressedTo: [destination], owes: ["deliver": .init(to: "conversation:" + row.id), "accept": .init(to: destination), "answer": .init(to: destination)])
+                    if try await store.experience(experience.id) == nil { try await store.begin(experience) }
+                    let words = item.text + (item.held.map { "\n\nHeld: " + $0 } ?? "")
+                    try await store.append([.face(.init(words: TurnSecretRedactor.redactText(words), artifacts: []))], to: item.id)
+                }
+                let exchange = row.exchanges?.last { $0.id == row.operationID }
+                guard exchange != nil || ["sending", "waiting"].contains(row.phase) else { continue }
+                let experience = Experience(id: row.operationID, kind: .message,
+                    evidence: [.init(source: "agents/conversations", id: row.id)],
+                    addressedTo: [destination], owes: ["accept": .init(to: destination), "answer": .init(to: destination)])
+                if try await store.experience(experience.id) == nil { try await store.begin(experience) }
+                if row.phase != "sending", AgentConversationDelivery.accepted(row), try await store.experience(experience.id)?.owes["accept"]?.phase.isSettled == false {
+                    try await store.append([.obligation(key: "accept", phase: .accepted,
+                        evidence: .init(source: "agents/conversations", id: row.id))], to: experience.id)
+                }
+                try await store.append([.face(.init(words: TurnSecretRedactor.redactText(exchange?.reply ?? exchange?.prompt ?? ""),
+                    artifacts: []))], to: experience.id)
+                let delivery = AgentConversationDelivery.of(row, read: false)
+                guard try await store.experience(experience.id)?.owes["answer"]?.phase.isSettled == false else { continue }
+                if delivery == .answered || (!row.awaitsReply && [.delivered, .read].contains(delivery)) {
+                    try await store.append([.obligation(key: "answer", phase: .accepted,
+                        evidence: .init(source: "agents/conversations", id: row.id))], to: experience.id)
+                } else if [.failed, .notDelivered].contains(delivery) {
+                    try await store.append([.letGo(key: "answer", reason: .failed)], to: experience.id)
+                }
+            }
+        }
     }
 }
 

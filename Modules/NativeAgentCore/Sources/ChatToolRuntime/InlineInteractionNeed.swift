@@ -4,6 +4,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import MacControl
+import MacIntegration
 
 /// Builds the typed "I need something from you" tool envelope that a dispatch
 /// boundary returns INSTEAD of an error string, and reads it back out.
@@ -29,12 +30,11 @@ import MacControl
 public enum InlineInteractionNeed {
     public static func blocksTurn(_ interaction: InlineInteraction) -> Bool {
         (interaction.kind == .permission && interaction.allTargets.contains {
-            SystemAppleScriptAdapter.automationTarget($0) != nil
+            SystemPermissionPreflight.cardSettingsCapability($0) != nil
         }) || ![.connector, .permission, .capability].contains(interaction.kind)
     }
 
-    /// Automation needs the owner's tap to ask macOS; other setup skips
-    /// without blocking unrelated work. Both retain the typed card.
+    /// macOS grants wait for the person's tap; other setup keeps its typed card.
     public static func envelope(_ interaction: InlineInteraction) -> JSONValue {
         // A skill's step never raises a card: it hands back to her.
         if SkillRunContext.handsBack { return SkillRunContext.handBack(interaction.title) }
@@ -52,7 +52,7 @@ public enum InlineInteractionNeed {
         let unavailable = interaction.kind == .connector ? "connected" : "allowed"
         object["detail"] = .string(blocksTurn(interaction)
             ? interaction.kind == .permission
-                ? "Waiting for the owner's Automation consent; allow the permission card to ask macOS."
+                ? "Waiting for your permission; tap Allow on the card in NativeAgent."
                 : interaction.why
             : "skipped: \(interaction.target) isn't \(unavailable) — card filed")
         if let encoded = encode(interaction) {

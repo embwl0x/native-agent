@@ -31,8 +31,7 @@ public struct AgentContactRoutes: Sendable {
         contactPaths.contains(path) || path.hasPrefix("/a2a/")
     }
 
-    /// Adapt a verified contact credential to the existing listener gate. This
-    /// is internal only and is never applied to builder or control routes.
+    /// Adapt the door's own bearer only for contact operations, never control routes.
     public static func contactHeaders(path: String, headers: [String: String], liveToken: String,
                                dataRoot: URL,
                                readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> [String: String] {
@@ -46,18 +45,6 @@ public struct AgentContactRoutes: Sendable {
         adapted[AgentBridgePrincipal.peerSecretHeader] = String(authorization.dropFirst(7))
         adapted["authorization"] = "Bearer " + liveToken
         return adapted
-    }
-
-    /// Any authenticated call from Claude — her own lane or the agent-contact
-    /// route her MCP link uses — stamps `claude-live`; contact health reads
-    /// it (10 minutes) for the Home and Agents presence word.
-    public static func markClaudeLive(dataRoot: URL = defaultDataRoot()) {
-        let live = AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot).appendingPathComponent("claude-live").path
-        if !FileManager.default.fileExists(atPath: live) {
-            FileManager.default.createFile(atPath: live, contents: nil)
-        } else {
-            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: live)
-        }
     }
 
     public static func mcpTransportRejection(headers: [String: String], port: UInt16) -> Int? {
@@ -101,9 +88,7 @@ public struct AgentContactRoutes: Sendable {
             BridgeCore.writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
             return
         }
-        if let peerID = principal.peerID, AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + peerID) == "claude" {
-            Self.markClaudeLive(dataRoot: dataRoot)
-        }
+        if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
 
         let isGrok = principal.replyOnly
         // This credential may only answer a pending request, never call MCP,

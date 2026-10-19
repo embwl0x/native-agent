@@ -318,7 +318,14 @@ extension TelegramPollLoop {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let timeoutInterval { request.timeoutInterval = timeoutInterval }
         request.httpBody = try body()
-        let (data, response) = try await session.data(for: request)
+        let data: Data, response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let error as URLError where error.code == .cancelled {
+            // URLSession reports cooperative task cancellation as -999; keep it a
+            // cancellation, as the long poll does, so shutdown mid-send retries.
+            throw CancellationError()
+        }
         return try _tgValidateResponse(
             data,
             response: response,

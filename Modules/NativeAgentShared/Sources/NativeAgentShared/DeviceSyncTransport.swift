@@ -313,9 +313,13 @@ public enum DeviceSyncError: Error, LocalizedError, Sendable {
     case payloadTooLarge(actualBytes: Int, maximumBytes: Int)
     case transient(message: String)
     case underlying(message: String)
+    /// Another Mac on this Apple Account holds the phone's pairing.
+    case pairedElsewhere
 
     public var snapshotRecoveryMessage: String {
         switch self {
+        case .pairedElsewhere:
+            return "In Connectors → iPhone on this Mac, choose Use my iPhone with this Mac."
         case .account, .unauthorized:
             return DeviceSyncAccountFailure.macMessage + "."
         case .quotaExceeded:
@@ -340,6 +344,7 @@ public enum DeviceSyncError: Error, LocalizedError, Sendable {
             return "This message is too large for iCloud delivery (\(actualKB) KB; limit \(maximumKB) KB). Choose a smaller image or attachment."
         case .transient(let m): return "transient device sync error: \(m)"
         case .underlying(let m): return "device sync error: \(m)"
+        case .pairedElsewhere: return "Your iPhone is paired with another Mac on this Apple Account."
         }
     }
 }
@@ -373,11 +378,21 @@ public protocol DeviceSyncTransport: Sendable {
     /// device. Mirrors `iCloudBridge.observeIncomingMessages`. Idempotent —
     /// last registration wins (there is exactly one logical forwarder).
     /// The handler returns `true` when the message was accepted/delivered.
-    func observeIncoming(_ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool) async
+    /// Returns whether the push subscriptions were successfully established.
+    @discardableResult
+    func observeIncoming(_ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool) async -> Bool
 
     /// Publish this device's pairing secret. Mirrors
     /// `PairingSecretManager.publishMaterialToKVS`.
     func publishPairing(secret: Data) async throws
+
+    /// Take the account's Mac pairing only if it is free or already this
+    /// Mac's; true when held, false when another Mac holds it, nil unknown.
+    @discardableResult
+    func claimPairing(secret: Data) async -> Bool?
+
+    /// True while another Mac on this Apple Account holds the pairing.
+    var pairingHeldElsewhere: Bool { get }
 
     /// Observe the peer device's published pairing secret.
     /// The handler returns true only after the canonical pairing owner has

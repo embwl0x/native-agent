@@ -858,6 +858,10 @@ public enum SystemPermissionPreflight {
     }
 
     public static func cardSettingsCapability(_ id: String) -> SystemPermissionCapability? {
+        if id.hasPrefix("privacy:") {
+            let capability = SystemPermissionCapability(rawValue: String(id.dropFirst(8)))
+            return capability == .automation ? nil : capability
+        }
         if SystemAppleScriptAdapter.automationTarget(id) != nil { return .automation }
         switch id {
         case "calendar": return .calendars
@@ -876,13 +880,25 @@ public enum SystemPermissionPreflight {
     }
 
     public static func cardSettingsInstructions(_ ids: [String]) -> [String] {
-        let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "NativeAgent"
         var seen: Set<SystemPermissionCapability> = []
         return ids.compactMap { id in
             guard let pane = cardSettingsCapability(id), seen.insert(pane).inserted else { return nil }
-            let section = pane == .notifications ? "" : "Privacy & Security → "
-            return "System Settings → \(section)\(cardPaneName(pane)) → turn on \(app)."
+            return pane == .fullDiskAccess
+                ? "Add NativeAgent from Finder to the pane that opens, then turn it on."
+                : "Allow \(pane.displayName) on this card; turn on NativeAgent in the pane that opens."
         }
+    }
+
+    public static func remedy(_ id: String, mode: InlineInteraction.AccessMode? = nil) -> JSONValue? {
+        guard let capability = cardSettingsCapability(id) else { return nil }
+        let target = SystemAppleScriptAdapter.automationTarget(id).map { "applescript:" + $0 }
+            ?? capability.rawValue
+        let name = SystemAppleScriptAdapter.automationTarget(id).map { "Automation for " + $0 } ?? capability.displayName
+        var args: [String: JSONValue] = ["capability": .string(target), "why": .string("NativeAgent needs \(name) for this work. Allow?")]
+        if let mode { args["mode"] = .string(mode.rawValue) }
+        return Repair.remedy(owner: "macOS \(name) grant", nextCall: .object([
+            "tool": .string("app"), "input": .object(["action": .string("permissions.request"), "args": .object(args)]),
+        ]), tap: "Allow \(name) on the permission card in NativeAgent")
     }
 
     // MARK: - Non-prompting reads
@@ -945,6 +961,7 @@ public enum SystemPermissionPreflight {
         case .contacts:
             switch CNContactStore.authorizationStatus(for: .contacts) {
             case .authorized: return .granted
+            case .limited: return .granted
             case .denied: return .denied
             case .restricted: return .restricted
             case .notDetermined: return .notDetermined
@@ -982,24 +999,16 @@ public enum SystemPermissionPreflight {
         }
     }
 
-    /// User-facing copy for one warning. Names the capability AND the System
-    /// Settings pane, because the whole point of the card is that the user can
-    /// get from the message to the switch.
+    /// The permission card owns acquisition; status reads never prompt.
     public static func warningSummary(for snapshot: SystemPermissionSnapshot) -> String {
         let name = snapshot.capability.displayName
-        let pane = "System Settings → Privacy & Security → \(name)"
         switch snapshot.status {
-        case .notDetermined:
-            return "\(name) has never been approved for NativeAgent. "
-                + "Background features that need it will fail silently until it is granted in \(pane)."
-        case .denied:
-            return "\(name) is denied for NativeAgent. macOS will not re-prompt once denied — "
-                + "turn it back on in \(pane)."
+        case .notDetermined, .denied:
+            return "NativeAgent needs \(name). Allow it on the permission card."
         case .restricted:
-            return "\(name) is restricted on this Mac (device management or parental controls). "
-                + "Check \(pane)."
+            return "\(name) is restricted by this Mac's administrator. Ask them to allow NativeAgent."
         case .granted, .unknown:
-            return "\(name) status: \(snapshot.status.rawValue). See \(pane)."
+            return "\(name): \(snapshot.status.rawValue)."
         }
     }
 
@@ -1078,8 +1087,6 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
     private let manager = CLLocationManager()
     private var waiters: [CheckedContinuation<JSONValue, Never>] = []
     private var deadline: Task<Void, Never>?
-    /// macOS is showing its own Location prompt for this request.
-    private var askingMacOS = false
     /// The kept manager's status, readable from any thread; a manager made per
     /// read answered notDetermined for a moment after launch.
     nonisolated(unsafe) private static var knownStatus: CLAuthorizationStatus?
@@ -1136,10 +1143,7 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
                 do { try await Task.sleep(for: Self.answer) } catch { return }
                 finish()
             }
-        case .notDetermined:
-            askingMacOS = true; manager.requestWhenInUseAuthorization()
-            finish(Self.failure("location_not_allowed", "macOS is asking now whether NativeAgent may use Location Services. Once it is allowed, ask again; or try phone.location or give a place."))
-        default: finish(Self.failure("location_not_allowed", "Location Services is off for NativeAgent on this Mac. System Settings → Privacy & Security → Location Services → NativeAgent turns it on; or try phone.location or give a place."))
+        default: finish(Self.failure("location_not_allowed", "NativeAgent needs Location Services. Allow it on the permission card."))
         }
     }
 
@@ -1147,9 +1151,6 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
         Self.knownStatus = manager.authorizationStatus
         // A card waiting on this permission settles on the answer, whoever gave it.
         NotificationCenter.default.post(name: SystemPermissionPreflight.permissionDidChange, object: nil)
-        guard askingMacOS, manager.authorizationStatus != .notDetermined else { return }
-        askingMacOS = false
-        request()
     }
 
     /// The fix just given is the one the manager now holds.
@@ -1174,7 +1175,8 @@ public final class MacLocationReader: NSObject, @preconcurrency CLLocationManage
     }
 
     private static func failure(_ reason: String, _ detail: String) -> JSONValue {
-        .object(["status": .string("failed"), "reason": .string(reason), "detail": .string(detail), "effects": .string("none")])
+        .object(["status": .string("failed"), "reason": .string(reason), "detail": .string(detail), "effects": .string("none"),
+                 "remedy": reason == "location_not_allowed" ? SystemPermissionPreflight.remedy("location") ?? .null : .null])
     }
 
     /// Every waiting read gets the fix the Mac holds, however old, with its age; with none, why not.
@@ -1215,11 +1217,9 @@ extension SystemPermissionPreflight {
             } else { current = cardStatus(gate, mode: mode) }
             if current == .granted { continue }
             if current == .unknown {
-                return "I can't verify \(gate.displayName) here. "
-                    + cardSettingsInstructions([id]).joined(separator: " ") + " Then try the original action again."
+                return "macOS hasn't confirmed \(gate.displayName) yet."
             }
-            return "macOS hasn't allowed \(gate.displayName) yet. " + cardSettingsInstructions([id]).joined(separator: " ")
-                + (gate == .screenRecording ? " macOS may ask to reopen NativeAgent." : "")
+            return "macOS hasn't allowed \(gate.displayName) yet. Return after turning it on; I'll continue."
         }
         return nil
     }
@@ -1238,14 +1238,4 @@ extension SystemPermissionPreflight {
         }
     }
 
-    private static func cardPaneName(_ capability: SystemPermissionCapability) -> String {
-        switch capability {
-        case .accessibility:
-            if #available(macOS 27.0, *) { return "Device Control and Data Access" }
-            return capability.displayName
-        case .calendars: return "Calendars"
-        case .screenRecording: return "Screen & System Audio Recording"
-        default: return capability.displayName
-        }
-    }
 }

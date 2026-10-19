@@ -953,7 +953,7 @@ extension NativeAgentEngine {
         do {
             let stream = MacChatStreamAdapter.chatStream(
                 client: client, text: trimmed, attachments: attachments,
-                sessionId: requestSessionId, activityIdentity: activityIdentity, metaBox: metaBox,
+                sessionId: requestSessionId, activityIdentity: activityIdentity, replyRowId: bubbleId, metaBox: metaBox,
                 hideUserBubble: hideUserBubble,
                 serviceTier: { NativeChatTurnOptions.current(surface: "chat").serviceTier },
                 onTurnActivity: { [weak port] in await port?.receiveChatTurnActivity($0) },
@@ -1006,9 +1006,9 @@ extension NativeAgentEngine {
                 turns.clearStreamingBubbleState(requestSessionId)
             }
             // Fluid glass A1: a reply that settled before the stream ended is
-            // still crossfading (or folding its notes). The disk rows replace
-            // it under new ids, which would cut that short mid-swap, so they
-            // wait the one crossfade.
+            // still crossfading (or folding its notes). Its saved row keeps this
+            // bubble's id (TurnTraceContext.replyRow) and lands in place; the
+            // reload still waits the one crossfade before rewriting it.
             if !streamProducedNoContent, turns.isReplyTextSettled(requestSessionId) {
                 await finishReplyPresentation()
             }

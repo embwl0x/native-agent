@@ -334,7 +334,7 @@ extension TelegramPollLoop {
                 var answerOwed = false
                 do {
                     let progress = makeProgressSink(delivery: delivery, card: card)
-                    let reply = try await runChatHandler(
+                    let (reply, imagePaths) = try await runChatHandler(
                         destination: destination,
                         text: prompt,
                         attachments: [],
@@ -347,7 +347,7 @@ extension TelegramPollLoop {
                     let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
                     let deliveredText = trimmed.isEmpty ? acknowledgement : trimmed
                     let saved = TelegramAssistantDeliveryState(reply: TelegramRichMessageRenderer.sanitize(
-                        TelegramRichMessageRenderer.stripBoldMarkers(deliveredText)), imagePaths: [])
+                        TelegramRichMessageRenderer.stripBoldMarkers(deliveredText)), imagePaths: imagePaths)
                     guard try await inbox.annotateChatContinuation(approvalId, done: false,
                         assistantDelivery: JSONValue.parse(JSONEncoder().encode(saved))) else {
                         throw TelegramBotError.underlying("Approval answer delivery could not be recorded.")

@@ -7,6 +7,7 @@ import PersistenceCore
 import TurnTrace
 import Transcripts
 import Desk
+import Experiences
 import PersonaEngine
 import MemoryV2
 import MCPDispatcher
@@ -70,6 +71,40 @@ private actor ToolProgressPersistenceBuffer {
 }
 
 extension SwiftNativeChatOrchestrationClient {
+    static func transcriptRef(_ session: String, _ messageID: String) -> Experience.Ref {
+        .init(source: "chat/messages/\(session).jsonl", id: messageID)
+    }
+
+    static func face(_ words: String, _ attachments: [MultimodalAttachment]) -> Experience.Face {
+        .init(words: TurnTraceRedactor.redactText(words), artifacts: attachments.compactMap { attachment in
+            attachment.path.map { Experience.Ref(source: $0, id: attachment.id) } })
+    }
+
+    /// The answer is born once, built off the reply path in its own order; a later
+    /// writer (recovery, a resend) finds it born and leaves it. Its heard settles
+    /// in the heard's order.
+    static func recordAnswer(id: String, heardID: String, evidence: Experience.Ref?, state: TurnEngineResult.TerminalState,
+                             dataRoot: URL, build: @escaping @Sendable () -> Experience) {
+        ExperienceStore.record(dataRoot, id) { store in
+            guard try await store.experience(id) == nil else { return }
+            try await store.begin(build())
+        }
+        ExperienceStore.record(dataRoot, heardID) { store in
+            guard let heard = try await store.experience(heardID) else { return }
+            var changes: [ExperienceStore.Change] = []
+            if state == .waiting { changes.append(.progress("waiting")) }
+            else if heard.outcome == nil {
+                changes.append(.outcome(.init(domain: "turn", status: state.rawValue)))
+            }
+            if state == .completed {
+                changes.append(.obligation(key: "answer", phase: .accepted, evidence: evidence ?? .init(source: "experience", id: id)))
+            } else if state != .waiting {
+                changes.append(.letGo(key: "answer", reason: .failed))
+            }
+            try await store.append(changes, to: heardID)
+        }
+    }
+
     func metacognitiveTerminalEvent(
         turnId: String,
         sessionId: String,
@@ -145,7 +180,7 @@ extension SwiftNativeChatOrchestrationClient {
         observation: ToolLoopTraceObservation? = nil
     ) -> TurnTraceEvent {
         let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-        let terminalReason: TurnEngineResult.TerminalReason
+        var terminalReason: TurnEngineResult.TerminalReason
         if [.authExpired, .codexCLISessionExpired, .routingUnavailable, .modelUnavailable].contains(ProviderFailure.classify(error)) {
             terminalReason = .providerRequired
         } else if case .streamInterrupted(let partial, _) = error as? TurnEngineError {
@@ -154,9 +189,15 @@ extension SwiftNativeChatOrchestrationClient {
             terminalReason = .executionFailed
         }
         var payload = observation?.tracePayload ?? [:]
+        payload["reason"] = .string(String(reason.prefix(200)))
+        if let call = (error as? ToolFailureError)?.nextCall,
+           case .object(let fields)? = try? JSONValue.parse(Data(call.utf8)),
+           case .object(let input)? = fields["input"], input["action"] == .string("turn.reconcile") {
+            payload["repairPending"] = .bool(true)
+            terminalReason = .providerRequired
+        }
         payload["status"] = .string(terminalReason.state.rawValue)
         payload["terminalReason"] = .string(terminalReason.rawValue)
-        payload["reason"] = .string(String(reason.prefix(200)))
         return TurnTraceEvent(
             turnId: turnId,
             kind: terminalReason.state == .waiting ? "turn.terminal" : "turn.failed",
@@ -214,6 +255,7 @@ extension SwiftNativeChatOrchestrationClient {
         ChatTurnExecution.current?.bindHistoryRunID(runId)
         var livePartial: String?
         let boundTurnId = TurnTraceContext.turnId ?? TurnTraceContext.mintTurnId()
+        let heardID = suppressUserAppend ? ChatToolSessionContext.envelope?.answerExperienceID ?? boundTurnId : boundTurnId
         // Finish evidence must reach disk before recovery ownership is removed.
         var terminal: TurnTraceEvent?
         defer {
@@ -262,7 +304,7 @@ extension SwiftNativeChatOrchestrationClient {
         // user row below keeps `message`).
         let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot,
-            queryUserMessage: TurnRelevanceContext.queryUserMessage)
+            queryUserMessage: TurnRelevanceContext.queryUserMessage, runId: runId)
         let imageBlocks = attachmentInput.imageBlocks
         var modelMessage = attachmentInput.userMessage
         if queueUnavailable { modelMessage += "\n\n[MY QUEUE is unavailable; no queued step was admitted with this message.]" }
@@ -296,6 +338,23 @@ extension SwiftNativeChatOrchestrationClient {
             )
         } else {
             origin = try await consumeEnqueuedMessage(sessionId: resolvedSession, runId: runId)
+        }
+        // Her turn hears the message and owes its conversation an answer.
+        let heard = Experience(id: heardID, kind: .heard,
+            evidence: origin.map { [Self.transcriptRef(resolvedSession, $0.messageId)] } ?? [],
+            addressedTo: ["her"], owes: ["answer": .init(to: "conversation:" + resolvedSession)])
+        let correlation = ChatToolSessionContext.replyRoute?.correlationId
+        ExperienceStore.record(dataRoot, heardID) { store in
+            if heardID == boundTurnId {
+                try await store.begin(heard)
+                try await store.append([.face(Self.face(message, attachments))], to: heardID)
+            }
+            try await store.append([.progress("working"),
+                .evidence(.init(source: "run", id: runId)),
+                .evidence(.init(source: "runtime", id: ExperienceStore.processID))], to: heardID)
+            if let correlation {
+                try await store.append([.evidence(.init(source: "correlation", id: correlation))], to: heardID)
+            }
         }
         var afterTurnStarted = false
         var survivingReply = ""
@@ -366,7 +425,8 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         let steeringToken = await ChatTurnSteering.shared.openTurn(
-            sessionId: resolvedSession, turnId: TurnTraceContext.turnId ?? runId, dataRoot: dataRoot, persist: steeringPersister)
+            sessionId: resolvedSession, turnId: TurnTraceContext.turnId ?? runId, dataRoot: dataRoot,
+            door: ChatToolSessionContext.replyRoute ?? TurnEnvelope.current(surface: surface).deliveryRoute, persist: steeringPersister)
         defer {
             if TurnAdmission.token == nil {
                 Task {
@@ -388,16 +448,15 @@ extension SwiftNativeChatOrchestrationClient {
                 sessionId: resolvedSession,
                 model: model,
                 surface: surface,
-                runId: runId
+                runId: runId,
+                progress: progress
             )
         } catch {
-            // Two turns died silently on 2026-09-05 (00:34, 10:12) with no trace
-            // after their last tool; a cancellation left nothing on paper.
-            terminal = turnCancelledEvent(
-                turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
-                location: "structured_chat.\(#line)"
-            )
-            throw CancellationError()
+            terminal = error is CancellationError
+                ? turnCancelledEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
+                    location: "structured_chat.\(#line)")
+                : turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
+            throw error
         }
 
         let gated = makeTracedGatedDispatcher(
@@ -562,6 +621,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
 
         let loopObservation = ToolLoopTraceObservation()
+        let replyChoices = ReplyChoices()
         let result: TurnEngineResult
         do {
             // Turn Inspector W1: bind the per-turn trace id around the engine
@@ -571,7 +631,8 @@ extension SwiftNativeChatOrchestrationClient {
             // turn gets one spine. Same turnId as the context build above.
             result = try await AfterTurnSource.$origin.withValue(origin) {
             do {
-            return try await ToolLoopTraceObservation.$current.withValue(loopObservation) {
+            return try await ReplyChoices.$current.withValue(replyChoices) {
+            try await ToolLoopTraceObservation.$current.withValue(loopObservation) {
             try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(boundTurnId) {
             try await LLMCallContext.$turnActiveTools.withValue(Set(providerCtx?.toolSchemas.map(\.name) ?? [])) {
@@ -638,7 +699,10 @@ extension SwiftNativeChatOrchestrationClient {
             }
             }
             }
+            }
             } catch {
+                let failed = await turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error)
+                if case .object(let payload) = failed.payload, payload["repairPending"] == .bool(true) { throw error }
                 let partial: String
                 let cancelled: Bool
                 switch error {
@@ -657,7 +721,7 @@ extension SwiftNativeChatOrchestrationClient {
                     runId: runId,
                     text: partial,
                     attachments: ChatGeneratedImageArtifacts.attachments(
-                        from: loopObservation.toolDispatches, dataRoot: dataRoot
+                        from: loopObservation.toolDispatches, chosen: replyChoices.paths, dataRoot: dataRoot
                     ),
                     cancelled: cancelled,
                     failure: error,
@@ -731,6 +795,7 @@ extension SwiftNativeChatOrchestrationClient {
                 turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error,
                 observation: loopObservation
             )
+            if case .object(let payload)? = terminal?.payload, payload["repairPending"] == .bool(true) { throw error }
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             if Self.shouldPersistFailureMessage(surface: surface) {
                 try? await appendFailureMessageIfNeeded(
@@ -758,13 +823,15 @@ extension SwiftNativeChatOrchestrationClient {
             turnId: boundTurnId
         )
 
-        let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
-            from: result.toolDispatches,
-            dataRoot: dataRoot
-        )
-
         let reply = BotRunner.conditionReply(result.reply, sessionID: resolvedSession)
         let transcriptRow = TurnSettle.transcriptRow(for: reply)
+        let generatedAttachments = ChatGeneratedImageArtifacts.attachments(from: result.toolDispatches,
+                                                                           chosen: replyChoices.paths, dataRoot: dataRoot)
+        // The row the surface drew this reply in, when it drew one for this
+        // turn: the answer lands in place instead of replacing it.
+        let answerID = TurnTraceContext.replyRow.flatMap {
+            $0.turnId == boundTurnId ? $0.messageId : nil
+        } ?? UUID().uuidString
         try await appendMessage(
             sessionId: resolvedSession,
             role: "assistant",
@@ -786,8 +853,26 @@ extension SwiftNativeChatOrchestrationClient {
                     message.hasPrefix("[NativeAgent internal interaction continuation]") ||
                     message.hasPrefix("[NativeAgent internal approval continuation]")
                 )
-            )
+            ),
+            messageId: answerID
         )
+        // The answer is its conversation's once the transcript holds it, and owes
+        // the door the turn came from until that door accepts it: the delivery its
+        // checkpoint keeps. Its face is that row's words, redacted as the
+        // transcript's evidence is, and the artifacts she chose; built off the reply path.
+        let answerRef = Self.transcriptRef(resolvedSession, answerID)
+        let answerState = result.resolvedTerminalReason(dataRoot: dataRoot).state
+        Self.recordAnswer(id: Experience.answer(run: runId), heardID: heardID, evidence: answerRef, state: answerState,
+                          dataRoot: dataRoot) { [dataRoot, words = transcriptRow.text] in
+            var answer = Experience(id: Experience.answer(run: runId), kind: .answer, cause: [heardID], evidence: [answerRef],
+                face: Self.face(words, generatedAttachments), addressedTo: ["conversation:" + resolvedSession])
+            let checkpoint = try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: resolvedSession, turnId: boundTurnId)
+            if let owed = checkpoint?.owedDelivery(status: answerState.rawValue) {
+                answer.addressedTo.append(owed.to)
+                answer.owes[owed.key] = .init(to: owed.to)
+            }
+            return answer
+        }
         livePartial = transcriptRow.text
         if !reply.isEmpty, await outputMilestoneGate.claim() {
             TurnLifecycleTelemetry.emit(
@@ -856,7 +941,11 @@ extension SwiftNativeChatOrchestrationClient {
         }
         return StructuredChatExecution(response: response, turn: result)
         }
-        return try await PeerDataTaint.$current.withValue(taint, operation: executeCarriedTurn)
+        var envelope = TurnEnvelope.current(surface: surface)
+        envelope.answerExperienceID = heardID
+        return try await ChatToolSessionContext.$envelope.withValue(envelope) {
+            try await PeerDataTaint.$current.withValue(taint, operation: executeCarriedTurn)
+        }
         } catch {
             // A run that ended before naming its own terminal (attachments,
             // the user row, a queued message's pickup, the reply's save).
@@ -864,6 +953,22 @@ extension SwiftNativeChatOrchestrationClient {
                 ? turnCancelledEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface,
                                      location: "structured_chat.\(#line)")
                 : turnFailedEvent(turnId: boundTurnId, sessionId: resolvedSession, surface: surface, error: error))
+            // A turn that ended without its answer lets it go, for the reason its own
+            // terminal names; one left waiting (on a provider) still owes it.
+            let letGo: ObligationPhase.LetGo? = switch terminal?.kind {
+            case "turn.cancelled": .cancelled
+            case "turn.failed": .failed
+            default: nil
+            }
+            ExperienceStore.record(dataRoot, heardID) { store in
+                guard let current = try await store.experience(heardID) else { return }
+                var changes: [ExperienceStore.Change] = [.progress("waiting")]
+                if let letGo, current.outcome == nil {
+                    changes.append(.outcome(.init(domain: "turn", status: letGo.rawValue)))
+                }
+                if let letGo { changes.append(.letGo(key: "answer", reason: letGo)) }
+                try await store.append(changes, to: heardID)
+            }
             let live: ChatLiveTap.Kind = error is CancellationError
                 ? .cancelled
                 : .failed(ProviderFailure.report(error)?.personDescription ?? "The reply could not be completed.")

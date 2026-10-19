@@ -16,15 +16,19 @@ public enum DoctorProviderPathReading {
         guard let providers = try? await ProvidersFacade(dataRoot: dataRoot).list() else {
             return .unavailable
         }
-        if routing.activeProviders.values.contains(where: { id in
+        let needsSignIn = routing.activeProviders.values.filter { id in
             let state = providers.first { $0.provider_id == id }?.auth_status.state.lowercased()
             return ["needs_oauth", "needs_key", "needs_credentials"].contains(state ?? "")
-        }) {
-            return .configurationIssue(CheckResult(
+        }.sorted()
+        if !needsSignIn.isEmpty {
+            let controls = providers.filter { needsSignIn.contains($0.provider_id) }.map {
+                "Providers → \($0.display_name) → " + ($0.auth_modes.contains("api_key") ? "API key" : "Sign in")
+            }.sorted()
+            return .configurationIssue(CheckResult(source: "Providers accounts: " + needsSignIn.joined(separator: ", "),
                 id: "live.providers", title: "Providers and OAuth", status: "warn",
                 detail: "Saved provider configuration retained; credentials unavailable",
                 harm: "She cannot answer through the affected saved provider configuration.",
-                human_action: "Sign in again", ask: .signIn
+                human_action: controls.joined(separator: "; "), ask: .signIn
             ))
         }
         if let notice = routing.unusablePickNotice(for: surface) {

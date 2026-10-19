@@ -1,7 +1,12 @@
 import Foundation
+import CryptoKit
 import PersistenceCore
 
 extension AgentWorkspaceNavigation {
+    static func windowReference(_ place: AgentWorkspaceLocation) -> String? {
+        placeIdentity(place).map { "window:place:" + SHA256.hash(data: Data($0.utf8)).map { String(format: "%02x", $0) }.joined() }
+    }
+
     /// Distinguish same-titled windows without exposing routing handles.
     /// Ordering by resident identity keeps labels stable across recency changes.
     static func windowTitle(_ place: AgentWorkspaceLocation, session: Session) -> String {
@@ -38,6 +43,10 @@ extension AgentWorkspaceNavigation {
     func window(named query: String, key: String) -> AgentWorkspaceAction? {
         guard let session = sessions[key] else { return nil }
         let name = query.lowercased()
+        if name.hasPrefix("place:") {
+            return Self.recognizedPlaces(session).first { Self.windowReference($0) == "window:" + name }
+                .map { .window(Self.windowAction($0)) }
+        }
         let places = Self.recognizedPlaces(session).filter {
             Self.windowTitle($0, session: session).lowercased() == name || $0.title.lowercased() == name }
         if places.count > 1 { return nil }

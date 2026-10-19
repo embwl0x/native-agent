@@ -41,10 +41,19 @@ private struct ChatHistorySearchHit: Sendable {
     var peer: String?
 }
 
-private struct ChatHistorySearchRow: Sendable {
+/// One transcript line as history search reads it; `ChatHistoryIndex` keeps
+/// it by the line's bytes.
+struct ChatHistorySearchRow: Sendable {
     var valid: Bool
-    var object: [String: JSONValue]
     var identity: String
+    /// As stored: continuity excerpts match it exactly, the scan lowercases it.
+    var role: String?
+    var runId: String?
+    var messageId: String?
+    /// `createdAt`, else `timestamp`.
+    var timestamp: String?
+    /// A conversation row's stored words (`content`, else `text`).
+    var rawContent: String?
     var content: String
     var searchable: String
     var folded: String
@@ -54,60 +63,11 @@ private struct ChatHistorySearchRow: Sendable {
     var peer: String?
     var tool: String?
     var displayPrefix: String
-}
+    /// As the canonical transcript reader sees the line: 0 not JSON, 1 JSON it
+    /// rejects (not an object, or no string role and words), 2 a message.
+    var shape = 0
 
-/// Rebuildable search fields only; canonical files and their coverage remain authoritative.
-private final class ChatHistorySearchCache: @unchecked Sendable {
-    static let shared = ChatHistorySearchCache()
-    private let lock = NSLock()
-    private var entries: [String: (size: Int, modified: Date, inode: UInt64, receipts: Bool, rows: [ChatHistorySearchRow], cost: Int, use: UInt64)] = [:]
-    private var cost = 0
-    private var use: UInt64 = 0
-    private let maximumCost = 256 * 1024 * 1024
-
-    func rows(at file: URL, receipts: Bool, project: (String) -> ChatHistorySearchRow) throws -> [ChatHistorySearchRow] {
-        lock.lock()
-        defer { lock.unlock() }
-        let path = file.path
-        let attributes: [FileAttributeKey: Any]
-        do { attributes = try FileManager.default.attributesOfItem(atPath: path) }
-        catch {
-            cost -= entries.removeValue(forKey: path)?.cost ?? 0
-            throw error
-        }
-        let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
-        let modified = attributes[.modificationDate] as? Date ?? .distantPast
-        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-        guard FileManager.default.isReadableFile(atPath: path) else {
-            cost -= entries.removeValue(forKey: path)?.cost ?? 0
-            throw CocoaError(.fileReadNoPermission)
-        }
-        use += 1
-        if var entry = entries[path], entry.size == size, entry.modified == modified, entry.inode == inode,
-           entry.receipts || !receipts {
-            entry.use = use
-            entries[path] = entry
-            return entry.rows
-        }
-        cost -= entries.removeValue(forKey: path)?.cost ?? 0
-        let data = try Data(contentsOf: file)
-        guard let text = String(data: data, encoding: .utf8) else { throw CocoaError(.fileReadInapplicableStringEncoding) }
-        let rows = text.split(separator: "\n", omittingEmptySubsequences: true).map { project(String($0)) }
-        // Include string storage and per-row/dictionary overhead, not the large discarded receipt metadata.
-        let bytes = rows.reduce(0) { $0 + 1024 + 2 * ($1.identity.utf8.count + $1.content.utf8.count
-            + $1.searchable.utf8.count + $1.folded.utf8.count) }
-        let settled = try FileManager.default.attributesOfItem(atPath: path)
-        if bytes <= maximumCost, [.size, .modificationDate, .systemFileNumber].allSatisfy({
-            (attributes[$0] as? NSObject) == (settled[$0] as? NSObject)
-        }) {
-            while cost + bytes > maximumCost, let oldest = entries.min(by: { $0.value.use < $1.value.use })?.key {
-                cost -= entries.removeValue(forKey: oldest)!.cost
-            }
-            entries[path] = (size, modified, inode, receipts, rows, bytes, use)
-            cost += bytes
-        }
-        return rows
-    }
+    var isToolRow: Bool { role?.lowercased() == "tool" }
 }
 
 // MARK: - Chat history search tools
@@ -185,6 +145,7 @@ extension SwiftToolDispatcher {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         let sessionMeta = readChatHistorySessionMetadata()
+        let index = ChatHistoryIndex.shared(dataRoot: dataRoot)
         let tokens = chatSearchTokens(query)
         let normalizedQuery = query.lowercased()
         // Native messages carry fractional seconds while compaction rows and
@@ -256,9 +217,7 @@ extension SwiftToolDispatcher {
             for (sessionId, file) in messageFiles {
                 var fileRows: Set<String> = []
                 searchedSessions.insert(sessionId)
-                guard let rows = try? ChatHistorySearchCache.shared.rows(at: file, receipts: roleFilter == "tool", project: { line in
-                    Self.chatHistorySearchRow(line, receipts: roleFilter == "tool", fractional: fractionalTimestamp, whole: wholeTimestamp)
-                }) else {
+                guard let rows = try? index.rows(at: file, receipts: roleFilter == "tool") else {
                     unreadableSessions.insert(sessionId)
                     continue
                 }
@@ -268,18 +227,17 @@ extension SwiftToolDispatcher {
                 var runTools: [String: Set<String>] = [:]
                 for (messageIndex, row) in rows.enumerated() {
                     if !row.valid, row.identity.isEmpty { continue }
-                    let obj = row.object
                     guard row.valid else {
                         malformedRows.insert("\(sessionId):\(messageIndex)")
                         continue
                     }
-                    let role = (jsonString(obj["role"]) ?? "unknown").lowercased()
+                    let role = (row.role ?? "unknown").lowercased()
                     let key = sessionId + ":" + row.identity
                     guard !seen.contains(key) else { continue }
                     fileRows.insert(key)
-                    if let excludingRunID, jsonString(obj["runId"]) == excludingRunID { continue }
+                    if let excludingRunID, row.runId == excludingRunID { continue }
                     if workContextQuery != nil, role == "tool",
-                       let runID = jsonString(obj["runId"]), !runID.isEmpty {
+                       let runID = row.runId, !runID.isEmpty {
                         if let tool = row.tool { runTools[runID, default: []].insert(tool) }
                     }
                     if let roleFilter, !roleFilter.isEmpty, role != roleFilter {
@@ -306,7 +264,7 @@ extension SwiftToolDispatcher {
                         exactMode: exactMode
                     )
                     guard score > 0 || query.isEmpty else { continue }
-                    let timestamp = jsonString(obj["createdAt"]) ?? jsonString(obj["timestamp"]) ?? ""
+                    let timestamp = row.timestamp ?? ""
                     let instant = row.instant
                     if before != nil || after != nil {
                         guard let instant else {
@@ -318,7 +276,7 @@ extension SwiftToolDispatcher {
                     }
                     hits.append(ChatHistorySearchHit(
                         score: score,
-                        runId: jsonString(obj["runId"]),
+                        runId: row.runId,
                         sessionId: sessionId,
                         sessionTitle: meta?.title,
                         sessionCreatedAt: meta?.createdAt,
@@ -327,7 +285,7 @@ extension SwiftToolDispatcher {
                         authorRoute: row.route,
                         timestamp: timestamp,
                         timestampInstant: instant,
-                        messageId: jsonString(obj["id"]),
+                        messageId: row.messageId,
                         messageIndex: messageIndex,
                         row: row,
                         neighbors: continuityMode && !dayDigest
@@ -680,34 +638,49 @@ extension SwiftToolDispatcher {
         return days
     }
 
-    private static func chatHistorySearchRow(
-        _ line: String, receipts: Bool, fractional: ISO8601DateFormatter, whole: ISO8601DateFormatter
-    ) -> ChatHistorySearchRow {
+    /// What history search derives from one transcript line: a pure function
+    /// of the line's bytes and this build's code, which `ChatHistoryIndex`
+    /// stores by both. A tool line also yields its receipt lane, from the
+    /// same parse: the row as an explicit receipt search reads it.
+    static func chatHistorySearchRow(
+        _ line: String, fractional: ISO8601DateFormatter, whole: ISO8601DateFormatter
+    ) -> (row: ChatHistorySearchRow, receipt: ChatHistorySearchRow?) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parsed = try? JSONValue.parse(Data(trimmed.utf8)), case .object(let obj) = parsed else {
-            return ChatHistorySearchRow(valid: false, object: [:], identity: trimmed, content: "", searchable: "", folded: "",
-                instant: nil, author: nil, route: nil, peer: nil, tool: nil, displayPrefix: "")
+        let parsed = try? JSONValue.parse(Data(trimmed.utf8))
+        guard case .object(let obj)? = parsed else {
+            return (ChatHistorySearchRow(valid: false, identity: trimmed, content: "", searchable: "", folded: "",
+                displayPrefix: "", shape: parsed == nil ? 0 : 1), nil)
         }
         func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value { return text }; return nil }
         let role = (string(obj["role"]) ?? "unknown").lowercased()
-        var content = role == "tool" ? (receipts ? persistedToolReceiptText(row: obj) : "")
-            : (string(obj["content"]) ?? string(obj["text"]) ?? "")
-        if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { content = "" }
-        // Only persisted bridge provenance strips routing boilerplate; quoted words stay searchable.
-        let searchable = ChatTranscriptBoilerplate.substantiveText(content,
-            bridgeRouted: ChatTranscriptBoilerplate.isBridgeRouted(rowMetadata: obj["metadata"]))
-        let timestamp = string(obj["createdAt"]) ?? string(obj["timestamp"]) ?? ""
+        let words = role == "tool" ? nil : string(obj["content"]) ?? string(obj["text"])
+        let bridgeRouted = ChatTranscriptBoilerplate.isBridgeRouted(rowMetadata: obj["metadata"])
+        let timestamp = string(obj["createdAt"]) ?? string(obj["timestamp"])
+        let instant = fractional.date(from: timestamp ?? "") ?? whole.date(from: timestamp ?? "")
         let metadata = persistedHistoryMetadata(row: obj)
         let name = string(metadata["toolName"] ?? obj["toolName"])
-        return ChatHistorySearchRow(
-            valid: true,
-            object: obj.filter { ["id", "role", "runId", "createdAt", "timestamp", "content", "text"].contains($0.key) && (role != "tool" || !["content", "text"].contains($0.key)) },
-            identity: string(obj["id"]) ?? trimmed, content: content, searchable: searchable, folded: searchable.lowercased(),
-            instant: role == "tool" && !receipts ? nil : (fractional.date(from: timestamp) ?? whole.date(from: timestamp)),
-            author: persistedHistoryAuthor(role: role, row: obj), route: persistedHistoryRoute(row: obj),
-            peer: role != "tool" || receipts ? persistedHistoryPeer(role: role, row: obj) : nil,
-            tool: name.flatMap { $0.isEmpty ? nil : ToolNameAliases.shown($0, inputJSON: string(metadata["inputJSON"])).name },
-            displayPrefix: chatHistoryDisplayEvidence("", role: role, row: obj))
+        func project(_ text: String) -> ChatHistorySearchRow {
+            let content = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : text
+            // Only persisted bridge provenance strips routing boilerplate; quoted words stay searchable.
+            let searchable = ChatTranscriptBoilerplate.substantiveText(content, bridgeRouted: bridgeRouted)
+            return ChatHistorySearchRow(
+                valid: true,
+                identity: string(obj["id"]) ?? trimmed, role: string(obj["role"]), runId: string(obj["runId"]),
+                messageId: string(obj["id"]), timestamp: timestamp, rawContent: words,
+                content: content, searchable: searchable, folded: searchable.lowercased(),
+                instant: role == "tool" ? nil : instant,
+                author: persistedHistoryAuthor(role: role, row: obj), route: persistedHistoryRoute(row: obj),
+                peer: role != "tool" ? persistedHistoryPeer(role: role, row: obj) : nil,
+                tool: name.flatMap { $0.isEmpty ? nil : ToolNameAliases.shown($0, inputJSON: string(metadata["inputJSON"])).name },
+                displayPrefix: chatHistoryDisplayEvidence("", role: role, row: obj),
+                shape: string(obj["role"]) != nil && (string(obj["content"]) ?? string(obj["text"])) != nil ? 2 : 1)
+        }
+        guard role == "tool" else { return (project(words ?? ""), nil) }
+        // Receipt metadata is an explicit evidence lane, never conversation recall.
+        var receipt = project(persistedToolReceiptText(row: obj))
+        receipt.instant = instant
+        receipt.peer = persistedHistoryPeer(role: role, row: obj)
+        return (project(""), receipt)
     }
 
     private static func persistedHistoryMetadata(row: [String: JSONValue]) -> [String: JSONValue] {
@@ -916,12 +889,11 @@ extension SwiftToolDispatcher {
     ) -> [JSONValue] {
         return rows.enumerated().compactMap { localIndex, cached in
             let offset = startIndex + localIndex
-            let row = cached.object
             guard offset != index,
-                  case .string(let role)? = row["role"],
+                  let role = cached.role,
                   ["user", "assistant"].contains(role),
                   roleFilter == nil || roleFilter == role,
-                  case .string(let content)? = row["content"] ?? row["text"] else { return nil }
+                  let content = cached.rawContent else { return nil }
             let author = cached.author
             if let authorFilter, !authorFilter.isEmpty, author?.lowercased() != authorFilter { return nil }
             let display = cached.displayPrefix + String(content.prefix(480))
@@ -938,9 +910,9 @@ extension SwiftToolDispatcher {
                 result["agent"] = .string(peer)
                 result["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(peer) && !display.isEmpty)
             }
-            if let excludingRunID, row["runId"] == .string(excludingRunID) { return nil }
-            result["timestamp"] = row["createdAt"] ?? row["timestamp"]
-            if case .string(let messageId)? = row["id"], !messageId.isEmpty {
+            if let excludingRunID, cached.runId == excludingRunID { return nil }
+            result["timestamp"] = cached.timestamp.map(JSONValue.string)
+            if let messageId = cached.messageId, !messageId.isEmpty {
                 result["message_id"] = .string(messageId)
                 result["read_locator"] = .object([
                     "tool": .string("read_chat_message"),
@@ -1086,8 +1058,8 @@ extension SwiftToolDispatcher {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         // The session ids to look in, most recently written first. An explicit
-        // id is the most specific instruction there is; without one this walks
-        // the same file set search_chat_history walks and stops at the match.
+        // id is the most specific instruction there is; without one this looks
+        // through the same file set search_chat_history searches.
         let files: [(String, URL)]
         var listingFailed = false
         let archived = try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot)
@@ -1119,7 +1091,20 @@ extension SwiftToolDispatcher {
         var missingSessionCount = 0
         var malformedRowCount = 0
         var invalidShapeRowCount = 0
+        let index = ChatHistoryIndex.shared(dataRoot: dataRoot)
         for (sessionId, file) in files {
+            // The history index says which transcripts hold the id; only those are read whole.
+            guard let rows = try? index.rows(at: file, receipts: false) else {
+                if FileManager.default.fileExists(atPath: file.path) { unreadableSessionCount += 1 }
+                else { missingSessionCount += 1 }
+                continue
+            }
+            guard rows.contains(where: { $0.valid && $0.messageId == messageId }) else {
+                // Counted as the canonical reader would have counted this transcript.
+                malformedRowCount += rows.filter { $0.shape == 0 && !$0.identity.isEmpty }.count
+                invalidShapeRowCount += rows.filter { $0.shape == 1 }.count
+                continue
+            }
             guard let read = try? await reader.messagesWithStats(forSessionId: sessionId, strictEvidence: true, transcriptURL: file) else {
                 unreadableSessionCount += 1
                 continue

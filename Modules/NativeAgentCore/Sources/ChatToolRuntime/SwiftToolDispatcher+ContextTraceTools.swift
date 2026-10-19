@@ -114,6 +114,7 @@ extension SwiftToolDispatcher {
         let limit = max(1, min(requestedLimit, 50))
         let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
         let effectsOnly = input["effects_only"] == .bool(true)
+        let receiptID = jsonString(input["receipt_id"])
         let receiptView = effectsOnly || jsonString(input["view"]) == "receipts"
         let since: Date?
         if let raw = jsonString(input["since"]) ?? (usage ? "today" : nil) {
@@ -178,8 +179,10 @@ extension SwiftToolDispatcher {
         let snapshot: TurnTraceRecentReader.Snapshot
         do {
             snapshot = try await TurnTraceRecentReader(dataRootOverride: dataRoot).read(
-                history: completedTurns != nil || turnID?.isEmpty == false, since: since,
-                holding: shapesView ? [turnID!] : [], trace: shapesView ? trace : nil)
+                history: receiptID != nil || completedTurns != nil || turnID?.isEmpty == false,
+                since: since ?? (receiptID != nil && trace == nil ? Date.distantPast : nil),
+                holding: shapesView ? [turnID!] : receiptID != nil ? ["tool.dispatch"] : [],
+                trace: shapesView || receiptID != nil ? trace : nil)
         } catch {
             return .object([
                 "status": .string("failed"),
@@ -193,16 +196,45 @@ extension SwiftToolDispatcher {
         if shapesView {
             var calls: [JSONValue] = []
             var incomplete = snapshot.truncated
-            for event in snapshot.events.sorted(by: { $0.ts < $1.ts }) where event.turnId == turnID {
-                guard event.kind == "tool.dispatch", case .object(let payload) = event.payload,
-                      payload["name"] == .string("app"), payload["phase"] == .string("begin") else { continue }
-                if payload["_truncated"] == .bool(true) { incomplete = true; continue }
-                guard payload["parentId"] == nil, case .array(let shapes)? = payload["callShapes"] else { continue }
+            let turn = snapshot.events.sorted(by: { $0.ts < $1.ts }).filter { $0.turnId == turnID && $0.kind == "tool.dispatch" }
+            // Each call answers for itself from its own end receipt: whether it
+            // landed, whether it wrote, and which skill a skill run ran. A list
+            // (actions:[...]) is its members, each traced under it.
+            var ends: [String: [String: JSONValue]] = [:], members: [String: [TurnTraceEvent]] = [:]
+            func id(_ payload: [String: JSONValue]) -> String? {
+                if case .object(let receipt)? = payload["receipt"] { return jsonString(receipt["id"]) }
+                return nil
+            }
+            for event in turn {
+                guard case .object(let payload) = event.payload else { continue }
+                if payload["phase"] == .string("end"), let id = id(payload), case .object(let receipt)? = payload["receipt"] { ends[id] = receipt }
+                if payload["phase"] == .string("begin"), payload["name"] == .string("app"),
+                   let parent = jsonString(payload["parentId"]) { members[parent, default: []].append(event) }
+            }
+            func emit(_ event: TurnTraceEvent) {
+                guard case .object(let payload) = event.payload else { return }
+                if payload["_truncated"] == .bool(true) { incomplete = true; return }
+                let callID = id(payload)
+                if case .array(let keys)? = payload["argKeys"], keys.contains(.string("actions")) {
+                    return (callID.flatMap { members[$0] } ?? []).forEach(emit)
+                }
+                guard case .array(let shapes)? = payload["callShapes"] else { return }
+                let end = callID.flatMap { ends[$0] } ?? [:]
+                let result: [String: JSONValue] = if case .object(let fields)? = end["resultReceipt"] { fields } else { [:] }
+                // A preview ran nothing: it neither landed nor wrote.
+                let landed = end["status"] == .string("ok") && end["resultClass"] != .string("preview")
                 for case .object(var call) in shapes {
-                    guard let action = jsonString(call["action"]), !["skill.run", "skill.resume"].contains(action) else { continue }
+                    call["landed"] = .bool(landed)
+                    call["wrote"] = .bool(landed && result["read_only"] == .bool(false))
+                    if let action = jsonString(call["action"]), ["skill.run", "skill.resume"].contains(action) { call["skill"] = result["skill"] }
                     call["createdAt"] = .string(event.ts.formatted(.iso8601))
                     calls.append(.object(call))
                 }
+            }
+            for event in turn {
+                guard case .object(let payload) = event.payload, payload["name"] == .string("app"),
+                      payload["phase"] == .string("begin"), payload["parentId"] == nil else { continue }
+                emit(event)
             }
             var page: [JSONValue] = [], pageBytes = 0
             let remaining = Array(calls.reversed().dropFirst(offset))
@@ -293,6 +325,10 @@ extension SwiftToolDispatcher {
                 payload = [:]
             }
             let status = jsonString(payload["status"]) ?? ""
+            if let receiptID {
+                guard payload["phase"] == .string("end"), case .object(let receipt)? = payload["receipt"],
+                      receipt["id"] == .string(receiptID) else { continue }
+            }
             if let kindFilter, !kind.lowercased().contains(kindFilter) {
                 continue
             }
@@ -418,7 +454,7 @@ extension SwiftToolDispatcher {
             "has_more": .bool(hasMore),
             "next_call": hasMore ? .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(next)])]) : .null,
             "traces": .array(summaries),
-            "source": .string("data/turn_traces/\(snapshot.sourceURL.lastPathComponent)"),
+            "source": .string("data/turn_traces/\((snapshot.sourceURLs.first ?? snapshot.sourceURL).lastPathComponent)"),
             "sources": .array(snapshot.sourceURLs.map { .string("data/turn_traces/\($0.lastPathComponent)") }),
             "scan_truncated": .bool(snapshot.truncated),
             "completed_turn_ids": .array(completedIDs.map(JSONValue.string)),
@@ -430,6 +466,12 @@ extension SwiftToolDispatcher {
         ]
         if receiptView {
             response["order_note"] = .string("Non-read actions first, then reads; newest first within each group. Receipts include attempts and failures; inspect resultClass and resultReceipt for recorded effects.")
+        }
+        if receiptID != nil, summaries.isEmpty {
+            response["status"] = .string("unavailable")
+            response["detail"] = .string(snapshot.truncated
+                ? "The receipt was not found in incomplete retained evidence. Its absence and the operation's outcome are unknown; do not replay it."
+                : "No retained dispatch receipt matches receipt_id. This does not establish the original operation's outcome; do not replay it.")
         }
         if effectsOnly {
             response["effects_note"] = .string("Successful non-read actions, excluding previews and explicit no-effect results. args/result are bounded redacted previews for target and effect; paired inner/app receipts can describe one action. No matches is not proof of no changes; check scan_truncated and has_more. Dispatch success does not prove the effect still persists.")

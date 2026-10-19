@@ -72,7 +72,7 @@ extension SwiftToolDispatcher {
 
     /// Keep the range receipt and replay the authorized caller path spelling.
     static func fileReadPresentation(_ result: JSONValue, callerPath: String) -> JSONValue {
-        guard case .object(var object) = result, case .string? = object["content"] else { return result }
+        guard case .object(var object) = result else { return result }
         if case .object(var next)? = object["next"] {
             next["path"] = .string(callerPath)
             object["next"] = .object(next)

@@ -874,7 +874,7 @@ public actor SwiftNativeMacControl: MacControlClient {
 
         let decision = MacControlGate.gate(policy, category: category, trigger: trigger)
         if !decision.allowed {
-            let result = Self.refusalResult(action: action, reason: decision.reason, now: now)
+            let result = Self.refusalResult(action: action, reason: decision.reason, now: now, remedy: decision.remedy)
             await emitBlockedAudit(action: action, category: category, reason: decision.reason, trigger: trigger, policy: policy, body: body)
             return .refuse(result)
         }
@@ -926,7 +926,8 @@ public actor SwiftNativeMacControl: MacControlClient {
     private static func refusalResult(
         action: String,
         reason: String,
-        now: @Sendable () -> Date
+        now: @Sendable () -> Date,
+        remedy: JSONValue? = nil
     ) -> MacControlResult {
         MacControlResult(
             ok: false,
@@ -937,6 +938,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 "error": .string(reason),
                 "block_reason": .string(reason),
                 "blocked_by": .string("swift_gate_preflight"),
+                "remedy": remedy ?? .null,
             ]),
             error: reason,
             durationMs: 0,

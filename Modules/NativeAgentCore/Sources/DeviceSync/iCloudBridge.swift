@@ -19,6 +19,7 @@ import ChatOrchestration
 import PersistenceCore
 import ProviderRouting
 import OSLog
+import Network
 
 // MARK: - iCloudBridge (Mac)
 // BridgeMessage, BridgeError, and all HMAC helpers are now in NativeAgentShared.
@@ -140,18 +141,10 @@ public final class iCloudBridge: ObservableObject {
     private static let pushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "push")
 
     private enum DrainTrigger: String {
-        case fallbackTimer, cloudKitPush, legacyKVS, coalesced
+        case fallbackTimer, cloudKitPush, legacyKVS, coalesced, repair, wake, network
     }
 
     unowned let sync: DeviceSync
-    /// Silent CloudKit pushes are best-effort, even after APNs registration
-    /// succeeds. Keep the Mac-side safety pull responsive so one missed wake
-    /// cannot strand an already-sent iPhone turn until the phone's 180-second
-    /// watchdog fires. This is deliberately the same for development and
-    /// distribution builds; successful registration proves capability, not
-    /// delivery of every individual wake.
-    nonisolated static let responsiveDeviceDrainFallbackSeconds: TimeInterval = 8
-
     // MARK: Published state
 
     @Published public internal(set) var available: Bool = false
@@ -160,11 +153,51 @@ public final class iCloudBridge: ObservableObject {
         didSet {
             if accountFailure != nil, syncStatus != DeviceSyncAccountFailure.macMessage {
                 syncStatus = DeviceSyncAccountFailure.macMessage
+            } else if accountFailure == nil, phonePairedElsewhere, syncStatus != Self.pairedElsewhereStatus {
+                syncStatus = Self.pairedElsewhereStatus
             }
         }
     }
-    @Published public private(set) var accountFailure: DeviceSyncAccountFailure?
+    @Published public private(set) var accountFailure: DeviceSyncAccountFailure? {
+        didSet { refreshPhoneConnection() }
+    }
     private var accountFailureGeneration: UInt64 = 0
+    /// Another Mac on this Apple Account holds the phone's pairing; this Mac
+    /// stays quiet toward the phone until the person moves it here.
+    @Published public private(set) var phonePairedElsewhere = false {
+        didSet { refreshPhoneConnection() }
+    }
+    /// Whether this Mac has read its claim on the account's pairing since
+    /// setup. Until it has, it writes nothing the phone reads as the Mac's.
+    private var phonePairingSettled = false {
+        didSet { refreshPhoneConnection() }
+    }
+    /// The phone's connection as this Mac knows it: pairing, transport and the
+    /// last accepted exchange, each with its owner. Connectors › iPhone and
+    /// Doctor say where the connection stands through this one value.
+    @Published public private(set) var phoneConnection = NAPhoneConnection(
+        pairing: .init(.waiting, "Checking this Mac's pairing."),
+        transport: .init(.waiting, "iCloud is not checked yet."),
+        exchange: .init(.waiting, "No message from your iPhone yet."))
+    /// Why this build has no CloudKit transport, when it was meant to.
+    private var transportRefusal: NAPhoneConnection.Fact? { didSet { refreshPhoneConnection() } }
+    private var pairingKeyUnreadable = false { didSet { refreshPhoneConnection() } }
+    /// When the phone was last there, from a message this Mac accepted.
+    private var lastPhoneContactAt: Date? { didSet { refreshPhoneConnection() } }
+    /// When this Mac last turned away a phone message signed with another key.
+    private var lastPhoneRejectedAt: Date? { didSet { refreshPhoneConnection() } }
+    private var pairedPhonesSubscription: AnyCancellable?
+    private var phonePairingRecheckDue = false
+    /// This Mac speaks to the phone: it holds the account's pairing.
+    private var speaksToPhone: Bool { deviceTransport != nil && phonePairingSettled && !phonePairedElsewhere }
+    nonisolated static let pairedElsewhereStatus =
+        "Your iPhone is paired with another Mac (or an earlier install) on this Apple Account. Choose Use my iPhone with this Mac to move it here."
+    /// This install changed its key and the account's pairing record has not
+    /// taken it yet: owed, not lost. Per data root, like the key itself.
+    private var pairingPublicationOwedKey: String {
+        let root = SHA256.hash(data: Data(sync.dataRoot.standardizedFileURL.path.utf8))
+        return "NativeAgent.pairing.cloudKitPublicationOwed.v1." + root.prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
 
     // MARK: Private
 
@@ -173,8 +206,12 @@ public final class iCloudBridge: ObservableObject {
     private var messageHandlers: [(BridgeMessage) async -> Bool] = []
     // Only the entitlement-checked resolver installs this CloudKit transport.
     private var deviceTransport: DeviceSyncTransport?
-    private var doctorTransportHealth: ICloudBridgeHealthSnapshot.Health = .unmeasured
-    private var doctorSendFailures: [String: ICloudBridgeHealthSnapshot.Health] = [:]
+    private var doctorTransportHealth: ICloudBridgeHealthSnapshot.Health = .unmeasured {
+        didSet { refreshPhoneConnection() }
+    }
+    private var doctorSendFailures: [String: ICloudBridgeHealthSnapshot.Health] = [:] {
+        didSet { refreshPhoneConnection() }
+    }
     private var doctorSendMeasured = false
     var onTransportSucceeded: (() -> Void)?
     public lazy var phoneRequests = MacPhoneRequestChannel(bridge: self)
@@ -182,22 +219,25 @@ public final class iCloudBridge: ObservableObject {
         deviceTransport != nil
     }
     public private(set) var cloudKitVisualNotificationPeerReady: Bool = false
-    // CK-3c: single-flight guard for the transport drain (timer + observe +
-    // on-demand triggers coalesce; per-message delivery is already atomic in the
-    // transport) + a dynamic fallback poll. APNs is the normal wake path when
-    // registration succeeds; development/ad-hoc builds without APS retain the
-    // fast poll rather than silently losing phone messages.
+    // Push/receive deadlines coalesce; the transport owns message deduplication.
     private var deviceDrainInFlight = false
     private var activeCloudKitChats = 0
     private var deviceDrainQueued = false
     private var deviceDrainTimerTask: Task<Void, Never>?
+    private var cloudKitPushProofAt: Date?
+    private var cloudKitPushProven: Bool { cloudKitPushProofAt != nil }
+    private var deviceDrainTriggeredByPush = false
+    private var cloudKitPushUnavailable = false
+    private var deviceDrainCadence: TimeInterval?
+    private var deviceNetworkMonitor: NWPathMonitor?
+    private var deviceNetworkSatisfied: Bool?
     // 2026-09-06: the retention sweep's own single-flight slot. It runs beside
     // the drain, never inside it, so a slow or timing-out sweep cannot delay
     // message delivery; a sweep still running when the next drain finishes is
     // simply not started again.
     private var deviceRetentionSweepInFlight = false
     private var deviceRetentionSweepTask: Task<Void, Never>?
-    /// E3: decides whether each fallback tick actually spends a CloudKit fetch.
+    /// Owns the receive deadline while delivery needs one.
     var drainPolicy = AdaptiveDrainPolicy()
     private var lastDeviceDrainAt = Date.distantPast
     /// Last successfully published deterministic provider projection. Repeated
@@ -264,6 +304,9 @@ public final class iCloudBridge: ObservableObject {
         ICloudBridgeHealthReader.register(dataRoot: sync.dataRoot) { [weak self] in
             self?.doctorHealthSnapshot
         }
+        PhoneConnectionReader.register(dataRoot: sync.dataRoot) { [weak self] in
+            self?.phoneConnection
+        }
     }
 
     private var doctorHealthSnapshot: ICloudBridgeHealthSnapshot? {
@@ -292,11 +335,15 @@ public final class iCloudBridge: ObservableObject {
         case .notConfigured: return .notEntitled
         case .quotaExceeded: return .quotaExceeded
         case .account(let failure): return .accountFailure(code: failure.code, detail: failure.detail)
+        case .pairedElsewhere: return .pairedElsewhere
         default: return .unavailable(error.localizedDescription)
         }
     }
 
     private func recordSendResult(operation: String, error: Error? = nil) async {
+        // A Mac whose phone is paired elsewhere says so once, as its receive
+        // health; each refused write is that same fact, not a send failure.
+        if case .pairedElsewhere? = error as? DeviceSyncError { return }
         doctorSendMeasured = true
         doctorSendFailures[operation] = error.map(Self.transportHealth)
         if let error, case .account(let failure) = error as? DeviceSyncError {
@@ -356,6 +403,15 @@ public final class iCloudBridge: ObservableObject {
         // N10 fix: guard against repeat setup() calls stacking KVS observers.
         guard !isSetUp else { return }
         isSetUp = true
+        // A stored sentence from an earlier key change could never settle; the
+        // owed publication (the pairing fact) says it now, and settles itself.
+        UserDefaults.standard.removeObject(forKey: "NativeAgent.pairing.publicationWarning.v1")
+        if pairedPhonesSubscription == nil {
+            pairedPhonesSubscription = sync.pairedPhones.$phones.sink { [weak self] _ in
+                Task { @MainActor in self?.refreshPhoneConnection() }
+            }
+        }
+        lastPhoneContactAt = SignedPeerEvidenceStore.load(dataRoot: sync.dataRoot)?.contactAt
         doctorTransportHealth = .unmeasured
         doctorSendFailures.removeAll()
         doctorSendMeasured = false
@@ -367,6 +423,7 @@ public final class iCloudBridge: ObservableObject {
         // CloudKit-only starts do not pass through the Drive bootstrap below,
         // so restore their persisted replay filter before the first drain.
         loadCKSeenIDs()
+        recordCloudKitPushEvidence()
 
         // CloudKit is independent of the ubiquity/Drive mount. Public
         // Developer ID builds may have the CloudKit service without
@@ -399,6 +456,9 @@ public final class iCloudBridge: ObservableObject {
             }
             return
         }
+
+        // Without the CloudKit transport, KVS is the pairing channel itself.
+        Task.detached(priority: .userInitiated) { await PairingSecretManager.publishMaterialToKVS() }
 
         // 2026-05-28 fix: FileManager.default.url(forUbiquityContainerIdentifier:)
         // is SYNCHRONOUS and can block for many seconds (sometimes 30s+) on first
@@ -506,12 +566,11 @@ public final class iCloudBridge: ObservableObject {
             containerIdentifier: containerID
         ) else {
             recordTransportOrgansOff("no CloudKit transport")
+            transportRefusal = Self.cloudKitRefusal(containerID: containerID)
             return
         }
+        transportRefusal = nil
         deviceTransport = transport
-        // The drain and the presence beat run over this transport: their
-        // clocks start here (and stop in `recordTransportOrgansOff`).
-        OrganPulse.recordStarting("icloud_drain", cadence: drainPolicy.idleInterval)
         OrganPulse.recordStarting("presence_beat", cadence: NAMacPresence.beat)
         (transport as? CloudKitDeviceTransport)?.useAssetSecret {
             guard let encoded = try? PairingSecretManager.existingSecretBase64() else { return nil }
@@ -536,41 +595,84 @@ public final class iCloudBridge: ObservableObject {
                 }
             )
         }
-        Task {
-            let pairingPublished = await PairingSecretManager.publishMaterial(to: transport)
-            await self.recordSendResult(operation: "pairing", error: pairingPublished ? nil :
-                DeviceSyncError.underlying(message: "Pairing publication failed; check the Mac pairing key and iCloud."))
-            if !pairingPublished {
-                self.syncStatus = "iPhone pairing unavailable — check the Mac pairing key and iCloud"
-            }
-            _ = await self.publishProviderCatalogStatus()
-        }
+        Task { await self.claimPhonePairing() }
 
-        startDeviceDrainFallback(every: 8)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(deviceDidWake),
+            name: NSWorkspace.didWakeNotification, object: nil)
+        let generation = setupGeneration
+        let monitor = NWPathMonitor()
+        deviceNetworkMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor in
+                guard let self, self.setupGeneration == generation else { return }
+                let regained = self.deviceNetworkSatisfied == false && satisfied
+                self.deviceNetworkSatisfied = satisfied
+                if regained { _ = await self.drainDeviceTransport(trigger: .network) }
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "NativeAgent.DeviceSync.network"))
+        scheduleNextDeviceDrainFallback()
         NSApplication.shared.registerForRemoteNotifications(matching: [])
     }
 
-    /// `interval` is the FAST cadence while a peer correlation is outstanding
-    /// or the phone was recently active. The fallback is one-shot: after each
-    /// drain it arms directly for the next policy deadline. Pushes drain
-    /// immediately, and outbound state changes re-arm the deadline, so an idle
-    /// Mac no longer wakes every eight seconds just to reject an early tick.
-    func startDeviceDrainFallback(every interval: TimeInterval) {
-        drainPolicy.fastInterval = interval
-        scheduleNextDeviceDrainFallback()
+    @objc private func deviceDidWake() {
+        Task { _ = await self.drainDeviceTransport(trigger: .wake) }
     }
 
-    private func scheduleNextDeviceDrainFallback() {
+    private var deviceReceiveCadence: TimeInterval? {
+        drainPolicy.interval(now: Date(), polling: !cloudKitPushProven,
+            active: activeCloudKitChats > 0 || phoneRequests.hasPendingRequest)
+    }
+
+    private var devicePollingNote: String {
+        cloudKitPushProven ? "" : cloudKitPushUnavailable
+            ? "polling: push unavailable" : "polling: push unproven"
+    }
+
+    /// A received push proves delivery across launches; an unannounced phone
+    /// message older than two eight-second re-signals disproves it. This local
+    /// scalar is separate from account failures, which a healthy pull clears.
+    private func recordCloudKitPushEvidence(received: Bool? = nil) {
+        let url = sync.dataRoot.appendingPathComponent("icloud/chat_push_proof.json")
+        do {
+            if let received {
+                cloudKitPushProofAt = received ? Date() : nil
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(cloudKitPushProofAt).write(to: url, options: .atomic)
+            } else if FileManager.default.fileExists(atPath: url.path) {
+                cloudKitPushProofAt = try JSONDecoder().decode(Date?.self, from: Data(contentsOf: url))
+            }
+        } catch {
+            nativeLog("[iCloudBridge] push evidence unavailable: %@", error.localizedDescription)
+        }
+    }
+
+    func scheduleNextDeviceDrainFallback() {
         deviceDrainTimerTask?.cancel()
+        deviceDrainTimerTask = nil
         guard deviceTransport != nil else {
             deviceDrainTimerTask = nil
             recordTransportOrgansOff("iPhone transport gone")
             return
         }
+        guard !phonePairedElsewhere else {
+            deviceDrainTimerTask = nil
+            return
+        }
         let now = Date()
-        drainPolicy.prune(now: now)
-        let policyDelay = drainPolicy.nextDrainDelay(now: now, lastDrainAt: lastDeviceDrainAt)
-        let delay = activeCloudKitChats > 0 ? min(policyDelay, drainPolicy.fastInterval) : policyDelay
+        guard let delay = drainPolicy.nextDrainDelay(now: now, lastDrainAt: lastDeviceDrainAt,
+            polling: !cloudKitPushProven, active: activeCloudKitChats > 0 || phoneRequests.hasPendingRequest) else {
+            deviceDrainCadence = nil
+            OrganPulse.recordOff("icloud_drain", because: "resting — waiting for change")
+            return
+        }
+        let cadence = deviceReceiveCadence
+        if deviceDrainCadence != cadence {
+            deviceDrainCadence = cadence
+            OrganPulse.record("icloud_drain", .skipped,
+                note: devicePollingNote.isEmpty ? "starting" : devicePollingNote, cadence: cadence)
+        }
         let delayNanoseconds = UInt64(delay * 1_000_000_000)
         deviceDrainTimerTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: delayNanoseconds)
@@ -580,6 +682,10 @@ public final class iCloudBridge: ObservableObject {
             // chat. Retaining this handle there cancelled the final reply's
             // owner as soon as its first delta was sent.
             self.deviceDrainTimerTask = nil
+            guard self.deviceReceiveCadence != nil else {
+                self.scheduleNextDeviceDrainFallback()
+                return
+            }
             await self.drainDeviceTransport(trigger: .fallbackTimer)
         }
     }
@@ -590,14 +696,12 @@ public final class iCloudBridge: ObservableObject {
         for organ in ["icloud_drain", "presence_beat"] { OrganPulse.recordOff(organ, because: reason) }
     }
 
-    /// APNs registration is a runtime capability, not per-message delivery
-    /// proof. A VM missed a valid silent wake in production and the former
-    /// five-minute fallback let an iPhone turn outlive its 180-second watchdog.
-    /// Keep the responsive safety pull after registration as well as failure.
+    /// Registration alone does not prove the subscription can wake this process.
     public func cloudKitPushRegistrationSucceeded() {
         Self.pushLog.notice("APNs registration succeeded")
         guard deviceTransport != nil else { return }
-        startDeviceDrainFallback(every: Self.responsiveDeviceDrainFallbackSeconds)
+        cloudKitPushUnavailable = false
+        scheduleNextDeviceDrainFallback()
     }
 
     public func cloudKitPushRegistrationFailed(_ error: Error) {
@@ -605,16 +709,33 @@ public final class iCloudBridge: ObservableObject {
         guard deviceTransport != nil else { return }
         nativeLog("[iCloudBridge] CloudKit push unavailable; retaining polling fallback: %@",
               error.localizedDescription)
-        startDeviceDrainFallback(every: Self.responsiveDeviceDrainFallbackSeconds)
+        recordCloudKitPushUnavailable()
+    }
+
+    private func recordCloudKitPushUnavailable() {
+        cloudKitPushUnavailable = true
+        recordCloudKitPushEvidence(received: false)
+        deviceDrainCadence = nil
+        scheduleNextDeviceDrainFallback()
     }
 
     public func recognizesCloudKitRemoteNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
         let recognized = CloudKitDeviceTransport.isDeviceSyncNotification(userInfo)
+        if CloudKitDeviceTransport.isPairingNotification(userInfo) { phonePairingRecheckDue = true }
         Self.pushLog.notice("Remote notification received deviceSync=\(recognized)")
         return recognized
     }
 
-    public func handleCloudKitPushWake() async {
+    public func handleCloudKitPushWake(_ userInfo: [AnyHashable: Any]) async {
+        if phonePairingRecheckDue || !phonePairingSettled {
+            phonePairingRecheckDue = false
+            await claimPhonePairing()
+        }
+        guard !phonePairedElsewhere else { return }
+        if CloudKitDeviceTransport.isChatNotification(userInfo) {
+            recordCloudKitPushEvidence(received: true)
+            cloudKitPushUnavailable = false
+        }
         // A push is peer activity; follow-up traffic keeps the fast cadence.
         drainPolicy.notePeerActivity(at: Date())
         _ = await drainDeviceTransport(trigger: .cloudKitPush)
@@ -624,11 +745,222 @@ public final class iCloudBridge: ObservableObject {
     /// This avoids a second disk read becoming a different authority decision.
     @discardableResult
     public func publishPairingSecret(_ secret: Data) async -> Bool {
+        let generation = setupGeneration
+        guard await publishPairing(secret), generation == setupGeneration else { return false }
+        notePairingHeld()
+        return true
+    }
+
+    /// A key change is owed to the account's pairing record from before the
+    /// key changes until the record takes it, so no quit or claim in between
+    /// reads this install's own old key as another Mac's. Only a key change
+    /// owes: a move-here the person pressed that failed stays their error to
+    /// retry, never a standing claim.
+    public func owePairingPublication(_ owed: Bool) {
+        if owed {
+            UserDefaults.standard.set(true, forKey: pairingPublicationOwedKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: pairingPublicationOwedKey)
+        }
+        refreshPhoneConnection()
+    }
+
+    /// The account's pairing record takes this Mac's key: the person's act or
+    /// this Mac's own key change. Landing settles anything owed.
+    private func publishPairing(_ secret: Data) async -> Bool {
         guard let deviceTransport else { return false }
         let published = await PairingSecretManager.publishMaterial(secret, to: deviceTransport)
         await recordSendResult(operation: "pairing", error: published ? nil :
             DeviceSyncError.underlying(message: "Pairing publication failed; check the Mac pairing key and iCloud."))
+        if published { owePairingPublication(false) }
         return published
+    }
+
+    /// The phone follows one Mac: whichever key the account's Mac pairing
+    /// record holds. Launch takes that record only when it is free or already
+    /// this Mac's. Another Mac keeps the phone until the person moves it here
+    /// (`usePhoneHere`), so launching a second Mac never takes the phone.
+    private func claimPhonePairing() async {
+        guard let transport = deviceTransport else { return }
+        let generation = setupGeneration
+        let accountGeneration = accountFailureGeneration
+        let secret: Data
+        do {
+            secret = try PairingSecretManager.loadOrGenerateSecret()
+        } catch {
+            nativeLog("[PairingBootstrap] Pairing unavailable; refusing device claim: \(error.localizedDescription)")
+            pairingKeyUnreadable = true
+            await recordSendResult(operation: "pairing", error:
+                DeviceSyncError.underlying(message: "Pairing publication failed; check the Mac pairing key and iCloud."))
+            syncStatus = "iPhone pairing unavailable — check the Mac pairing key and iCloud"
+            return
+        }
+        pairingKeyUnreadable = false
+        let held: Bool?
+        if UserDefaults.standard.bool(forKey: pairingPublicationOwedKey) {
+            held = await publishPairing(secret) ? true : nil
+        } else {
+            held = await transport.claimPairing(secret: secret)
+            if held == nil {
+                await recordSendResult(operation: "pairing", error:
+                    DeviceSyncError.transient(message: "The iPhone pairing record could not be read; retrying at the next sync."))
+            } else {
+                await recordSendResult(operation: "pairing")
+            }
+        }
+        guard generation == setupGeneration, let held else { return }
+        // The account answered; a stored account failure is no longer true.
+        if accountFailure != nil, accountGeneration == accountFailureGeneration { await clearAccountFailure() }
+        if held {
+            notePairingHeld()
+        } else {
+            notePairedElsewhere()
+        }
+    }
+
+    /// The person's act: move the phone to this Mac.
+    @discardableResult
+    public func usePhoneHere() async -> Bool {
+        guard deviceTransport != nil,
+              let secret = try? PairingSecretManager.loadOrGenerateSecret() else { return false }
+        return await publishPairingSecret(secret)
+    }
+
+    /// This Mac holds the pairing. Coming out of silence (launch, or another
+    /// Mac had the phone), everything it has for the phone goes out afresh:
+    /// the other Mac may have written over all of it.
+    private func notePairingHeld() {
+        let wasSpeaking = speaksToPhone
+        let wasElsewhere = phonePairedElsewhere
+        phonePairingSettled = true
+        phonePairedElsewhere = false
+        guard !wasSpeaking else { return }
+        lastPublishedProviderCatalogStatus = nil
+        lastPublishedMobileSnapshotStatus.removeAll()
+        if wasElsewhere {
+            // The drain and the presence republish below record their own pulses.
+            doctorTransportHealth = .unmeasured
+            syncStatus = "CloudKit ready"
+        }
+        Task.detached(priority: .utility) { await PairingSecretManager.publishMaterialToKVS() }
+        Task {
+            _ = await self.publishProviderCatalogStatus()
+            await self.sync.engine.republishPhonePages()
+            if wasElsewhere { _ = await self.drainDeviceTransport(trigger: .coalesced) }
+        }
+    }
+
+    private func notePairedElsewhere() {
+        phonePairingSettled = true
+        phonePairedElsewhere = true
+        syncStatus = Self.pairedElsewhereStatus
+        doctorTransportHealth = .pairedElsewhere
+        doctorSendFailures.removeAll()
+        deviceDrainTimerTask?.cancel()
+        deviceDrainTimerTask = nil
+        recordTransportOrgansOff("the iPhone is paired with another Mac")
+    }
+
+    // MARK: - The phone connection
+
+    func notePhoneContact(at peerTimestamp: Date) {
+        let contact = min(peerTimestamp, Date())
+        if contact > (lastPhoneContactAt ?? .distantPast) { lastPhoneContactAt = contact }
+    }
+
+    private func refreshPhoneConnection() {
+        let next = NAPhoneConnection(pairing: phonePairingFact, transport: phoneTransportFact, exchange: phoneExchangeFact)
+        if next != phoneConnection { phoneConnection = next }
+    }
+
+    private var phonePairingFact: NAPhoneConnection.Fact {
+        if pairingKeyUnreadable {
+            return .init(.broken, "This Mac's pairing key can't be read.", owner: .personOnMac,
+                         lever: "Choose Regenerate the pairing key below, then pair the iPhone again.")
+        }
+        if deviceTransport != nil, UserDefaults.standard.bool(forKey: pairingPublicationOwedKey) {
+            return .init(.waiting, "This Mac's new pairing key is waiting for iCloud to take it.", owner: .network,
+                         lever: "Keep this Mac online with NativeAgent open; it publishes the key on its own.")
+        }
+        if phonePairedElsewhere {
+            return .init(.waiting, "Your iPhone is paired with another Mac (or an earlier install) on this Apple Account.",
+                         owner: .personOnMac,
+                         lever: "Choose Use my iPhone with this Mac. That disconnects it from the other one.")
+        }
+        let phones = sync.pairedPhones.phones.filter { $0.status != .removed }
+        if phones.contains(where: { $0.status == .pending }) {
+            return .init(.waiting, "An iPhone is waiting for you to pair it.", owner: .personOnMac,
+                         lever: "Match the code the iPhone shows, then choose Pair below.")
+        }
+        guard phones.contains(where: { $0.status == .paired }) else {
+            return .init(.waiting, "No iPhone is paired yet.", owner: .personOnPhone,
+                         lever: "Open NativeAgent on your iPhone, signed in to this Apple Account, and tap Connect.")
+        }
+        if deviceTransport != nil, !phonePairingSettled {
+            return .init(.waiting, "Paired; checking in iCloud that this Mac still holds the pairing.")
+        }
+        return .init(.holds, "Paired with your iPhone.")
+    }
+
+    private var phoneTransportFact: NAPhoneConnection.Fact {
+        if accountFailure != nil {
+            return .init(.broken, "iCloud sign-in needs attention on this Mac.", owner: .iCloudAccount,
+                         lever: "Open System Settings → Apple Account and finish signing in to iCloud.")
+        }
+        if deviceTransport == nil, let transportRefusal { return transportRefusal }
+        let carrier = deviceTransport != nil ? "CloudKit" : "iCloud Drive"
+        switch doctorTransportHealth {
+        case .available, .pairedElsewhere:
+            guard doctorSendFailures.isEmpty else {
+                return .init(.waiting, "\(carrier) is up; some deliveries to the iPhone are waiting to resend.", owner: .network,
+                             lever: "Keep this Mac online with NativeAgent open; it resends on its own.")
+            }
+            return .init(.holds, "\(carrier) carries their messages.")
+        case .unmeasured:
+            return .init(.waiting, "\(carrier) is starting; not measured yet.")
+        case .signedOut:
+            return .init(.broken, "This Mac is not signed in to iCloud.", owner: .iCloudAccount,
+                         lever: "Open System Settings → Apple Account and sign in.")
+        case .notEntitled:
+            return .init(.broken, "This build is not signed to use iCloud for the phone.", owner: .builder,
+                         lever: "Install a signed NativeAgent build.")
+        case .quotaExceeded:
+            return .init(.broken, "iCloud storage is full.", owner: .iCloudAccount,
+                         lever: "Free iCloud storage in System Settings → Apple Account → iCloud.")
+        case .accountFailure(_, let detail):
+            return .init(.broken, "iCloud turned this Mac away: \(detail)", owner: .iCloudAccount,
+                         lever: "Open System Settings → Apple Account and check iCloud.")
+        case .unavailable(let reason):
+            return .init(.waiting, "\(carrier)'s last receive failed: \(reason)", owner: .network,
+                         lever: "Check this Mac's internet connection; NativeAgent retries on its own.")
+        }
+    }
+
+    private var phoneExchangeFact: NAPhoneConnection.Fact {
+        if let rejected = lastPhoneRejectedAt, rejected > (lastPhoneContactAt ?? .distantPast) {
+            return .init(.broken,
+                         "Turned away the iPhone's last message (\(rejected.formatted(date: .abbreviated, time: .shortened))): it was signed with a key this Mac does not hold.",
+                         owner: .personOnPhone,
+                         lever: "On the iPhone, open Settings › Connection and choose Pair with Mac.")
+        }
+        guard let contact = lastPhoneContactAt else {
+            return .init(.waiting, "No message from your iPhone yet.", owner: .personOnPhone,
+                         lever: "Send a message from NativeAgent on your iPhone.")
+        }
+        return .init(.holds, "Last message from your iPhone: \(contact.formatted(date: .abbreviated, time: .shortened)).")
+    }
+
+    /// Why a build meant to use CloudKit got no transport for the phone.
+    nonisolated static func cloudKitRefusal(containerID: String) -> NAPhoneConnection.Fact? {
+        guard DeviceSyncTransportResolver.resolvedKind() == .cloudkit else { return nil }
+        guard DeviceCloudKitPreflight.hasCloudKitEntitlement() else {
+            return .init(.broken, "This build is not signed for CloudKit, so the iPhone cannot reach it.", owner: .builder,
+                         lever: "Install a NativeAgent build signed with CloudKit.")
+        }
+        return .init(.broken,
+                     "This build is configured for iCloud container \(containerID), but its signature grants another, so the iPhone cannot reach it.",
+                     owner: .builder,
+                     lever: "Install a NativeAgent build whose iCloud container matches its signature.")
     }
 
     // MARK: - Drive directory bootstrap
@@ -747,7 +1079,9 @@ public final class iCloudBridge: ObservableObject {
             reservation["updatedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
             try await SwiftNativePersistenceCore().writeDataAtomicDurable(try JSONValue.object(reservation).serializedData(pretty: false), to: path)
         }
-        try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: root, sessionId: answerSession, runId: response.runId)
+        // CloudKit took it; the phone has not said it holds it, so it stays owed there.
+        try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: root, sessionId: answerSession,
+                                                                           runId: response.runId, verdict: "accepted_by_transport")
         return settled
     }
 
@@ -918,7 +1252,8 @@ public final class iCloudBridge: ObservableObject {
             )
             if finalReply, let sessionID, let correlationID,
                try await Self.replyVerdict(correlationID: correlationID, runID: runID, dataRoot: root) == "completed" {
-                try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: root, sessionId: sessionID, runId: runID)
+                try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: root, sessionId: sessionID,
+                                                                                   runId: runID, verdict: "accepted_by_transport")
             }
             // CK-5: fire the lightweight KVS "new message" nudge so the peer drains
             // CloudKit IMMEDIATELY — an event-driven foreground trigger (fires on
@@ -1119,6 +1454,7 @@ public final class iCloudBridge: ObservableObject {
     func sendShortStatus(key: String, value: String) {
         // CK-3b: route status through the CloudKit transport when active.
         if let ck = deviceTransport {
+            guard speaksToPhone else { return }
             Task {
                 do {
                     try await ck.setStatus(key: key, value: value)
@@ -1144,7 +1480,7 @@ public final class iCloudBridge: ObservableObject {
     /// provider configuration owner.
     @discardableResult
     public func publishProviderCatalogStatus() async -> Bool {
-        guard let deviceTransport else { return false }
+        guard let deviceTransport, speaksToPhone else { return false }
         do {
             let snapshot = try await sync.host.providerCatalogSnapshot()
             let catalog = NAProviderCatalogStatus(
@@ -1193,7 +1529,7 @@ public final class iCloudBridge: ObservableObject {
         snapshotDirectory: URL,
         shouldPublish: @MainActor () -> Bool = { true }
     ) async -> [NAMobileSnapshotGroup: DeviceSyncError]? {
-        guard let deviceTransport, !groups.isEmpty else { return nil }
+        guard let deviceTransport, speaksToPhone, !groups.isEmpty else { return nil }
         var failures: [NAMobileSnapshotGroup: DeviceSyncError] = [:]
         for group in NAMobileSnapshotGroup.allCases where groups.contains(group) {
             do {
@@ -1231,7 +1567,7 @@ public final class iCloudBridge: ObservableObject {
 
     /// One presence beat (`NAMacPresence`).
     func publishMacPresence() async -> Bool {
-        guard let deviceTransport else { return false }
+        guard let deviceTransport, speaksToPhone else { return false }
         do {
             guard let encoded = try PairingSecretManager.existingSecretBase64(),
                   let secret = Data(base64Encoded: encoded) else { return false }
@@ -1405,16 +1741,26 @@ public final class iCloudBridge: ObservableObject {
             return await self.admitsPhoneControl(message, generation: observerGeneration)
         }
         Task { [weak self] in
-            await transport.observeIncoming { [weak self] message in
+            let subscriptionsReady = await transport.observeIncoming { [weak self] message in
                 guard let self,
                       await self.acceptsIncomingObserver(generation: observerGeneration)
                 else { return false }
-                return await self.handleIncomingFromTransport(message, observerGeneration: observerGeneration)
+                let handled = await self.handleIncomingFromTransport(message, observerGeneration: observerGeneration)
+                guard handled, message.metadata?["kind"] == PhonePlaceEvent.messageKind
+                    || message.metadata?["kind"] == PhoneRequestResult.messageKind else { return handled }
+                guard message.sender == "ios", let encoded = try? PairingSecretManager.existingSecretBase64(),
+                      let secret = Data(base64Encoded: encoded), message.verifySignature(secret: secret) else { return handled }
+                // These deliveries have no answer of their own. Use the same
+                // signed progress channel as chat acceptance, durably over CK.
+                return (try? await self.sendChatMessage(text: "Mac received it", sessionID: message.sessionID,
+                    correlationID: message.id, metadata: ["kind": "progress", "stage": "received"])) != nil
             }
             guard let self,
                   self.acceptsIncomingObserver(generation: observerGeneration)
             else { return }
+            if !subscriptionsReady { self.recordCloudKitPushUnavailable() }
             self.incomingObserverInstalled = true
+            _ = await transport.drainIncoming()
         }
     }
 
@@ -1472,6 +1818,14 @@ public final class iCloudBridge: ObservableObject {
         }
         if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
         if disposition == .permanentlyRejected(reason: "signature_invalid") {
+            // A phone that now signs with another Mac's key was moved there:
+            // its messages are that Mac's, not an attack on this one.
+            if !phonePairedElsewhere { await claimPhonePairing() }
+            if phonePairedElsewhere { return true }
+            // The phone's clock, like contact: an old-key message sent before
+            // newer accepted ones is not the latest word.
+            let rejectedAt = min(msg.timestamp, Date())
+            if rejectedAt > (lastPhoneRejectedAt ?? .distantPast) { lastPhoneRejectedAt = rejectedAt }
             let retained = await incomingVerifier.quarantine(msg, dataRoot: PersistenceCore.defaultDataRoot())
             if let observerGeneration, !acceptsIncomingObserver(generation: observerGeneration) { return false }
             syncStatus = retained ? "Rejected iPhone message (CloudKit): signature_invalid"
@@ -1480,6 +1834,11 @@ public final class iCloudBridge: ObservableObject {
         }
         // Authentication suspended; a concurrent cancellation may have completed.
         if seenMessageIDs.contains(msg.id) { return true }
+        if !deviceDrainTriggeredByPush, let proof = cloudKitPushProofAt,
+           msg.timestamp > proof, Date().timeIntervalSince(msg.timestamp) > 16 {
+            recordCloudKitPushEvidence(received: false)
+            scheduleNextDeviceDrainFallback()
+        }
         switch disposition {
         case .permanentlyRejected(let reason):
             if reason == "stale_timestamp" {
@@ -1504,6 +1863,8 @@ public final class iCloudBridge: ObservableObject {
         }
         // Every signed message is the phone's contact, its answers to our
         // requests included: a phone that just answered is not silent.
+        drainPolicy.notePeerActivity(at: Date())
+        scheduleNextDeviceDrainFallback()
         do {
             try await SignedPeerEvidenceStore.record(
                 eventID: msg.id,
@@ -1511,6 +1872,7 @@ public final class iCloudBridge: ObservableObject {
                 peerCreatedAt: msg.timestamp,
                 dataRoot: PersistenceCore.defaultDataRoot()
             )
+            notePhoneContact(at: msg.timestamp)
         } catch {
             nativeLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
                   msg.id, error.localizedDescription)
@@ -1537,10 +1899,15 @@ public final class iCloudBridge: ObservableObject {
             return true
         }
         if msg.metadata?["kind"] == "icloud_action" {
+            let correlation = msg.metadata?["actionId"] ?? msg.id
+            drainPolicy.noteOutstanding(correlation, at: Date())
+            scheduleNextDeviceDrainFallback()
+            defer {
+                drainPolicy.resolve(correlation, at: Date())
+                scheduleNextDeviceDrainFallback()
+            }
             let handled = await sync.engine.processCloudKitActionMessage(msg)
             if handled {
-                // E3: the action's signed response is owed on the same id.
-                drainPolicy.noteOutstanding(msg.id, at: Date())
                 recordSeenMessageID(msg.id)
                 persistCKSeenIDs()
                 lastSyncAt = Date()
@@ -1549,14 +1916,14 @@ public final class iCloudBridge: ObservableObject {
             return handled
         }
         activeCloudKitChats += 1
-        defer { activeCloudKitChats -= 1 }
+        defer {
+            activeCloudKitChats -= 1
+            scheduleNextDeviceDrainFallback()
+        }
         drainPolicy.notePeerActivity(at: Date())
         scheduleNextDeviceDrainFallback()
         let delivery = await deliverIncomingChat(msg)
         if delivery != .deferred {
-            // E3: this turn's reply is owed — hold the fast drain cadence until
-            // it is sent (or the correlation ages out).
-            drainPolicy.noteOutstanding(msg.id, at: Date())
             if delivery == .delivered {
                 await Self.appendInboundSuccessReceipt(
                     msg,
@@ -1614,7 +1981,11 @@ public final class iCloudBridge: ObservableObject {
     private func deliverIncomingChat(_ message: BridgeMessage) async -> IncomingChatDelivery {
         guard !inFlightIncomingMessageIDs.contains(message.id) else { return .deferred }
         inFlightIncomingMessageIDs.insert(message.id)
-        defer { inFlightIncomingMessageIDs.remove(message.id) }
+        defer {
+            inFlightIncomingMessageIDs.remove(message.id)
+            drainPolicy.resolve(message.id, at: Date())
+            scheduleNextDeviceDrainFallback()
+        }
         let dataRoot = PersistenceCore.defaultDataRoot()
         switch await incomingVerifier.reserveChat(message, dataRoot: dataRoot, canDispatch: !messageHandlers.isEmpty) {
         case .completed:
@@ -1657,6 +2028,8 @@ public final class iCloudBridge: ObservableObject {
         case .reserved:
             break
         }
+        drainPolicy.noteOutstanding(message.id, at: Date())
+        scheduleNextDeviceDrainFallback()
         if let resent = await resendSavedReply(message, dataRoot: dataRoot) { return resent ? .handled : .deferred }
         var delivered = false
         for handler in messageHandlers {
@@ -1733,6 +2106,10 @@ public final class iCloudBridge: ObservableObject {
     /// efficiency guard, not a correctness one. Returns true if any incoming
     /// message was dispatched.
     @discardableResult
+    public func repairReceive() async {
+        _ = await drainDeviceTransport(trigger: .repair)
+    }
+
     private func drainDeviceTransport(trigger: DrainTrigger) async -> Bool {
         guard let ck = deviceTransport else { return false }
         if deviceDrainInFlight {
@@ -1746,11 +2123,13 @@ public final class iCloudBridge: ObservableObject {
         }
         lastDeviceDrainAt = Date()
         deviceDrainInFlight = true
+        deviceDrainTriggeredByPush = trigger == .cloudKitPush
         Self.pushLog.info("Drain started trigger=\(trigger.rawValue, privacy: .public)")
         // Keep missed-push recovery alive even when the stream emits no deltas.
         scheduleNextDeviceDrainFallback()
         defer {
             deviceDrainInFlight = false
+            deviceDrainTriggeredByPush = false
             if deviceDrainQueued {
                 deviceDrainQueued = false
                 Task { await self.drainDeviceTransport(trigger: .coalesced) }
@@ -1761,16 +2140,24 @@ public final class iCloudBridge: ObservableObject {
             // so the housekeeping sweep never sits in front of a drain.
             startDeviceRetentionSweepIfIdle(ck)
         }
+        // An unsettled claim, or a key change iCloud has not taken yet, is
+        // retried on the drain's own cadence until it lands.
+        if !phonePairingSettled || UserDefaults.standard.bool(forKey: pairingPublicationOwedKey) {
+            await claimPhonePairing()
+        }
         let accountGeneration = accountFailureGeneration
         let doctorGeneration = setupGeneration
         let result = await ck.drainIncoming()
+        // The claim may have found another Mac while this drain was reading.
+        guard !phonePairedElsewhere else { return false }
         if doctorGeneration == setupGeneration {
             switch result {
             case .success(let count):
                 doctorTransportHealth = .available
                 onTransportSucceeded?()
-                OrganPulse.record("icloud_drain", found: count, note: "\(count) drained", cadence: drainPolicy.idleInterval)
-            case .skipped: OrganPulse.record("icloud_drain", .skipped, cadence: drainPolicy.idleInterval)
+                let note = ["\(count) drained", devicePollingNote].filter { !$0.isEmpty }.joined(separator: "; ")
+                OrganPulse.record("icloud_drain", found: count, note: note, cadence: deviceReceiveCadence)
+            case .skipped: OrganPulse.record("icloud_drain", .skipped, note: devicePollingNote, cadence: deviceReceiveCadence)
             // No pulse: a drain that keeps failing goes overdue.
             case .failure(let error, _): doctorTransportHealth = Self.transportHealth(error)
             }
@@ -1924,14 +2311,13 @@ public final class iCloudBridge: ObservableObject {
                                 peerCreatedAt: pending.message.timestamp,
                                 dataRoot: PersistenceCore.defaultDataRoot()
                             )
+                            self.notePhoneContact(at: pending.message.timestamp)
                         } catch {
                             nativeLog("[iCloudBridge] could not persist signed peer evidence for %@: %@",
                                   pending.message.id, error.localizedDescription)
                         }
                         let delivery = await self.deliverIncomingChat(pending.message)
                         if delivery != .deferred {
-                            // E3: same owed-reply bookkeeping as the CloudKit lane.
-                            self.drainPolicy.noteOutstanding(pending.message.id, at: Date())
                             if delivery == .delivered {
                                 await Self.appendInboundSuccessReceipt(
                                     pending.message,
@@ -2182,8 +2568,19 @@ public final class iCloudBridge: ObservableObject {
         metadataQuery?.stop()
         metadataQuery = nil
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        deviceNetworkMonitor?.cancel()
+        deviceNetworkMonitor = nil
+        deviceNetworkSatisfied = nil
+        cloudKitPushProofAt = nil
+        cloudKitPushUnavailable = false
+        deviceDrainCadence = nil
+        drainPolicy = AdaptiveDrainPolicy()
         messageHandlers = []
         deviceTransport = nil  // CK-3b: drop the transport; setup() re-resolves it
+        phonePairingSettled = false
+        phonePairedElsewhere = false
+        phonePairingRecheckDue = false
         cloudKitVisualNotificationPeerReady = false
         lastPublishedProviderCatalogStatus = nil
         lastPublishedMobileSnapshotStatus = [:]

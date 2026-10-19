@@ -84,7 +84,7 @@ extension SwiftToolDispatcher {
         }
         // She names it by its kind as often as by `target` (09-24:
         // connector:"github" came back missing_target).
-        let target = text("target", rawKind) ?? ""
+        let target = text("target", rawKind) ?? (kind == .permission ? text("capability").map { SystemAppleScriptAdapter.automationTarget($0) == nil ? "privacy:" + $0 : $0 } : nil) ?? ""
         // Her own words for what a decline costs, when she has them; the
         // registry's default otherwise. Never empty — Agent's rule is that
         // every decline says what happens next.
@@ -134,15 +134,18 @@ extension SwiftToolDispatcher {
             if capabilities.contains("applescript") || capabilities.contains("automation") {
                 return failed("missing_target", "Automation consent is per app. Request permission with target applescript:<bundle_id>.")
             }
+            var integrationAllowed = true
             if capabilities.contains(where: MacIntegrationID.all.contains) {
                 do {
-                    let permissions = try await MacIntegrationPermissionStore(dataRoot: dataRoot).readinessChecked()
+                    let permissions = try await MacIntegrationPermissionStore(dataRoot: dataRoot).snapshotChecked()
                     for capability in capabilities where MacIntegrationID.all.contains(capability) {
                         for mode in [MacIntegrationPermissionMode.read, .write]
-                        where access == nil || access?.rawValue == mode.rawValue || access == .readWrite {
-                            if let refusal = permissions.refusal(integration: capability, mode: mode) {
+                        where (access == nil || access?.rawValue == mode.rawValue || access == .readWrite)
+                            && (mode == .read ? MacIntegrationID.supportsRead(capability) : MacIntegrationID.supportsWrite(capability)) {
+                            if let refusal = permissions.readiness.refusal(integration: capability, mode: mode) {
                                 return failed("operator_permission_off", refusal)
                             }
+                            if !permissions.allows(capability, mode: mode) { integrationAllowed = false }
                         }
                     }
                 } catch { return failed("permission_settings_unavailable", "Mac permission settings could not be read; the saved switch must be available before requesting access.") }
@@ -154,13 +157,14 @@ extension SwiftToolDispatcher {
                     return failed("app_not_installed", "No installed app resolves \(bundleID); install that app before requesting Automation consent.")
                 }
                 automation.append(permission)
-                if fields["state"] == .string("allowed"), !MacIntegrationID.all.contains(capability) {
-                    capabilities.removeAll { $0 == capability }
-                }
             }
-            if capabilities.isEmpty, !automation.isEmpty {
+            if integrationAllowed, !capabilities.isEmpty, capabilities.allSatisfy({
+                SystemPermissionPreflight.cardSettingsCapability($0) != nil
+                    && (!InlineInteractionRegistry.isMacControlCategory($0)
+                        || InlineInteractionRegistry.macControlCategoryAllowed($0, dataRoot: dataRoot))
+            }), await SystemPermissionPreflight.cardBlockReason(capabilities, mode: access) == nil {
                 return .object(["status": .string("ok"), "already_done": .bool(true), "effects": .string("none"),
-                    "summary": .string("Automation is already allowed; no card is needed."), "automation": .array(automation)])
+                    "summary": .string("Permission is already allowed; no card is needed."), "automation": .array(automation)])
             }
             // She may say which axis she needs; she cannot widen one. An
             // unknown value reads as "both", which is what the card would have

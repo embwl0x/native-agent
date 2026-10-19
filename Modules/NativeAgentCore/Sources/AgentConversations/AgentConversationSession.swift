@@ -105,6 +105,7 @@ package enum AgentConversationSession {
             throw AgentConversationStore.Failure(message: "expects_reply must be true or false.")
         }
         guard var agent = string(args["agent"]) else { return try await perform(tool, args) }
+        agent = AgentConversationDelivery.door(for: agent, dataRoot: dataRoot)?.agent ?? agent
         let dot = try agent.hasPrefix("peer:") && AgentPeerStore(dataRoot: dataRoot).list().contains {
             "peer:" + $0.id == agent && ChatGPTDotIPCTransport.owns($0)
         }
@@ -130,7 +131,7 @@ package enum AgentConversationSession {
         }
         // A built-in lane's wake names its thread by id (walk 09-25: the read
         // refused it while suggesting it): read that thread's newest exchanges.
-        if tool == "agent_read", ["codex", "claude", "omp"].contains(agent), label == nil, !fresh,
+        if tool == "agent_read", AgentConversationDelivery.lane(for: agent, dataRoot: dataRoot) != nil, label == nil, !fresh,
            let conversation = string(args["conversation_id"]), string(args["message_id"]) == nil {
             return try await builtInThread(agent: agent, conversation: conversation, args: args,
                                            scope: scope, dataRoot: dataRoot, perform: perform)
@@ -154,19 +155,7 @@ package enum AgentConversationSession {
         }
         let store = AgentConversationStore(dataRoot: dataRoot)
         let peers = try AgentPeerStore(dataRoot: dataRoot).list()
-        var peer = peers.first { "peer:" + $0.id == agent }
-        // 2026-09-23: a contact removed and connected again gets a new id; its
-        // older records and windows keep the old one under the same name. A READ
-        // follows the one saved contact with that name. A send never routes by
-        // name (another contact could share it): it is refused, naming the id.
-        if agent.hasPrefix("peer:"), peer == nil,
-           let name = (try? store.records())?.first(where: { $0.agent == agent })?.name {
-            let same = peers.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
-            if same.count == 1, tool != "agent_read" {
-                throw AgentConversationStore.Failure(message: "That contact's id changed; the current \(same[0].name) is peer:\(same[0].id); send to that.")
-            }
-            if same.count == 1 { peer = same[0]; agent = "peer:" + same[0].id; args["agent"] = .string(agent) }
-        }
+        let peer = peers.first { "peer:" + $0.id == agent }
         if agent.hasPrefix("peer:"), peer == nil { throw AgentConversationStore.Failure(message: "This contact is no longer connected.") }
         let botName = try BotDefinitionStore(dataRoot: dataRoot).list().first {
             "bot:" + $0.id.uuidString.lowercased() == agent.lowercased()
@@ -203,7 +192,7 @@ package enum AgentConversationSession {
                 // this facade above. Do not substitute an older cached ask.
                 return withQueue(try await perform(tool, args), row: previous)
             }
-            if ["codex", "claude", "omp"].contains(agent) {
+            if AgentConversationDelivery.lane(for: agent, dataRoot: dataRoot) != nil {
                 if label != nil || pinned.record != nil, let row = previous, let conversation = row.conversationID {
                     let read = try await builtInThread(agent: agent, conversation: conversation, args: args,
                                                        scope: scope, dataRoot: dataRoot, perform: perform)
@@ -305,7 +294,7 @@ package enum AgentConversationSession {
                                       text: string(args["text"])),
                                   reservation: reservation)
         // Her side of a contact's conversation lives in the contact's own session, as Dot's does.
-        if let owner = peer?.id ?? (["codex", "claude", "omp"].contains(agent) ? agent : nil), let text = string(args["text"]) {
+        if let owner = peer?.id, let text = string(args["text"]) {
             await ContactThread.write(.send(owner: owner, text: text, sendID: row.operationID,
                                             byPerson: row.personInitiated == true), dataRoot: dataRoot)
         }
@@ -314,7 +303,7 @@ package enum AgentConversationSession {
         if case .object(let receipt)? = row.receipt, receipt["needs_input"] == .bool(true),
            let task = receipt["task_id"] { args["task_id"] = task }
         // Her inbox row says whether an answer is owed.
-        if agent == "claude" { args["expects_reply"] = .bool(row.awaitsReply) }
+        args["expects_reply"] = .bool(row.awaitsReply)
         return noting(try await send(row, store: store, peer: peer, reservation: reservation, dataRoot: dataRoot, dispatch: perform) { [args] in
             try await perform(tool, args)
         }, carried: carried)
@@ -447,7 +436,8 @@ package enum AgentConversationSession {
     /// read that would be refused is refused, not waited past.
     package static func waitForReply(input: [String: JSONValue], scope: String, dataRoot: URL, admit: Bool = false,
                              read: @escaping Dispatch) async throws -> JSONValue {
-        guard let agent = string(input["agent"]) else { throw AgentConversationStore.Failure(message: "Name the contact to wait for.") }
+        guard var agent = string(input["agent"]) else { throw AgentConversationStore.Failure(message: "Name the contact to wait for.") }
+        agent = AgentConversationDelivery.door(for: agent, dataRoot: dataRoot)?.agent ?? agent
         let pinned = named(string(input["conversation"]), agent: agent, scope: scope, dataRoot: dataRoot)
         let label = pinned.label
         let exact = input.filter { ["conversation_id", "message_id", "task_id"].contains($0.key) && $0.value != .null && $0.value != .string("") }
@@ -806,10 +796,19 @@ package enum AgentConversationSession {
                 continue
             }
             let transport = (try? AgentPeerStore(dataRoot: dataRoot).list())?.first { "peer:" + $0.id == row.agent }?.transport
+            // The door the thread was asked from, as the row kept it: its sends
+            // write it back and carry it on, never this launch's.
+            let route = row.replyRoute.map { saved in
+                ChatToolSessionContext.ReplyRoute(surface: saved["surface"] ?? row.sourceSurface, destinationId: saved["destinationId"],
+                    threadId: saved["threadId"], sourceKey: saved["sourceKey"], replyTo: saved["replyTo"],
+                    correlationId: saved["correlationId"], requesterUserId: saved["requesterUserId"])
+            }
             Task {
-                await sendWhenSettled(row: row.id, item: item.id, agent: row.agent, label: row.label, carried: [:],
-                                      transport: transport, scope: row.scopeSessionID, surface: row.sourceSurface,
-                                      dataRoot: dataRoot, perform: perform)
+                await ChatToolSessionContext.$replyRoute.withValue(route) {
+                    await sendWhenSettled(row: row.id, item: item.id, agent: row.agent, label: row.label, carried: [:],
+                                          transport: transport, scope: row.scopeSessionID, surface: row.sourceSurface,
+                                          dataRoot: dataRoot, perform: perform)
+                }
             }
         }
     }
@@ -1104,7 +1103,7 @@ package enum AgentConversationSession {
     /// None for a helper bot, whose conversation is its shelf.
     static func threadID(_ agent: String) -> String? {
         if agent.hasPrefix("peer:") { return ContactThread.session(owner: String(agent.dropFirst(5))) }
-        return ["codex", "claude", "omp"].contains(agent) ? ContactThread.session(owner: agent) : nil
+        return nil
     }
 
     /// Names the thread a send implicitly went on in, and how old it was.
@@ -1195,10 +1194,15 @@ package enum AgentConversationSession {
     }
 
     package static func absorb(_ receipt: JSONValue, into row: inout AgentConversationRecord) {
-        let receipt = AgentConversationView.expiringReply(receipt)
+        var receipt = AgentConversationView.expiringReply(receipt)
+        if row.phase != "sending", case .object(let previous)? = row.receipt,
+           let path = previous["filePath"], case .object(var fields) = receipt, fields["filePath"] == nil {
+            fields["filePath"] = path
+            receipt = .object(fields)
+        }
         // A wake owns completion. A lookup before its job is visible, or
         // while its receipt is unreadable, is not a terminal no-reply result.
-        if ["codex", "claude", "omp"].contains(row.agent), row.phase == "waiting",
+        if row.readInput != nil, row.phase == "waiting",
            case .object(let root) = receipt,
            (root["jobs"] == .array([]) || ["not_found", "unavailable", "unknown"].contains(string(root["status"]) ?? "")),
            root["terminal"] != .bool(true), root["sent"] != .bool(false) {
@@ -1209,7 +1213,7 @@ package enum AgentConversationSession {
         var value = root
         if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
         if let conversation = string(value["conversation_id"]) ?? string(value["conversationId"]) { row.conversationID = conversation }
-        else if row.agent == "codex", let thread = string(value["thread_id"]) { row.conversationID = "codex:" + thread }
+        else if let thread = string(value["thread_id"]) { row.conversationID = "codex:" + thread }
         // A route whose saved chat is gone says null (Muse): the next send opens a new one.
         else if value["conversation_id"] == .null { row.conversationID = nil }
         if case .object(let action)? = root["read_with"], case .object(var read)? = action["input"] {
@@ -1227,14 +1231,14 @@ package enum AgentConversationSession {
             // Evidence only (walk 2, 09-25): a contact's "answered" that carries no
             // reply field, not even an empty one, is a status, never an answer.
             row.phase = "attention"
-        } else if row.agent == "claude", state == "delivered", row.awaitsReply, reply(value) == nil {
-            row.phase = "waiting"
-        } else if value["needs_input"] == .bool(true) || value["completed"] == .bool(true)
-                    || value["terminal"] == .bool(true) || ["replied", "completed", "succeeded", "done", "answered", "sent", "delivered"].contains(state)
+        } else if AgentConversationDelivery.claudeInbox(row), ["delivered", "delivered_live", "queued", "read"].contains(state), reply(value) == nil {
+            row.phase = (root["read"] ?? value["read"]) == .bool(true) && !row.awaitsReply ? "ready" : "waiting"
+        } else if (value["needs_input"] == .bool(true) || value["completed"] == .bool(true)
+                    || value["terminal"] == .bool(true) || ["replied", "completed", "succeeded", "done", "answered"].contains(state)) && AgentConversationDelivery.accepted(row)
                     || (state == "delivered_live" && reply(value) != nil) {
             // A live hand-off whose answer came back (a bridge reply naming it) is answered.
             row.phase = "ready"
-        } else if ["enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending", "delivered_live", "delivery_unknown"].contains(state) {
+        } else if ["enqueued", "queued", "running", "working", "submitted", "accepted", "delivering", "pending", "delivered", "sent", "delivered_live", "delivery_unknown"].contains(state) {
             // delivered_live: in the agent's live session; its answer is a chat of its own (`settled`).
             row.phase = "waiting"
         } else if reply(value) != nil {
@@ -1275,7 +1279,6 @@ package enum AgentConversationSession {
             guard case .object(let fields)? = shown[key] else { return false }
             return fields["untrusted_remote_data"] == .bool(true)
         }
-        // A built-in lane (Claude, Codex, OMP) is a peer too (Agent, 10-02).
         if shown["untrusted_remote_data"] == .bool(true) || !(string(shown["reply"]) ?? "").isEmpty || hasRemoteData,
            peer?.elevationAllowed != true {
             PeerDataTaint.markConsumed(peer: row.agent, line: string(shown["reply"]) ?? "")
@@ -1294,7 +1297,7 @@ package enum AgentConversationSession {
     }
 
     private static func builtInJob(_ row: AgentConversationRecord) -> [String: JSONValue]? {
-        guard ["codex", "claude", "omp"].contains(row.agent), case .object(let root)? = row.receipt,
+        guard case .object(let root)? = row.receipt,
               case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] else { return nil }
         return job
     }
@@ -1307,7 +1310,8 @@ package enum AgentConversationSession {
 
     /// Only this exchange's settlement can release an owed reply.
     static func settled(_ row: AgentConversationRecord) -> Bool {
-        stoppedOrReleased(row) || !row.awaitsReply || row.phase == "ready"
+        stoppedOrReleased(row) || row.phase == "ready"
+            || (!row.awaitsReply && [.delivered, .read].contains(AgentConversationDelivery.of(row, read: false)))
     }
 
     package static func conversationPresentation(_ row: AgentConversationRecord, transport: AgentPeerTransport? = nil) -> JSONValue {
@@ -1360,7 +1364,7 @@ package enum AgentConversationSession {
         if let current = row.exchanges?.last(where: { $0.id == row.operationID }) {
             result.merge(current.timing) { _, timing in timing }
         }
-        if ["codex", "claude", "omp"].contains(row.agent), root["jobs"] != nil {
+        if root["jobs"] != nil {
             let original = AgentConversationView.codingReply(value)
             if let text = original.text {
                 result["reply"] = .string(text)
@@ -1375,7 +1379,7 @@ package enum AgentConversationSession {
                 }
             }
         } else if let text = reply(value) { result["reply"] = .string(text) }
-        for key in ["reply_state", "reply_deadline", "automatic_resend", "untrusted_remote_data", "source_availability", "read_error", "completed", "terminal", "needs_input", "needs_authentication", "sent", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages", "healed", "repair", "harness_item"] {
+        for key in ["reply_state", "reply_deadline", "automatic_resend", "untrusted_remote_data", "source_availability", "read_error", "read", "completed", "terminal", "needs_input", "needs_authentication", "sent", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages", "healed", "repair", "remedy", "harness_item"] {
             if let field = value[key] ?? root[key] { result[key] = field }
         }
         // delegation_status.detail is a format selector ("full"), not an
@@ -1385,7 +1389,7 @@ package enum AgentConversationSession {
             result["detail"] = .string("Waiting in \(row.name)'s inbox until its next turn; no one is answering yet."
                 + (handOffSettled ? " A new message can go now." : " A new message can go once \(row.name) answers."))
         } else if row.phase == "waiting" {
-            let automatic = row.automaticRead || ["codex", "claude", "omp"].contains(row.agent)
+            let automatic = row.automaticRead || row.readInput != nil
             result["detail"] = .string(transport == .desktop
                 ? "\(row.name) is answering in its own chat; the answer is read from there and lands on this exchange by itself (within three minutes). Do not resend this message."
                 : backgroundSend(row)

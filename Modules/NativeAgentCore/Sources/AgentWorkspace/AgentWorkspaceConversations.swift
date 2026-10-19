@@ -147,7 +147,6 @@ enum AgentWorkspaceConversations {
     }
 
     private static func exactAgent(_ agent: String) -> Bool {
-        if ["codex", "claude", "omp"].contains(agent) { return true }
         if agent.hasPrefix("bot:") { return UUID(uuidString: String(agent.dropFirst(4))) != nil }
         if agent.hasPrefix("peer:") {
             let id = agent.dropFirst(5)
@@ -307,8 +306,7 @@ struct AgentWorkSession {
     }
 
     static func people(dataRoot: URL) -> [(agent: String, name: String)] {
-        [("claude", "Claude"), ("codex", "Codex"), ("omp", "Omp")]
-            + ((try? AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot)) ?? []).map { ("peer:" + $0.id, $0.name) }
+        HerScreen.contacts(identity: AgentContactIdentity(dataRoot: dataRoot), usable: []).map { ($0.id, $0.name) }
     }
 
     /// The one person this sender is, or nil when none or several match.
@@ -320,6 +318,8 @@ struct AgentWorkSession {
 
     static func sessions(with agent: String, dataRoot: URL) -> [Self] {
         let people = people(dataRoot: dataRoot)
-        return all(dataRoot: dataRoot).filter { owner($0.sender, people: people)?.agent == agent }
+        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        return all(dataRoot: dataRoot).filter { identity.canonical($0.sender) == identity.canonical(agent)
+            && people.contains(where: { identity.canonical($0.agent) == identity.canonical(agent) }) }
     }
 }

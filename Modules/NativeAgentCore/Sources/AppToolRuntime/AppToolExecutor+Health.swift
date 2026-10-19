@@ -119,20 +119,23 @@ extension AppToolExecutor {
         let executableRepairs = DoctorSafeRepairPolicy.executableCoreIDs(for: report.checks)
         let checks = report.checks.map { check in
             let repairAvailable = executableRepairs.contains(check.id)
-                || (check.id.hasPrefix("live.") && check.repair_available == true
+                || (check.repair_available == true
                     && DoctorSafeRepairPolicy.isAdverse(check.status))
             var row: [String: JSONValue] = [
                 "id": .string(check.id),
+                "check_id": .string(check.checkID),
                 "title": .string(check.title),
                 "status": .string(check.status),
                 "detail": .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(check.detail))),
                 "repair_available": .bool(repairAvailable),
+                "remedy": check.remedy ?? .null,
+                "repair_face": .string(NativeAppSecretRedactor.redactText(check.repairFace)),
             ]
             if let harm = check.harm {
                 row["harm"] = .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(harm)))
             }
-            if let owner = DoctorOwner.of(check, repairAvailable: repairAvailable) {
-                row["owner"] = .string(owner.rawValue)
+            if check.remedy != nil {
+                row["owner"] = check.repairOwner.map(JSONValue.string) ?? .null
             }
             if let action = check.recoveryAction(repairAvailable: repairAvailable) {
                 row["human_action"] = .string(NativeAppSecretRedactor.redactText(boundedDoctorDetail(action)))
@@ -146,8 +149,8 @@ extension AppToolExecutor {
         let maintenanceIDs = Set(["oauth_token_expiry"])
         let activeProviderIsReady = activeProviderReady == true
         let maintenanceChecks = report.checks.filter { check in
-            if maintenanceIDs.contains(check.id) { return true }
-            return check.id == "live.providers"
+            if maintenanceIDs.contains(check.checkID) { return true }
+            return check.checkID == "live.providers"
                 && check.status.lowercased() == "warn"
                 && activeProviderIsReady
         }

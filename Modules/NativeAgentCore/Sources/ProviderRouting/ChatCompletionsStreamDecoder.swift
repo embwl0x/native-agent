@@ -51,13 +51,39 @@ public struct ChatCompletionsStreamDecoder {
     /// malformed-frame rule in `consume`.
     private var sawSemanticOutput = false
     public private(set) var reachedLengthLimit = false
+    private var terminalBoundaryReason: LLMToolBoundaryReason?
+    private var streamError: Error?
+    var errorDetail: String? { streamError.map(ProviderFailure.diagnosticDescription) }
     private var runaway = RunawayOutputDetector()
     public var toolBoundaryReason: LLMToolBoundaryReason? {
-        reachedLengthLimit ? .outputLimit : runaway.toolBoundaryReason
+        reachedLengthLimit ? .outputLimit : terminalBoundaryReason ?? runaway.toolBoundaryReason
     }
 
     public init(providerLabel: String) {
         self.providerLabel = providerLabel
+    }
+
+    /// Read failures share EOF's finalizer; cancellation and provider verdicts
+    /// remain errors rather than permission to execute retained calls.
+    mutating func consume<Events: AsyncSequence>(
+        _ events: Events, onFrame: (DecodedFrame) -> Void
+    ) async throws where Events.Element == SSEEvent {
+        do {
+            for try await event in events {
+                try Task.checkCancellation()
+                let frame = try consume(payload: event.data)
+                if frame.isDone { break }
+                onFrame(frame)
+                if toolBoundaryReason != nil { break }
+            }
+        } catch {
+            try Task.checkCancellation()
+            guard !(error is any ProviderFailureWrapping),
+                  ProviderFailure.classify(error) == .network else { throw error }
+            streamError = error
+            terminalBoundaryReason = .interrupted
+        }
+        try Task.checkCancellation()
     }
 
     /// One decoded frame's surface-relevant content. Every field is
@@ -134,7 +160,7 @@ public struct ChatCompletionsStreamDecoder {
         }
         if let content = delta["content"] as? String, !content.isEmpty {
             _ = runaway.feed(content)
-            let kept = runaway.keptPart(of: content)
+            let kept = runaway.takeCommittedText()
             frame.content = kept.isEmpty ? nil : kept
             sawSemanticOutput = true
         }
@@ -220,49 +246,40 @@ public struct ChatCompletionsStreamDecoder {
         return name == existing
     }
 
-    /// The adapter's terminal gate: require DONE, validate the batch, then
-    /// reject an empty response. Wire provider IDs preserve existing diagnostics.
-    func finalizedToolCalls(
+    /// Return committed calls with their boundary, or retain the read failure
+    /// when no calls survived. Wire provider IDs preserve existing diagnostics.
+    mutating func finalizedToolCalls(
         idPrefix: String,
         providerID: String,
         sawContent: Bool
     ) throws -> [ChatCompletionsToolCall] {
         if reachedLengthLimit {
             RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
-            return []
         }
-        guard sawDone || toolBoundaryReason != nil else {
-            throw LLMError.streamTruncated(message: "\(providerID) stream ended without [DONE]")
+        if !sawDone && toolBoundaryReason == nil {
+            terminalBoundaryReason = .interrupted
+            streamError = LLMError.streamTruncated(message: "\(providerID) stream ended without [DONE]")
         }
-        let completed = try completedToolCalls(idPrefix: idPrefix)
+        var completed: [ChatCompletionsToolCall] = []
+        for index in toolOrder {
+            guard let call = toolAccum[index] else { continue }
+            let name = call.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let id = call.id.isEmpty ? "\(idPrefix)_\(index)_\(call.name)" : call.id
+            let arguments = call.arguments.isEmpty && toolBoundaryReason == nil ? "{}" : call.arguments
+            guard !name.isEmpty,
+                  (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) is [String: Any] else {
+                if toolBoundaryReason == nil { terminalBoundaryReason = .incompleteCall }
+                continue
+            }
+            completed.append(ChatCompletionsToolCall(id: id, name: call.name, arguments: arguments))
+        }
+        if completed.isEmpty, let streamError { throw streamError }
         if !sawContent && completed.isEmpty && toolBoundaryReason == nil {
             throw LLMError.streamTruncated(
                 message: "\(providerID) stream produced no content ([DONE], empty)"
             )
         }
         return completed
-    }
-
-    /// Validate the entire batch before returning any calls in first-seen order.
-    /// Empty arguments mean `{}`; a missing name or non-object JSON rejects
-    /// the batch so no sibling can execute a partial plan.
-    public func completedToolCalls(idPrefix: String) throws -> [ChatCompletionsToolCall] {
-        if reachedLengthLimit { return [] }
-        var out: [ChatCompletionsToolCall] = []
-        for index in toolOrder {
-            guard let call = toolAccum[index] else { continue }
-            let name = call.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty else {
-                throw LLMError.failure(.malformedResponse)
-            }
-            let id = call.id.isEmpty ? "\(idPrefix)_\(index)_\(call.name)" : call.id
-            let arguments = call.arguments.isEmpty ? "{}" : call.arguments
-            guard (try? JSONSerialization.jsonObject(with: Data(arguments.utf8))) is [String: Any] else {
-                throw LLMError.failure(.malformedResponse)
-            }
-            out.append(ChatCompletionsToolCall(id: id, name: call.name, arguments: arguments))
-        }
-        return out
     }
 }
 

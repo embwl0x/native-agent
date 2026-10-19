@@ -9,6 +9,22 @@ extension AppQuietToolHost {
     // MARK: - mind_run
 
     func runMind(verb: String, input: [String: JSONValue]) async -> QuietMindOutcome {
+        if verb == "trigger_fire" {
+            guard case .string(let surface)? = input["surface"], ["inbox", "workshop"].contains(surface),
+                  case .string(let name)? = input["name"], !name.isEmpty else {
+                return (false, "Pass surface (inbox or workshop) and name from the trigger's repair obligation.", [:])
+            }
+            let occurrence: String? = if case .string(let value)? = input["occurrence"] { value } else { nil }
+            let result = await NativeAgentEngine.makeNativeTriggerScheduler(dataRoot: appModel.engine.dataRoot)
+                .repairTrigger(surface: surface, name: name, occurrence: occurrence)
+            return (result.status == "fired", result.error ?? "Trigger \(name): \(result.status).", [:])
+        }
+        if verb == "rem", input["repair"] == .bool(true) {
+            do {
+                _ = try await NativeAgentEngine.runRem(dataRoot: appModel.engine.dataRoot, repair: true)
+                return (true, "REM staging checked under Trust and archival completed without generating new proposals.", [:])
+            } catch { return (false, error.localizedDescription, [:]) }
+        }
         if verb == "misses" { return await AppToolExecutor.quietMindMisses(dataRoot: appModel.engine.dataRoot) }
         return await AppToolExecutor.runQuietMind(
             verb: verb, input: input, runtime: NativeAgentEngine.liveCognition,

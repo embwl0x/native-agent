@@ -148,15 +148,22 @@ extension SwiftNativeMacControl {
                     return injectionRefusal(action: "hand", error: "key needs keys", status: 400)
                 }
                 plan = try MacKeySyntax.parseChords(keys).flatMap(MacHandRepertoire.chord)
-            case "hold_key":
+            case "hold_key", "key_down", "key_up":
                 guard let keys = body.stringValue("keys") else {
-                    return injectionRefusal(action: "hand", error: "hold_key needs a held key set", status: 400)
+                    return injectionRefusal(action: "hand", error: "\(gesture) needs a held key set", status: 400)
                 }
                 let held = try MacKeySyntax.parseHeldKeys(keys)
                 plan = try MacHandRepertoire.hold(
                     modifiers: held.modifiers,
                     keys: held.keys
-                ) { [.wait(milliseconds: waitMs)] }
+                ) { gesture == "hold_key" ? [.wait(milliseconds: waitMs)] : [] }
+                // Half a hold: only a watch's binding keeps the key down past this call.
+                if gesture != "hold_key" {
+                    guard MacDriverContext.holdsAcrossCalls else {
+                        return injectionRefusal(action: "hand", error: "\(gesture) holds a key across calls only inside a watch", status: 400)
+                    }
+                    plan = plan.filter { $0.keyEvent?.down == (gesture == "key_down") }
+                }
             default:
                 return injectionRefusal(
                     action: "hand",
@@ -185,7 +192,7 @@ extension SwiftNativeMacControl {
             return injectionRefusal(action: "hand", error: "invalid gesture: \(error)", status: 400)
         }
 
-        guard !plan.isEmpty, MacHandRepertoire.isBalanced(plan) else {
+        guard !plan.isEmpty, MacHandRepertoire.isBalanced(plan) || ["key_down", "key_up"].contains(gesture) else {
             return injectionRefusal(action: "hand", error: "gesture plan was empty or unbalanced", status: 400)
         }
         if plan.contains(where: { $0.keyEvent != nil }),
@@ -301,6 +308,16 @@ extension SwiftNativeMacControl {
         // A front:true act: every event is posted only while that app is in
         // front — User switching mid-act stops the hand before it reaches his app.
         let requiredFront = Self.intValue(body, "require_front_pid").map { Int32(clamping: $0) }
+        // A watch's hand: every event lands on that exact window, read at the event.
+        let requiredWindow = Self.intValue(body, "require_front_window")
+        // Every point is checked before the first event too, so a drag that
+        // would end on another window never presses the button.
+        if let requiredFront, let requiredWindow, let missed = executionPlan.lazy.compactMap({ step -> String? in
+            guard case .mouse = step else { return nil }
+            return self.watchedWindowMiss(step, window: requiredWindow, pid: requiredFront)
+        }).first {
+            return injectionRefusal(action: "hand", error: missed, extra: ["requested_events_emitted": .int(0)])
+        }
         var textInput: MacAXTextInput?
         var checkedTextInput = false
         var clickTarget: (pid: Int32, element: MacAXActTarget, point: CGPoint)?
@@ -313,6 +330,15 @@ extension SwiftNativeMacControl {
             if let requiredFront, posts, accessibilitySource.frontmostApp()?.processIdentifier != requiredFront {
                 let released = recoverNeutral()
                 return injectionRefusal(action: "hand", error: "front_changed", extra: [
+                    "requested_events_emitted": .int(Int64(emittedEvents)),
+                    "recovery_events_emitted": .int(Int64(released)),
+                    "effects_may_have_occurred": .bool(emittedEvents > 0),
+                ])
+            }
+            if let requiredFront, let requiredWindow, posts,
+               let missed = watchedWindowMiss(step, window: requiredWindow, pid: requiredFront) {
+                let released = recoverNeutral()
+                return injectionRefusal(action: "hand", error: missed, extra: [
                     "requested_events_emitted": .int(Int64(emittedEvents)),
                     "recovery_events_emitted": .int(Int64(released)),
                     "effects_may_have_occurred": .bool(emittedEvents > 0),
@@ -453,6 +479,34 @@ extension SwiftNativeMacControl {
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
+    }
+
+    /// Whether a watch's event would miss its window, read at the event: a
+    /// pointer event must land on it (the topmost window at that point), a key
+    /// down must go to it (its app's focused window, matched by its live frame).
+    func watchedWindowMiss(_ step: MacHandStep, window number: Int, pid: Int32) -> String? {
+        let windows = SystemMacVisualObstructionProbe.windows()
+        switch step {
+        case .mouse(let event):
+            let hit = SystemMacVisualObstructionProbe.topmost(in: windows, x: event.x, y: event.y)
+            guard hit?.number != number else { return nil }
+            return "covered: " + (hit.map { "\($0.ownerName)'s window \($0.number)" } ?? "no window") + " is at that point, not the watched one"
+        case .key(let event) where event.down:
+            // The focused window is the app's one live window at that frame; two
+            // at the same frame cannot be told apart, so that refuses too.
+            let focused = accessibilityActSource.focusedWindow(pid: pid)?.identity.frame
+            let matches = focused.map { focused in windows.filter { window in
+                window.ownerPID == pid && window.layer == 0
+                    && abs(focused.x - window.frame.x) <= 2 && abs(focused.y - window.frame.y) <= 2
+                    && abs(focused.w - window.frame.w) <= 2 && abs(focused.h - window.frame.h) <= 2
+            } } ?? []
+            guard matches.count == 1, matches[0].number == number else {
+                return "front_changed: another window has the keyboard focus, not the watched one"
+            }
+            return nil
+        // A key-up types nothing anywhere and releases what the watch holds.
+        case .key, .scroll, .wait: return nil
+        }
     }
 
     // MARK: nudge (W7)

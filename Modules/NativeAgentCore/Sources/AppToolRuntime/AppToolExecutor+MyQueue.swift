@@ -4,7 +4,6 @@ import Desk
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import Skills
 import TrustCenter
 
 extension AppToolExecutor {
@@ -48,7 +47,7 @@ extension AppToolExecutor {
             return .object(["status": .string("ok"), "id": .string("desk." + item.alias),
                             "owner": filedOwner.map(JSONValue.string) ?? .null,
                             "confirmation": .string("Filed: " + item.title + ownership)])
-        } catch { return Self.failure("house_file_failed", error.localizedDescription) }
+        } catch { return Self.failure("house_file_failed", error.localizedDescription, extra: ["effects": .string("unknown")]) }
     }
 
     /// MY QUEUE's actions (Wave 2 #7): queue a step, or mark one done or
@@ -62,6 +61,8 @@ extension AppToolExecutor {
         }
         func receipt(_ entry: MyQueue.Entry, _ change: String) -> JSONValue {
             .object(["status": .string("ok"), "id": .string(entry.name), "queue": .string(change), "owner": .string("hers"),
+                     "peerSteering": .object(["sources": .array(entry.step.peers.map(JSONValue.string)),
+                                               "elevated": .array(entry.step.elevated.map(JSONValue.string))]),
                      "when": .string(entry.step.when + (entry.step.card.map { " " + $0 } ?? "")),
                      "confirmation": .string("\(entry.name) \(change): \"\(entry.step.words)\"")])
         }
@@ -105,15 +106,13 @@ extension AppToolExecutor {
             }
             let dropped = verb == "drop"
             try await MyQueue.finish(entry, dropped: dropped, why: text("reason") ?? (dropped ? "dropped" : "done"), store: store)
-            // A repeated-work line: dropped stays quiet until 3 more turns; done is covered.
-            SkillPatterns.closed(item: entry.item.handle, dropped: dropped, root: store.dataRoot)
             // A stopped skill run's step, closed: the run is closed too, and lets go of what it held.
             if let run = MyQueue.skillRun(in: entry.step.words) {
                 try? FileManager.default.removeItem(at: SkillRunStore.file(run, root: store.dataRoot))
             }
             return receipt(entry, dropped ? "dropped" : "done")
         } catch {
-            return Self.failure("queue_failed", error.localizedDescription + " Home's MY QUEUE shows what is there now.")
+            return Self.failure("queue_failed", error.localizedDescription + " Home's MY QUEUE shows what is there now.", extra: ["effects": .string("unknown")])
         }
     }
 }

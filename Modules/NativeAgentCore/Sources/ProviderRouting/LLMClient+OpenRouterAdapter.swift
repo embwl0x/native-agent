@@ -224,10 +224,7 @@ public final class OpenRouterAdapter: LLMAdapter {
 
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenRouter")
                     var sawContent = false
-                    for try await sse in SSEEventStream(bytes) {
-                        try Task.checkCancellation()
-                        let frame = try decoder.consume(payload: sse.data)
-                        if frame.isDone { break }
+                    try await decoder.consume(SSEEventStream(bytes)) { frame in
                         if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
                             ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000)
                         }
@@ -237,7 +234,6 @@ public final class OpenRouterAdapter: LLMAdapter {
                             continuation.yield(.textDelta(content))
                         }
                         for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
-                        if decoder.toolBoundaryReason != nil { break }
                     }
                     let terminal = Result {
                         try decoder.finalizedToolCalls(
@@ -252,7 +248,9 @@ public final class OpenRouterAdapter: LLMAdapter {
                         usage: decoder.usage,
                         ttftMs: ttftMs,
                         durationMs: Int((DispatchTime.now().uptimeNanoseconds &- startedNs) / 1_000_000),
-                        status: decoder.reachedLengthLimit ? "incomplete" : (try terminal.chatCompletionsTerminalStatus())
+                        status: decoder.toolBoundaryReason != nil ? "incomplete" : (try terminal.chatCompletionsTerminalStatus()),
+                        stopReason: decoder.toolBoundaryReason?.rawValue,
+                        errorDetail: decoder.errorDetail
                     )
                     let completed = try terminal.get()
                     for call in completed {

@@ -337,13 +337,16 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
 
             HStack(spacing: 6) {
                 Menu {
-                    Button(action: onCaptureScreen) {
+                    Button {
+                        if screenCaptureAllowed { onCaptureScreen() }
+                        else { SettingsLink.open(.trust, tab: TrustTab.features.rawValue) }
+                    } label: {
                         Label(
                             screenCaptureAllowed ? "Show Agent My Screen" : "Enable Screen Capture in Trust",
                             systemImage: "camera.viewfinder"
                         )
                     }
-                    .disabled(screenCaptureDisabled)
+                    .disabled(screenCaptureAllowed && screenCaptureDisabled)
                     Button(action: onAttach) {
                         Label("Attach Image or File…", systemImage: "paperclip")
                     }
@@ -446,6 +449,17 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         // into a bitmap blanks the WHOLE capture, not just itself, so the
         // chat page came back as an empty (black) image.
         .background {
+            // A click on the card's padding focuses the field. Only the padding:
+            // a click in the field is the field's own, and focusing it again
+            // from here (on mouse-up, from a focus state that had not caught
+            // up) restarted its editor with the caret at the start, so what
+            // was typed straight after the click split around it (10-18).
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    composerCardState?.dismiss()
+                    onFocusRequest?()
+                }
             if reduceTransparency || quietOffscreenRead {
                 RoundedRectangle(
                     cornerRadius: NativeAgentShellLayout.composerRadius,
@@ -491,11 +505,6 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         // The thinking rim: one arc of light travelling round the edge. Outside
         // the focus animation's scope; it carries its own fade.
         .overlay { ThinkingGlow(kind: .rim, cornerRadius: NativeAgentShellLayout.composerRadius, sessionId: sessionId) }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            composerCardState?.dismiss()
-            onFocusRequest?()
-        }
         #if DEBUG
         .onAppear {
             if showsConversationSettings, let card = composerCardRequestedForCapture(),

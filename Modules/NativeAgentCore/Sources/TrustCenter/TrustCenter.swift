@@ -40,6 +40,32 @@ public actor SwiftNativeTrustCenter {
         return try TrustPolicy(policyObject: try await loadTrustPolicyChecked())
     }
 
+    /// Called only by the person's recovery control, never a tool. Preserve
+    /// damaged authority before explicitly reauthorizing the Safe posture.
+    public func reauthorizeSafePolicy() async throws -> TrustPolicy {
+        let path = trustPolicyPath, defaults = defaultTrustPolicy()
+        let saved = try await persistence.withFileLock(path) { [persistence] in
+            do {
+                _ = try Self.loadSavedPolicyChecked(at: path, defaults: defaults)
+                throw TrustCenterError.invalidRequest
+            } catch TrustCenterError.invalidRequest { throw TrustCenterError.invalidRequest }
+            catch {
+                guard let bytes = try Self.policyBytesChecked(at: path) else { throw TrustCenterError.invalidRequest }
+                let backup = path.deletingLastPathComponent().appendingPathComponent("policy.unavailable-\(UUID().uuidString).json")
+                try bytes.write(to: backup, options: .withoutOverwriting)
+                var safe = defaults
+                safe["permissionLevel"] = .string("strict")
+                safe["enableAutonomy"] = .bool(false)
+                safe["developerMode"] = .bool(false)
+                try Self.validateAuthorityPolicyShape(safe)
+                try Self.validateKnownAuthorityPolicyTypes(safe, against: defaults)
+                try await persistence.writeJSON(.object(safe), to: path)
+                return safe
+            }
+        }
+        return try TrustPolicy(policyObject: saved)
+    }
+
     /// Canonical checked trust-policy mutation. Every patch is merged against
     /// one freshly validated raw generation under the cross-process file lock,
     /// and the returned normalized policy is derived from that exact written

@@ -1,4 +1,6 @@
 import EngineRuntime
+import MacIntegration
+import ChatToolRuntime
 import NativeAgentCore
 import SwiftUI
 
@@ -573,6 +575,7 @@ struct InlineCardView: View {
 
     @State private var fieldValues: [String: String] = [:]
     @State private var selection: String?
+    @State private var relaunchError: String?
 
     /// A card that collects something keeps its controls while it submits: the
     /// primary takes the spinner and the busy label ("Connecting…"), the quiet
@@ -693,9 +696,25 @@ struct InlineCardView: View {
                     fullSetupLink
                 }
                 details
+                screenRecordingRelaunch
             }
         }
         .accessibilityIdentifier("inline-card.\(model.kind.rawValue)")
+    }
+
+    @ViewBuilder
+    private var screenRecordingRelaunch: some View {
+        if (model.state == .running || model.state == .failed),
+           model.systemPermissions.contains(.screenRecording),
+           SystemPermissionPreflight.status(.screenRecording) != .granted {
+            Text("If you've allowed Screen Recording, relaunch to finish. Your work will continue.")
+                .font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
+            Button("Relaunch to finish") {
+                AppRestartCoordinator.relaunchApp(terminate: { AppDelegate.terminateForRestart() },
+                    onSpawnFailure: { relaunchError = "Could not relaunch NativeAgent: \($0.localizedDescription)" })
+            }
+            if let relaunchError { Text(relaunchError).font(ShellType.caption) }
+        }
     }
 
     // Still, not shimmering: one indicator, the honest note beside it, and Stop
@@ -747,6 +766,7 @@ struct InlineCardView: View {
                 }
                 fullSetupLink
                 details
+                screenRecordingRelaunch
             }
         }
         .accessibilityIdentifier("inline-card.\(model.kind.rawValue).failed")

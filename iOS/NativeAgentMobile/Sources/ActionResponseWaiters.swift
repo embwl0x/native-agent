@@ -21,6 +21,8 @@ final class ActionResponseWaiters {
     private var armed: Set<String> = []
     private var timeoutTasks: [UUID: Task<Void, Never>] = [:]
 
+    func isWaiting(_ correlationID: String) -> Bool { armed.contains(correlationID) }
+
     /// Start watching `correlationID`. Called before the first response read so
     /// an arrival that races the first poll is remembered, not lost.
     func arm(_ correlationID: String) {
@@ -30,6 +32,7 @@ final class ActionResponseWaiters {
 
     /// Stop watching and release anyone still parked on this correlation.
     func disarm(_ correlationID: String) {
+        iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
         armed.remove(correlationID)
         arrived.remove(correlationID)
         for token in Array((waiters[correlationID] ?? [:]).keys) {

@@ -221,10 +221,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                         // terminal finish_reason.
                         var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI")
                         var sawContent = false
-                        for try await sse in SSEEventStream(bytes) {
-                            try Task.checkCancellation()
-                            let frame = try decoder.consume(payload: sse.data)
-                            if frame.isDone { break }
+                        try await decoder.consume(SSEEventStream(bytes)) { frame in
                             if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
                                 ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                             }
@@ -245,7 +242,6 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                                finish == "tool_calls" || finish == "stop" {
                                 continuation.yield(.keepAlive)
                             }
-                            if decoder.toolBoundaryReason != nil { break }
                         }
                         // User, 2026-09-06: `[DONE]` with no content and no tool
                         // calls was accepted as success — the same empty-and-
@@ -264,7 +260,9 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                             usage: decoder.usage,
                             ttftMs: ttftMs,
                             durationMs: durationMs,
-                            status: decoder.reachedLengthLimit ? "incomplete" : (try terminal.chatCompletionsTerminalStatus())
+                            status: decoder.toolBoundaryReason != nil ? "incomplete" : (try terminal.chatCompletionsTerminalStatus()),
+                            stopReason: decoder.toolBoundaryReason?.rawValue,
+                            errorDetail: decoder.errorDetail
                         )
                         let completedCalls = try terminal.get()
                         for call in completedCalls {

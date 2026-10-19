@@ -116,7 +116,7 @@ extension OpenAIOAuthDirectAdapter {
                     resumeReply()
                     stampTTFT()
                     let boundary = runaway.feed(delta)
-                    let kept = runaway.keptPart(of: delta)
+                    let kept = runaway.takeCommittedText()
                     if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
                     if boundary { return true }
                 }

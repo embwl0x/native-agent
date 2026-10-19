@@ -323,7 +323,7 @@ public enum QuietComposerCommands {
         appModel.chatFastMode = on
         let result = await appModel.saveQuietChatBrain()
         if !result.succeeded {
-            return .refuse("model card Fast toggle", "fast_write_failed", result.agentMessage)
+            return .refuse("model card Fast toggle", "fast_write_failed", result.agentMessage, effects: .unknown)
         }
         return .done("model card Fast toggle", "Fast is now \(appModel.chatFastMode ? "on" : "off") for every chat (app-wide default).", changed: changed)
     }
@@ -369,7 +369,7 @@ public enum QuietComposerCommands {
             return .refuse(
                 "model pane row \"\(item.displayName)\" under \(group.provider)",
                 "model_write_failed",
-                "Chat is still on \(before): \(failure)"
+                "Chat is still on \(before): \(failure)", effects: .unknown
             )
         }
         // The CANONICAL tuple, read back after it landed — not what was asked.
@@ -397,7 +397,7 @@ public enum QuietComposerCommands {
         appModel.chatReasoningEffort = effort
         let result = await appModel.saveQuietChatBrain()
         guard result.succeeded else {
-            return .refuse("think card", "think_write_failed", result.agentMessage)
+            return .refuse("think card", "think_write_failed", result.agentMessage, effects: .unknown)
         }
         return .done(
             "think card step \"\(efforts[index].label)\"",
@@ -429,7 +429,7 @@ public enum QuietComposerCommands {
             )
         }
         if let failure = await appModel.startQuietSpeech(text) {
-            return .refuse("read aloud", "speak_failed", failure)
+            return .refuse("read aloud", "speak_failed", failure, effects: .unknown)
         }
         return .done("read aloud", "Started reading \(text.count) characters aloud. Playback completion is not confirmed.", status: "started")
     }
@@ -441,7 +441,7 @@ public enum QuietComposerCommands {
             return .refuse("/scratch", "missing_scratch", "Pass the key (one word) in choice and the text in value.")
         }
         let result = await appModel.writeQuietScratch(key: key, value: value, sessionId: sessionID)
-        guard result.succeeded else { return .refuse("/scratch", "scratch_write_failed", result.agentMessage) }
+        guard result.succeeded else { return .refuse("/scratch", "scratch_write_failed", result.agentMessage, effects: .unknown) }
         return .done("/scratch", "Scratch \(key) is set in \(sessionID); app chat.scratch_read reads it back.")
     }
 }

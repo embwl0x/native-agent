@@ -48,6 +48,12 @@ extension NativeAgentNotificationActions {
             } else if let handle = response.deskHandle {
                 _ = NativeAgentAppCoordinator.shared.request(.sidebar(.desk))
                 NativeAgentAppCoordinator.shared.appModel?.pendingDeskHandle = handle
+            } else if let pageRoute = response.pageRoute {
+                let parts = pageRoute.split(separator: "/", maxSplits: 1).map(String.init)
+                if let page = parts.first,
+                   case .sidebar(let item) = NativeAgentNavigationDestination.route(page) {
+                    SettingsLink.open(item, tab: parts.count > 1 ? parts[1] : nil)
+                }
             }
             return
         }

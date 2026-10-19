@@ -64,6 +64,119 @@ public struct ChatSessionRecollection: Sendable, Equatable {
 }
 
 public enum ChatSessionRecollections {
+    /// One experience across live subjects, dated exchange refs and historical message IDs.
+    public static func experienceIdentities(for references: [String], dataRoot: URL?) async throws -> [String: String] {
+        try await ExperienceResolver(dataRoot: dataRoot).resolve(for: references, includingSourceRows: false).identities
+    }
+
+    /// A mind pass shares transcript reads, including failures, without coupling unrelated claims.
+    public actor ExperienceResolver {
+        private let dataRoot: URL?
+        private var identities: [String: String] = [:]
+        private var transcripts: [URL: Task<[JSONValue], Error>] = [:]
+        private var archived: Result<[String: [URL]], Error>?
+
+        public init(dataRoot: URL?) { self.dataRoot = dataRoot }
+
+        public func resolve(for references: [String], includingSourceRows: Bool) async throws -> (
+            identities: [String: String], messages: [String: (session: String, row: [String: JSONValue])]
+        ) {
+            let known = identities
+            var identities: [String: String] = [:]
+            var messages: [String: (session: String?, id: String, run: String?)] = [:]
+            var resolved: [String: (session: String, row: [String: JSONValue])] = [:]
+            for reference in references {
+                if !includingSourceRows, let identity = known[reference] {
+                    identities[reference] = identity
+                    continue
+                }
+                var undated = String(reference.prefix { $0 != "@" })
+                for prefix in ["chat.user_turn:", "chat.assistant_turn:"] where undated.hasPrefix(prefix) {
+                    let subject = undated.dropFirst(prefix.count)
+                    if let separator = subject.lastIndex(of: ":") {
+                        undated = "message:" + subject[..<separator] + "/" + subject[subject.index(after: separator)...]
+                    }
+                }
+                if undated.hasPrefix("exchange:") {
+                    let citation = undated.components(separatedBy: "#message:")
+                    let path = citation[0].dropFirst(9).split(separator: "/", maxSplits: 1).map(String.init)
+                    identities[reference] = path.count == 2
+                        ? "exchange:" + path[0] + "/" + (UUID(uuidString: path[1])?.uuidString ?? path[1]) : citation[0]
+                    if includingSourceRows, path.count == 2, citation.count == 2 {
+                        messages[reference] = (path[0], UUID(uuidString: citation[1])?.uuidString ?? citation[1],
+                                               UUID(uuidString: path[1])?.uuidString ?? path[1])
+                    }
+                    continue
+                }
+                let recollection = undated.hasPrefix("recollection:")
+                let path = undated.dropFirst(recollection ? 13 : (undated.hasPrefix("message:") ? 8 : 0))
+                    .split(separator: "/", maxSplits: 1).map(String.init)
+                let id = path.last ?? undated
+                if recollection || undated.hasPrefix("message:") || UUID(uuidString: undated) != nil {
+                    let canonical = UUID(uuidString: id)?.uuidString ?? id
+                    identities[reference] = recollection ? undated : "message:" + canonical
+                    if !recollection || (includingSourceRows && path.count == 2) {
+                        messages[reference] = (path.count == 2 ? path[0] : nil, canonical, nil)
+                    }
+                } else {
+                    identities[reference] = undated
+                }
+            }
+            guard !messages.isEmpty, let dataRoot else {
+                self.identities.merge(identities) { _, new in new }
+                return (identities, resolved)
+            }
+            let sessions = Set(messages.values.compactMap(\.session))
+            let unscoped = messages.values.contains { $0.session == nil }
+            func files(_ archived: [String: [URL]]) throws -> [(String, URL)] {
+                try unscoped ? ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, archived: archived)
+                    : sessions.sorted().flatMap {
+                        try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, sessionId: $0, archived: archived)
+                    }
+            }
+            var readFiles: Set<URL> = []
+            func read(_ files: [(String, URL)], isolation: isolated ExperienceResolver) async throws {
+                for (session, file) in files {
+                    let wanted = messages.filter { $0.value.session == nil || $0.value.session == session }
+                    guard !wanted.isEmpty, readFiles.insert(file.standardizedFileURL).inserted else { continue }
+                    let key = file.standardizedFileURL
+                    if transcripts[key] == nil {
+                        transcripts[key] = Task {
+                            let read = try await SwiftNativePersistenceCore().readJSONLReporting(file)
+                            guard read.report.isClean else {
+                                throw PersistenceCoreError.ioFailure("experience identity transcript is incomplete: \(session)")
+                            }
+                            return read.rows
+                        }
+                    }
+                    for value in try await transcripts[key]!.value {
+                        guard case .object(let row) = value, case .string(let id)? = row["id"] else { continue }
+                        let run: String?
+                        if case .string(let value)? = row["runId"] { run = UUID(uuidString: value)?.uuidString ?? value }
+                        else { run = nil }
+                        for (reference, message) in wanted where messages[reference] != nil
+                            && message.id == (UUID(uuidString: id)?.uuidString ?? id)
+                            && (message.run == nil || message.run == run) {
+                            resolved[reference] = (session, row)
+                            if let run, !run.isEmpty, !reference.hasPrefix("recollection:") {
+                                identities[reference] = "exchange:\(session)/\(run)"
+                            }
+                            messages.removeValue(forKey: reference)
+                        }
+                    }
+                    if messages.isEmpty { break }
+                }
+            }
+            try await read(files([:]), isolation: self)
+            if !messages.isEmpty {
+                if archived == nil { archived = Result { try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) } }
+                try await read(files(archived!.get()), isolation: self)
+            }
+            self.identities.merge(identities) { _, new in new }
+            return (identities, resolved)
+        }
+    }
+
     public struct LatestScan: Sendable {
         public let recollection: ChatSessionRecollection?
         /// Start of an unfinished trailing line, or EOF after a newline.

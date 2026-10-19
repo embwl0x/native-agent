@@ -502,7 +502,7 @@ extension WorkOverviewRead {
     private static let claudeJobRowPrefix = "claude:"
 
     public static func waitingApprovals(_ approvals: [ApprovalRecord]) -> [ApprovalRecord] {
-        approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }
+        approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }
     }
 
     public static func waitingOnDesk(total: Int?, approvals: Int) -> Int {

@@ -2,6 +2,7 @@ import Foundation
 import ApprovalInbox
 import ChatSessionWork
 import Desk
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
@@ -16,6 +17,48 @@ public protocol MyQueueTurnProjectionProviding: Sendable {
 
 /// Which MY QUEUE steps are ready now: the hook her wake asks (Wave 2 #7).
 public enum MyQueueReady {
+    /// Read only the named conditions, never scan her experience history.
+    package static func conditions(items: [DeskItem], dataRoot: URL) async throws -> [String: Experience] {
+        let ids = Set(items.flatMap(\.blockedOn).filter { $0.hasPrefix("exp:") }.map { String($0.dropFirst(4)) })
+        var conditions: [String: Experience] = [:]
+        for id in ids { conditions[id] = try await ExperienceStore.at(dataRoot).experience(id) }
+        return conditions
+    }
+
+    /// A condition that no longer owes anything is written off the items that
+    /// waited on it, with a note saying what released them: the Desk is the one
+    /// truth every reader (her wake, home, continuations, the Desk views) sees.
+    @discardableResult
+    package static func release(items: [DeskItem], dataRoot: URL) async throws -> Bool {
+        let waiting = items.filter { !$0.status.isTerminal && $0.blockedOn.contains { $0.hasPrefix("exp:") } }
+        guard !waiting.isEmpty else { return false }
+        let conditions = try await conditions(items: waiting, dataRoot: dataRoot)
+        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
+        var released = false
+        for item in waiting {
+            let settled = item.blockedOn.compactMap { blocker -> Experience? in
+                guard blocker.hasPrefix("exp:"), let experience = conditions[String(blocker.dropFirst(4))],
+                      !experience.isOpen else { return nil }
+                return experience
+            }
+            guard !settled.isEmpty else { continue }
+            let ids = Set(settled.map { "exp:" + $0.id })
+            let words = settled.map { experience -> String in
+                let phase = experience.outcome?.status
+                    ?? Set(experience.owes.values.map { $0.reason?.rawValue ?? $0.phase.rawValue }).sorted().joined(separator: ", ")
+                return "Released: \(conditionName(experience)) \(experience.id) settled (\(phase))."
+            }.joined(separator: " ")
+            try await store.releaseBlockers(item.handle, removing: ids, note: words, author: "system")
+            released = true
+        }
+        return released
+    }
+
+    package static func conditionName(_ experience: Experience) -> String {
+        if experience.owes["repair"] != nil { return "repair" }
+        return experience.kind == .decision ? "card" : experience.kind.rawValue
+    }
+
     /// Carried work whose unattended condition is met. A peer-steered step
     /// retains its recorded peers when the wake admits it.
     package static func ready(items: [DeskItem], context: MyQueue.Context) -> [DeskItem] {
@@ -99,17 +142,41 @@ extension HerScreen {
     /// peer's turn says whose, and opening it reads it), then what the rest wait on.
     /// A step she wrote a note on since queuing it (a wake put it on hold) says
     /// so, so another chat of hers reads it before acting (User, 10-02).
-    static func queueRows(_ world: HerWorld, dataRoot: URL, person: String, now: Date) -> [String] {
+    static func queueRows(_ world: HerWorld, dataRoot: URL, person: String, now: Date) async -> [String] {
         guard let desk = world.desk else { return [] }
         let entries = MyQueue.entries(desk)
-        guard !entries.isEmpty else { return [] }
+        let otherWaits = desk.items.filter { $0.assignee == "agent" && $0.project != MyQueue.project && !$0.status.isTerminal && !$0.blockedOn.isEmpty }
+        guard !entries.isEmpty || !otherWaits.isEmpty else { return [] }
         func noted(_ entry: MyQueue.Entry) -> String? {
             entry.item.notes.compactMap { DeskClock.parseISO($0.ts) }.max().map { "note " + age(now.timeIntervalSince($0)) }
         }
         let context = queueContext(dataRoot: dataRoot, now: now, ownTurn: false)
+        let conditions: [String: Experience]
+        do { conditions = try await MyQueueReady.conditions(items: desk.items, dataRoot: dataRoot) }
+        catch { return ["Wait conditions are unavailable: \(error.localizedDescription) · experiences/experiences.sqlite"] }
+        let plan = DeskSequencing.compute(desk, now: now)
+        func waitLine(_ item: DeskItem) -> String? {
+            let blockers = plan.byHandle[item.handle]?.effectiveBlockers ?? []
+            guard !blockers.isEmpty else { return nil }
+            return "desk." + item.alias + " waits " + blockers.map { blocker in
+                guard blocker.hasPrefix("exp:") else {
+                    return "on " + (desk.items.first { $0.handle == blocker }?.alias ?? blocker)
+                }
+                let id = String(blocker.dropFirst(4))
+                guard let experience = conditions[id] else { return "on experience " + id + " (unavailable)" }
+                if experience.owes["decide"]?.phase.isSettled == false { return "on card \(id) (\(person) decides)" }
+                if let answer = experience.owes["answer"], !answer.phase.isSettled, answer.to.hasPrefix("agent:") {
+                    let agent = String(answer.to.dropFirst(6))
+                    let peer = agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent
+                    let name = world.identity.peers.first { $0["id"] == peer }?["name"] ?? peer
+                    return "on \(name)'s answer to \(id)"
+                }
+                return "on " + MyQueueReady.conditionName(experience) + " " + id
+            }.joined(separator: ", ")
+        }
         var ready: [MyQueue.Entry] = [], waiting: [MyQueue.Entry] = []
         for entry in entries {
-            if MyQueue.isReady(entry, context) { ready.append(entry) } else { waiting.append(entry) }
+            if plan.byHandle[entry.item.handle]?.isReady == true && MyQueue.isReady(entry, context) { ready.append(entry) } else { waiting.append(entry) }
         }
         var rows = ready.prefix(4).map { entry in
             pad(entry.name, 10) + (entry.peerBorn ? clip(entry.item.title, 44) + " · open it to read"
@@ -118,10 +185,21 @@ extension HerScreen {
                 + (DeskClock.parseISO(entry.item.openedAt).map { " " + age(now.timeIntervalSince($0)) } ?? "")
                 + (noted(entry).map { " · " + $0 } ?? "")
         }
+        rows += otherWaits.compactMap(waitLine)
         if ready.count > 4 { rows.append("+\(ready.count - 4) more ready · app desk.read {query:\"\(MyQueue.project)\"}") }
         var waits: [(String, Int)] = [], notes: [String] = []
         for entry in waiting {
-            if let note = noted(entry) { notes.append(entry.name + " " + note) }
+            if let line = waitLine(entry.item) { rows.append(line); continue }
+            if let reason = nonEmpty(entry.item.blockedReason) {
+                var blocked = entry.name + " blocked: " + reason
+                    + ". Give it a condition with app {action:\"desk.wait\", args:{handle:\"\(entry.item.handle)\", on:\"<card, message or debt id>\"}}."
+                for peer in entry.step.peers where peer.hasPrefix("peer:") && !CapabilityLifecycle.ownerTrusts(peer) {
+                    let id = String(peer.dropFirst(5))
+                    let name = world.identity.peers.first { $0["id"] == id }?["name"] ?? id
+                    blocked += " Peer elevation is the person's: Trust > Connected agents > \(name) (\(id)) > Trusted."
+                }
+                notes.append(blocked)
+            } else if let note = noted(entry) { notes.append(entry.name + " " + note) }
             let word = switch MyQueue.when(entry) {
             case .afterCard: "on a card"
             case .userWrites: "for \(person) to write"

@@ -27,6 +27,8 @@ import PersistenceCore
 public enum ApprovedReplayVerification: String, Sendable, Equatable {
     case verified
     case recordNotFound = "approval_record_not_found"
+    case recordUnavailable = "approval_requests_store_unavailable"
+    case spendUnavailable = "approval_effect_spend_store_unavailable"
     case notApproved = "approval_not_resolved_approved"
     case toolMismatch = "approval_is_for_a_different_tool"
     case surfaceMismatch = "approval_is_for_a_different_surface"
@@ -81,7 +83,10 @@ public struct ApprovalInboxApprovedReplayVerifier: ApprovedReplayVerifying {
     ) async -> ApprovedReplayVerification {
         let id = approvalID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return .recordNotFound }
-        guard let record = try? await inbox.get(id) else { return .recordNotFound }
+        let record: ApprovalRecord
+        do { record = try await inbox.get(id) }
+        catch ApprovalInboxError.notFound { return .recordNotFound }
+        catch { return .recordUnavailable }
         guard record.status.lowercased() == "resolved",
               record.decision?.lowercased() == "approved" else {
             return .notApproved
@@ -115,7 +120,10 @@ public struct ApprovalInboxApprovedReplayVerifier: ApprovedReplayVerifying {
 
         // The executor's durable spend, which it writes immediately before it
         // re-dispatches. An id nobody spent is an id nobody executed.
-        guard case .object(let marker)? = await inbox.approvedEffectSpend(id: id) else {
+        let spend: JSONValue?
+        do { spend = try await inbox.approvedEffectSpend(id: id) }
+        catch { return .spendUnavailable }
+        guard case .object(let marker)? = spend else {
             return .notSpentByExecutor
         }
         guard let spentAction = Self.string(marker["action"]),
@@ -140,8 +148,9 @@ public struct ApprovalInboxApprovedReplayVerifier: ApprovedReplayVerifying {
             return .notSpentByExecutor
         }
 
-        guard await inbox.consumeApprovedReplayDispatch(id: id) else { return .alreadyConsumed }
-        return .verified
+        do {
+            return try await inbox.consumeApprovedReplayDispatch(id: id)
+        } catch { return .spendUnavailable }
     }
 
     /// The executor's own "nothing ran" annotation: a replay op that failed

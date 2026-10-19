@@ -194,6 +194,7 @@ public enum SessionHistoryPromptRenderer {
         let kind = string(metadata?["kind"])?.lowercased() ?? ""
         let isTool = role == "tool" || kind == "tool_use"
         let isCompactionSummary = kind == "compaction_summary"
+        guard !isCompactionSummary || string(metadata?["distill"]) == "llm" else { return nil }
 
         var content: String
         if isTool {
@@ -709,6 +710,30 @@ public enum SessionHistoryPromptRenderer {
             "recent_receipts": .array(Array(receipts.reversed())),
             "verification_scope": .string("historical_tool_response_not_current_source_state"),
         ]))
+    }
+
+    /// Her world as her recent turns here left it: each turn's closing record
+    /// of what changed on disk (`ChatWrittenFileArtifacts.world`), the newest
+    /// word on each file first. Read as each turn closed, not now.
+    package static func worldRecord(from messages: [ChatMessage]) -> String? {
+        let day = DateFormatter()
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.dateFormat = "yyyy-MM-dd HH:mm"
+        var seen: Set<String> = [], lines: [String] = []
+        for message in messages.reversed() where message.role == "assistant" && lines.count < 12 {
+            guard let entries = array(object(object(message.extras)?["metadata"])?["world"]) else { continue }
+            for entry in entries.compactMap(object) where lines.count < 12 {
+                guard let path = string(entry["path"]), seen.insert(path).inserted else { continue }
+                if let note = string(entry["note"]) { lines.append("- " + path + ": " + note); continue }
+                guard let modified = string(entry["modified"]).flatMap({ ISO8601DateFormatter().date(from: $0) }) else { continue }
+                let size = entry["folder"] == .bool(true) ? "folder"
+                    : int(entry["bytes"]).map { ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file) }
+                lines.append("- " + day.string(from: modified) + " " + path + (size.map { " (" + $0 + ")" } ?? ""))
+            }
+        }
+        guard !lines.isEmpty else { return nil }
+        return "What your recent turns here changed in your world, newest first (files modified in the folders your writes landed in, read as each turn closed):\n"
+            + lines.joined(separator: "\n")
     }
 
     /// A receipt uses returned envelope fields only, never an input id, a

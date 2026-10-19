@@ -507,6 +507,13 @@ enum FileSystemActions {
         // Guard against a negative max_bytes trapping Data.prefix(_:). Python's
         // negative slice is a misuse-case quirk; clamp to 0 (empty window).
         maxBytes = max(0, maxBytes)
+        if let query = input["query"], query != .null {
+            guard case .string(let text) = query else { return errResult("query must be a string", code: "bad_input") }
+            if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                guard offset == 0 else { return errResult("Search continues with start_line and version, not offset.", code: "bad_input") }
+                return fileExcerpt(input, ctx)
+            }
+        }
 
         let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
         let allowed = allowedRoots(ctx)
@@ -551,7 +558,7 @@ enum FileSystemActions {
         // file and render another after a swap.
         // Exact bytes only for an explicitly raw read of a binary file; text
         // files keep their windows and errors unchanged.
-        let explicitlyRaw = input["raw"] == .bool(true) && FileReadSourceMaterial.isBinary(path: resolved.path)
+        let explicitlyRaw = rawBytes(input, resolved.path)
         if !explicitlyRaw && VerifiedImageRead.isImagePath(resolved) {
             guard offset == 0 && expectedVersion.isEmpty else {
                 return errResult("Image reads return pixels, not byte windows. Omit offset and version.", code: "bad_input")
@@ -632,6 +639,11 @@ enum FileSystemActions {
         return .object(result)
     }
 
+    /// Exact bytes only for an explicitly raw read of a binary file.
+    static func rawBytes(_ input: [String: JSONValue], _ path: String) -> Bool {
+        input["raw"] == .bool(true) && FileReadSourceMaterial.isBinary(path: path)
+    }
+
     /// read_file on a folder with a glob: the first eight matching files by
     /// name in one call, each through the ordinary single-file read (same
     /// gates; images as pixels). Agent read UI frames one call per PNG.
@@ -657,14 +669,26 @@ enum FileSystemActions {
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         var single = input
         single["match"] = nil; single["offset"] = nil; single["version"] = nil
-        let files: [JSONValue] = names.prefix(folderReadLimit).map { name in
-            single["path"] = .string(folder.appendingPathComponent(name).path)
-            return .object(["name": .string(name), "result": readFile(single, ctx)])
+        // Images past the round's budget come back as paths, read next.
+        var files: [JSONValue] = [], later: [JSONValue] = []
+        for name in names.prefix(folderReadLimit) {
+            let path = folder.appendingPathComponent(name)
+            // Only a pixel read spends the budget; raw and metadata-only reads never wait.
+            if VerifiedImageRead.isImagePath(path), !rawBytes(single, path.path), !FileReadSourceMaterial.metadataOnly,
+               LocalToolImage.sink?.round.hasRoom == false {
+                later.append(.string(path.path)); continue
+            }
+            single["path"] = .string(path.path)
+            files.append(.object(["name": .string(name), "result": readFile(single, ctx)]))
         }
         var result: [String: JSONValue] = [
             "status": .string("ok"), "path": .string(folder.path), "match": .string(pattern),
             "matched": .int(Int64(names.count)), "files": .array(files),
         ]
+        if !later.isEmpty {
+            result["more_images"] = .array(later)
+            result["more_images_note"] = .string("\(later.count) more images; read them next.")
+        }
         if names.count > folderReadLimit {
             result["omitted"] = .int(Int64(names.count - folderReadLimit))
             result["note"] = .string("\(names.count - folderReadLimit) more matched; narrow match to read them.")
@@ -683,6 +707,18 @@ enum FileSystemActions {
         }
         let startLine = max(1, startLineRaw)
         let maxLines = max(1, min(maxLinesRaw, 240))
+        for key in ["query", "version"] {
+            switch input[key] {
+            case nil, .null?, .string?: break
+            default: return errResult("\(key) must be a string", code: "bad_input")
+            }
+        }
+        let query = stringField(input, "query")
+        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        let expectedVersion = stringField(input, "version")
+        if !terms.isEmpty && startLine > 1 && expectedVersion.isEmpty {
+            return errResult("Continue a search with its returned start_line and version.", code: "bad_input")
+        }
 
         let resolved = resolvePath(rawPath, repoRoot: ctx.repoRoot)
         let allowed = allowedRoots(ctx)
@@ -700,11 +736,17 @@ enum FileSystemActions {
         if !exists { return errResult("File not found: \(resolved.path)", code: "file_not_found") }
         if isDir.boolValue { return errResult("Not a file: \(resolved.path)", code: "file_not_found") }
 
-        let window: (total: Int, rendered: [String])
+        let window: (total: Int, lines: [(number: Int, text: String)], bytes: Int, version: String, matches: Int, next: Int?)
         do {
             let handle = try openRegularReadHandle(resolved)
             defer { try? handle.close() }
-            window = try readExcerptWindow(handle: handle, path: resolved, startLine: startLine, maxLines: maxLines)
+            if FileReadSourceMaterial.metadataOnly {
+                let metadata = try readFileWindow(handle: handle, path: resolved, maxBytes: 0,
+                    useCompactDefault: false, offset: 0, expectedVersion: expectedVersion)
+                return .object(["ok": .bool(true), "path": .string(resolved.path), "bytes": .int(Int64(metadata.totalBytes))])
+            }
+            window = try readExcerptWindow(handle: handle, path: resolved, startLine: startLine,
+                maxLines: maxLines, terms: terms, expectedVersion: expectedVersion)
         } catch let failure as FileReadFailure {
             if failure.code == "file_changed" {
                 return errResult("The file changed during this read; a consistent excerpt could not be established. Retry the selection. If it came from a search, repeat that search because line positions may have moved.", code: "file_changed")
@@ -716,7 +758,12 @@ enum FileSystemActions {
         let total = window.total
         let startIdx = min(startLine - 1, total)
         let endIdx = min(total, startIdx + maxLines)
-        return .object([
+        let nextLine = terms.isEmpty ? (endIdx < total ? endIdx + 1 : nil) : window.next
+        var next: [String: JSONValue] = ["path": .string(rawPath), "max_lines": .int(Int64(maxLines)),
+            "version": .string(window.version)]
+        if let nextLine { next["start_line"] = .int(Int64(nextLine)) }
+        if !terms.isEmpty { next["query"] = .string(query) }
+        var result: [String: JSONValue] = [
             "ok": .bool(true),
             "path": .string(resolved.path),
             "start_line": .int(Int64(total > 0 ? startIdx + 1 : 1)),
@@ -724,33 +771,63 @@ enum FileSystemActions {
             "status": .string("ok"),
             "end_line": .int(Int64(endIdx)),
             "total_lines": .int(Int64(total)),
-            "excerpt": .string(window.rendered.joined(separator: "\n")),
-            "truncated": .bool(endIdx < total),
-            "has_more": .bool(endIdx < total),
-            "next": endIdx < total ? .object(["path": .string(rawPath),
-                "start_line": .int(Int64(endIdx + 1)), "max_lines": .int(Int64(maxLines))]) : .null,
-        ])
+            "version": .string(window.version),
+            "truncated": .bool(nextLine != nil),
+            "has_more": .bool(nextLine != nil),
+            "next": nextLine != nil ? .object(next) : .null,
+        ]
+        if terms.isEmpty {
+            result["excerpt"] = .string(window.lines.map { "\($0.number): \($0.text)" }.joined(separator: "\n"))
+        } else {
+            result["query"] = .string(query)
+            result["records"] = .array(window.lines.map { .object(["line": .int(Int64($0.number)), "text": .string($0.text)]) })
+            result["start_line"] = window.lines.first.map { .int(Int64($0.number)) } ?? .null
+            result["end_line"] = window.lines.last.map { .int(Int64($0.number)) } ?? .null
+            result["coverage"] = .object(["searched_bytes": .int(Int64(window.bytes)),
+                "searched_lines": .int(Int64(total)), "matching_lines": .int(Int64(window.matches)), "complete": .bool(true)])
+        }
+        return .object(result)
     }
 
     /// Count the complete stable source while retaining only the requested
     /// lines. Reuse the byte reader's version checks and UTF-8 boundaries;
     /// newline state persists across chunks, including a split CRLF.
     private static func readExcerptWindow(
-        handle: FileHandle, path: URL, startLine: Int, maxLines: Int
-    ) throws -> (total: Int, rendered: [String]) {
+        handle: FileHandle, path: URL, startLine: Int, maxLines: Int, terms: [String], expectedVersion: String
+    ) throws -> (total: Int, lines: [(number: Int, text: String)], bytes: Int, version: String, matches: Int, next: Int?) {
         var offset = 0
-        var version = ""
+        var version = expectedVersion
         var total = 0
         var current = ""
+        var currentBytes = 0
         var currentHasContent = false
         var previousWasCR = false
         var retainedBytes = 0
-        var rendered: [String] = []
+        var lines: [(number: Int, text: String)] = []
+        var matches = 0
+        var next: Int?
         func selected() -> Bool { total >= startLine - 1 && total - (startLine - 1) < maxLines }
-        func finishLine() {
-            if selected() { rendered.append("\(total + 1): \(current)") }
+        func finishLine() throws {
+            if terms.isEmpty {
+                if selected() { lines.append((total + 1, current)) }
+            } else if terms.allSatisfy({ current.localizedCaseInsensitiveContains($0) }) {
+                matches += 1
+                if total >= startLine - 1 && next == nil {
+                    let size = try JSONValue.string(current).serialize(pretty: false).utf8.count + 64
+                    if lines.count >= maxLines || retainedBytes + size > 24_000 {
+                        guard !lines.isEmpty else {
+                            throw FileReadFailure(message: "Matching line \(total + 1) exceeds one search page. Read that record with read_file byte windows.", code: "excerpt_too_large")
+                        }
+                        next = total + 1
+                    } else {
+                        lines.append((total + 1, current))
+                        retainedBytes += size
+                    }
+                }
+            }
             total += 1
             current = ""
+            currentBytes = 0
             currentHasContent = false
         }
         while true {
@@ -758,8 +835,16 @@ enum FileSystemActions {
                 handle: handle, path: path, maxBytes: 65_536, useCompactDefault: false,
                 offset: offset, expectedVersion: version
             )
+            let text: String
+            if terms.isEmpty { text = decodeUTF8Replacing(chunk.data) }
+            else {
+                guard !chunk.data.contains(0), let decoded = String(data: chunk.data, encoding: .utf8) else {
+                    throw FileReadFailure(message: "query searches plain text only; omit it to read image or binary material.", code: "binary_file")
+                }
+                text = decoded
+            }
             version = chunk.version ?? ""
-            for scalar in decodeUTF8Replacing(chunk.data).unicodeScalars {
+            for scalar in text.unicodeScalars {
                 if previousWasCR && scalar.value == 0x0A {
                     previousWasCR = false
                     continue
@@ -767,11 +852,15 @@ enum FileSystemActions {
                 previousWasCR = scalar.value == 0x0D
                 switch scalar.value {
                 case 0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029:
-                    finishLine()
+                    try finishLine()
                 default:
                     currentHasContent = true
-                    if selected() {
-                        retainedBytes += scalar.utf8.count
+                    if !terms.isEmpty || selected() {
+                        currentBytes += scalar.utf8.count
+                        guard currentBytes <= 1_048_576 else {
+                            throw FileReadFailure(message: "Line \(total + 1) exceeds 1 MiB of text. Read that record with read_file byte windows.", code: "excerpt_too_large")
+                        }
+                        if terms.isEmpty { retainedBytes += scalar.utf8.count }
                         guard retainedBytes <= 1_048_576 else {
                             throw FileReadFailure(
                                 message: "Requested excerpt exceeds 1 MiB of text. Narrow max_lines, or use read_file byte windows and its returned next arguments for a very long line.",
@@ -788,8 +877,8 @@ enum FileSystemActions {
                 throw FileReadFailure(message: "File ended before its measured size; retry the read.", code: "file_changed")
             }
         }
-        if currentHasContent { finishLine() }
-        return (total, rendered)
+        if currentHasContent { try finishLine() }
+        return (total, lines, offset, version, matches, next)
     }
 
     // MARK: - write_file

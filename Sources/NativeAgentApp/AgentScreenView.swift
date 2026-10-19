@@ -54,7 +54,8 @@ struct AgentScreenView: View {
         }
         .task(id: Watch(root: root, scope: scope, room: room)) {
             let root = root, room = room
-            await EventDeadlinePhysiology.refreshOnChanges(paths: HerScreenPreview.watchedPaths.map { root.appendingPathComponent($0) }) {
+            await EventDeadlinePhysiology.refreshOnChanges(paths: HerScreenPreview.watchedPaths.map { root.appendingPathComponent($0) },
+                                                         notifications: [HerScreenPreview.didChange]) {
                 pane = await HerScreenPreview.paneText(room, root: root, scope: scope)
             }
         }

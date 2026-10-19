@@ -382,7 +382,17 @@ extension CognitiveSubstrate {
         let known = existing.occurrences.isEmpty
             ? [Self.occurrenceKey(day: existing.createdAt, source: existing.lineageId)]
             : existing.occurrences
-        guard Self.isIndependentOccurrence(key, of: known) else { return existing }
+        do {
+            guard try await isIndependentOccurrence(key, of: known) else { return existing }
+        } catch {
+            FileHandle.standardError.write(Data("Reflection independence unavailable: \(error)\n".utf8))
+            return existing
+        }
+        // The await above lets a review (approve, retire) land first; a revisit
+        // never writes back the copy it read before that.
+        guard let current = standingViews[existing.id], current == existing else {
+            return standingViews[existing.id] ?? existing
+        }
         var view = existing
         view.occurrences = Array((known + [key]).suffix(CognitiveStandingView.maximumOccurrences))
         // The same conclusion, now with its reasons: they fill an empty field

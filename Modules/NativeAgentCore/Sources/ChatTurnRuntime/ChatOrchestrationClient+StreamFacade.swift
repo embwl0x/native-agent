@@ -219,7 +219,10 @@ extension SwiftNativeChatOrchestrationClient {
         consumerRendersInlineCards: Bool = false,
         /// Where User was when his door received a "take over". Bound inside
         /// the producer, same parameter-not-wrapper rule.
-        macContinuation: MacWorkContinuation? = nil
+        macContinuation: MacWorkContinuation? = nil,
+        /// The row the surface is drawing this reply in: the answer is saved
+        /// under it and lands in place. Same parameter-not-wrapper rule.
+        replyRowID: String? = nil
     ) -> ChatStreamExecution {
         // Turn Inspector W1: bind the per-turn trace id ONCE around the whole
         // streaming turn. runStream runs the streaming tool loop; it (and the
@@ -252,6 +255,9 @@ extension SwiftNativeChatOrchestrationClient {
                     .withValue(replacementAssistantMessageID) {
                         await TurnTraceContext.$bus.withValue(turnTraceBus) {
                         await TurnTraceContext.$turnId.withValue(turnId) {
+                        await TurnTraceContext.$replyRow.withValue(replyRowID.map {
+                            TurnTraceContext.ReplyRow(turnId: turnId, messageId: $0)
+                        }) {
                             func run() async {
                                 await self.runStream(
                                     message: message,
@@ -342,6 +348,7 @@ extension SwiftNativeChatOrchestrationClient {
                             } else {
                                 await runWithTakeover()
                             }
+                        }
                         }
                         }
                 }

@@ -20,6 +20,7 @@ import WorkshopExecution
 import ApprovalInbox
 import NativeAgentShared
 import NotificationInbox
+import Experiences
 
 /// `NativeAgentEngine.desk` (S10): the Desk for one data root, in core types —
 /// the board (desk items, executions, GitHub), the schedule, and research lab
@@ -104,6 +105,9 @@ public final class DeskFacade {
         var inboxRows: [NotificationInbox.InboxItemRecord] = []
         let approvals: Result<[ApprovalRecord], Error>
         let inbox: Result<[NotificationInbox.InboxItemRecord], Error>
+        var experiences: [Experience] = []
+        do { experiences = try await ExperienceStore.at(dataRoot).projection() }
+        catch { unavailable.append("Experiences: \(Self.loadFailure(error))") }
         do {
             approvalRows = try await approvalsRead
             approvals = .success(approvalRows)
@@ -119,7 +123,7 @@ public final class DeskFacade {
             unavailable.append("Inbox: \(Self.loadFailure(error))")
         }
         return (WorkOverviewRead.project(board: board, approvals: approvalRows,
-            inbox: inboxRows, unavailable: unavailable, now: Date()), approvals, inbox)
+            inbox: inboxRows, experiences: experiences, unavailable: unavailable, now: Date()), approvals, inbox)
     }
 
     /// Every Desk execution, queue then legacy, as the phone's

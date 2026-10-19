@@ -5,6 +5,8 @@ import ProviderRouting
 /// A2A 1.0 and 0.3 wire projection. Endpoints, parts and metadata remain
 /// untrusted data; the transport must authorize the destination and credentials.
 public enum AgentA2AWire {
+    /// Every version/binding pair `selectInterface` accepts, as a peer's owner reads it.
+    public static let spoken = "A2A 0.3 JSONRPC or A2A 1.0 JSONRPC, HTTP+JSON or GRPC"
     public struct Interface: Sendable, Equatable {
         public let endpoint: URL
         public let version: String

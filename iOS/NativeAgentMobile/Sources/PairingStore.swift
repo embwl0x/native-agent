@@ -195,6 +195,9 @@ final class PairingStore: ObservableObject {
             if oldValue != iCloudPairingSecret, iCloudSyncEngine.shared.pairingStore === self {
                 iCloudSyncEngine.shared.invalidateSnapshots(pairing: iCloudPairingSecret)
             }
+            if oldValue != iCloudPairingSecret, iCloudBridge.shared.pairingStore === self {
+                iCloudBridge.shared.deliveryPairingDidChange(from: oldValue)
+            }
         }
     }
     @Published private(set) var connectionRepairPending = UserDefaults.standard.bool(forKey: "mobile.pairing.connectionRepairPending")

@@ -90,7 +90,7 @@ public final class FileChangeWatcher: @unchecked Sendable {
                 fd: fd,
                 targetPath: path,
                 directory: false,
-                mask: [.write, .extend, .rename, .delete, .revoke]
+                mask: [.write, .extend, .rename, .delete, .revoke, .attrib]
             )
             return
         }

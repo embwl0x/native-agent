@@ -66,7 +66,7 @@ public enum QuietChatSessionCommands {
             let changed = appModel.activeChatSessionId != session.id
             await appModel.selectChatSession(session.row)
             guard appModel.activeChatSessionId == session.id else {
-                return failure("show_failed", "The window did not switch: \(appModel.statusForAgent)", session)
+                return failure("show_failed", "The window did not switch: \(appModel.statusForAgent)", session, effects: "unknown")
             }
             return ok(session, changed: changed, "\(session.title) is now the conversation the chat page shows.")
         case "rename":
@@ -74,13 +74,13 @@ public enum QuietChatSessionCommands {
             guard !title.isEmpty else { return failure("missing_title", "Pass the new name in title.", session) }
             await appModel.renameChatSession(id: session.id, title: title)
             let now = appModel.chatCommandTranscripts.sessions.first { $0.id == session.id }
-            guard let now, now.title == title else { return failure("rename_failed", appModel.statusForAgent, session) }
+            guard let now, now.title == title else { return failure("rename_failed", appModel.statusForAgent, session, effects: "unknown") }
             return ok(ChatSessionRef(row: now), changed: session.title != title, "Renamed from \(session.title) to \(title).")
         case "pin":
             let was = appModel.quietPinnedChatSessionIDs.contains(session.id)
             appModel.pinChatSessionForDetachedWindow(session.id)
             guard appModel.quietPinnedChatSessionIDs.contains(session.id) else {
-                return failure("pin_failed", "Pinned tabs could not be saved; nothing changed.", session)
+                return failure("pin_failed", "Pinned tabs could not be saved; nothing changed.", session, effects: "unknown")
             }
             return ok(session, changed: !was, "\(session.title) is pinned as a tab.")
         case "unpin":
@@ -90,18 +90,18 @@ public enum QuietChatSessionCommands {
             case false?:
                 return ok(session, changed: false, "\(session.title) was not pinned.")
             case nil:
-                return failure("unpin_failed", "The pinned tab could not be closed; it stays pinned.", session)
+                return failure("unpin_failed", "The pinned tab could not be closed; it stays pinned.", session, effects: "unknown")
             }
         case "clear":
             let result = await appModel.clearQuietChatMessages(sessionId: session.id)
-            guard result.succeeded else { return failure("clear_failed", result.agentMessage, session) }
+            guard result.succeeded else { return failure("clear_failed", result.agentMessage, session, effects: "unknown") }
             HarnessDecidedRow.post(requester: "Full Mac", tool: "chat.clear \(session.id)",
                                    sessionID: AppToolExecutor.inputString(input["__session_id"]),
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             return ok(session, changed: true, "Every message in \(session.title) is gone for good.")
         case "archive":
             let result = await appModel.archiveQuietChat(sessionId: session.id)
-            guard result.succeeded else { return failure("archive_failed", result.agentMessage, session) }
+            guard result.succeeded else { return failure("archive_failed", result.agentMessage, session, effects: "unknown") }
             return ok(session, changed: true, "\(session.title) is archived.")
         case "stop":
             guard isRunning(session.id, appModel) else {
@@ -120,7 +120,7 @@ public enum QuietChatSessionCommands {
                     providerID: appModel.chatProvider, force: true
                 )
                 if let failure = compactionFailure(outcome) {
-                    return self.failure("compact_failed", failure, session)
+                    return self.failure("compact_failed", failure, session, effects: "unknown")
                 }
                 if !appModel.macChatTurns.streamingSessions.contains(session.id),
                    let messages = try? await appModel.chatCommandTranscripts.loadMessages(sessionId: session.id, cached: true) {
@@ -128,7 +128,8 @@ public enum QuietChatSessionCommands {
                 }
                 return ok(session, changed: true, "Older messages in \(session.title) are compacted into a summary.")
             } catch {
-                return failure("compact_failed", "Compaction failed: \(error.localizedDescription)", session)
+                if error is ToolFailureError { return ChatToolOutcome.failure(error: error) }
+                return failure("compact_failed", "Compaction failed: \(error.localizedDescription)", session, effects: "unknown")
             }
         case "export":
             do {
@@ -138,12 +139,12 @@ public enum QuietChatSessionCommands {
                 if case .object(var fields) = body { fields["path"] = .string(file.path); body = .object(fields) }
                 return body
             } catch {
-                return failure("export_failed", "Export failed: \(error.localizedDescription)", session)
+                return failure("export_failed", "Export failed: \(error.localizedDescription)", session, effects: "unknown")
             }
         case "detach":
             appModel.openQuietChatWindow(sessionId: session.id)
             guard appModel.quietChatIsDetached(session.id) else {
-                return failure("detach_failed", "Its window did not open; the conversation list may still be loading. Try again in a moment.", session)
+                return failure("detach_failed", "Its window did not open; the conversation list may still be loading. Try again in a moment.", session, effects: "unknown")
             }
             return ok(session, changed: true, "\(session.title) is open in its own window.")
         case "close_window":
@@ -166,6 +167,14 @@ public enum QuietChatSessionCommands {
         let session: ChatSessionRef
         switch resolve(text(input["session_id"]), appModel: appModel) {
         case .success(let found): session = found
+        case .failure where verb == "compact_now":
+            let id = text(input["session_id"])
+            guard NativeAgentChatSessionID.normalizedPathComponent(id) == id,
+                  FileManager.default.fileExists(atPath: (appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                    .appendingPathComponent("chat/messages/\(id).jsonl").path) else {
+                return .failure(Refusal(json: AppToolExecutor.failure("missing_transcript", "Pass the exact session_id of the retained recollection.")))
+            }
+            session = ChatSessionRef(row: ChatSessionRow(id: id, title: id, createdAt: ""))
         case .failure(let refusal): return .failure(refusal)
         }
         if !reachesUser, ["show", "detach", "close_window"].contains(verb) {
@@ -244,7 +253,7 @@ public enum QuietChatSessionCommands {
             appModel.chatCommandTranscripts.setMessages([], for: row.id)
             appModel.chatCommandTranscripts.sessions = try await appModel.chatCommandTranscripts.list()
         } catch {
-            return AppToolExecutor.failure("new_failed", "New chat failed: \(error.localizedDescription)")
+            return AppToolExecutor.failure("new_failed", "New chat failed: \(error.localizedDescription)", extra: ["effects": .string("unknown")])
         }
         appModel.publishChatSnapshot()
         let session = ChatSessionRef(row: row)
@@ -426,7 +435,7 @@ public enum QuietChatSessionCommands {
     }
 
     private static func compactionFailure(_ result: ChatSessionCompactionOutcome) -> String? {
-        guard !result.compacted else { return nil }
+        guard !result.compacted, result.summaryRowId == nil else { return nil }
         let detail = result.reason.trimmingCharacters(in: .whitespacesAndNewlines)
         return detail.isEmpty
             ? "Context compaction did not run. Try again after the next context refresh."
@@ -444,9 +453,9 @@ public enum QuietChatSessionCommands {
         ])
     }
 
-    private static func failure(_ reason: String, _ detail: String, _ session: ChatSessionRef) -> JSONValue {
+    private static func failure(_ reason: String, _ detail: String, _ session: ChatSessionRef, effects: String = "none") -> JSONValue {
         AppToolExecutor.failure(reason, detail, extra: [
-            "session_id": .string(session.id), "title": .string(session.title),
+            "session_id": .string(session.id), "title": .string(session.title), "effects": .string(effects),
         ])
     }
 

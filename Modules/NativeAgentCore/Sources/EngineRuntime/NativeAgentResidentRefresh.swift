@@ -7,17 +7,14 @@ import PersonaEngine
 public extension NativeAgentEngine {
     @MainActor
     func bindResidentPresentation(
-        activityCountChanged: @escaping @MainActor () -> Void,
         publishWorkStatus: @escaping @MainActor () async -> Void,
         policyChanged: @escaping @MainActor () -> Void,
         memoryProposalsChanged: @escaping @MainActor () -> Void
     ) {
         approvals.recordsDidChange = {
-            activityCountChanged()
             Task { await publishWorkStatus() }
         }
         inbox.itemsDidChange = {
-            activityCountChanged()
             Task { await publishWorkStatus() }
         }
         turns.activityDidChange = {

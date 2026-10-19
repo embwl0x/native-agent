@@ -117,18 +117,17 @@ extension NativeCognitionRuntime {
         let quietAt = lastTurnActivityAt.addingTimeInterval(StudioWanderLane.quietInterval)
         guard revision == SwiftNativeDeskStore.currentRevision else { return nil }
         let opportunities = ResidentWake.carriedOpportunities(dataRoot: root,
-            handles: candidates.filter { Self.carries($0) && !$0.isPursuit }.map(\.handle), at: at)
+            items: candidates.filter { Self.carries($0) && !$0.isPursuit }, at: at)
         var next: Date?, best: DeskItem?
         var readyByTime: [Date: Set<String>] = [:]
         for item in candidates {
             guard let wakeAt = opportunities[item.handle] else { continue }
-            var crossing = Self.carriedTouch(item, at: at).addingTimeInterval(CognitiveSubstrate.ruminationMinimumAge)
+            var crossing = wakeAt
             if let entry = MyQueue.entry(item), case .at(let due) = MyQueue.when(entry) {
-                crossing = max(Self.carriedTouch(item, at: at), due)
+                crossing = max(crossing, due)
             }
             if let deferred = item.deferUntil.flatMap(DeskSequencing.parseDeferStamp) { crossing = max(crossing, deferred) }
             crossing = max(crossing, quietAt)
-            crossing = max(crossing, wakeAt)
             context.now = max(at, crossing)
             let ready = readyByTime[context.now] ?? Set(MyQueueReady.ready(items: candidates, context: context).map(\.handle))
             readyByTime[context.now] = ready

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 
 // Her-screen Phase 5 — per-app maps, the four-verb side (store: MacAppMaps.swift).
 //
@@ -46,6 +47,24 @@ extension MacFourVerbs {
         }
         await store.record(bundle: bundle, window: window, asked: asked, label: label,
                            kind: candidate.kind, path: path)
+    }
+
+    /// Whether a press of this kind of control in this app takes the pointer:
+    /// the route that last showed a consequence there. Accessibility is the
+    /// default and needs no entry.
+    func pressesByPointer(_ pressed: ActTarget, in sighting: Sighting) async -> Bool {
+        guard let bundle = sighting.bundleIdentifier else { return false }
+        return await MacAppMapStore.shared.learned(bundle: bundle, "press " + pressed.kind) == "pointer"
+    }
+
+    /// A press's outcome folded into the app's learned routes, on positive
+    /// evidence only: a pointer press with a consequence sets the pointer, a
+    /// verified accessibility press clears it, an inconclusive one (an
+    /// already-selected tab) changes nothing.
+    func learnRoute(pointer: Bool, pressed: ActTarget, reply: MacFourVerbsReply, in sighting: Sighting) async {
+        guard let bundle = sighting.bundleIdentifier, !pressed.isSupplemental, reply.ok,
+              Self.string(reply.detail["verification"]) == MotorVerificationState.satisfied.rawValue else { return }
+        await MacAppMapStore.shared.learn(bundle: bundle, "press " + pressed.kind, pointer ? "pointer" : nil)
     }
 
     /// Whether the app's own menu bar has an item with exactly this label

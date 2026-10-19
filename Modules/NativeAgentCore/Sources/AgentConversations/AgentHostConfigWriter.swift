@@ -2,6 +2,7 @@ import AgentLinkTransport
 import Darwin
 import CryptoKit
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 /// Writing ONE entry into somebody else's configuration file.
@@ -27,9 +28,12 @@ public enum AgentHostConfigWriter {
         case cleanupFailed
         case rollbackFailed(String)
         case changedUnderneath
+        case entryExists(String)
 
         public var errorDescription: String? {
             switch self {
+            case .entryExists(let at):
+                return "Connector collision at \(at). The existing entry belongs to another contact or has no peer ID. Review its ownership or change the recipe's configPath/format; it was left unchanged."
             case .changedUnderneath:
                 return "The settings file changed while I was working; nothing was written."
             case .unreadable(let detail): return "The configuration file could not be read safely: \(detail). Nothing was changed."
@@ -45,6 +49,40 @@ public enum AgentHostConfigWriter {
 
     /// Bounded by the same order of magnitude as the peer store's own limit.
     public static let maximumConfigurationBytes = 4 * 1_048_576
+    /// nil writes; false checks an unconnected host; true requires its saved entry.
+    @TaskLocal static var checking: Bool? = nil
+    @TaskLocal static var repairingPeer: String? = nil
+
+    static func checkEntry(_ existing: String?, expected: String, json: Bool, at: String) throws -> Bool {
+        guard let existing else {
+            if checking == true { throw Failure.unparsable("missing connector at \(at); connect this host after reviewing host.configPath/format with agent.recipe") }
+            return false
+        }
+        // An exact entry needs no write; ownership permits reconciling a moved installation.
+        let same: Bool
+        if json {
+            let a = try JSONSerialization.jsonObject(with: Data(existing.utf8)) as? NSDictionary
+            let b = try JSONSerialization.jsonObject(with: Data(expected.utf8)) as? NSDictionary
+            same = a != nil && a == b
+        }
+        else { same = existing.trimmingCharacters(in: .whitespacesAndNewlines) == expected.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if same { return true }
+        func peerID(_ text: String) throws -> String? {
+            if json {
+                guard let value = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return nil }
+                return ((value["envs"] ?? value["env"]) as? [String: Any])?[AgentHostDirectory.peerIDVariable] as? String
+            }
+            return try TOMLEntrySplice.identity(Data(text.utf8), name: AgentHostDirectory.entryName)?.peerID
+        }
+        guard let peer = try peerID(expected), !peer.isEmpty, try peerID(existing) == peer,
+              repairingPeer == nil || repairingPeer == peer else { throw Failure.entryExists(at) }
+        if checking != nil {
+            throw ToolFailureError("This contact's connector at \(at) needs reconciliation. Connect it again to update its owned entry.",
+                effects: .none, owner: at, nextCall: ToolFailureError.call("app", ["action": .string("agent.connect"),
+                    "args": .object(["name": .string("peer:" + peer)])]))
+        }
+        return false
+    }
 
     /// What a write did, for an honest tool result. Never carries file content.
     public struct Outcome: Sendable, Equatable {
@@ -57,6 +95,13 @@ public enum AgentHostConfigWriter {
     // MARK: - The two formats
 
     static func writeEnvironment(path: String, descriptorPath: String, peerID: String, secret: String) throws -> Outcome {
+        if checking != nil {
+            let expected = environmentData(descriptorPath: descriptorPath, peerID: peerID, secret: secret)
+            if FileManager.default.fileExists(atPath: path) {
+                guard checking == true, try read(path: path).0 == expected else { throw Failure.entryExists(path) }
+            } else if checking == true { throw Failure.unparsable("missing environment file \(path); reconnect this host") }
+            return .init(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
+        }
         let directory = URL(fileURLWithPath: path).deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
@@ -123,7 +168,7 @@ public enum AgentHostConfigWriter {
                 throw Failure.unparsable("messaging permission ownership belongs to another connection")
             }
             let (current, _) = try read(path: path)
-            try checkMessagingConflicts(current, server: server, rules: rules)
+            try checkMessagingConflicts(current, server: server, rules: rules, path: path)
             let allowed = try permissionRules(current, "allow")
             guard rules.allSatisfy(allowed.contains) else {
                 throw Failure.unparsable("this connection's messaging allowances were changed or removed; review them in Antigravity. They were not restored automatically")
@@ -136,7 +181,7 @@ public enum AgentHostConfigWriter {
             return JSONOwnership(command: "antigravity-messaging", peerID: peerID, name: server,
                 original: original?.value, originalMember: original?.member)
         }) { data in
-            try checkMessagingConflicts(data, server: server, rules: rules)
+            try checkMessagingConflicts(data, server: server, rules: rules, path: path)
             let existing = try permissionRules(data, "allow")
             let added = rules.filter { !existing.contains($0) }
             guard !added.isEmpty else { return nil }
@@ -173,7 +218,7 @@ public enum AgentHostConfigWriter {
         try JSONEntrySplice.entry(data, name: key, containerKey: "permissions", comments: true, trailingCommas: true)?.value
     }
 
-    private static func checkMessagingConflicts(_ data: Data, server: String, rules: [String]) throws {
+    private static func checkMessagingConflicts(_ data: Data, server: String, rules: [String], path: String) throws {
         for key in ["deny", "ask"] {
             let blocked = try permissionRules(data, key).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             // The documented wildcards are mcp(*) and mcp(server/*). Refuse
@@ -182,7 +227,10 @@ public enum AgentHostConfigWriter {
             guard !blocked.contains(where: {
                 ["*", "mcp", "mcp(\(server))", "mcp(*)", "mcp(\(server)/*)"].contains($0) || rules.contains($0)
             }) else {
-                throw Failure.unparsable("an existing \(key) rule covers or ambiguously constrains this connection's messaging tools; leave that rule intact and review it in Antigravity")
+                // The person's own Ask/Deny rule is his decision, never a repair of ours.
+                throw ToolFailureError("An existing \(key) rule in \(path) covers or ambiguously constrains this connection's messaging tools. That rule is the person's decision; it was left intact and nothing was connected.",
+                    effects: .none, owner: path + " permissions." + key,
+                    tap: "Antigravity settings › permissions › \(key) (\(path))", personDecides: true)
             }
         }
     }
@@ -214,12 +262,12 @@ public enum AgentHostConfigWriter {
         return try edit(path: path, backupRecordURL: backupRecordURL, initial: Data("{}".utf8),
             ownership: { data in
                 guard let command, let peerID else { return nil }
-                let original = try JSONEntrySplice.entry(data, name: name, containerKey: containerKey,
-                    comments: comments, trailingCommas: trailingCommas)
                 return JSONOwnership(command: command, peerID: peerID, name: name,
-                    original: original?.value, originalMember: original?.member)
+                    original: nil, originalMember: nil)
             }) { data in
-            try JSONEntrySplice.upsert(data, name: name, entryJSON: entryJSON, containerKey: containerKey, comments: comments, trailingCommas: trailingCommas)
+            if try checkEntry(JSONEntrySplice.entry(data, name: name, containerKey: containerKey,
+                comments: comments, trailingCommas: trailingCommas)?.value, expected: entryJSON, json: true, at: path + ":" + containerKey + "." + name) { return nil }
+            return try JSONEntrySplice.upsert(data, name: name, entryJSON: entryJSON, containerKey: containerKey, comments: comments, trailingCommas: trailingCommas)
         }
     }
 
@@ -229,7 +277,7 @@ public enum AgentHostConfigWriter {
         let owner = try backupRecords(at: backupRecordURL).last?.jsonOwnership
         if let peerID {
             guard let owner, owner.peerID == peerID else {
-                throw Failure.unparsable("the connection's ownership receipt is missing; retain the key and contact for recovery")
+                throw Failure.unparsable("ownership receipt \(backupRecordURL.path) is missing or names another peer; settings at \(path) were preserved")
             }
         }
         return try edit(path: path, backupRecordURL: backupRecordURL, removing: true, cleanupBackups: peerID == nil) { data in
@@ -249,9 +297,10 @@ public enum AgentHostConfigWriter {
         return try edit(path: path, backupRecordURL: backupRecordURL, initial: Data(), tomlOwnership: { data in
             guard let identity else { return nil }
             return JSONOwnership(command: identity.command, peerID: identity.peerID, name: name,
-                original: try TOMLEntrySplice.entry(data, name: name))
+                original: nil)
         }) { data in
-            try TOMLEntrySplice.upsert(data, name: name, entryTOML: entryTOML)
+            if try checkEntry(TOMLEntrySplice.entry(data, name: name), expected: entryTOML, json: false, at: path + ":mcp_servers." + name) { return nil }
+            return try TOMLEntrySplice.upsert(data, name: name, entryTOML: entryTOML)
         }
     }
 
@@ -259,7 +308,7 @@ public enum AgentHostConfigWriter {
         let owner = try backupRecords(at: backupRecordURL).last?.tomlOwnership
         if let peerID {
             guard let owner, owner.peerID == peerID else {
-                throw Failure.unparsable("the connection's ownership receipt is missing; retain the key and contact for recovery")
+                throw Failure.unparsable("ownership receipt \(backupRecordURL.path) is missing or names another peer; settings at \(path) were preserved")
             }
         }
         return try edit(path: path, backupRecordURL: backupRecordURL, removing: true, cleanupBackups: peerID == nil) { data in
@@ -276,6 +325,7 @@ public enum AgentHostConfigWriter {
         tomlOwnership: ((Data) throws -> JSONOwnership?)? = nil,
         _ splice: (Data) throws -> (data: Data, replaced: Bool, removed: Bool)?
     ) throws -> Outcome {
+        if checking != nil { _ = try backupRecords(at: backupRecordURL) }
         var info = stat()
         let missing = lstat(path, &info) != 0 && errno == ENOENT
         if missing && removing { return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false) }
@@ -289,6 +339,7 @@ public enum AgentHostConfigWriter {
             return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
         }
         guard result.data.count <= maximumConfigurationBytes else { throw Failure.tooLarge }
+        if checking != nil { return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false) }
         // Restore exact original spacing (including an originally absent section)
         // only while the file still matches our write. Later host edits win.
         var restoreAbsence = false
@@ -461,7 +512,8 @@ public enum AgentHostConfigWriter {
 
     private static func backupRecords(at url: URL) throws -> [BackupRecord] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
-        return try JSONDecoder().decode([BackupRecord].self, from: Data(contentsOf: url))
+        do { return try JSONDecoder().decode([BackupRecord].self, from: Data(contentsOf: url)) }
+        catch { throw Failure.unreadable("ownership receipt \(url.path) must read as a BackupRecord array: \(error.localizedDescription). Restore that receipt before connecting or verifying") }
     }
 
     private static func saveBackupRecords(_ records: [BackupRecord], at url: URL) throws {
@@ -1117,10 +1169,13 @@ enum TOMLEntrySplice {
         var end = text.endIndex
         var cursor = text.startIndex
         var blocks = 0
+        var section = ""
         while cursor < text.endIndex {
             let lineEnd = text[cursor...].firstIndex(of: "\n").map { text.index(after: $0) } ?? text.endIndex
             let line = text[cursor..<lineEnd].trimmingCharacters(in: .whitespacesAndNewlines)
             if let line = try tableHeader(in: line) {
+                guard !line.contains("\\") else { throw AgentHostConfigWriter.Failure.unparsable("an escaped table key cannot be spliced safely; use plain table keys before connecting") }
+                section = line.filter { !$0.isWhitespace && $0 != "\"" && $0 != "'" }
                 try rejectEquivalentSpelling(line, name: name)
                 let isOurs = line == header || line.hasPrefix(nested)
                 guard !isOurs || end == text.endIndex else {
@@ -1130,6 +1185,13 @@ enum TOMLEntrySplice {
                 if line == header { blocks += 1 }
                 if isOurs, start == nil { start = cursor }
                 if !isOurs, start != nil, end == text.endIndex { end = cursor }
+            } else if !line.hasPrefix("#"), let equal = line.firstIndex(of: "=") {
+                let key = line[..<equal].filter { !$0.isWhitespace && $0 != "\"" && $0 != "'" }
+                guard !key.contains("\\") else { throw AgentHostConfigWriter.Failure.unparsable("an escaped assignment key cannot be spliced safely; use plain keys before connecting") }
+                let qualified = section.isEmpty ? key : String(section.dropFirst().dropLast()) + "." + key
+                if qualified == tablePrefix || qualified == tablePrefix + "." + name || qualified.hasPrefix(tablePrefix + "." + name + ".") && !section.hasPrefix(header.dropLast()) {
+                    throw AgentHostConfigWriter.Failure.unparsable("existing inline/dotted assignment \(qualified); review it before connecting. Only an absent [\(tablePrefix).\(name)] entry can be added")
+                }
             }
             cursor = lineEnd
         }

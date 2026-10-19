@@ -16,6 +16,7 @@
 
 import SwiftUI
 import UIKit
+import NativeAgentShared
 
 // MARK: - The colour setting
 
@@ -1274,17 +1275,36 @@ enum AliveConnection {
     /// The one reason on every control the phone cannot use yet.
     static let pairToChange = "Pair with your Mac to change this"
 
-    static func line(for status: BridgeStatus, paired: Bool) -> String {
-        if status == .iCloudAccountAttention { return status.displayName }
-        guard paired else { return unpaired }
-        switch status {
-        case .online: return "Here"
-        case .offline: return noICloud
-        case .iCloudAccountAttention: return status.displayName
-        case .macUnreachable, .stale, .awaitingMacActivity: return unreachable
-        case .deviceOffline: return "You\u{2019}re offline. I\u{2019}ll send when you\u{2019}re back"
-        case .connecting: return "Finding your Mac\u{2026}"
+    /// The connection's headline: "Here" when all three facts hold, else the
+    /// first fact that does not (`NAPhoneConnection.headline`).
+    static func line(_ connection: NAPhoneConnection) -> String {
+        connection.holds ? "Here" : connection.headline.line
+    }
+}
+
+/// One fact of the connection: what is true, and the way on when it does not
+/// hold. The header popover and Settings › Connection draw facts with this.
+struct AliveConnectionFactLine: View {
+    let label: String
+    let fact: NAPhoneConnection.Fact
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Circle()
+                .fill(fact.state == .holds ? Color.green : fact.state == .waiting ? Color.orange : Color.red)
+                .frame(width: 7, height: 7)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label).font(.footnote.weight(.semibold)).foregroundStyle(AlivePalette.text)
+                Text(fact.line).font(.footnote).foregroundStyle(AlivePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if fact.state != .holds, let lever = fact.lever {
+                    Text(lever).font(.footnote).foregroundStyle(AlivePalette.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
+        .accessibilityElement(children: .combine)
     }
 }
 

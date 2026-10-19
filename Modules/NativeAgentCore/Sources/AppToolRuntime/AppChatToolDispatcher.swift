@@ -149,16 +149,23 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             return nil
         }
         let result = try await OwnedProgramInvocation.$host.withValue(host) {
-            try await AppDoorReentry.$waitForInteraction.withValue({ need, tool, input in
-                guard let session = ChatToolSessionContext.verifiedSessionId else {
-                    return AppToolExecutor.failure("door_unavailable", "A card needs the originating conversation.")
+            try await MacScreenWatch.$open.withValue({ request, hands in
+                guard let dispatcher = self.inner as? SwiftToolDispatcher else {
+                    throw SenseFailure(code: "unavailable", message: "The originating tool dispatcher is unavailable.")
                 }
-                return await self.interactions.waitForAnswer(need, tool: tool, input: input,
-                    sessionID: session, dataRoot: self.securityCenter.dataRoot)
+                return try await dispatcher.openScreenWatch(request, hands: hands, surface: surface)
             }) {
-                try await dispatchWithoutOrganismPosture(
-                    tool: tool, input: canonicalInput, surface: surface
-                )
+                try await AppDoorReentry.$waitForInteraction.withValue({ need, tool, input in
+                    guard let session = ChatToolSessionContext.verifiedSessionId else {
+                        return AppToolExecutor.failure("door_unavailable", "A card needs the originating conversation.")
+                    }
+                    return await self.interactions.waitForAnswer(need, tool: tool, input: input,
+                        sessionID: session, dataRoot: self.securityCenter.dataRoot)
+                }) {
+                    try await dispatchWithoutOrganismPosture(
+                        tool: tool, input: canonicalInput, surface: surface
+                    )
+                }
             }
         }
         await observeMotorOutcomeIfNeeded(tool: tool, result: result)
@@ -243,7 +250,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
     /// tool call: nothing is dispatched, gated or loaded.
     public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
         guard let swift = inner as? SwiftToolDispatcher else {
-            return .object(["status": .string("unavailable"), "tools": .array([])])
+            return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("unavailable"), "tools": .array([])]))
         }
         return await withTrust(catalog: try await swift.toolManifest(detail: detail, surface: surface), surface: surface)
     }
@@ -305,7 +312,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
     }
 
     private static func securityGateResponse(_ envelope: SecurityToolEnvelope) -> JSONValue {
-        .object([
+        ChatToolOutcome.refusedBeforeRunning(.object([
             "status": .string(envelope.requiresApproval ? "pending_approval" : "blocked"),
             "runtime": .string("swift-native"),
             "tool": .string(envelope.tool),
@@ -319,6 +326,6 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
             "reasons": .array(envelope.reasons.map { .string($0.persistedValue) }),
             "capabilities": .array(envelope.capabilities.map { .string($0) }),
             "message": .string(envelope.requiresApproval ? "Security Center requires approval before running this tool." : "Security Center blocked this tool before execution."),
-        ])
+        ]))
     }
 }

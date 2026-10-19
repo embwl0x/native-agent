@@ -157,6 +157,9 @@ extension SwiftToolDispatcher {
     }
 
     func runCodexMessage(input: [String: JSONValue], surface: String) async throws -> JSONValue {
+        guard AgentConversationDelivery.lane(for: "codex", dataRoot: dataRoot, bridgeConfigRoot: agentBridgeConfigRoot) != nil else {
+            throw ToolFailureError("No contact carries this inbox door.", effects: .none, owner: "Saved agent contacts", nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]))
+        }
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
@@ -256,7 +259,7 @@ extension SwiftToolDispatcher {
             ?? repositoryResolvedDirectory
             ?? inferredRepositoryDirectory
         let callerSelectedDirectory = requestedDirectory ?? repositoryResolvedDirectory
-        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
+        let worktreeResult = try await BuilderWorktreeAllocator.shared.resolve(
             agent: .codex,
             conversationId: conversation.conversationId,
             messageId: messageId,
@@ -931,7 +934,7 @@ extension SwiftToolDispatcher {
         }
         let process = Process()
         process.executableURL = codex
-        let args = codexExecArguments(
+        var args = codexExecArguments(
             sandbox: sandbox,
             approvalPolicy: launch.permission.codexApprovalPolicy,
             cwd: cwdRaw,
@@ -941,6 +944,7 @@ extension SwiftToolDispatcher {
             serviceTier: brain.serviceTier,
             prompt: fullPrompt
         )
+        if input["skip_git_repo_check"] == .bool(true) { args.insert("--skip-git-repo-check", at: 2) }
         process.arguments = Array(args.dropFirst())
         process.currentDirectoryURL = URL(fileURLWithPath: cwdRaw)
         process.environment = environment

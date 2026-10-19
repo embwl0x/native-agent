@@ -24,6 +24,7 @@ if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || (( TIMEOUT_SECONDS < 1 )); then
 fi
 
 EXECUTABLE="$APP_BUNDLE/Contents/MacOS/NativeAgentApp"
+started=$SECONDS
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 last_reason="runtime did not become ready"
 state_file="$(mktemp)"
@@ -65,7 +66,7 @@ while (( SECONDS < deadline )); do
   elif [[ "$running_dirty" != "$EXPECTED_DIRTY" ]]; then
     last_reason="running dirty state '$running_dirty' does not match '$EXPECTED_DIRTY'"
   else
-    echo "ready: authenticated bridge, chat, and source identity verified"
+    echo "ready: authenticated bridge, chat, and source identity verified in $((SECONDS - started))s"
     exit 0
   fi
   sleep 0.25

@@ -1206,6 +1206,34 @@ public enum MacActClosedLoop {
         }
     }
 
+    /// What a press caused (Resolve 10-17: the Edit tab read selected while
+    /// the page never changed). `own`: the pressed control's value, label or
+    /// selection, its same-kind siblings' (that selection moving), or its own
+    /// retitle (an added/removed pair at one path) — proof of the press, not
+    /// of a consequence. `consequence`: structural only — the window's title
+    /// or modal, controls appearing or going (both reads complete), another
+    /// control renamed, or the focus landing on what was clicked. A value
+    /// moving elsewhere (a readout, a counter) is shown, never evidence.
+    public static func pressEvidence(
+        _ diff: EffectDiff, before: MacLookFrame, pressed: MacLookFrameEntry, clicked: Bool
+    ) -> (own: Bool, consequence: Bool) {
+        func inGroup(_ path: [Int], _ role: String) -> Bool {
+            path == pressed.path || (role == pressed.role && path.dropLast() == pressed.path.dropLast())
+        }
+        let retitled = Set(diff.added.filter { inGroup($0.path, $0.role) }.map(\.path))
+            .intersection(diff.removed.filter { inGroup($0.path, $0.role) }.map(\.path))
+        var own = !retitled.isEmpty
+        var renamed = false
+        for row in diff.changed {
+            guard let path = before.entries[row.handle]?.path else { continue }
+            if inGroup(path, row.role) { own = true } else if row.beforeLabel != row.afterLabel { renamed = true }
+        }
+        let consequence = diff.windowTitleChanged || diff.modalAppeared || diff.modalDisappeared || renamed
+            || (diff.diffComparable && diff.addedTotal + diff.removedTotal > 2 * retitled.count)
+            || (clicked && diff.focusChanged && diff.focusHandleAfter == pressed.handle)
+        return (own, consequence)
+    }
+
     // MARK: - The Open command (Agent round 6, live)
 
     /// Apps whose "open the selected item" keystroke is PROVEN, by app name.

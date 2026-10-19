@@ -745,8 +745,7 @@ extension CognitiveSubstrate {
         return "even"
     }
 
-    /// The disposition's own lexicon (`dispositionTone`): positive reads
-    /// settled, negative reads heavy. Between them it is genuinely level.
+    /// Words for the persisted disposition; never a reading of her prose.
     static func innerStateDispositionWord(_ valence: Double) -> String {
         if valence >= moodCongruenceValenceThreshold { return "settled" }
         if valence <= -moodCongruenceValenceThreshold { return "heavy" }
@@ -911,40 +910,12 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// What the night left: the newest dream episode's DATE and a mood word
-    /// scored through the same `dispositionTone` lexicon that actually moved her
-    /// undertone when that dream landed. The dream's text is never returned —
-    /// the timeline row's summary is read only to score it, exactly as the
-    /// disposition writer reads the mood line only to score it.
+    /// Project the existing dream contribution, never classify an episode's prose.
     func innerStateDreamResidue() -> CognitiveInnerStateReading.DreamResidue? {
-        guard let newest = developmentalTimeline.values
-            .filter({ $0.kind == .dreamEpisode })
-            .max(by: { lhs, rhs in
-                if lhs.occurredAt != rhs.occurredAt { return lhs.occurredAt < rhs.occurredAt }
-                return lhs.id.uuidString < rhs.id.uuidString
-            })
-        else { return nil }
-        let tone = dispositionTone(from: newest.summary)
-        let word: String
-        if tone > 0 {
-            word = "settled"
-        } else if tone < 0 {
-            word = "heavy"
-        } else {
-            word = "even"
-        }
-        // `lineageId` is `dream:<yyyy-MM-dd>` — the dream's own date, which is
-        // what she means by "last night". Fall back to the row's timestamp.
-        let date: String
-        if newest.lineageId.hasPrefix("dream:") {
-            date = String(newest.lineageId.dropFirst("dream:".count))
-        } else {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.dateFormat = "yyyy-MM-dd"
-            formatter.timeZone = TimeZone.current
-            date = formatter.string(from: newest.occurredAt)
-        }
-        return CognitiveInnerStateReading.DreamResidue(moodWord: word, date: date)
+        guard let transition = dispositionTransitions.last(where: { $0.source.hasPrefix("dream ") }) else { return nil }
+        let tone = transition.afterContribution - transition.afterDecay
+        let word = tone > 0 ? "settled" : tone < 0 ? "heavy" : "even"
+        return CognitiveInnerStateReading.DreamResidue(
+            moodWord: word, date: String(transition.source.dropFirst("dream ".count)))
     }
 }

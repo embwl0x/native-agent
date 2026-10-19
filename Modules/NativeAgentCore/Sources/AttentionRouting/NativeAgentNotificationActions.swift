@@ -31,6 +31,7 @@ public enum NativeAgentNotificationActions {
         public let sessionID: String?
         public let newConversation: Bool
         public let deskHandle: String?
+        public let pageRoute: String?
         public let text: String?
         public let title: String
         public let body: String
@@ -45,6 +46,7 @@ public enum NativeAgentNotificationActions {
             sessionID = userInfo[sessionKey] as? String
             newConversation = userInfo[newConversationKey] as? String == "true"
             deskHandle = NativeAgentNotificationRoute.deskHandle(in: userInfo)
+            pageRoute = userInfo[NativeAgentNotificationRoute.pageKey] as? String
             self.text = text
             self.title = title
             self.body = body

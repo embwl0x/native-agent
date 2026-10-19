@@ -1,5 +1,8 @@
 import Foundation
+import Experiences
+import NativeAgentCore
 import PersistenceCore
+import Transcripts
 
 // Canonical REM proposal store — `<dataRoot>/rem_proposals.jsonl`, one
 // camelCase row per line. This is THE store: REMConsolidator (full weekly
@@ -111,12 +114,13 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
 }
 
 /// Stages one pending row into the approval queue; returns the created
-/// approval record's id, or nil when staging failed (the row stays
-/// unstamped and is retried on the next pipeline pass). Wired app-side
+/// approval record's id, or nil for an explicit Trust block. Failures throw
+/// and remain owed; unstamped rows keep their identity. Wired app-side
 /// (SwiftNativeApprovalInbox + the notifications/inbox.jsonl card) so this
 /// module never depends on ApprovalInbox — mirrors
 /// WeeklySelfImprovementLoop's injected `stageProposal`.
-public typealias REMApprovalStager = @Sendable (REMProposalRow) async -> String?
+/// The count is resolved for this pass; nil means claim-bound support is unavailable.
+public typealias REMApprovalStager = @Sendable (REMProposalRow, Int?) async throws -> String?
 
 public enum REMProposalStoreError: Error, LocalizedError, Equatable {
     case notFound(String)
@@ -494,17 +498,25 @@ public struct REMProposalStore: Sendable {
     /// ONE critical section so two concurrent drivers can't both see the
     /// same unstamped row. Returns the number staged.
     @discardableResult
-    public func stagePendingApprovals(_ stage: @escaping REMApprovalStager) async throws -> Int {
-        try await lockCore.withFileLock(proposalsURL) {
+    public func stagePendingApprovals(_ stage: @escaping REMApprovalStager,
+        resolver: ChatSessionRecollections.ExperienceResolver? = nil, limit: Int = .max
+    ) async throws -> Int {
+        let resolver = resolver ?? ChatSessionRecollections.ExperienceResolver(dataRoot: dataRoot)
+        do {
+        let staged = try await lockCore.withFileLock(proposalsURL) {
             _ = try self.requireReadableBaseRows()
             var lines = Self.readLines(self.proposalsURL)
             guard !lines.isEmpty else { return 0 }
+            let pending = lines.indices.compactMap { i -> (Int, REMProposalRow)? in
+                guard let row = Self.decodeRow(lines[i]), row.status == "pending", row.approvalId == nil,
+                      Self.supportsProposalTarget(row.targetDoc) else { return nil }
+                return (i, row)
+            }
             var staged = 0
-            for i in lines.indices {
-                guard let row = Self.decodeRow(lines[i]),
-                      row.status == "pending", row.approvalId == nil,
-                      Self.supportsProposalTarget(row.targetDoc) else { continue }
-                guard let approvalId = await stage(row) else { continue }
+            for (i, row) in pending.prefix(max(0, limit)) {
+                let identities = try await resolver.resolve(
+                    for: row.asREMProposal.supportingExperienceReferences ?? [], includingSourceRows: false).identities
+                guard let approvalId = try await stage(row, row.asREMProposal.supportingExperienceCount(identities: identities)) else { continue }
                 var stamped = row
                 stamped.approvalId = approvalId
                 lines[i] = Data(try Self.encodeRow(stamped).utf8)
@@ -514,6 +526,19 @@ public struct REMProposalStore: Sendable {
                 try Self.writeLines(lines, to: self.proposalsURL)
             }
             return staged
+        }
+        if try loadAllStrictly().allSatisfy({ $0.status != "pending" || $0.approvalId != nil }) {
+            await RepairOwed.settle(dataRoot, operation: "rem.stage",
+                evidence: .init(source: "rem_proposals.jsonl", id: "approval stamps")).value
+        }
+        return staged
+        } catch {
+            try Task.checkCancellation()
+            await RepairOwed.owe(dataRoot, id: "rem-stage-repair:" + UUID().uuidString, kind: .run,
+                operation: "rem.stage", owner: "rem_proposals.jsonl approval stamps",
+                words: "REM approval staging failed: \(error.localizedDescription)",
+                nextCall: ToolFailureError.call("app", ["action": .string("mind.rem"), "args": .object(["repair": .bool(true)])])).value
+            throw error
         }
     }
 

@@ -213,6 +213,26 @@ public struct MacFourVerbsReply: Sendable, Equatable {
     public init(ok: Bool, text: String, detail: [String: JSONValue] = [:]) {
         self.ok = ok
         self.text = text
+        var detail = detail
+        if !ok, detail["remedy"] == nil, case .string(let code)? = detail["error"] {
+            detail["remedy"] = Self.privacyRemedy(code)
+        }
         self.detail = detail
+    }
+
+    public static func privacyRemedy(_ code: String) -> JSONValue? {
+        let pane: String, capability: String
+        switch code {
+        case "accessibility_not_trusted", "ax_untrusted", "accessibility_untrusted":
+            pane = "Accessibility"; capability = "accessibility"
+        case "screen_recording_not_trusted":
+            pane = "Screen Recording"; capability = "screenRecording"
+        default: return nil
+        }
+        return Repair.remedy(owner: "macOS \(pane) grant", nextCall: .object([
+            "tool": .string("app"), "input": .object(["action": .string("permissions.request"), "args": .object([
+                "capability": .string(capability), "why": .string("NativeAgent needs \(pane) to \(capability == "accessibility" ? "click and type for you" : "see your screen"). Allow?"),
+            ])]),
+        ]), tap: "Allow \(pane) on the permission card in NativeAgent")
     }
 }

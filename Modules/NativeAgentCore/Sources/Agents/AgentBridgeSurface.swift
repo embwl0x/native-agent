@@ -6,32 +6,7 @@ import TrustCenter
 
 // MARK: - The inbound peer surface
 
-/// A REMOTE PEER IS NEVER THE PERSON — BUT SHE IS ALWAYS HERSELF.
-///
-/// `/agent/mcp`, `/a2a` and `/agent/message` accept messages from other
-/// agents. Those turns used to run as surface "chat" — the Mac operator's own
-/// surface, which `SecurityCenter+FullMacPolicy` treats as local and Full
-/// Mac/YOLO opens completely. The bridge bearer does not attest the caller
-/// (see the note at ClaudeBridge.route), so "authenticated" there means only
-/// "reached this port". `agent-bridge` is that lane's own surface: declared
-/// remote, absent from the Full Mac local AND trusted-remote sets. Claude's
-/// own bridge lane (`/claude/message`) keeps `claude-bridge` and today's
-/// authority exactly.
-///
-/// What that surface is NOT, since User's ruling of 2026-09-15, is a smaller
-/// agent. The first cut of this file answered the risk with a six-tool
-/// allowlist, and the price was the wrong one: a peer met an Agent with no
-/// memory, no history, no persona kernel and nothing to say. "Anybody that
-/// connects gets the WHOLE Agent — her memories, fluid context, her
-/// personality, everything that makes her Agent."
-///
-/// So there is no tool fence here any more. Her full tool set loads, and the
-/// fence moved to the one place it belongs: an EFFECT asked for by a peer
-/// raises the person's ordinary permission card instead of running, with the
-/// peer named as the requester (`PeerTurnEffectPolicy`, applied in
-/// `AutonomyGatedDispatcher`). Her own behaviour is the rest of the safety —
-/// when another agent asks her for something destructive, she comes to the
-/// person and asks.
+/// An agent door opens the same agent, with effect authority owned by Trust.
 public enum AgentBridgeSurface {
     public static let id = ConversationSurfaceProfile.agentBridgeID
 
@@ -78,15 +53,11 @@ public enum AgentBridgeSurface {
 
 /// The principal behind one inbound peer request.
 ///
-/// The bridge bearer is a TRANSPORT credential shared by every route; it says
-/// the caller reached the port. Every route of a built-in lane (`/claude/…`,
-/// `/codex/…`) binds it to that lane's contact; generic routes require a peer's scoped credential
-/// from `AgentPeerCredentials`. Explicit peer headers always bind as that peer.
-/// Authority comes from the contact's elevation in Trust Center; an unelevated
-/// caller remains on `agent-bridge`.
+/// A route handle locates a who, never a grant. Only the door whose own key
+/// authenticated the call can carry its elevation. The shared listener bearer
+/// cannot attest a door or borrow its identity or grant.
 public struct AgentBridgePrincipal: Sendable {
-    /// Stable id used in the replay claim key. "shared-bearer" when the caller
-    /// presented only a generic transport credential.
+    /// Authenticated door id used in replay claims, or the anonymous caller id.
     public let id: String
     public let peerID: String?
     public let elevated: Bool
@@ -113,7 +84,8 @@ public struct AgentBridgePrincipal: Sendable {
                                     declaredRemote: !elevated)
         let text = AgentBridgeSurface.turnHeader(peerName: displayName, elevated: elevated)
             + (plain.isEmpty ? "Please read the attached content." : AgentBridgeSurface.quotingImpersonation(plain))
-        var origin = ChatMessageOrigin(surface: "agent-bridge", agent: "agent", authored: .agent, replyTo: originID)
+        var origin = ChatMessageOrigin(surface: "agent-bridge", agent: peerID.map { "peer:" + $0 } ?? "another agent",
+                                       authored: .agent, replyTo: originID)
         origin.peerSources = [peerID.map { "peer:" + $0 } ?? "another agent"]
         return TurnRequest(message: text, sessionID: context.map(storedConversation), attachments: attachments,
                            surface: surface, envelope: envelope, verifiedSessionID: .some(context.map(storedConversation)), replyRoute: route,
@@ -148,30 +120,27 @@ public struct AgentBridgePrincipal: Sendable {
         }
     }
 
-    /// `authenticatedLane` is supplied only after the listener verifies the built-in bearer.
-    public static func resolve(headers: [String: String], dataRoot: URL, authenticatedLane: String? = nil,
+    public static func resolve(headers: [String: String], dataRoot: URL,
                         readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> AgentBridgePrincipal {
         if !claimsIdentity(headers: headers) {
             guard let authorization = headers["authorization"], authorization.hasPrefix("Bearer "),
                   let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return .anonymous }
             let secret = String(authorization.dropFirst(7))
-            let peer: AgentPeerContact?
-            if let authenticatedLane {
-                peer = PeerTrust.contact(forLane: authenticatedLane, among: peers)
-            } else {
-                peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential)
-            }
-            guard let peer else { return .anonymous }
+            guard let peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential),
+                  AgentPeerCredentials.isAvailable(peer, peers: peers, readCredential: readCredential) else { return .anonymous }
             return AgentBridgePrincipal(id: peer.id, peerID: peer.id,
-                elevated: peer.elevationAllowed, displayName: peer.name, replyOnly: peer.transport == .grokBot)
+                elevated: peer.elevationAllowed, displayName: peers.first { $0.id == peer.who }?.name ?? peer.name,
+                replyOnly: peer.transport == .grokBot)
         }
         guard let rawID = headers[peerIDHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let secret = headers[peerSecretHeader]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !rawID.isEmpty, !secret.isEmpty else { return .anonymous }
         let peerID = rawID.lowercased()
         guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID,
-              let peer = try? AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peerID }),
+              let peers = try? AgentPeerStore(dataRoot: dataRoot).list(),
+              let peer = peers.first(where: { $0.id == peerID }),
               peer.credentialKey == AgentPeerContact.credentialKey(for: peerID),
+              AgentPeerCredentials.isAvailable(peer, peers: peers, readCredential: readCredential),
               let stored = (try? readCredential(peerID)) ?? nil,
               constantTimeEquals(stored, secret) else {
             // A wrong or unknown credential is not an error the caller learns
@@ -182,7 +151,7 @@ public struct AgentBridgePrincipal: Sendable {
             id: peerID,
             peerID: peerID,
             elevated: peer.elevationAllowed,
-            displayName: peer.name,
+            displayName: peers.first { $0.id == peer.who }?.name ?? peer.name,
             replyOnly: peer.transport == .grokBot
         )
     }

@@ -47,23 +47,15 @@ public final class InboxFacade {
     /// snapshot inherits this order.
     public nonisolated func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
         let rows = try await store.rows()
-        var items: [InboxItemRecord] = []
-        var unreadable = 0
-        for row in rows {
-            guard let item = InboxItemRecord(row: row) else {
-                unreadable += 1
-                continue
-            }
-            if unreadOnly && !item.isUnread { continue }
-            items.append(item)
-        }
-        if !rows.isEmpty && unreadable == rows.count {
+        var items = InboxItemRecord.latest(in: rows)
+        if !rows.isEmpty && items.isEmpty {
             throw NSError(domain: "NativeAgent", code: -3, userInfo: [
                 NSLocalizedDescriptionKey:
                     "getInboxItems: all \(rows.count) inbox row(s) failed to decode — "
                     + "refusing to render a corrupt inbox as empty"
             ])
         }
+        if unreadOnly { items = items.filter(\.isUnread) }
         items.sort { lhs, rhs in
             if lhs.created_at.isEmpty { return false }
             if rhs.created_at.isEmpty { return true }
@@ -74,13 +66,13 @@ public final class InboxFacade {
     }
 
     /// A resolving card action publishes its refreshed state to the phone.
-    public func publishAfterAction(_ actionID: String, refresh: @MainActor () async -> Void) async {
+    public func publishAfterAction(refresh: @MainActor () async -> Void) async {
         await refresh()
-        if actionID != "read" { await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots() }
+        await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
     }
 
-    /// Marks the shown card read after a successful read action, so badges
-    /// agree before the next reload.
+    /// Marks the shown card read after a successful read action. Reading does
+    /// not settle an owner obligation.
     public func markRead(_ id: String) {
         if let idx = items.firstIndex(where: { $0.id == id }), items[idx].isUnread {
             items[idx].status = "read"
@@ -215,22 +207,13 @@ public enum InboxVisibleActionsPresentation {
 ///
 /// The inbox was one flat list per lane in arrival order, and opening a card
 /// marked it read — so an approval he opened, thought about and did not act on
-/// sank under the next hour of notices and was gone. READING IS NOT
-/// RESOLVING. This derives prominence from the authoritative records the card
-/// already carries (its linked approval, and the actions that resolve real
-/// work), never from read state, and it deliberately spans BOTH lanes: a
-/// request that happens to have been filed under System is still a request.
+/// sank under the next hour of notices and was gone. Reading is not resolving;
+/// the same OwnerAttentionPolicy as the overview owns this section.
 ///
 /// Resolution is what removes it. A resolved approval's card stops coming back
 /// from the reload, which is the existing tombstone path — no second source of
 /// truth about what is outstanding.
 public enum InboxNeedsYou {
-    /// Action ids that mean the person still has to do something. `read` and
-    /// `dismiss` are deliberately absent: acknowledging is not deciding.
-    public static let resolvingActionIDs: Set<String> = [
-        "act", "approve", "reject", "open_approvals", "repair",
-    ]
-
     public struct Sections {
         public let needsYou: [InboxItemRecord]
         public let rest: [InboxItemRecord]
@@ -238,14 +221,7 @@ public enum InboxNeedsYou {
         public var isEmpty: Bool { needsYou.isEmpty && rest.isEmpty }
     }
 
-    public static func needsYou(_ item: InboxItemRecord) -> Bool {
-        guard !item.isHiddenFromDefaultInbox else { return false }
-        if item.hasLinkedApproval { return true }
-        return item.actions.contains { resolvingActionIDs.contains($0.id) }
-    }
-
-    /// - Parameter everywhere: the visible population across every lane, so a
-    ///   System-lane request is not hidden from the person it is waiting on.
+    /// - Parameter everywhere: the visible population across every lane.
     /// - Parameter lane: the lane's own visible population, which keeps its
     ///   arrival order below.
     public static func sections(
@@ -253,7 +229,7 @@ public enum InboxNeedsYou {
         lane: [InboxItemRecord]
     ) -> Sections {
         let needsYou = everywhere
-            .filter(needsYou)
+            .filter(\.requiresOwnerInput)
             .sorted { $0.created_at > $1.created_at }
         let claimed = Set(needsYou.map(\.id))
         return Sections(needsYou: needsYou, rest: lane.filter { !claimed.contains($0.id) })

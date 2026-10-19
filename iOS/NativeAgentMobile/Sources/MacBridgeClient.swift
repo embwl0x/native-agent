@@ -204,6 +204,9 @@ final class MacBridgeClient: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var reconnectGeneration = 0
     private var bridgeAvailabilityCancellable: AnyCancellable?
+    private var macKeyCancellable: AnyCancellable?
+    /// The key the account's Mac pairing record held when last read.
+    @Published private(set) var macPairingKey: iCloudBridge.MacPairingKeyReading?
     private var networkPathCancellable: AnyCancellable?
     private var statusRefreshTask: Task<Void, Never>?
     private let pathObserver: NetworkPathObserver = .shared
@@ -256,6 +259,10 @@ final class MacBridgeClient: ObservableObject {
                     self?.refreshBridgeStatus()
                 }
             }
+        macKeyCancellable = bridge.$macPairingKey
+            .sink { [weak self] key in
+                Task { @MainActor in self?.macPairingKey = key }
+            }
         // E8: replaces the unconditional 5s forever-timer. refreshBridgeStatus
         // re-arms this with an interval derived from the current ages, and
         // stops arming it entirely once the projection is settled.
@@ -276,6 +283,71 @@ final class MacBridgeClient: ObservableObject {
         }
         pathObserver.start()
         refreshBridgeStatus()
+    }
+
+    /// The phone's connection as this phone knows it: pairing, iCloud and
+    /// the last word from the Mac, each with who can fix it and how. Every
+    /// place on the phone that says where the Mac stands says it through this.
+    var connection: NAPhoneConnection {
+        NAPhoneConnection(pairing: pairingFact, transport: transportFact, exchange: exchangeFact)
+    }
+
+    private var pairingFact: NAPhoneConnection.Fact {
+        guard let pairingStore, pairingStore.isICloudSigned else {
+            return .init(.waiting, AliveConnection.unpaired, owner: .personOnPhone,
+                         lever: "Tap Pair with Mac, with NativeAgent open on your Mac.")
+        }
+        if pairingStore.isRepairingConnection {
+            return .init(.waiting, "Repairing the connection\u{2026}")
+        }
+        if let reading = macPairingKey, reading.phoneKey == pairingStore.iCloudPairingSecret,
+           reading.recordKey != reading.phoneKey {
+            return .init(.broken, "My key isn\u{2019}t your Mac\u{2019}s anymore", owner: .personOnPhone,
+                         lever: "Your Mac holds a newer pairing key, or another Mac took the pairing. Tap Pair with Mac to take your Mac\u{2019}s current key.")
+        }
+        guard pairingStore.isICloudPaired else {
+            return .init(.waiting, "Waiting for you to pair on your Mac", owner: .personOnMac,
+                         lever: "On your Mac, open Connectors \u{203A} iPhone, match the code and choose Pair.")
+        }
+        return .init(.holds, "Paired with your Mac")
+    }
+
+    private var transportFact: NAPhoneConnection.Fact {
+        switch bridgeStatus {
+        case .deviceOffline:
+            return .init(.broken, "You\u{2019}re offline. I\u{2019}ll send when you\u{2019}re back", owner: .network,
+                         lever: "Reconnect this iPhone to Wi-Fi or cellular data.")
+        case .iCloudAccountAttention:
+            return .init(.broken, DeviceSyncAccountFailure.phoneMessage, owner: .iCloudAccount,
+                         lever: "Open Settings \u{203A} Apple Account on this iPhone and finish signing in to iCloud.")
+        case .offline:
+            // Unpaired, the bridge never started: nothing is wrong with iCloud.
+            guard pairingStore?.isICloudSigned == true else {
+                return .init(.waiting, "Not connected yet; pairing starts it")
+            }
+            return .init(.broken, AliveConnection.noICloud, owner: .iCloudAccount,
+                         lever: "Sign in to iCloud in Settings on this iPhone, with the same Apple Account as your Mac.")
+        case .connecting:
+            return .init(.waiting, "Finding your Mac\u{2026}")
+        case .macUnreachable:
+            return .init(.waiting, "iCloud isn\u{2019}t connecting", owner: .network,
+                         lever: "Check this iPhone\u{2019}s connection; I keep trying.")
+        case .online, .stale, .awaitingMacActivity:
+            return .init(.holds, "iCloud is carrying our messages")
+        }
+    }
+
+    private var exchangeFact: NAPhoneConnection.Fact {
+        let heard = lastSeenAt.map { " Last heard \($0.formatted(date: .abbreviated, time: .shortened))." } ?? ""
+        switch bridgeStatus {
+        case .online:
+            return .init(.holds, lastSeenAt.map { "Heard from your Mac \($0.formatted(date: .omitted, time: .shortened))" } ?? "Here")
+        case .stale, .macUnreachable, .awaitingMacActivity:
+            return .init(.waiting, AliveConnection.unreachable, owner: .personOnMac,
+                         lever: "Open NativeAgent on your Mac and keep it awake." + heard)
+        case .connecting, .offline, .deviceOffline, .iCloudAccountAttention:
+            return .init(.waiting, "Not heard from your Mac yet")
+        }
     }
 
     func configureICloud() {
@@ -371,12 +443,24 @@ final class MacBridgeClient: ObservableObject {
             suppressRemoteUserAppend: suppressRemoteUserAppend,
             replacementAssistantMessageID: replacementAssistantMessageID
         )
+        let references = try await Task.detached(priority: .utility) {
+            try attachments.map { attachment in
+                var reference = attachment
+                if reference.type == "audio", reference.utterance != nil {
+                    _ = try MobileLocalStorage.retainRecording(reference)
+                    reference.utterance?.audioReference = "iphone-recording:\(reference.id)"
+                    reference.base64 = ""
+                    reference.path = nil
+                }
+                return reference
+            }
+        }.value
         let msg = try await bridge.sendChatMessage(
             id: messageID,
             text: text,
             sessionID: sessionID,
             metadata: metadata,
-            attachments: attachments,
+            attachments: references,
             preparedMessage: preparedMessage,
             onPrepared: onPrepared
         )
@@ -622,7 +706,8 @@ final class MacBridgeClient: ObservableObject {
                     name: a.name ?? "attachment",
                     type: a.type,
                     mime: a.mime,
-                    byteSize: a.byteSize.map(Int.init)
+                    byteSize: a.byteSize.map(Int.init),
+                    utterance: a.utterance
                 )
             }
             var message = ChatMessage(id: uuid, role: role, text: interaction == nil ? rec.content : "", attachments: attachments, runId: rec.runId,

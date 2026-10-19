@@ -111,9 +111,18 @@ extension HerScreen {
         let bad = checks.filter { text($0["status"]) != "ok" }
         let overall = text(row["overall_status"]) ?? text(row["active_path_status"]) ?? text(row["status"]) ?? "unknown"
         let items = (bad + checks.filter { text($0["status"]) == "ok" }).map { check in
-            AgentWorkspaceItem(title: (text(check["title"]) ?? text(check["id"]) ?? "Check") + " · " + (text(check["status"]) ?? "?")
+            var content = check
+            content["summary"] = check["repair_face"] ?? check["detail"] ?? .null
+            var actions: [AgentWorkspaceButton] = []
+            if case .object(let remedy)? = check["remedy"],
+               case .object(let call)? = remedy["next_call"], let tool = text(call["tool"]),
+               case .object(let input)? = call["input"] {
+                actions.append(.init(label: "Repair", action: .perform(tool: tool, input: input,
+                    title: text(check["title"]) ?? "Repair", textField: nil, isEffect: true)))
+            }
+            return AgentWorkspaceItem(title: (text(check["title"]) ?? text(check["id"]) ?? "Check") + " · " + (text(check["status"]) ?? "?")
                                    + (text(check["owner"]).map { " · owner " + $0 } ?? ""),
-                               content: .object(["summary": check["detail"] ?? .null]), actions: [])
+                               content: .object(content), actions: actions)
         }
         return .init(title: "Doctor", content: .object(["status": .string("ok"),
             "message": .string("Last report · Overall \(overall): \(checks.count - bad.count) of \(checks.count) checks ok.")]), items: items,

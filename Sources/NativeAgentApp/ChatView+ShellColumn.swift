@@ -347,10 +347,6 @@ extension ChatView {
     /// sees. Scrolled up, the arrival is instant and the "Latest" pill leads.
     var animatesMessageArrival: Bool { scrollCoordinator.autoFollow }
 
-    var showsLatestPill: Bool {
-        ChatViewportPresentation.shouldShowLatestPill(autoFollow: scrollCoordinator.autoFollow)
-    }
-
     var latestPillAnimation: Animation? {
         NativeAgentMotion.respecting(NativeAgentMotion.spring, reduceMotion: reduceMotion)
     }
@@ -388,43 +384,40 @@ extension ChatView {
     /// `.snappy` and its glyph bounces once per arriving message — the whole
     /// point being that the arrival itself is off-screen.
     func latestPillOverlay(_ proxy: ScrollViewProxy) -> some View {
-        ZStack(alignment: .bottomTrailing) {
-            if showsLatestPill {
-                Button {
-                    transcriptLatestRequest &+= 1
-                    scrollCoordinator.forceFollow()
-                    // User, 2026-09-13: the pill jumps, it does not ease. An
-                    // eased jump across a long transcript re-lays the whole
-                    // column for every frame of the ease.
-                    scrollToBottom(proxy, animated: false, delay: 0.03, force: true)
-                } label: {
-                    latestPillLabel
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        // A quiet screenshot takes the opaque pill, as the
-                        // composer does: tinted glass blanks the capture.
-                        .background {
-                            if reduceTransparency || quietOffscreenRead { Capsule().fill(NativeAgentShell.room) }
-                        }
-                        .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate.interactive(), in: Capsule())
-                }
-                .buttonStyle(.borderless)
-                .accessibilityIdentifier("chat.latest")
-                .accessibilityLabel("Jump to latest message")
-                .padding(.horizontal, 18)
-                .padding(.top, 18)
-                // phase 4: lift clear of the floating thinking row while a turn
-                // streams so it stays visible/clickable. 2026-09-13: the
-                // clearance is read inside the modifier's own body, so a card
-                // that grows re-lays out this pill and not ChatView.
-                .modifier(ChatTurnCardClearancePadding(
-                    store: turnCardClearanceStore,
-                    idle: 18
-                ))
-                .transition(latestPillTransition)
+        ChatLatestPillGate(coordinator: scrollCoordinator, animation: latestPillAnimation) {
+            Button {
+                transcriptLatestRequest &+= 1
+                scrollCoordinator.forceFollow()
+                // User, 2026-09-13: the pill jumps, it does not ease. An
+                // eased jump across a long transcript re-lays the whole
+                // column for every frame of the ease.
+                scrollToBottom(proxy, animated: false, delay: 0.03, force: true)
+            } label: {
+                latestPillLabel
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    // A quiet screenshot takes the opaque pill, as the
+                    // composer does: tinted glass blanks the capture.
+                    .background {
+                        if reduceTransparency || quietOffscreenRead { Capsule().fill(NativeAgentShell.room) }
+                    }
+                    .glassEffect(reduceTransparency || quietOffscreenRead ? .identity : HouseGlass.plate.interactive(), in: Capsule())
             }
+            .buttonStyle(.borderless)
+            .accessibilityIdentifier("chat.latest")
+            .accessibilityLabel("Jump to latest message")
+            .padding(.horizontal, 18)
+            .padding(.top, 18)
+            // phase 4: lift clear of the floating thinking row while a turn
+            // streams so it stays visible/clickable. 2026-09-13: the
+            // clearance is read inside the modifier's own body, so a card
+            // that grows re-lays out this pill and not ChatView.
+            .modifier(ChatTurnCardClearancePadding(
+                store: turnCardClearanceStore,
+                idle: 18
+            ))
+            .transition(latestPillTransition)
         }
-        .animation(latestPillAnimation, value: showsLatestPill)
     }
 
     /// One bounce per arriving message, so the eye is led to what it cannot
@@ -437,5 +430,23 @@ extension ChatView {
                 options: .nonRepeating,
                 value: reduceMotion ? 0 : appModel.chatMessages.count
             )
+    }
+}
+
+/// Reads the follow state in its own body, so the reader crossing the bottom
+/// re-renders the pill and not ChatView.
+struct ChatLatestPillGate<Pill: View>: View {
+    let coordinator: ChatScrollCoordinator
+    let animation: Animation?
+    @ViewBuilder let pill: () -> Pill
+
+    var body: some View {
+        let shows = ChatViewportPresentation.shouldShowLatestPill(
+            autoFollow: coordinator.autoFollow, atBottom: coordinator.atBottom,
+            pagedBack: coordinator.transcriptPagedBack)
+        ZStack(alignment: .bottomTrailing) {
+            if shows { pill() }
+        }
+        .animation(animation, value: shows)
     }
 }

@@ -84,7 +84,7 @@ extension SwiftToolDispatcher {
                 "detail": .string("That OMP conversation's session no longer exists, so nothing was sent and no work started. Start a new conversation to ask again."),
             ])
         }
-        let worktreeResult = await BuilderWorktreeAllocator.shared.resolve(
+        let worktreeResult = try await BuilderWorktreeAllocator.shared.resolve(
             agent: .omp,
             conversationId: conversation.conversationId,
             messageId: messageId,

@@ -17,9 +17,12 @@ struct MobileWorkOverviewView: View {
         TimelineView(.explicit(deadlines)) { context in
             if let overview = sync.workOverview {
                 ForEach(overview.unavailable, id: \.self) { AliveFootnote($0) }
-                section("Now", rows: overview.now, now: context.date)
+                // What needs the person comes first: the page's headline counts
+                // these, and under a long Now list they sat a long scroll down
+                // (10-18: REM lessons to approve).
                 section("Needs you", rows: overview.needsYou, now: context.date, waiting: true)
                 if let overflow = overview.needsYouOverflow { AliveFootnote(overflow) }
+                section("Now", rows: overview.now, now: context.date)
                 section("Recently done", rows: overview.recentlyDone, now: context.date)
                 if overview.omittedNow > 0 || overview.omittedRecentlyDone > 0 {
                     AliveFootnote("\(overview.omittedNow) other work items and \(overview.omittedRecentlyDone) older results remain in Desk tasks and history.")

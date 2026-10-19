@@ -725,13 +725,9 @@ extension AppModel: MacChatSessionSelectionPort {
             nextMemoryProposals
         )
         // Render-cost audit F13/F14: this is a file-watch-driven refresh
-        // (`ContentView.swift:130-143`), so it fires on any touch of the
         // approvals/inbox/memory files — including SQLite WAL churn that
-        // changed nothing. Each of these four writes invalidates the root
-        // `ContentView` (it reads `pendingActivityCount`, which fans out to
-        // these collections). Observation fires on write, not on change, so
-        // gate every one: an unchanged badge refresh now performs zero writes
-        // and triggers zero render passes.
+        // changed nothing. Observation fires on write, not on change, so gate
+        // collection writes before publishing the canonical work overview.
         let nextApprovalRows = Self.keepingLastGood(approvalStore.records, fetched: approvalRows)
         if approvalStore.records != nextApprovalRows { approvalStore.records = nextApprovalRows }
         let nextInboxRows = Self.keepingLastGood(inbox.items, fetched: inboxRows)

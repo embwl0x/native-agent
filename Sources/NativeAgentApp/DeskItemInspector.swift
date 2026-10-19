@@ -17,7 +17,8 @@ struct DeskItemInspector: View {
     let select: (String) -> Void
     let dismiss: () -> Void
 
-    @State private var noteDraft = ""
+    private var draftSubject: String { "desk-item/\(item.handle)/note" }
+    private var noteDraft: String { appModel.editDraft(draftSubject, seed: "") }
     @State private var showingNote = false
     @State private var showingDefer = false
     @State private var copiedRef: String?
@@ -80,7 +81,7 @@ struct DeskItemInspector: View {
                         }
                         if showingNote {
                             HStack {
-                                TextField("Note…", text: $noteDraft)
+                                TextField("Note…", text: appModel.editBinding(draftSubject, seed: ""))
                                     .textFieldStyle(.roundedBorder)
                                     .focused($noteFocused)
                                     .onSubmit { submitNote() }
@@ -197,11 +198,13 @@ struct DeskItemInspector: View {
         if mode == .deferItem { showingDefer = true; showingNote = false }
     }
     private func submitNote() {
-        let text = noteDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submitted = noteDraft
+        let text = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isBusy else { return }
+        let subject = draftSubject
         addNote(text) { ok in
             guard ok else { return }
-            noteDraft = ""
+            if appModel.editDraft(subject, seed: "") == submitted { appModel.clearEditDraft(subject) }
             showingNote = false
             inspectorFocused = true
         }

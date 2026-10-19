@@ -11,6 +11,26 @@ enum ChatSendDisposition: Equatable {
 
 /// Local payloads share one serial IO owner; callers retain their existing keys.
 final class MobileLocalStorage: @unchecked Sendable {
+    static func recordingURL(id: String) throws -> URL {
+        guard let id = UUID(uuidString: id) else { throw CocoaError(.fileReadInvalidFileName) }
+        return URL.applicationSupportDirectory.appendingPathComponent("chat/attachments/\(id.uuidString).caf")
+    }
+
+    /// Audio stays on this phone, independently of the rolling transcript cache.
+    static func retainRecording(_ attachment: MultimodalAttachment) throws -> URL {
+        let url = try recordingURL(id: attachment.id)
+        guard let bytes = Data(base64Encoded: attachment.base64), !bytes.isEmpty else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try directory.setResourceValues(values)
+        try bytes.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        return url
+    }
+
     private let defaults: UserDefaults
     private let queue = DispatchQueue(label: "nativeagent.mobile.defaults", qos: .utility)
     private var errors: [String: Error] = [:]

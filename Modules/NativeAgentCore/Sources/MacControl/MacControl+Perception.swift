@@ -2387,29 +2387,28 @@ extension SwiftNativeMacControl {
             guard !Task.isCancelled else { return await cancelCapture() }
         }
 
-        // 3. Draw them, under the byte cap. Pixel-first semantic perception
-        // gets the dominant canvas/image cropped from the native capture BEFORE
-        // PNG fitting. Otherwise a high-entropy moving canvas spends the whole
-        // window's byte budget before OCR ever sees its small status text.
+        // Semantic perception keeps the whole native observation. Only the
+        // delivery path may crop or fit it after recognition and selection.
         var imageDownscale: Double?
         var imageBytes: Int?
         let imageRenderStartedNs = DispatchTime.now().uptimeNanoseconds
-        if pictured, let shot, let geometry {
-            #if canImport(CoreGraphics)
-            let renderShot = semanticFocusFrame.flatMap { shot.cropped(to: $0) } ?? shot
-            #else
-            let renderShot = shot
-            #endif
-            let renderGeometry = MacScreenViewGeometry(shot: renderShot)
+        if pictured, let shot {
+            let renderGeometry = MacScreenViewGeometry(shot: shot)
+            guard let secrets = MacScreenViewTextRedaction.secretFrames(
+                nodes: snapshot?.nodes ?? [], geometry: renderGeometry, deadline: .distantFuture
+            ) else { return await discardUnboundCapture() }
             let placements = semanticRawFrame
                 ? []
                 : selection.marks.compactMap {
                     renderGeometry.placement(mark: $0.mark, frame: $0.frame)
                 }
-            let fitted = MacScreenViewBuilder.fitImage(maxBytes: maxImageBytes) { rung in
+            let encode: (Double) -> Data? = { rung in
                 guard !Task.isCancelled else { return nil }
-                return screenImageRenderer.renderPNG(shot: renderShot, placements: placements, downscale: rung)
+                return self.screenImageRenderer.renderPNG(shot: shot, placements: placements, secretFrames: secrets, downscale: rung)
             }
+            let fitted = semanticRawFrame
+                ? encode(1).map { (data: $0, downscale: 1.0) }
+                : MacScreenViewBuilder.fitImage(maxBytes: maxImageBytes, encode: encode)
             guard !Task.isCancelled else { return await cancelCapture() }
             if let fitted {
                 output["image"] = .string(fitted.data.base64EncodedString())
@@ -2436,7 +2435,7 @@ extension SwiftNativeMacControl {
                     ])
                 } ?? .null
             } else {
-                imageFailure = .exceedsByteCap
+                imageFailure = semanticRawFrame ? .encodeFailed : .exceedsByteCap
             }
         }
         let imageRenderFinishedNs = DispatchTime.now().uptimeNanoseconds
@@ -2445,7 +2444,12 @@ extension SwiftNativeMacControl {
         ))
         if output["image"] == nil {
             output["image"] = .null
-            if pictured { output["image_unavailable_reason"] = .string((imageFailure ?? .captureFailed).rawValue) }
+            if pictured {
+                let failure = imageFailure ?? .captureFailed
+                output["image_unavailable_reason"] = .string(failure.rawValue)
+                output["message"] = .string(failure.localizedDescription)
+                output["remedy"] = failure.remedy(app: scope == .fullScreen ? nil : app?.bundleIdentifier)
+            }
         }
         output["image_bytes"] = imageBytes.map { .int(Int64($0)) } ?? .null
         output["image_downscale"] = imageDownscale.map { .double($0) } ?? .null
@@ -2497,6 +2501,7 @@ extension SwiftNativeMacControl {
         }
         if !viewCurrent && Task.isCancelled { return await cancelCapture() }
         output["view"] = viewCurrent ? .string(viewId) : .null
+        output["frame_id"] = .string(binding?.frameID ?? viewId)
         output["view_current"] = .bool(viewCurrent)
         if !viewCurrent {
             output["view_note"] = .string("This capture was superseded or invalidated while in flight. Its image and legend are diagnostic only; take a fresh view before acting.")
@@ -2547,14 +2552,12 @@ extension SwiftNativeMacControl {
         output["view_total_ms"] = .int(elapsedMilliseconds(
             from: viewStartedNs, to: viewFinishedNs
         ))
-        // ok reflects whether ANY perception came back. Both permissions off is
-        // a real failure; either one on is a real answer.
-        let ok = viewCurrent && (accessibilityTrusted || output["image"] != .null)
+        let ok = viewCurrent && (pictured ? output["image"] != .null : accessibilityTrusted)
         return MacControlResult(
             ok: ok,
             action: "view",
             output: .object(output),
-            error: ok ? nil : (viewCurrent ? "no_perception_available" : "view_capture_superseded"),
+            error: ok ? nil : (viewCurrent ? imageFailure?.rawValue ?? "no_perception_available" : "view_capture_superseded"),
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }

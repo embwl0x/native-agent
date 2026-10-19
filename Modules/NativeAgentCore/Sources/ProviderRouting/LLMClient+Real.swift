@@ -3,6 +3,7 @@ import NativeAgentCore
 import os
 import PersistenceCore
 import TurnTrace
+import Experiences
 
 // MARK: - LLMAdapter
 
@@ -361,11 +362,15 @@ public final class SwiftNativeLLMClient: LLMClient {
         if case .noReply? = error.flatMap(ProviderFailure.classify) { noReply = true }
         await lifecycleObserver?.observeProviderCall(started.terminal(
             phase, firstOutputMs: receipt?.withLock(\.ttftMs), streamKind: streamKind?.rawValue, noReply: noReply))
+        if phase == .succeeded {
+            RepairOwed.settle(moonshotCatalogDataRoot, operation: "model.call:" + started.providerId + ":" + started.model,
+                             evidence: .init(source: "provider", id: started.id))
+        }
     }
 
     /// Written under the request's identity: no row when the adapter's came first.
     private func recordFailedCall(_ started: LLMCallLifecycleEvent, error: Error,
-                                  startedAt: TimeInterval, recorded: OSAllocatedUnfairLock<LLMCallTraceRecorder.Receipt>) async {
+                                  startedAt: TimeInterval, recorded: OSAllocatedUnfairLock<LLMCallTraceRecorder.Receipt>) async -> Error {
         await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
         await LLMCallContext.$surface.withValue(started.surface) {
             await LLMCallTraceRecorder(dataRootOverride: LLMCallContext.traceDataRootOverride).record(
@@ -381,6 +386,15 @@ public final class SwiftNativeLLMClient: LLMClient {
             await LLMCallTraceRecorder(dataRootOverride: LLMCallContext.traceDataRootOverride)
                 .recordNoReply(provider: started.providerId, seconds: seconds, events: events, surface: started.surface)
         }
+        if case .outputLengthLimit = error as? LLMError { return error }
+        if ProviderFailure.classify(error) == .contextTooLong { return ProviderFailure.normalize(error) }
+        let detail = ProviderFailure.diagnosticDescription(error)
+        let repair = ProviderFailure.repair(error, provider: started.providerId, model: started.model, surface: started.surface,
+            dataRoot: moonshotCatalogDataRoot, id: "provider-repair:" + started.id, evidence: [.init(source: "provider", id: started.id)])
+        let normalized = ProviderFailure.normalize(error) as? ProviderFailure.Diagnostic
+        return ProviderFailure.Diagnostic(cause: ProviderFailure.classify(error) ?? .malformedResponse, detail: detail,
+            deadlineExpired: normalized?.deadlineExpired ?? false, admitted: normalized?.admitted ?? false,
+            liveFirstOutputCut: normalized?.liveFirstOutputCut ?? false, repair: repair)
     }
 
     /// Adapter choice produced by `resolveAdapterAndModel`. Used by
@@ -666,9 +680,22 @@ public final class SwiftNativeLLMClient: LLMClient {
     }
 
     private func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot {
-        do { return try await router.checkedRoutingSnapshot() }
+        do {
+            let snapshot = try await router.checkedRoutingSnapshot()
+            RepairOwed.settle(moonshotCatalogDataRoot, operation: "provider.routing.read",
+                             evidence: .init(source: "provider.routing", id: UUID().uuidString))
+            return snapshot
+        }
         catch is CancellationError { throw CancellationError() }
         catch let error as URLError where error.code == .cancelled { throw CancellationError() }
+        catch let failure as ToolFailureError {
+            let id = "routing-repair:" + UUID().uuidString
+            if let owner = failure.owner {
+                RepairOwed.owe(moonshotCatalogDataRoot, id: id, kind: .act, operation: "provider.routing.read",
+                    owner: owner, words: failure.message, nextCall: failure.nextCall, tap: failure.tap)
+            }
+            throw ProviderFailure.Diagnostic(cause: .routingUnavailable, detail: failure.message, repair: failure)
+        }
         catch { throw LLMError.failure(.routingUnavailable) }
     }
 
@@ -749,7 +776,6 @@ public final class SwiftNativeLLMClient: LLMClient {
             surface: surface,
             routingSnapshot: routingSnapshot
         )
-        try validateCatalogAvailability(resolution)
         ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
         let controls = executionControls(for: surface, routingSnapshot: routingSnapshot)
         let attemptStartedAt = ProcessInfo.processInfo.systemUptime
@@ -761,8 +787,8 @@ public final class SwiftNativeLLMClient: LLMClient {
         )
         let recorded = OSAllocatedUnfairLock(initialState: LLMCallTraceRecorder.Receipt())
         do {
-            let result = try await ProviderRecoveryPolicy.retryOverload {
-                try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in
+            try validateCatalogAvailability(resolution)
+            let result = try await withCompletionWall("\(resolution.choice)", providerId: resolution.providerId) { [self] in
                     try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
                         try await LLMCallContext.$surface.withValue(surface) {
                             try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
@@ -772,7 +798,6 @@ public final class SwiftNativeLLMClient: LLMClient {
                             }
                         }
                     }
-                }
             }
             await providerLifecycleFinish(lifecycle, phase: .succeeded)
             return result
@@ -781,8 +806,7 @@ public final class SwiftNativeLLMClient: LLMClient {
             throw CancellationError()
         } catch {
             await providerLifecycleFinish(lifecycle, phase: .failed)
-            await recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
-            throw ProviderFailure.normalize(error)
+            throw await recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
         }
     }
 
@@ -852,7 +876,6 @@ public final class SwiftNativeLLMClient: LLMClient {
                         surface: surface,
                         routingSnapshot: routingSnapshot
                     )
-                    try self.validateCatalogAvailability(resolution)
                     ProviderToolCapability.recordOfferedTools(providerID: resolution.providerId, tools: tools)
                     // F1-M1 NOTE: the guard for "tools[] must never reach a
                     // Claude OAuth adapter" lives inside `adapter(for:tools:)`'s
@@ -875,6 +898,7 @@ public final class SwiftNativeLLMClient: LLMClient {
                         reasoningEffort: controls.effort
                     )
                     lifecycle = started
+                    try self.validateCatalogAvailability(resolution)
                     try await LLMCallTraceRecorder.$requestRecorded.withValue(recorded) {
                     try await LLMCallContext.$reasoningEffort.withValue(controls.effort) {
                     try await LLMCallContext.$serviceTier.withValue(controls.serviceTier) {
@@ -912,7 +936,9 @@ public final class SwiftNativeLLMClient: LLMClient {
                     if let lifecycle {
                         await self.providerLifecycleFinish(lifecycle, phase: .failed, receipt: recorded,
                                                            streamKind: streamKind, error: error)
-                        await self.recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
+                        let owned = await self.recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
+                        continuation.finish(throwing: owned)
+                        return
                     }
                     continuation.finish(throwing: ProviderFailure.normalize(error))
                 }
@@ -985,12 +1011,6 @@ public final class SwiftNativeLLMClient: LLMClient {
                     surface: surface,
                     routingSnapshot: routingSnapshot
                 )
-                do {
-                    try self.validateCatalogAvailability(resolution)
-                } catch {
-                    continuation.finish(throwing: ProviderFailure.normalize(error))
-                    return
-                }
                 let effectiveModel = resolution.model
                 let controls = self.executionControls(
                     for: surface,
@@ -1009,13 +1029,14 @@ public final class SwiftNativeLLMClient: LLMClient {
                 let adapter: any LLMAdapter
                 let providerLabel: String
                 do {
+                    try self.validateCatalogAvailability(resolution)
                     let resolved = try self.adapter(for: resolution, tools: nil)
                     adapter = resolved.adapter
                     providerLabel = resolved.label
                 } catch {
                     await self.providerLifecycleFinish(started, phase: .failed)
-                    await self.recordFailedCall(started, error: error, startedAt: attemptStartedAt, recorded: recorded)
-                    continuation.finish(throwing: ProviderFailure.normalize(error))
+                    let owned = await self.recordFailedCall(started, error: error, startedAt: attemptStartedAt, recorded: recorded)
+                    continuation.finish(throwing: owned)
                     return
                 }
                 var guardConfig = streamGuardConfig
@@ -1053,7 +1074,9 @@ public final class SwiftNativeLLMClient: LLMClient {
                 } catch {
                     if let lifecycle {
                         await self.providerLifecycleFinish(lifecycle, phase: .failed, receipt: recorded, error: error)
-                        await self.recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
+                        let owned = await self.recordFailedCall(lifecycle, error: error, startedAt: attemptStartedAt, recorded: recorded)
+                        continuation.finish(throwing: owned)
+                        return
                     }
                     continuation.finish(throwing: ProviderFailure.normalize(error))
                 }

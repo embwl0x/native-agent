@@ -62,10 +62,6 @@ public enum IntraTurnContextCompaction {
     /// overflow the window it exists to protect.
     static let distillInputMaxChars = 120_000
 
-    /// Hard wall-clock ceiling on the working-notes call. A stalled distiller
-    /// must cost the fold's quality, never the turn.
-    static let distillDeadlineSeconds: TimeInterval = 60
-
     /// The one line a surface shows while a compaction is in flight, and the
     /// notice kind both surfaces match on.
     static let noticeKind = "context_compaction"
@@ -79,7 +75,7 @@ public enum IntraTurnContextCompaction {
     struct Receipt: Sendable, Equatable {
         let charsBefore: Int
         let charsAfter: Int
-        /// "stub" | "fold_llm" | "fold_mechanical" | "none"
+        /// "stub" | "fold_llm" | "none"
         let mode: String
     }
 
@@ -177,11 +173,11 @@ public enum IntraTurnContextCompaction {
         surface: String,
         turnRecoveries: Int,
         progress: ChatOrchestrationProgressHandler?
-    ) async -> Bool {
+    ) async throws -> Bool {
         guard estimatedChars(conversation) > pressureChars(windowTokens: windowTokens) else {
             return false
         }
-        let receipt = await IntraTurnContextCompaction.compact(
+        let receipt = try await IntraTurnContextCompaction.compact(
             conversation: &conversation,
             turnStartIndex: turnStartIndex,
             windowTokens: windowTokens,
@@ -210,7 +206,7 @@ public enum IntraTurnContextCompaction {
         keepRecentRounds: Int = 5,
         pressure: Pressure = .proactive,
         distill: (String) async throws -> String?
-    ) async -> Receipt {
+    ) async throws -> Receipt {
         let charsBefore = estimatedChars(conversation)
         // A confirmed overflow means the estimate already missed (dense
         // tokens, schema and system costs it does not see), so the goal is a
@@ -282,7 +278,7 @@ public enum IntraTurnContextCompaction {
         // STEP B — fold the span between the seeded prefix and the keep tail
         // into one working-notes message.
         guard keepTailStart > foldStart else {
-            return await overflowFallback(
+            return try await overflowFallback(
                 conversation: &conversation, foldStart: foldStart, target: target,
                 charsBefore: charsBefore, mode: stubbed ? "stub" : "none",
                 turnStartIndex: turnStartIndex, windowTokens: windowTokens,
@@ -311,7 +307,7 @@ public enum IntraTurnContextCompaction {
         // the span instead (the overflow recursion drops the keep tail, which
         // puts real steps back in front of the distiller).
         guard !rendered.isEmpty else {
-            return await overflowFallback(
+            return try await overflowFallback(
                 conversation: &conversation, foldStart: foldStart, target: target,
                 charsBefore: charsBefore, mode: stubbed ? "stub" : "none",
                 turnStartIndex: turnStartIndex, windowTokens: windowTokens,
@@ -320,28 +316,12 @@ public enum IntraTurnContextCompaction {
         }
         let pinned = priorNote.isEmpty ? "" : "[My earlier working notes — carry everything in them forward]\n" + String(priorNote.prefix(noteCapChars)) + "\n\n[Steps since then]\n"
         let room = max(1_000, distillInputMaxChars - pinned.count)
-        let note = try? await distill(pinned + String(rendered.suffix(room)))
-        // Note contract: a distilled note is capped once at `noteCapChars`
-        // when written and then carried WHOLE. The mechanical fallback keeps
-        // the prior note intact and budgets the new steps separately, so a
-        // second failed distillation never amputates the first note.
-        let mode: String
-        let body: String
-        if let note, !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            mode = "fold_llm"
-            body = String(note.prefix(noteCapChars))
-        } else {
-            // One bounded representation: the whole note never exceeds
-            // `noteCapChars`. Without a distiller the note is a rolling
-            // window that keeps the NEWEST work: two thirds from the tail of
-            // the prior note, one third from the steps since (Codex review
-            // 2026-09-05, round three: prior + new used to sum to twice the
-            // cap and the next fold cut the new half off).
-            mode = "fold_mechanical"
-            let priorBudget = priorNote.isEmpty ? 0 : noteCapChars * 2 / 3
-            let head = priorNote.isEmpty ? "" : String(priorNote.suffix(priorBudget)) + "\n\n[Steps since then]\n"
-            body = String((head + String(rendered.suffix(noteCapChars - priorBudget))).prefix(noteCapChars))
+        guard let note = try await distill(pinned + String(rendered.suffix(room))),
+              !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ToolFailureError("Working recollection returned no text; the saved turn remains available for repair.", effects: .none)
         }
+        let mode = "fold_llm"
+        let body = String(note.prefix(noteCapChars))
         // Tool additions/removals are provider state, not prose the notes can
         // replace. Carry them whole, in order, before the surviving rounds.
         let toolChangeMessages = conversation[foldStart..<keepTailStart].filter { !$0.toolChanges.isEmpty }
@@ -356,7 +336,7 @@ public enum IntraTurnContextCompaction {
             .assistantText("\(priorNoteMarker)\n\(body)"),
             .user(continuation),
         ] + toolChangeMessages)
-        return await overflowFallback(
+        return try await overflowFallback(
             conversation: &conversation, foldStart: foldStart, target: target,
             charsBefore: charsBefore, mode: mode,
             turnStartIndex: turnStartIndex, windowTokens: windowTokens,
@@ -378,13 +358,13 @@ public enum IntraTurnContextCompaction {
         keepRecentRounds: Int,
         pressure: Pressure,
         distill: (String) async throws -> String?
-    ) async -> Receipt {
+    ) async throws -> Receipt {
         let after = estimatedChars(conversation)
         guard pressure == .overflow, after > target else {
             return Receipt(charsBefore: charsBefore, charsAfter: after, mode: mode)
         }
         if keepRecentRounds > 0 {
-            let inner = await compact(
+            let inner = try await compact(
                 conversation: &conversation,
                 turnStartIndex: turnStartIndex,
                 windowTokens: windowTokens,
@@ -415,9 +395,7 @@ public enum IntraTurnContextCompaction {
     }
 
     /// The folded span as plain text: role, assistant prose, and each tool call
-    /// with its input and the head of what it returned. This is what the
-    /// distiller reads, and — truncated newest-last — what the mechanical
-    /// fallback ships verbatim.
+    /// with its input and the head of what it returned, for the distiller.
     static func render(_ messages: ArraySlice<LLMMessage>) -> String {
         var lines: [String] = []
         for message in messages {

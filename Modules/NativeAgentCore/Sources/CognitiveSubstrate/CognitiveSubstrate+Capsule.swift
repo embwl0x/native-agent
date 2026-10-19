@@ -55,10 +55,10 @@ extension CognitiveSubstrate {
             why: &cueWhy
         )
         let dynamicLines = request.surface == Self.cadenceExemptCapsuleSurface ? lines : Self.oneFeltCue(lines)
-        let provenanceNodeIds = innerStateProvenance(from: capsuleItems, at: now)
         return assembledCapsule(
             request, at: now, dynamicLines: dynamicLines,
-            provenanceNodeIds: provenanceNodeIds, maximumCharacters: maximumCharacters)
+            workspaceItems: capsuleItems, thoughtSeeds: projectedThoughtSeeds(at: now), why: cueWhy,
+            maximumCharacters: maximumCharacters)
     }
 
     /// The moment this turn's unbidden recall already resolved, if any. It is a
@@ -136,15 +136,10 @@ extension CognitiveSubstrate {
         )
         let dynamicLines = request.surface == Self.cadenceExemptCapsuleSurface
             ? candidateLines : Self.oneFeltCue(candidateLines)
-        let provenanceNodeIds = innerStateProvenance(
-            from: items,
-            at: read.fixedAt,
-            thoughtSeeds: read.thoughtSeeds,
-            trustedPeerIds: read.trustedPeerIds
-        )
         let capsule = assembledCapsule(
             request, at: read.fixedAt, dynamicLines: dynamicLines,
-            provenanceNodeIds: provenanceNodeIds, maximumCharacters: maximumCharacters)
+            workspaceItems: items, thoughtSeeds: read.thoughtSeeds, why: cueWhy,
+            maximumCharacters: maximumCharacters)
         let turnKind = request.resolvedTurnKind
         let commit: CognitiveCapsulePresentationCommit?
         // Phase 5A: an EMPTY capsule is a normal accepted turn now, so it
@@ -176,7 +171,9 @@ extension CognitiveSubstrate {
         _ request: CognitiveCapsuleRequest,
         at now: Date,
         dynamicLines: [String],
-        provenanceNodeIds: [UUID],
+        workspaceItems: [CognitiveWorkspaceItem],
+        thoughtSeeds: [CognitiveThoughtSeed],
+        why: CapsuleCueWhy,
         maximumCharacters: Int
     ) -> CognitiveCapsule {
         let stableKernel = Self.capsuleStableKernel("How you feel:", dynamicLines: dynamicLines)
@@ -184,13 +181,16 @@ extension CognitiveSubstrate {
         let separatorCost = dynamicLines.isEmpty || boundedStableKernel.isEmpty ? 0 : 2
         let remaining = max(0, maximumCharacters - boundedStableKernel.count - separatorCost)
         let fittedLines = fitCapsuleLines(dynamicLines, maxCharacters: remaining)
+        let provenance = innerStateProvenance(from: workspaceItems, thoughtSeeds: thoughtSeeds,
+            renderedSeedIds: Set(fittedLines.sources.compactMap { why.seedIds[$0] }))
         return CognitiveCapsule(
             generatedAt: now,
             mode: request.mode,
             stableKernel: boundedStableKernel,
             dynamicContext: fittedLines.text,
-            provenanceNodeIds: provenanceNodeIds,
-            truncated: fittedLines.truncated || boundedStableKernel.count < stableKernel.count
+            provenanceNodeIds: provenance.nodeIds,
+            truncated: fittedLines.truncated || boundedStableKernel.count < stableKernel.count,
+            sourcePeerIds: provenance.peerIds
         )
     }
 
@@ -402,7 +402,7 @@ extension CognitiveSubstrate {
                     cadenceKey: innerTakeawayCadenceKey(for: seed),
                     tier: .takeaway,
                     source: "seed:" + seed.id.uuidString,
-                    score: effectiveThoughtSeedPriority(seed, at: now))
+                    score: effectiveThoughtSeedPriority(seed, at: now), seedId: seed.id)
             }
             .filter { bypassInnerCadence || presentationState.innerLineRuns[$0.cadenceKey] == nil })
 
@@ -435,7 +435,7 @@ extension CognitiveSubstrate {
                     cadenceKey: "thread:" + candidate.seedId.uuidString,
                     tier: .thread,
                     source: candidate.externalId.map { "external:" + $0 } ?? "seed:" + candidate.seedId.uuidString,
-                    score: candidate.weight)
+                    score: candidate.weight, seedId: candidate.seedId)
             })
         let suppressions = frozenRead?.associationSuppressions ?? associationSuppressions
         innerCandidates.removeAll { candidate in
@@ -460,6 +460,7 @@ extension CognitiveSubstrate {
             why.chosenInner = chosen.cadenceKey
             why.sources[innerLine] = chosen.source
             why.scores[innerLine] = chosen.score
+            why.seedIds[innerLine] = chosen.seedId
         }
         let bodyLine = organismBodyLine(from: request.organismProjection)
         // SETTLING (2026-08-23, range bench scenario #2): the slow layer is still
@@ -619,6 +620,7 @@ extension CognitiveSubstrate {
     /// are produced. Trace only: none of it reaches the prompt.
     struct CapsuleCueWhy: Sendable {
         var sources: [String: String] = [:]
+        var seedIds: [String: UUID] = [:]
         var scores: [String: Double] = [:]
         var inner: [InnerCandidate] = []
         var chosenInner: String?
@@ -796,19 +798,16 @@ extension CognitiveSubstrate {
 
     private func innerStateProvenance(
         from workspaceItems: [CognitiveWorkspaceItem],
-        at now: Date,
-        thoughtSeeds explicitThoughtSeeds: [CognitiveThoughtSeed]? = nil,
-        trustedPeerIds: Set<String>? = nil
-    ) -> [UUID] {
+        thoughtSeeds: [CognitiveThoughtSeed],
+        renderedSeedIds: Set<UUID>
+    ) -> (nodeIds: [UUID], peerIds: [String]?) {
         var ids = workspaceItems.map(\.id)
-        for seed in explicitThoughtSeeds ?? projectedThoughtSeeds(at: now) {
-            if seed.kind == .reflectionTakeaway {
-                guard let peers = seed.sourcePeerIds,
-                      peers.allSatisfy({ trustedPeerIds?.contains($0) ?? dependencies.peerTrusted($0) }) else { continue }
-            }
+        var peers: [[String]?] = workspaceItems.map { Self.peerIdentity(metadata: $0.node.metadata).map { [$0] } ?? [] }
+        for seed in thoughtSeeds where renderedSeedIds.contains(seed.id) {
             ids.append(contentsOf: seed.sourceNodeIds)
+            peers.append(seed.sourcePeerIds ?? [])
         }
-        return unique(ids)
+        return (unique(ids), CognitiveReflectionCause.unionPeerIds(peers))
     }
 
     /// Production preparation seam: one immutable cognition epoch plus a pure
@@ -1040,11 +1039,12 @@ extension CognitiveSubstrate {
         return masked
     }
 
-    private func fitCapsuleLines(_ lines: [String], maxCharacters: Int) -> (text: String, truncated: Bool) {
+    private func fitCapsuleLines(_ lines: [String], maxCharacters: Int) -> (text: String, truncated: Bool, sources: [String]) {
         guard maxCharacters > 0 else {
-            return ("", !lines.isEmpty)
+            return ("", !lines.isEmpty, [])
         }
         var kept: [String] = []
+        var sources: [String] = []
         var used = 0
         for rawLine in lines {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1052,6 +1052,7 @@ extension CognitiveSubstrate {
             let separatorCost = kept.isEmpty ? 0 : 1
             if used + separatorCost + line.count <= maxCharacters {
                 kept.append(line)
+                sources.append(rawLine)
                 used += separatorCost + line.count
                 continue
             }
@@ -1064,11 +1065,12 @@ extension CognitiveSubstrate {
                 let clipped = capsuleLineText(line, maxCharacters: available)
                 if !clipped.isEmpty {
                     kept.append(clipped)
+                    sources.append(rawLine)
                 }
             }
-            return (kept.joined(separator: "\n"), true)
+            return (kept.joined(separator: "\n"), true, sources)
         }
-        return (kept.joined(separator: "\n"), false)
+        return (kept.joined(separator: "\n"), false, sources)
     }
 
     /// "- Settling:" — rendered only while the slow layer (mood valence, node-based)

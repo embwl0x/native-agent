@@ -67,7 +67,7 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         if let correlationID { body["correlationID"] = correlationID }
         if let metadata, !metadata.isEmpty { body["metadata"] = metadata }
         if let attachments, !attachments.isEmpty {
-            body["attachments"] = attachments.map { attachment in
+            body["attachments"] = try attachments.map { attachment in
                 var item: [String: Any] = [
                     "id": attachment.id,
                     "type": attachment.type,
@@ -80,6 +80,9 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
                 }
                 if let path = attachment.path, !path.isEmpty {
                     item["path"] = path
+                }
+                if let utterance = attachment.utterance {
+                    item["utterance"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(utterance))
                 }
                 return item
             }

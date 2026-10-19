@@ -1,9 +1,6 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-#if canImport(AppKit)
-import AppKit
-#endif
 
 extension MacFourVerbs {
     // MARK: 3 — LEGS
@@ -25,6 +22,8 @@ extension MacFourVerbs {
         // discover a fifth tool or translate `loginwindow` into that action.
         // A foreground move needs the screen, so the wake owner clears a covered
         // screen and steps her windows aside before it; behind, nothing is raised.
+        // While Shotgun is up the person has handed her the screen: she goes there.
+        let front = front || PersonOnlyWindows.isShowing
         let placement: [String: JSONValue] = front ? ["require_front": .bool(true)] : ["background": .bool(true)]
         func opening(_ url: URL) -> [String: JSONValue] { placement.merging(["url": .string(url.absoluteString)]) { _, new in new } }
         func covered(_ result: MacControlResult) -> MacFourVerbsReply? {
@@ -37,7 +36,7 @@ extension MacFourVerbs {
         var landingApp: String?
 
         let result: MacControlResult
-        let moved: String
+        var moved: String
         var verificationDestination = trimmed
         var settlesAsynchronously = false
         if let url = Self.webURL(trimmed) ?? Self.settingsPaneURL(trimmed) {
@@ -47,7 +46,6 @@ extension MacFourVerbs {
                 return await landingFailure("I couldn't ask the Mac to open that link.")
             }
             moved = "The Mac accepted the request to open \(trimmed)."
-            landingApp = Self.handlerApp(url)
             settlesAsynchronously = true
         } else if let path = Self.filePath(trimmed) ?? namedLocationRoots.first(where: {
             $0.lastPathComponent.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
@@ -58,7 +56,6 @@ extension MacFourVerbs {
                 return await landingFailure("I couldn't ask the Mac to open that path.")
             }
             moved = "The Mac accepted the request to open \(path.path)."
-            landingApp = Self.handlerApp(path)
             verificationDestination = path.path
             settlesAsynchronously = true
         } else {
@@ -78,7 +75,7 @@ extension MacFourVerbs {
                     landingApp = verificationDestination
                     moved = front ? "Switched to \(trimmed)."
                         : out["launched"] == .bool(true) ? "Launched \(trimmed) without activating it."
-                        : "\(trimmed) is running; I activated nothing."
+                        : "Reopened \(trimmed) without activating it."
                     settlesAsynchronously = true
                 } else {
                     // Search folders only when no such app exists. An app that
@@ -91,7 +88,6 @@ extension MacFourVerbs {
                     case .unique(let folder):
                         result = try await host.dispatch(action: "open_target", body: opening(folder))
                         moved = "The Mac accepted the request to open \(folder.path)."
-                        landingApp = Self.handlerApp(folder)
                         verificationDestination = folder.path
                         settlesAsynchronously = true
                     case .ambiguous(let parents):
@@ -116,6 +112,13 @@ extension MacFourVerbs {
         }
         guard !Task.isCancelled else { return MacFourVerbsReply(ok: false, text: "I stopped waiting for the app.") }
         if let refusal = covered(result) { return refusal }
+        if result.action == "open_target" {
+            let output = Self.object(result.output)
+            landingApp = Self.string(output["bundle_identifier"]) ?? Self.string(output["matched_name"])
+            if result.ok, let receiver = Self.string(output["matched_name"]) ?? landingApp {
+                moved += " The receiving app is \(receiver)."
+            }
+        }
         if !front, landingApp == nil {
             return MacFourVerbsReply(ok: result.ok, text: result.ok ? moved + " Nothing came to the front."
                 : "I couldn't complete the request to go to \(trimmed).", detail: Self.operationDetail(result))
@@ -131,24 +134,14 @@ extension MacFourVerbs {
             await clock.sleep(seconds: 0.5)
             landing = await sight(part: nil, app: landingApp)
         }
-        // 2026-09-22: an app raised with every window closed stays windowless
-        // until reopened. Opening its bundle while it runs makes Launch
-        // Services send kAEReopenApplication, the Dock-click event. Once.
-        if !Task.isCancelled, case .blind(let reply) = landing, reply.detail["error"] == windowless,
-           result.ok, result.action == "focus_app",
-           case .object(let out) = result.output, case .string(let bundle)? = out["bundle_identifier"],
-           let appURL = Self.applicationURL(bundleIdentifier: bundle) {
-            _ = try? await host.dispatch(action: "open_target", body: opening(appURL))
-            await clock.sleep(seconds: 0.5)
-            landing = await sight(part: nil, app: landingApp)
-        }
         switch landing {
         case .blind(let reply):
-            var detail = Self.operationDetail(result).merging(reply.detail) { current, _ in current }
+            var detail = reply.detail
+            detail["navigation"] = .object(Self.operationDetail(result).merging(["ok": .bool(result.ok)]) { _, new in new })
             let ownWindow = reply.detail["status"] == .string("in_process_route")
             if ownWindow, !result.ok { detail["execute_in_process"] = .bool(false) }
             return MacFourVerbsReply(
-                ok: result.ok,
+                ok: result.ok && reply.ok,
                 text: (result.ok ? moved : "I couldn't confirm that I got to \(trimmed).")
                     + " " + (ownWindow ? "My own window uses in-process page inspection." : reply.text),
                 detail: detail
@@ -194,24 +187,6 @@ extension MacFourVerbs {
     // Three shapes, tested in order, with no app-name branch anywhere: a URL
     // with a web scheme, a path or common home folder, then an app NAME
     // (running first, then installed). Other folder names use the bounded search.
-
-    /// The app that receives this link or path, independent of activation.
-    static func handlerApp(_ url: URL) -> String? {
-        #if canImport(AppKit)
-        if url.isFileURL, url.pathExtension.lowercased() == "app" { return Bundle(url: url)?.bundleIdentifier }
-        return NSWorkspace.shared.urlForApplication(toOpen: url).flatMap { Bundle(url: $0)?.bundleIdentifier }
-        #else
-        return nil
-        #endif
-    }
-
-    static func applicationURL(bundleIdentifier: String) -> URL? {
-        #if canImport(AppKit)
-        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
-        #else
-        return nil
-        #endif
-    }
 
     static func webURL(_ text: String) -> URL? {
         guard let url = URL(string: text), let scheme = url.scheme?.lowercased() else { return nil }

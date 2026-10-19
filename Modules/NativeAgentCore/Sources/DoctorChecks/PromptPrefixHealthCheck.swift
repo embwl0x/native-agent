@@ -205,16 +205,18 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         }
 
         // Rule 3: an input we could not read is never a clean number.
-        if !summary.unreadableDays.isEmpty {
-            return CheckResult(
+        if let day = summary.unreadableDays.first {
+            let file = root.appendingPathComponent("turn_traces/\(day).jsonl")
+            return CheckResult(source: file.path,
+                nextCall: ToolFailureError.fileRepairCall(file, dataRoot: root,
+                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."),
                 id: id, title: title, status: "fail",
                 detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
                     + " not be read (\(summary.unreadableDays.joined(separator: ", ")))."
                     + " Prefix-cache health is UNMEASURED \(window.describedAs) — this row"
                     + " is not reporting zero problems, it is reporting that it could not"
                     + " look.",
-                harm: "Prefix reuse problems cannot be diagnosed from the saved turns.",
-                repair: "Check permissions and encoding on data/turn_traces/<day>.jsonl."
+                harm: "Prefix reuse problems cannot be diagnosed from the saved turns."
             )
         }
 
@@ -237,7 +239,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             + " below \(minimumCacheInputTokens) input tokens (too small to judge cache reuse)."
 
         if summary.isEmptyFeed {
-            return CheckResult(
+            return CheckResult(source: "turn_traces/",
                 id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
                     + " data/turn_traces. Prefix-cache health has not been observed."
@@ -246,7 +248,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             )
         }
         guard !v2FirstCalls.isEmpty else {
-            return CheckResult(
+            return CheckResult(source: "turn_traces/",
                 // A bounded tail is not a failed measurement before the first eligible turn.
                 id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
@@ -504,11 +506,13 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             status = "unmeasured"
         }
 
-        return CheckResult(
+        return CheckResult(source: "turn_traces/",
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
             harm: DoctorSafeRepairPolicy.isAdverse(status) ? "Repeated prompt processing uses extra provider time and tokens." : nil,
-            repair: repair
+            repair: repair,
+            // A measured miss is the prompt assembly's: the build fixes it.
+            owner: DoctorSafeRepairPolicy.isAdverse(status) ? .builder : nil
         )
     }
 

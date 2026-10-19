@@ -19,18 +19,18 @@ import SwarmRuns
 import MacIntegration
 
 extension SwiftToolDispatcher {
-    // MARK: - Claude return-channel handler
-    //
-    // Bridge's her→me path. Agent calls `claude_message` (or agent_message to
-    // claude) to send Claude a message. It is appended to
-    // ~/.config/claude-bridge/claude-inbox.jsonl, which the live Claude
-    // session reads. Nothing is launched: Claude answers from that session
-    // over the bridge, as a chat of her own (User, 10-02: no headless Claude).
+    // A carried inbox door is read by its live session; it never starts a headless run.
     func runClaudeMessage(
         input: [String: JSONValue],
         surface: String = "chat",
         configRootOverride: URL? = nil
     ) async throws -> JSONValue {
+        let target = Self.stringField("agent", in: .object(input)) ?? "claude"
+        guard let door = AgentConversationDelivery.door(for: target, dataRoot: dataRoot, bridgeConfigRoot: configRootOverride), door.liveReader,
+              let who = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { ($0.handles ?? []).contains(door.handle) }) else {
+            throw ToolFailureError("No contact carries this inbox door.", effects: .none, owner: "Saved agent contacts", nextCall: ToolFailureError.call("app", ["action": .string("agent.contacts")]))
+        }
+        let inboxURL = door.inbox
         guard case .string(let text)? = input["text"], !text.isEmpty else {
             return .object([
                 "status": .string("failed"),
@@ -72,8 +72,7 @@ extension SwiftToolDispatcher {
 
         let originSessionId = Self.extractSessionId(from: input)
         let origin = Self.agentBridgeReplyOrigin(surface: surface, route: ChatToolSessionContext.replyRoute)
-        let dir = Self.bridgeConfigDirectory(named: "claude-bridge", configRootOverride: configRootOverride)
-        let inboxURL = dir.appendingPathComponent("claude-inbox.jsonl")
+        let dir = inboxURL.deletingLastPathComponent()
 
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -147,27 +146,30 @@ extension SwiftToolDispatcher {
                 "messageId": .string(messageId),
             ])
         }
-        // Inbox delivery does not start her live session.
         var response: [String: JSONValue] = [
-            "status": .string("delivered"),
+            "status": .string("queued"),
+            "sent": .bool(true),
+            "completed": .bool(false),
+            "read": .bool(false),
             "messageId": .string(messageId),
             "deduplicated": .bool(appendResult.status == "duplicate"),
             "filePath": .string(inboxURL.path),
             "priority": .string(priority),
             "queuedAt": .string(appendResult.queuedAt),
-            "detail": .string("Delivered to Claude's inbox. Her reply arrives when her live session reads and answers it; no session was started. Read the linked reply with app {action:\"agent.read\",args:{agent:\"claude\",message_id:\"\(messageId)\"}}."),
+            "detail": .string("Queued for \(who.name); acceptance is owed until its live session reads this message. Open that session and read this exact message with agent.read; do not resend it."),
+            "remedy": door.remedy(),
         ]
         Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
         if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
-            response["detail"] = .string((Self.stringField("detail", in: .object(response)) ?? "") + " desk_item '\(droppedDeskItem)' is not a live Desk item; the message was delivered without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
+            response["detail"] = .string((Self.stringField("detail", in: .object(response)) ?? "") + " desk_item '\(droppedDeskItem)' is not a live Desk item; the message was queued without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
         }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
         if let conversationId = conversation.conversationId {
             response["conversationId"] = .string(conversationId)
-            response["replyWith"] = .string("claude.say")
+            response["replyWith"] = .string("agent.message")
         }
         return .object(response)
     }

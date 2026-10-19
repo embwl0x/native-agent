@@ -841,7 +841,7 @@ struct InboxView: View {
     /// a dismissed card must not inflate the segment it sits behind.
     private func laneLabel(_ candidate: InboxLane) -> String {
         let unread = InboxLanePresentation.unreadVisibleCount(in: candidate, items: inboxLoadState.items)
-        return unread > 0 ? "\(candidate.title) (\(unread))" : candidate.title
+        return unread > 0 ? "\(candidate.title) (\(unread) unread)" : candidate.title
     }
 
     func load() async {

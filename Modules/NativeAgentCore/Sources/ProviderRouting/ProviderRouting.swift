@@ -52,6 +52,81 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             .appendingPathComponent("pending-surface-configuration.json")
     }
 
+    /// Read the reconstruction input without requiring the damaged state to decode.
+    public func routingRepairInput() async throws -> JSONValue {
+        let transactionPath = surfaceTransactionPath
+        return try await persistence.withFileLock(transactionPath) {
+            var fields: [String: JSONValue] = [:]
+            for (key, path) in [("surfaces", self.surfacesPath), ("active", self.activeProviderPath),
+                                ("pending", transactionPath)] {
+                fields[key + "BaseHash"] = try Self.fileSHA256(path).map(JSONValue.string) ?? .null
+                if FileManager.default.fileExists(atPath: path.path) {
+                    fields[key + "Bytes"] = .string(try Data(contentsOf: path).base64EncodedString())
+                }
+            }
+            return .object(fields)
+        }
+    }
+
+    /// An explicit complete replacement, guarded by the bytes inspected by the caller.
+    /// The old projections and intent remain beside their files, named by digest.
+    public func reconstructRouting(_ input: JSONValue) async throws {
+        guard case .object(let fields) = input,
+              case .object(let surfaces)? = fields["surfaces"],
+              case .object(let active)? = fields["active"],
+              surfaces["chat"] != nil, active["chat"] != nil else {
+            throw ProviderRoutingError.configurationFailed("Reconstruction needs complete surfaces and active objects, including Chat, and the three BaseHash values from providers.routing_repair.")
+        }
+        try Self.validateSurfacePreferences(surfaces)
+        let routes = try Self.loadActiveProviderObjectChecked(active)
+        guard Set(surfaces.keys) == Set(routes.keys), surfaces.keys.allSatisfy(MODEL_SURFACES.contains) else {
+            throw ProviderRoutingError.configurationFailed("Reconstruction needs an explicit model and account for every selected surface.")
+        }
+        let providers = try nativeListProviders(
+            openRouterModels: OpenRouterModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() },
+            moonshotModels: MoonshotModelCatalog.readCache(dataRoot: dataRoot)?.map { $0.providerJSON() }
+        ).providers
+        for (surface, value) in surfaces {
+            let model: String?
+            switch value {
+            case .string(let selected): model = selected
+            case .object(let selected):
+                if case .string(let id)? = selected["model"] { model = id } else { model = nil }
+            default: model = nil
+            }
+            guard let model, let route = routes[surface],
+                  let provider = providers.first(where: { $0.id == route }), provider.configured == true,
+                  case .array(let models)? = provider.modelCatalog,
+                  models.contains(where: { if case .object(let row) = $0 { return row["id"] == .string(model) }; return false }) else {
+                throw ProviderRoutingError.configurationFailed("Reconstruction needs a connected account and an available model for \(surface).")
+            }
+        }
+        let transactionPath = surfaceTransactionPath
+        try await persistence.withFileLock(transactionPath) {
+            for (key, path) in [("surfaces", self.surfacesPath), ("active", self.activeProviderPath),
+                                ("pending", transactionPath)] {
+                let hash = try Self.fileSHA256(path)
+                guard fields[key + "BaseHash"] == (hash.map(JSONValue.string) ?? .null) else {
+                    throw ProviderRoutingError.configurationFailed("Provider routing changed after inspection. Read providers.routing_repair again; nothing was replaced.")
+                }
+            }
+            try Task.checkCancellation()
+            for path in [self.surfacesPath, self.activeProviderPath, transactionPath] {
+                guard let hash = try Self.fileSHA256(path) else { continue }
+                let saved = path.appendingPathExtension("repair-" + hash)
+                if !FileManager.default.fileExists(atPath: saved.path) {
+                    try FileManager.default.copyItem(at: path, to: saved)
+                } else if try Data(contentsOf: saved) != Data(contentsOf: path) {
+                    throw ProviderRoutingError.configurationFailed("The preserved routing bytes do not match their digest; nothing was replaced.")
+                }
+            }
+            try await self.commitPickerStateLocked(PendingSurfaceConfiguration(
+                surfacesBaseHash: try Self.fileSHA256(self.surfacesPath),
+                activeBaseHash: try Self.fileSHA256(self.activeProviderPath), surfaces: surfaces, active: active
+            ))
+        }
+    }
+
     /// Provider state is bootstrap-empty only when absent. Existing unreadable,
     /// malformed, or wrong-shaped bytes are unavailable and must never be
     /// rewritten by a picker/config mutation as if they were missing.
@@ -68,21 +143,34 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         do {
             data = try Data(contentsOf: path)
         } catch {
-            throw ProviderRoutingError.underlying("saved \(description) state is unreadable")
+            throw providerStateFailure(at: path, description: description, detail: "is unreadable")
         }
         let value: JSONValue
         do {
             value = try JSONDecoder().decode(JSONValue.self, from: data)
         } catch {
-            throw ProviderRoutingError.underlying("saved \(description) state is malformed")
+            throw providerStateFailure(at: path, description: description, detail: "is malformed")
         }
         guard case .object(let object) = value else {
-            throw ProviderRoutingError.underlying("saved \(description) state must be a JSON object")
+            throw providerStateFailure(at: path, description: description, detail: "must be a JSON object")
         }
         if description == "surface preference" {
-            try validateSurfacePreferences(object)
+            do { try validateSurfacePreferences(object) }
+            catch { throw providerStateFailure(at: path, description: description, detail: error.localizedDescription) }
         }
         return object
+    }
+
+    private nonisolated static func providerStateFailure(at path: URL, description: String, detail: String) -> Error {
+        guard ["surface preference", "active-provider", "pending provider selection"].contains(description) else {
+            return ProviderRoutingError.underlying("saved \(description) state \(detail)")
+        }
+        let generation = (try? fileSHA256(path)) ?? "unreadable"
+        return ToolFailureError(
+            "Saved \(description) state \(detail). Inspect providers.routing_repair, then set its JSON text with the inspected BaseHash values and explicitly chosen complete surfaces and active objects. Original bytes are retained by digest; inspection does not repair routing.",
+            effects: .none, owner: "\(path.path) generation \(generation)",
+            nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string("providers.routing_repair")])])
+        )
     }
 
     private nonisolated static func validateSurfacePreferences(_ root: [String: JSONValue]) throws {
@@ -107,7 +195,8 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         at path: URL
     ) throws -> [String: String] {
         let raw = try loadProviderStateObjectChecked(at: path, description: "active-provider")
-        return try loadActiveProviderObjectChecked(raw)
+        do { return try loadActiveProviderObjectChecked(raw) }
+        catch { throw providerStateFailure(at: path, description: "active-provider", detail: error.localizedDescription) }
     }
 
     public nonisolated static func validateProviderConfiguration(_ fields: [String: JSONValue]) throws {
@@ -302,34 +391,26 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
             at: surfaceTransactionPath,
             description: "pending provider selection"
         )
-        let pending = try PendingSurfaceConfiguration(json: raw)
+        let pending: PendingSurfaceConfiguration
+        do { pending = try PendingSurfaceConfiguration(json: raw) }
+        catch { throw Self.providerStateFailure(at: surfaceTransactionPath, description: "pending provider selection", detail: error.localizedDescription) }
 
-        let currentSurfaces = try Self.loadProviderStateObjectChecked(
-            at: surfacesPath,
-            description: "surface preference"
-        )
-        let currentActiveObject = try Self.loadProviderStateObjectChecked(
-            at: activeProviderPath,
-            description: "active-provider"
-        )
-        _ = try Self.loadActiveProviderObjectChecked(currentActiveObject)
-
-        let surfacesRecoverable = try currentSurfaces == pending.surfaces
-            || Self.fileSHA256(surfacesPath) == pending.surfacesBaseHash
-        let activeRecoverable = try currentActiveObject == pending.active
-            || Self.fileSHA256(activeProviderPath) == pending.activeBaseHash
-        guard surfacesRecoverable, activeRecoverable else {
-            throw ProviderRoutingError.underlying(
-                "pending provider selection conflicts with newer provider state"
-            )
+        let surfacesAtBase = try Self.fileSHA256(surfacesPath) == pending.surfacesBaseHash
+        let activeAtBase = try Self.fileSHA256(activeProviderPath) == pending.activeBaseHash
+        let surfacesAtTarget = try surfacesAtBase || Self.loadProviderStateObjectChecked(
+            at: surfacesPath, description: "surface preference") == pending.surfaces
+        let activeAtTarget = try activeAtBase || Self.loadProviderStateObjectChecked(
+            at: activeProviderPath, description: "active-provider") == pending.active
+        guard surfacesAtTarget, activeAtTarget else {
+            throw Self.providerStateFailure(at: surfaceTransactionPath, description: "pending provider selection", detail: "conflicts with newer provider state")
         }
 
-        if currentSurfaces != pending.surfaces {
+        if surfacesAtBase {
             try await persistence.withFileLock(surfacesPath) {
                 try await self.persistence.writeJSON(.object(pending.surfaces), to: self.surfacesPath)
             }
         }
-        if currentActiveObject != pending.active {
+        if activeAtBase {
             try await persistence.withFileLock(activeProviderPath) {
                 try await self.persistence.writeJSON(.object(pending.active), to: self.activeProviderPath)
             }
@@ -726,13 +807,9 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
                 at: self.surfacesPath,
                 description: "surface preference"
             )
-            let originalActive = try Self.loadProviderStateObjectChecked(
-                at: self.activeProviderPath,
-                description: "active-provider"
-            )
-            let active = WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(
-                try Self.loadActiveProviderObjectChecked(originalActive)
-            )
+            let savedActive = try Self.loadActiveProviderStateChecked(at: self.activeProviderPath)
+            let originalActive = savedActive.mapValues(JSONValue.string)
+            let active = WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(savedActive)
             let current = model != nil && !clearOverride ? await self.selectionRoutingSnapshot(
                 surfaces: WorkshopSurfaceVocabulary.canonicalizeSurfaceKeys(originalSurfaces),
                 active: active
@@ -967,7 +1044,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         for id in ids {
             if let error = cache.reads[id]?.unreadable { throw ProviderRoutingError.underlying(error) }
             var row = byId[id] ?? Provider(id: id)
-            row.displayName = Self.connectableProviderIds.contains(id) ? displayName(for: id) : (row.displayName ?? displayName(for: id))
+            row.displayName = Self.connectableProviderIds.contains(id) ? Self.displayName(for: id) : (row.displayName ?? Self.displayName(for: id))
             row.kind = id.contains("oauth") || id == "codex" ? "oauth" : "api_key"
             // Preserve custom registry catalogs; shipped routes always use current catalogs.
             if Self.connectableProviderIds.contains(id) || row.modelCatalog == nil {
@@ -1097,7 +1174,7 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         }
     }
 
-    private nonisolated func displayName(for id: String) -> String {
+    nonisolated static func displayName(for id: String) -> String {
         switch id {
         case "openai": return "OpenAI (API key)"
         case "openai_oauth_direct": return "ChatGPT (OAuth)"

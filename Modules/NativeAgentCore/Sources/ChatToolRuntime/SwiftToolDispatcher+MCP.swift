@@ -47,37 +47,30 @@ extension SwiftToolDispatcher {
         let dispatcher = SwiftNativeMCPDispatcher(root: dataRoot)
         let servers = try await dispatcher.listServers()
         guard let server = servers.first(where: { $0.id == serverId }) else {
-            throw AutonomyGateError.toolDenied(reason: "MCP server not found: \(serverId)")
-        }
-        guard server.status != "needs_setup", server.status != "error" else {
-            throw AutonomyGateError.toolDenied(reason: "MCP server unavailable: \(serverId) (\(server.status))")
+            throw ToolFailureError("MCP server not found: \(serverId)", argumentPath: "server_id", accepted: "an id from app {page:\"mcp\"}", effects: .none)
         }
         let admission = try await dispatcher.toolAdmission(
             server: server, toolName: toolName, surface: surface, presentsApproval: false
         ) { [self] tool, surface in
             await fullMacYoloAdmitted(tool: tool, surface: surface)
         }
+        let consentTap = "Advanced > MCP Hub > Servers > \(server.name) > Tools > \(toolName) > Edit > Grant consent"
         let effectiveRisk: String
         switch admission {
         case .allowed(let risk):
             effectiveRisk = risk
-        case .revoked:
-            throw AutonomyGateError.toolDenied(
-                reason: "MCP tool '\(serverId)/\(toolName)' consent was revoked; explicitly grant consent before execution"
-            )
-        case .unpinned:
-            throw AutonomyGateError.toolDenied(
-                reason: "MCP tool '\(serverId)/\(toolName)' has unpinned consent; resolve/pin its implementation and explicitly grant consent again"
-            )
-        case .requiresApproval(let risk):
-            let effectiveRisk = risk
-            throw AutonomyGateError.toolDenied(
-                reason: "MCP tool '\(serverId)/\(toolName)' requires approval before Swift execution (risk=\(effectiveRisk))"
-            )
-        case .pinRequired:
-            throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again")
-        case .unpinnedGrant:
-            throw AutonomyGateError.toolDenied(reason: "MCP server '\(serverId)' could not be pinned; resolve its implementation and explicitly grant consent again. For a public web page, read_page needs no consent.")
+        case .revoked, .requiresApproval:
+            return ChatToolOutcome.refusedBeforeRunning(.object([
+                "status": .string("denied"), "reason": .string("mcp_consent_required"),
+                "message": .string("MCP tool '\(serverId)/\(toolName)' needs the person's consent before it can run."),
+                "remedy": Repair.why(owner: "MCP consent \(serverId)/\(toolName)",
+                    tap: consentTap),
+            ]))
+        case .unpinned, .pinRequired, .unpinnedGrant:
+            let path = await dispatcher.serversPath.path
+            throw ToolFailureError("\(path): server '\(serverId)' has no pinned execution identity. Read its command and extras with next_call, then use files.patch to bind the executable and interpreter inputs to installed, versioned files. Reading does not pin it or grant consent; consent remains at \(consentTap).",
+                effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(path)])]))
         }
         // Strip the chat-surface session marker before forwarding: it's
         // injected into EVERY tool input for the lazy-load gate, and remote
@@ -91,7 +84,8 @@ extension SwiftToolDispatcher {
             )
             return Self.explainedMCPFailure(result, serverId: serverId, toolName: toolName, read: read)
         } catch {
-            if let result = Self.localMCPFailure(error, serverId: serverId, toolName: toolName, endpoint: server.endpoint) {
+            if let result = Self.localMCPFailure(error, serverId: serverId, toolName: toolName, endpoint: server.endpoint,
+                                               configuration: await dispatcher.serversPath.path, read: read) {
                 return result
             }
             if read {
@@ -155,7 +149,7 @@ extension SwiftToolDispatcher {
         return .object(outer)
     }
 
-    static func localMCPFailure(_ error: Error, serverId: String, toolName: String, endpoint: String?) -> JSONValue? {
+    static func localMCPFailure(_ error: Error, serverId: String, toolName: String, endpoint: String?, configuration: String, read: Bool) -> JSONValue? {
         let address: String
         if case ResearchClientError.localServerNotRunning(let url) = error {
             address = url
@@ -166,7 +160,12 @@ extension SwiftToolDispatcher {
         } else { return nil }
         return .object(["status": .string("failed"), "server": .string(serverId),
                         "reason": .string("server_not_running"),
-                        "detail": .string("Local server for \(serverId) at \(address) is not running. Start or reconnect that server, then retry.")])
+                        "effects": .string(read ? "none" : "unknown"),
+                        "detail": .string("Local server for \(serverId) at \(address) is not accepting connections. Its registration is \(configuration)."),
+                        "remedy": .object(["kind": .string("inspect"),
+                            "instruction": .string("Read the server registration with next_call. Correct a wrong endpoint with files.patch, or start the independently hosted service with its own launch command through shell.run. MCP restart does not start an HTTP service; do not guess its launch command."),
+                            "next_call": .object(["tool": .string("app"), "input": .object([
+                                "action": .string("files.read"), "args": .object(["path": .string(configuration)])])])])])
     }
 
     func fullMacYoloAdmitted(tool: String, surface: String) async -> Bool {

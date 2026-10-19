@@ -16,6 +16,7 @@ import Desk
 import AttentionRouting
 import Privacy
 import ProviderRouting
+import Experiences
 
 // MARK: - Maintenance Loops
 
@@ -59,9 +60,9 @@ public struct MaintenanceBackgroundWork: Sendable {
     public func fileDoctorAsk(dataRoot: URL, rows: [CheckResult]) async -> Bool {
         let cardID = "doctor-ask"
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
-        let asks = rows.filter(DoctorSafeRepairPolicy.isUserAsk).compactMap { row in
+        let asks = Set(rows.filter(DoctorSafeRepairPolicy.isUserAsk).compactMap { row in
             row.human_action.map { "• \(row.title): \($0)" }
-        }.sorted()
+        }).sorted()
         do {
             guard !asks.isEmpty else {
                 // Cleared whatever User did with the card (read, archived or
@@ -130,59 +131,6 @@ public struct MaintenanceBackgroundWork: Sendable {
             nativeLog("[Doctor] sign-in ask card write failed: %@", error.localizedDescription)
             return false
         }
-    }
-
-    /// Findings have one Desk identity. Only a non-adverse reading heals it;
-    /// an adverse check with no stated harm is itself a builder finding.
-    public static func routeDoctorRows(_ rows: [CheckResult], dataRoot: URL) async -> Set<String> {
-        var routed = Set<String>()
-        var healed: [String] = []
-        for row in rows {
-            guard DoctorSafeRepairPolicy.isAdverse(row.status) else {
-                healed.append(row.id)
-                continue
-            }
-            let owner = DoctorOwner.of(row, repairAvailable: row.repair_available == true) ?? .builder
-            switch owner {
-            case .agent, .builder:
-                do {
-                    let item = try await HarnessQueue.file(HarnessFinding(
-                        key: row.id,
-                        title: "Doctor: \(row.title)",
-                        summary: row.detail + (row.harm.map { "\n" + $0 } ?? "") + (row.human_action.map { "\n" + $0 } ?? ""),
-                        owner: owner == .agent ? .agent : .builder,
-                        refs: [DeskRef(kind: .file(path: dataRoot.appendingPathComponent("doctor/latest.json").path,
-                                                   line: nil, label: "Doctor check \(row.id)"))],
-                        source: .doctor
-                    ), dataRoot: dataRoot, refreshRefs: true)
-                    try await HarnessQueue.fold(keyPrefixes: [row.id + "|"], into: item.title, dataRoot: dataRoot)
-                } catch DeskError.findingArchived {
-                    // The existing archive already holds this Doctor finding's route.
-                } catch {
-                    nativeLog("[Doctor] could not file %@ on the harness queue: %@", row.id, error.localizedDescription)
-                    continue
-                }
-                routed.insert(row.id)
-                ResidentWake.shared.clear(dataRoot: dataRoot, key: "doctor." + row.id)
-            default:
-                break
-            }
-        }
-        let waking = Set(ResidentWake.homeItems(dataRoot).compactMap(\.key))
-        for id in healed where waking.contains("doctor." + id) {
-            ResidentWake.shared.clear(dataRoot: dataRoot, key: "doctor." + id)
-        }
-        do {
-            for id in Set(healed) {
-                try await HarnessQueue.resolve(key: id, note: "Doctor no longer reports \(id) as adverse.", dataRoot: dataRoot)
-            }
-            try await HarnessQueue.resolve(keyPrefixes: Dictionary(uniqueKeysWithValues: Set(healed).map {
-                ($0 + "|", "Doctor no longer reports \($0) as adverse.")
-            }), dataRoot: dataRoot)
-        } catch {
-            nativeLog("[Doctor] could not resolve healed harness items: %@", error.localizedDescription)
-        }
-        return routed
     }
 
     /// The mounted six-hour retention wake handles date-named trace expiry,
@@ -431,13 +379,7 @@ public struct MaintenanceBackgroundWork: Sendable {
         }.map { ($0.id, $0.content) })
     }
 
-    /// Daily disk-hygiene watchdog. Walks `dataRoot` once per day and, when a
-    /// single file exceeds 1GB or the tree exceeds 2GB, files ONE notification
-    /// card listing the offenders. The loop itself NEVER deletes anything — the
-    /// card's "Clean Up" action (user click, `cleanUpDiskHygiene`) is the only
-    /// path that moves files, and only to the Trash. Dependency-clean: the
-    /// inbox write is an injected closure wired to the same `notifications/inbox.jsonl`
-    /// upsert path HeartbeatLoop uses.
+    /// Daily read-only accounting; only the card's action executes owner reclamation plans.
     public func makeDataRootDiskHygieneLoop(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> DataRootDiskHygieneCheck {
@@ -461,220 +403,199 @@ public struct MaintenanceBackgroundWork: Sendable {
 
     public let diskHygieneCardId = "disk-hygiene"
 
-    /// Upsert ONE stable disk-hygiene card to `notifications/inbox.jsonl`, keyed
-    /// by a fixed id so the daily re-check updates one card instead of stacking
-    /// duplicates. Mirrors `upsertHeartbeatNoticeCard`. The scan never deletes
-    /// anything — the card carries a "Clean Up" action so the human has the
-    /// lever, and an archived card STAYS archived while the finding is
-    /// unchanged (an identical daily re-scan must not resurrect it; a changed
-    /// report should).
-    // Internal (not private) so the sticky-archive contract test can drive the
-    // real upsert path — the tooth for "an unchanged re-scan must not
-    // resurrect an archived card."
+    private func diskStorageOwners(dataRoot: URL) -> [DiskStorageOwner] {
+        port.diskStorageOwners(dataRoot: dataRoot) + [
+            DiskStorageOwner(id: "residue", plan: {
+                let roots = DataRootDiskHygiene.residueRelativePrefixes
+                var candidates: [String: DiskStorageOwner.Candidate] = [:]
+                for path in roots where FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent(path).path) {
+                    candidates[path] = try DiskStorageOwner.candidate(path, dataRoot: dataRoot)
+                }
+                return DiskStorageOwner.Plan(owner: "residue", roots: roots,
+                    policy: "Unused HuggingFace residue moves to Trash.", candidates: candidates)
+            }, reclaim: { saved in
+                saved.candidates.sorted(by: { $0.key < $1.key }).map { path, token in
+                    guard DataRootDiskHygiene.residueRelativePrefixes.contains(path) else {
+                        return DiskStorageOwner.Outcome(relativePath: path, skippedReason: "not declared by this owner; kept")
+                    }
+                    return DiskStorageOwner.trash(path, candidate: token, dataRoot: dataRoot)
+                }
+            })
+        ]
+    }
+
     public func fileDiskHygieneNotice(dataRoot: URL, report: DiskHygieneReport) async -> Bool {
-        // Re-validate before writing (gpt-5.5 review: a user-initiated Clean Up
-        // can land between this tick's scan and this write; a card listing
-        // already-trashed files would sit stale for a day). Offenders that no
-        // longer exist are dropped; if nothing actionable remains, skip the
-        // write entirely and keep whatever card is already there.
-        let report = DiskHygieneReport(
-            largeFiles: report.largeFiles.filter {
-                FileManager.default.fileExists(
-                    atPath: dataRoot.appendingPathComponent($0.relativePath).path)
-            },
-            totalBytes: report.totalBytes,
-            totalOverBudget: report.totalOverBudget,
-            truncated: report.truncated,
-            depthTruncated: report.depthTruncated,
-            readFailed: report.readFailed,
-            largeDirectories: report.largeDirectories.filter {
-                FileManager.default.fileExists(
-                    atPath: dataRoot.appendingPathComponent($0.relativePath).path)
-            },
-            staticModelBytes: report.staticModelBytes
-        )
         guard report.tripped else {
             guard !report.truncated, !report.depthTruncated, !report.readFailed else { return true }
             do {
                 let now = Date()
                 _ = try await LiveNotificationInbox.live(dataRoot: dataRoot).archiveActive(
                     ids: [diskHygieneCardId], readAt: now.ISO8601Format(), createdNoLaterThan: now,
-                    metadata: ["automatically_resolved": .bool(true)]
-                )
+                    metadata: ["automatically_resolved": .bool(true), "actions": .array([]), "cleanup_plans": .array([])])
                 return true
             } catch {
                 nativeLog("Disk hygiene: resolved notice could not be archived: %@", String(describing: error))
                 return false
             }
         }
-        let now = ISO8601DateFormatter().string(from: Date())
-        var lines: [String] = []
-        if report.totalOverBudget {
-            lines.append("data/ dynamic storage is \(DataRootDiskHygiene.humanSize(report.dynamicBytes)) "
-                + "(over the \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget).")
+        var plans: [DiskStorageOwner.Plan] = []
+        var notes: [String] = []
+        for owner in diskStorageOwners(dataRoot: dataRoot) {
+            do { plans.append(try await owner.plan()) }
+            catch { notes.append("\(owner.id) kept: \(error.localizedDescription)") }
         }
-        if report.staticModelBytes > 0 {
-            lines.append("Required embedding model: \(DataRootDiskHygiene.humanSize(report.staticModelBytes)) "
-                + "(accounted separately from dynamic storage).")
+        if report.truncated || report.depthTruncated || report.readFailed {
+            notes.append("Storage accounting is incomplete; usage may be undercounted or required assets unclassified. Cleanup amounts come from complete owner plans.")
         }
-        for offender in report.largeDirectories.prefix(10) {
-            // A residue store is listed at ANY size and is not a "large branch"
-            // finding at all — it is a directory that must not be here. Say
-            // which one it is, or the card reads as ordinary growth.
-            let residue = DataRootDiskHygiene.isResidue(relativePath: offender.relativePath)
-                ? " — residue: this store should not be here" : ""
-            lines.append("▸ \(offender.relativePath)/ — "
-                + "\(DataRootDiskHygiene.humanSize(offender.sizeBytes)) across the whole branch\(residue)")
+        var usage = report.storageBytes.filter { !$0.key.contains("/") }
+        for plan in plans {
+            var bytes: Int64 = 0
+            for root in plan.roots {
+                let size = report.storageBytes[root] ?? 0
+                bytes += size
+                let top = String(root.split(separator: "/").first ?? "")
+                usage[top, default: 0] -= size
+            }
+            usage[plan.owner, default: 0] += bytes
         }
-        for offender in report.largeFiles.prefix(20) {
-            lines.append("• \(offender.relativePath) — \(DataRootDiskHygiene.humanSize(offender.sizeBytes))")
+        let reclaimable = plans.reduce(Int64(0)) { sum, plan in
+            sum + plan.candidates.values.reduce(0) { $0 + $1.sizeBytes }
         }
-        if report.truncated {
-            lines.append("(scan hit its file budget — totals may undercount; largest offenders shown)")
+        let finding = (usage.filter { $0.value > DataRootDiskHygiene.defaultDirectoryThreshold }
+            .keys.sorted() + (report.totalOverBudget ? ["dynamic"] : [])
+            + report.largeFiles.map { "file:\($0.relativePath)" }.sorted()
+            + plans.filter { !$0.candidates.isEmpty }.map { "reclaim:\($0.owner)" }.sorted()
+            + ["reclaim-tier:\(reclaimable / DataRootDiskHygiene.defaultDirectoryThreshold)"])
+            .joined(separator: "|")
+        var lines = [
+            "Measured dynamic storage: \(DataRootDiskHygiene.humanSize(report.dynamicBytes)) / \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget (includes backups and derived data).",
+            "Required embedding model: \(DataRootDiskHygiene.humanSize(report.staticModelBytes)), outside that budget."
+        ]
+        for (owner, bytes) in usage.sorted(by: { $0.value > $1.value }) where bytes > 0 {
+            let plan = plans.first { $0.owner == owner }
+            let reclaim = plan?.candidates.values.reduce(Int64(0)) { $0 + $1.sizeBytes } ?? 0
+            let policy = plan?.policy ?? "Kept: app state without a recoverable cleanup policy."
+            lines.append("• \(owner): \(DataRootDiskHygiene.humanSize(bytes)); reclaimable \(DataRootDiskHygiene.humanSize(reclaim)). \(policy)")
         }
-        let detail = ("Large files and directories under the app data directory "
-            + "(nothing was deleted):\n"
-            + lines.joined(separator: "\n")
-            + "\n\nClean Up moves only disposable residue to the Trash (recoverable). Other app data is kept.")
-        let summary = report.totalOverBudget
-            ? "data/ dynamic storage is \(DataRootDiskHygiene.humanSize(report.dynamicBytes)); "
-                + "\(report.largeFiles.count) large file(s), "
-                + "\(report.largeDirectories.count) large director(ies)"
-            : "\(report.largeFiles.count) large file(s), "
-                + "\(report.largeDirectories.count) large director(ies) in data/"
-        let card: JSONValue = .object([
-            "id": .string(diskHygieneCardId),
-            "created_at": .string(now),
-            "source": .string("disk_hygiene"),
-            "severity": .string("actionable"),
-            "title": .string("Disk usage is piling up"),
-            "summary": .string(String(summary.prefix(500))),
-            "detail": .string(detail),
-            "related_mission_id": .null,
-            "related_approval_id": .null,
-            "related_paths": .array(report.largeFiles.prefix(20).map {
-                .string(dataRoot.appendingPathComponent($0.relativePath).path)
-            }),
-            "related_groups": .array([]),
-            "actions": .array([
-                .object(["id": .string("act"), "label": .string("Clean Up"),
-                         "description": .string("Move disposable residue to the Trash")]),
-                .object(["id": .string("archive"), "label": .string("Archive"),
-                         "description": .string("Archive this card")]),
-                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                         "description": .string("Dismiss this card")]),
-            ]),
-            "status": .string("unread"),
-            "read_at": .null,
-        ])
-        guard let inserted = await upsertDiskHygieneCard(
-            dataRoot: dataRoot, card: card, preserveStatusWhenDetailUnchanged: true)
-        else { return false }
-        if inserted {
-            await port.notifyIfAttentionWorthy(
-                dataRoot: dataRoot,
-                itemId: diskHygieneCardId,
-                title: "Disk usage is piling up",
-                summary: String(summary.prefix(500)),
-                source: "disk_hygiene",
-                severity: "actionable"
-            )
+        lines += plans.flatMap(\.notes) + notes
+        lines.append(reclaimable > 0
+            ? "Clean Up will move \(DataRootDiskHygiene.humanSize(reclaimable)) out of app storage to Trash, recoverably. Disk space remains occupied until you empty the Trash."
+            : "Nothing is safely reclaimable. All storage above is kept for the reasons shown; no Clean Up is offered.")
+        let summary = "Dynamic storage \(DataRootDiskHygiene.humanSize(report.dynamicBytes)); reclaimable \(DataRootDiskHygiene.humanSize(reclaimable))"
+        var actions: [JSONValue] = []
+        if reclaimable > 0 {
+            actions.append(.object(["id": .string("act"), "label": .string("Clean Up"),
+                "description": .string("Move the listed owner-approved bytes to Trash")]))
         }
-        return true
+        actions += [
+            .object(["id": .string("archive"), "label": .string("Archive"), "description": .string("Archive this card")]),
+            .object(["id": .string("dismiss"), "label": .string("Dismiss"), "description": .string("Dismiss this card")])
+        ]
+        do {
+            let card: JSONValue = .object([
+                "id": .string(diskHygieneCardId), "created_at": .string(Date().ISO8601Format()),
+                "source": .string("disk_hygiene"), "severity": .string(reclaimable > 0 ? "actionable" : "info"),
+                "title": .string("Disk usage is piling up"), "summary": .string(summary),
+                "detail": .string(lines.joined(separator: "\n")), "finding_identity": .string(finding),
+                "cleanup_plans": try JSONValue.fromEncodable(plans), "actions": .array(actions),
+                "related_paths": .array([]), "related_groups": .array([]),
+                "related_mission_id": .null, "related_approval_id": .null,
+                "status": .string("unread"), "read_at": .null])
+            guard let notify = await upsertDiskHygieneCard(dataRoot: dataRoot, card: card, preserveStatus: true,
+                scanStartedAt: report.startedAt) else { return false }
+            if notify {
+                await port.notifyIfAttentionWorthy(dataRoot: dataRoot, itemId: diskHygieneCardId,
+                    title: "Disk usage is piling up", summary: summary, source: "disk_hygiene",
+                    severity: reclaimable > 0 ? "actionable" : "info")
+            }
+            return true
+        } catch {
+            nativeLog("Disk hygiene: plan could not be saved: %@", String(describing: error))
+            return false
+        }
     }
 
-    /// User clicked "Clean Up" on the disk-hygiene card. Re-scans `dataRoot`
-    /// (the card may be up to a day stale), moves only declared residue to the
-    /// Trash via `DataRootDiskHygiene.cleanup` (reversible; protected stores
-    /// and anything outside the data root are refused), then rewrites the card
-    /// with the results, marked read. Throws when there were offenders but
-    /// nothing could be moved, so the button surfaces failure instead of a
-    /// silent green. This is the ONLY deletion path — no loop calls it.
-    public func cleanUpDiskHygiene(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) async throws -> String {
-        let report = DataRootDiskHygiene.scan(dataRoot: dataRoot)
-        let residuePaths = report.largeDirectories
-            .filter { DataRootDiskHygiene.isResidue(relativePath: $0.relativePath) }
-            .map(\.relativePath)
-        let now = ISO8601DateFormatter().string(from: Date())
-        var lines: [String] = []
-        var summary: String
-        var nothingMovedError: NSError?
-        if residuePaths.isEmpty {
-            summary = "Nothing to clean — no disposable residue right now"
-            lines.append("A fresh scan found no disposable residue. Other app data was kept"
-                + (report.totalOverBudget
-                    ? ", but data/ dynamic storage is \(DataRootDiskHygiene.humanSize(report.dynamicBytes)) "
-                        + "(over the \(DataRootDiskHygiene.humanSize(DataRootDiskHygiene.defaultTotalThreshold)) budget) — worth a look by hand."
-                    : "; data/ total is \(DataRootDiskHygiene.humanSize(report.totalBytes))."))
-        } else {
-            let result = DataRootDiskHygiene.cleanup(
-                dataRoot: dataRoot,
-                relativePaths: residuePaths)
-            for outcome in result.trashed {
-                lines.append("• Moved to Trash: \(outcome.relativePath) — "
-                    + DataRootDiskHygiene.humanSize(outcome.sizeBytes))
+    /// Both the card and inbox.clean_up execute this saved plan, never a larger fresh one.
+    public func cleanUpDiskHygiene(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> String {
+        let inboxPath = dataRoot.appendingPathComponent("notifications/inbox.jsonl")
+        return try await SwiftNativePersistenceCore().withFileLock(inboxPath) {
+            let lines = try InboxRewriteGuard.readLines(inboxPath)
+            guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath),
+                  let row = lines.compactMap(\.row).first(where: {
+                      guard case .object(let object) = $0 else { return false }
+                      return object["id"] == .string(diskHygieneCardId)
+                  }), case .object(let object) = row else {
+                throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
+                    "No saved cleanup plan. Refresh the disk finding before cleaning up."])
             }
-            for outcome in result.skipped {
-                lines.append("• Skipped: \(outcome.relativePath) — "
-                    + (outcome.skippedReason ?? "unknown reason"))
+            // A pre-plan card authorized residue only. Publish the new scope for review, never expand that old click.
+            guard let plans = object["cleanup_plans"] else {
+                guard await fileDiskHygieneNotice(dataRoot: dataRoot, report: DataRootDiskHygiene.scan(dataRoot: dataRoot)) else {
+                    throw NSError(domain: "NativeAgentDisk", code: 500, userInfo: [NSLocalizedDescriptionKey:
+                        "Disk finding could not be refreshed; nothing was moved."])
+                }
+                throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
+                    "Disk finding refreshed. Review its current cleanup plan before running Clean Up."])
             }
-            if result.trashed.isEmpty {
-                // Still rewrite the card below with the skip reasons before
-                // throwing (gpt-5.5 review: throwing first left the stale
-                // actionable card up with only an error toast to explain).
-                summary = "Cleanup couldn't move anything — "
-                    + "\(result.skipped.count) item(s) skipped"
-                nothingMovedError = NSError(
-                    domain: "NativeAgentSwiftOnly", code: -424,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "Disk cleanup could not move anything to the Trash: "
-                        + lines.joined(separator: "; ")])
-            } else {
-                summary = "Moved \(result.trashed.count) residue item(s) to Trash, totaling "
-                    + DataRootDiskHygiene.humanSize(result.freedBytes) + " (in the Trash)"
+            let card = (object, try JSONDecoder().decode([DiskStorageOwner.Plan].self, from: plans.serializedData(pretty: false)))
+            let owners = diskStorageOwners(dataRoot: dataRoot)
+            guard card.1.contains(where: { !$0.candidates.isEmpty }) else {
+                throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
+                    "No safely reclaimable bytes are offered by this card. Its storage is kept for the reasons shown."])
             }
+            var outcomes: [DiskStorageOwner.Outcome] = []
+            for plan in card.1 where !plan.candidates.isEmpty {
+                do {
+                    guard let owner = owners.first(where: { $0.id == plan.owner }) else {
+                        throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey: "Storage owner is unavailable; kept."])
+                    }
+                    outcomes += try await owner.reclaim(plan)
+                } catch {
+                    outcomes += plan.candidates.keys.sorted().map {
+                        DiskStorageOwner.Outcome(relativePath: $0, skippedReason: error.localizedDescription)
+                    }
+                }
+            }
+            let reclaimed = outcomes.filter { $0.skippedReason == nil }.reduce(Int64(0)) { $0 + $1.sizeBytes }
+            let skipped = outcomes.filter { $0.skippedReason != nil }.count
+            let summary = "Reclaimed \(DataRootDiskHygiene.humanSize(reclaimed)) from app storage to Trash; \(skipped) skipped."
+            let receipt = summary + "\n" + outcomes.map {
+                if let reason = $0.skippedReason { return "• Skipped \($0.relativePath): \(reason)" }
+                return "• Moved \($0.relativePath) to Trash: \(DataRootDiskHygiene.humanSize($0.sizeBytes))"
+            }.joined(separator: "\n") + "\nTrash is recoverable and still occupies disk space until you empty it."
+            var replacement = card.0
+            replacement["cleanup_detail"] = .string(receipt)
+            replacement["detail"] = .string(receipt)
+            replacement["summary"] = .string(summary)
+            replacement["title"] = .string("Disk cleanup")
+            replacement["severity"] = .string(skipped == 0 ? "info" : "actionable")
+            replacement["status"] = .string("read")
+            replacement["read_at"] = .string(Date().ISO8601Format())
+            replacement["cleanup_completed_at"] = .double(Date().timeIntervalSince1970)
+            replacement["cleanup_plans"] = .array([])
+            if case .array(let actions)? = replacement["actions"] {
+                replacement["actions"] = .array(actions.filter {
+                    guard case .object(let action) = $0 else { return true }
+                    return action["id"] != .string("act")
+                })
+            }
+            guard await upsertDiskHygieneCard(dataRoot: dataRoot, card: .object(replacement), preserveStatus: false) != nil else {
+                throw NSError(domain: "NativeAgentDisk", code: 500, userInfo: [NSLocalizedDescriptionKey:
+                    receipt + "\nCleanup completed, but its card could not be saved."])
+            }
+            if reclaimed == 0, skipped > 0 {
+                throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey: receipt])
+            }
+            return summary
         }
-        let card: JSONValue = .object([
-            "id": .string(diskHygieneCardId),
-            "created_at": .string(now),
-            "source": .string("disk_hygiene"),
-            "severity": .string("info"),
-            "title": .string("Disk cleanup"),
-            "summary": .string(String(summary.prefix(500))),
-            "detail": .string("Disk cleanup ran at your request:\n" + lines.joined(separator: "\n")),
-            "related_mission_id": .null,
-            "related_approval_id": .null,
-            "related_paths": .array([]),
-            "related_groups": .array([]),
-            "actions": .array([
-                .object(["id": .string("archive"), "label": .string("Archive"),
-                         "description": .string("Archive this card")]),
-                .object(["id": .string("dismiss"), "label": .string("Dismiss"),
-                         "description": .string("Dismiss this card")]),
-            ]),
-            "status": .string("read"),
-            "read_at": .string(now),
-        ])
-        // Best-effort card rewrite — the cleanup itself already happened, so a
-        // failed write must not surface as a failed cleanup.
-        _ = await upsertDiskHygieneCard(
-            dataRoot: dataRoot, card: card, preserveStatusWhenDetailUnchanged: false)
-        if let nothingMovedError { throw nothingMovedError }
-        return summary
     }
 
-    /// Shared locked upsert for the single disk-hygiene card. Returns nil on
-    /// write failure, else whether the card was newly inserted (true = new
-    /// row appended, false = existing row replaced). With
-    /// `preserveStatusWhenDetailUnchanged`, an existing row whose `detail`
-    /// matches the new card keeps its `status`/`read_at` — the sticky-archive
-    /// contract: identical finding, no resurrection.
+    /// Preserve acknowledgment by owner/budget finding, and retain the last cleanup receipt.
     private func upsertDiskHygieneCard(
         dataRoot: URL,
         card: JSONValue,
-        preserveStatusWhenDetailUnchanged: Bool
+        preserveStatus: Bool,
+        scanStartedAt: Date? = nil
     ) async -> Bool? {
         let inboxPath = dataRoot
             .appendingPathComponent("notifications", isDirectory: true)
@@ -685,11 +606,12 @@ public struct MaintenanceBackgroundWork: Sendable {
                 let lines = try InboxRewriteGuard.readLines(inboxPath)
                 guard InboxRewriteGuard.rewriteIsSafe(lines: lines, path: inboxPath) else {
                     InboxRewriteGuard.refuse("DiskHygieneLoop", path: inboxPath)
-                    return false
+                    throw NSError(domain: "NativeAgentDisk", code: 422, userInfo: [NSLocalizedDescriptionKey: "Inbox rewrite was refused; existing bytes were kept."])
                 }
                 var mutated: [Data] = []
                 mutated.reserveCapacity(lines.count + 1)
                 var found = false
+                var notify = false
                 for line in lines {
                     guard case .object(let obj)? = line.row,
                           case .string(let id)? = obj["id"],
@@ -698,15 +620,34 @@ public struct MaintenanceBackgroundWork: Sendable {
                         mutated.append(line.raw)
                         continue
                     }
+                    if let scanStartedAt, case .double(let completed)? = obj["cleanup_completed_at"],
+                       completed > scanStartedAt.timeIntervalSince1970 {
+                        throw NSError(domain: "NativeAgentDisk", code: 409, userInfo: [NSLocalizedDescriptionKey:
+                            "Disk cleanup completed after this scan; a fresh accounting is required."])
+                    }
                     var replacement = card
-                    if preserveStatusWhenDetailUnchanged,
-                       obj["automatically_resolved"] != .bool(true),
-                       case .object(var newObj) = card,
-                       case .string(let newDetail)? = newObj["detail"],
-                       case .string(let oldDetail)? = obj["detail"],
-                       newDetail == oldDetail {
-                        newObj["status"] = obj["status"] ?? .string("unread")
-                        newObj["read_at"] = obj["read_at"] ?? .null
+                    if preserveStatus, case .object(var newObj) = card {
+                        newObj["cleanup_completed_at"] = obj["cleanup_completed_at"]
+                        func identity(_ value: JSONValue?) -> (Set<String>, Int64) {
+                            guard case .string(let value) = value else { return ([], 0) }
+                            let parts = value.split(separator: "|").map(String.init)
+                            let tier = parts.first { $0.hasPrefix("reclaim-tier:") }
+                                .flatMap { Int64($0.dropFirst("reclaim-tier:".count)) } ?? 0
+                            return (Set(parts.filter { !$0.hasPrefix("reclaim-tier:") }), tier)
+                        }
+                        let oldFinding = identity(obj["finding_identity"])
+                        let newFinding = identity(newObj["finding_identity"])
+                        let sameFinding = obj["finding_identity"] == nil
+                            || (newFinding.0.isSubset(of: oldFinding.0) && newFinding.1 <= oldFinding.1)
+                        if sameFinding, obj["automatically_resolved"] != .bool(true) {
+                            newObj["status"] = obj["status"] ?? .string("unread")
+                            newObj["read_at"] = obj["read_at"] ?? .null
+                        } else { notify = true }
+                        if case .string(let receipt)? = obj["cleanup_detail"],
+                           case .string(let detail)? = newObj["detail"] {
+                            newObj["cleanup_detail"] = .string(receipt)
+                            newObj["detail"] = .string(detail + "\n\nLast cleanup:\n" + receipt)
+                        }
                         replacement = .object(newObj)
                     }
                     mutated.append(Data(try replacement.serialize(pretty: false).utf8))
@@ -714,7 +655,7 @@ public struct MaintenanceBackgroundWork: Sendable {
                 }
                 if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
                 try InboxRewriteGuard.writeLines(mutated, to: inboxPath)
-                return !found
+                return !found || notify
             }
             return inserted
         } catch {
@@ -1732,6 +1673,8 @@ public struct DiskHygieneOffender: Sendable, Equatable {
 
 /// The result of one `dataRoot` size scan.
 public struct DiskHygieneReport: Sendable, Equatable {
+    public let startedAt: Date
+    public let storageBytes: [String: Int64]
     /// Single files larger than `singleFileThreshold`, largest first.
     public let largeFiles: [DiskHygieneOffender]
     /// F1: directories whose SUBTREE exceeds `directoryThreshold`, largest
@@ -1777,12 +1720,16 @@ public struct DiskHygieneReport: Sendable, Equatable {
         depthTruncated: Bool = false,
         readFailed: Bool = false,
         largeDirectories: [DiskHygieneOffender] = [],
-        staticModelBytes: Int64 = 0
+        staticModelBytes: Int64 = 0,
+        storageBytes: [String: Int64] = [:],
+        startedAt: Date = Date()
     ) {
         self.largeFiles = largeFiles
         self.largeDirectories = largeDirectories
         self.totalBytes = totalBytes
         self.staticModelBytes = staticModelBytes
+        self.storageBytes = storageBytes
+        self.startedAt = startedAt
         self.totalOverBudget = totalOverBudget
         self.truncated = truncated
         self.depthTruncated = depthTruncated
@@ -1841,22 +1788,25 @@ public enum DataRootDiskHygiene {
         maxScannedEntries: Int = defaultMaxScannedEntries,
         directoryThreshold: Int64 = defaultDirectoryThreshold
     ) -> DiskHygieneReport {
+        let startedAt = Date()
         let fm = FileManager.default
         var total: Int64 = 0
         var staticModelBytes: Int64 = 0
+        var readFailed = false
         let staticFiles: Set<String>
         do { staticFiles = try CoreMLEmbedderCheck.installedModelStorageFiles(dataRoot: dataRoot) }
         catch {
             nativeLog("Disk hygiene: installed model assets unavailable for accounting: %@", String(describing: error))
             staticFiles = []
+            readFailed = true
         }
         var offenders: [DiskHygieneOffender] = []
         var scanned = 0
         var truncated = false
         var depthTruncated = false
-        var readFailed = false
         /// relative path → subtree bytes, for every directory descended into.
         var directoryBytes: [String: Int64] = [:]
+        var fileBytes: [String: Int64] = [:]
         /// Relative paths of directories holding an over-threshold descendant,
         /// so only the deepest offender in a branch is reported.
         var hasOffendingChild: Set<String> = []
@@ -1883,14 +1833,20 @@ public enum DataRootDiskHygiene {
                 at: dir,
                 includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey],
                 options: []
-            ) else { readFailed = true; return subtree }
+            ) else {
+                readFailed = true
+                return subtree
+            }
             for entry in entries {
                 scanned += 1
                 if scanned > maxScannedEntries { truncated = true; return subtree }
                 guard let values = try? entry.resourceValues(forKeys: [
                     .isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey,
                 ]), values.isSymbolicLink != nil, values.isDirectory != nil,
-                    values.isRegularFile != nil else { readFailed = true; continue }
+                    values.isRegularFile != nil else {
+                    readFailed = true
+                    continue
+                }
                 if values.isSymbolicLink == true { continue }
                 if values.isDirectory == true {
                     if depth < maxDepth {
@@ -1904,7 +1860,10 @@ public enum DataRootDiskHygiene {
                     continue
                 }
                 if values.isRegularFile == true {
-                    guard let fileSize = values.fileSize else { readFailed = true; continue }
+                    guard let fileSize = values.fileSize else {
+                        readFailed = true
+                        continue
+                    }
                     let size = Int64(fileSize)
                     total += size
                     if staticFiles.contains(entry.standardizedFileURL.path) {
@@ -1912,6 +1871,7 @@ public enum DataRootDiskHygiene {
                         continue
                     }
                     subtree += size
+                    fileBytes[relativePath(of: entry, under: dataRoot)] = size
                     if size > singleFileThreshold {
                         offenders.append(DiskHygieneOffender(
                             relativePath: relativePath(of: entry, under: dataRoot),
@@ -1954,7 +1914,9 @@ public enum DataRootDiskHygiene {
             depthTruncated: depthTruncated,
             readFailed: readFailed,
             largeDirectories: directoryOffenders,
-            staticModelBytes: staticModelBytes
+            staticModelBytes: staticModelBytes,
+            storageBytes: directoryBytes.merging(fileBytes) { a, _ in a },
+            startedAt: startedAt
         )
     }
 
@@ -2003,116 +1965,6 @@ public enum DataRootDiskHygiene {
     /// back — a re-downloaded cache is residue, not a wanted permanent store.
     public static let residueRelativePrefixes = ["extras/hf_cache"]
 
-    // MARK: - Cleanup (user-initiated only)
-
-    /// What happened to one requested path during a cleanup pass.
-    public struct CleanupOutcome: Sendable, Equatable {
-        public let relativePath: String
-        public let sizeBytes: Int64
-        /// nil = moved to the Trash; non-nil = skipped, with the reason.
-        public let skippedReason: String?
-
-        public init(relativePath: String, sizeBytes: Int64, skippedReason: String?) {
-            self.relativePath = relativePath
-            self.sizeBytes = sizeBytes
-            self.skippedReason = skippedReason
-        }
-    }
-
-    /// The result of one user-initiated cleanup pass.
-    public struct CleanupResult: Sendable, Equatable {
-        public let outcomes: [CleanupOutcome]
-
-        public init(outcomes: [CleanupOutcome]) { self.outcomes = outcomes }
-
-        public var trashed: [CleanupOutcome] { outcomes.filter { $0.skippedReason == nil } }
-        public var skipped: [CleanupOutcome] { outcomes.filter { $0.skippedReason != nil } }
-        public var freedBytes: Int64 { trashed.reduce(0) { $0 + $1.sizeBytes } }
-    }
-
-    /// User-initiated, reversible cleanup of explicitly disposable residue
-    /// roots only. Size never authorizes removing a store. Both lexical and
-    /// resolved paths must name a residue root inside `dataRoot`.
-    public static func cleanup(
-        dataRoot: URL,
-        relativePaths: [String],
-        trash: (URL) throws -> Void = { url in
-            try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-        }
-    ) -> CleanupResult {
-        let fm = FileManager.default
-        let rootParts = dataRoot.standardizedFileURL.pathComponents
-        // Symlink-resolved root for the second containment check below. (On
-        // macOS the temp/home trees are full of benign aliases like
-        // /var → /private/var, so BOTH sides must be resolved consistently.)
-        let resolvedRootParts = dataRoot.standardizedFileURL
-            .resolvingSymlinksInPath().pathComponents
-        var outcomes: [CleanupOutcome] = []
-        for rel in Set(relativePaths).sorted() {
-            let candidate = dataRoot.appendingPathComponent(rel).standardizedFileURL
-            var size = (try? candidate.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-                .map(Int64.init) ?? 0
-            func skip(_ reason: String) {
-                outcomes.append(CleanupOutcome(
-                    relativePath: rel, sizeBytes: size, skippedReason: reason))
-            }
-            // Containment, twice (gpt-5.5 review BLOCKING): (1) lexically —
-            // refuse absolute inputs outright (appendPathComponent would
-            // splice them INSIDE the root, silently changing the target) and
-            // `..` traversal; (2) symlink-resolved — a symlinked PARENT
-            // component under dataRoot must not smuggle the real target
-            // outside it. The trash below operates on the resolved path, so
-            // what was verified is what moves. Residual check-to-move race is
-            // accepted: the inputs come from our own scan of the app's own
-            // data root, and an actor who can swap directories for symlinks
-            // there already owns the data outright.
-            let parts = candidate.pathComponents
-            guard !rel.hasPrefix("/"),
-                  !rel.split(separator: "/").contains(".."),
-                  parts.count > rootParts.count,
-                  Array(parts.prefix(rootParts.count)) == rootParts else {
-                skip("outside the data directory")
-                continue
-            }
-            guard isResidue(relativePath: relativePath(of: candidate, under: dataRoot)) else {
-                skip("not disposable residue; kept")
-                continue
-            }
-            // Leaf symlink check on the UNRESOLVED path — after resolution the
-            // link is indistinguishable from its target, and trashing a link's
-            // target is not what "skip symlinks" means.
-            if (try? candidate.resourceValues(forKeys: [.isSymbolicLinkKey]))?
-                .isSymbolicLink == true {
-                skip("symbolic link; kept")
-                continue
-            }
-            let resolved = candidate.resolvingSymlinksInPath()
-            let resolvedParts = resolved.pathComponents
-            guard resolvedParts.count > resolvedRootParts.count,
-                  Array(resolvedParts.prefix(resolvedRootParts.count)) == resolvedRootParts,
-                  isResidue(relativePath: resolvedParts.dropFirst(resolvedRootParts.count).joined(separator: "/")) else {
-                skip("outside the data directory")
-                continue
-            }
-            let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
-            guard values?.isRegularFile == true || values?.isDirectory == true else {
-                skip(fm.fileExists(atPath: resolved.path)
-                    ? "not a regular file or directory" : "already gone")
-                continue
-            }
-            if values?.isDirectory == true {
-                size = scan(dataRoot: resolved).totalBytes
-            }
-            do {
-                try trash(resolved)
-                outcomes.append(CleanupOutcome(
-                    relativePath: rel, sizeBytes: size, skippedReason: nil))
-            } catch {
-                skip("could not move to Trash: \(error.localizedDescription)")
-            }
-        }
-        return CleanupResult(outcomes: outcomes)
-    }
 
     /// A human-readable byte size (e.g. "194.0 MB").
     public static func humanSize(_ bytes: Int64) -> String {
@@ -2320,19 +2172,13 @@ public extension MaintenanceBackgroundWork {
             : .unknown(loopId: id)
     }
 
-    /// One carried finding per loop, filed from its failure outcome.
-    static func fileLoopFailureNotice(
-        dataRoot: URL, loopId: String, error: String
-    ) async {
-        let summary = "\(loopId) keeps failing (\(loopFailureCause(error))). "
-            + loopFailureRemedy(loopId: loopId, error: error)
-        do {
-            try await HarnessQueue.file(HarnessFinding(key: "loop-failure:" + loopId,
-                title: "\(loopId) keeps failing", summary: summary, owner: .agent, refs: [], source: .loop),
-                dataRoot: dataRoot)
-        } catch {
-            nativeLog("BackgroundLoopsManager: could not file %@ failure: %@", loopId, error.localizedDescription)
-        }
+    /// A failed run alone is an observation, not a durable fault to repair.
+    static func fileLoopFailureNotice(dataRoot: URL, loopId: String, error: String) async {
+        let fix = loopSettingFix(loopId: loopId, error: error)
+        await DoctorStatusProjection.recordReadings([CheckResult(source: fix?.step ?? "Background loop registration: " + loopId,
+            id: DoctorLoopRecovery.checkPrefix + loopId, title: "Background loop: " + loopId,
+            status: fix?.ask == nil ? "unmeasured" : "fail", detail: loopFailureCause(error),
+            human_action: fix?.step, ask: fix?.ask, owner: nil)], dataRoot: dataRoot)
     }
 
     /// The error as one plain clause: the human text out of an NSError dump
@@ -2360,12 +2206,6 @@ public extension MaintenanceBackgroundWork {
         error.lowercased().contains("telegram") && error.contains("notConfigured")
     }
 
-    /// Only fixes that are real. Network weather never reaches the card (the
-    /// scheduler drops it).
-    static func loopFailureRemedy(loopId: String, error: String) -> String {
-        loopSettingFix(loopId: loopId, error: error)?.step ?? "No setting fixes this; it needs a code fix."
-    }
-
     /// The setting that fixes a loop's failure, and whether it is a sign-in or
     /// a permission; nil when no setting does. The failure card and Doctor's
     /// loop row both read it, so they never disagree.
@@ -2373,12 +2213,15 @@ public extension MaintenanceBackgroundWork {
         let e = error.lowercased()
         if loopId == "offdisk_backup", e.contains("icloud drive") { return (DoctorLoopHealth.iCloudDriveStep, .permission) }
         if loopId == "telegram_poll", isTelegramTokenRejected(error) || e.contains("unauthoriz") || e.contains("token") {
-            return ("Open Connectors → Telegram and reconnect the bot token.", .signIn)
+            return ("Telegram → Bot token → Bot token, then Save.", .signIn)
         }
         if loopId == "slack_socket_mode", e.contains("auth") || e.contains("token") {
-            return ("Open Connectors → Slack and reconnect the workspace token.", .signIn)
+            return ("Connectors → Slack → Bot or user token and App token, to chat with me in Slack → Save token.", .signIn)
         }
-        if e.contains("no space left") { return ("Free disk space on this Mac.", nil) }
+        if e.contains("no space left") { return ("System Settings → General → Storage: review files and choose what to remove.", .permission) }
+        if e.contains("permission denied") || e.contains("not permitted") {
+            return ("Give this user read and write access to NativeAgent's data folder in Finder → Get Info → Sharing & Permissions.", .permission)
+        }
         return nil
     }
 
@@ -2387,14 +2230,21 @@ public extension MaintenanceBackgroundWork {
         dataRoot: URL, loopId: String, healthyAt: Date
     ) async -> Bool {
         do {
-            let key = "loop-failure:" + loopId
-            return try await HarnessQueue.resolve(key: key,
-                note: "The loop completed a healthy run at " + ISO8601DateFormatter().string(from: healthyAt) + ".",
-                dataRoot: dataRoot, observedAt: healthyAt)
-        } catch {
-            nativeLog("BackgroundLoopsManager: could not resolve %@ failure: %@", loopId, error.localizedDescription)
-            return false
-        }
+            let operation = "operation: doctor.check:" + DoctorLoopRecovery.checkPrefix + loopId
+            let owed = try await ExperienceStore.at(dataRoot).projection().filter {
+                $0.owes["repair"]?.phase.isSettled == false && $0.claims.contains { $0.claim == operation }
+            }
+            let format = ISO8601DateFormatter()
+            format.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            guard owed.allSatisfy({
+                guard let at = format.date(from: $0.at) ?? ISO8601DateFormatter().date(from: $0.at) else { return false }
+                return healthyAt > at
+            }) else { return false }
+        } catch { return false }
+        await DoctorStatusProjection.recordReadings([CheckResult(
+            id: DoctorLoopRecovery.checkPrefix + loopId, title: "Background loop: " + loopId,
+            status: "ok", detail: "Successful work at " + ISO8601DateFormatter().string(from: healthyAt))], dataRoot: dataRoot)
+        return true
     }
 }
 

@@ -307,7 +307,7 @@ extension AppModel {
         }
         return publishConversationAnchor(for: await startChatTurn(
             text,
-            attachments: attachments,
+            attachments: ChatComposerSupport.submittingSpeech(attachments, text: text),
             sessionId: targetSessionId,
             hideUserBubble: false,
             requireActiveSession: true
@@ -325,7 +325,7 @@ extension AppModel {
     ) async -> ChatTurnAcceptance {
         publishConversationAnchor(for: await startChatTurn(
             text,
-            attachments: attachments,
+            attachments: ChatComposerSupport.submittingSpeech(attachments, text: text),
             sessionId: sessionId,
             hideUserBubble: false,
             requireActiveSession: false

@@ -65,12 +65,11 @@ struct AdvancedView: View {
     var body: some View {
         NavigationStack {
             AlivePage(title: "More", line: "Rooms, settings and tools.", style: .root) {
-                if !pairingStore.isPaired || bridgeClient.bridgeStatus != .online {
+                if !bridgeClient.connection.holds {
                     AliveSection("Connection", surface: .none) {
-                        AliveCalmState(title: AliveConnection.line(for: bridgeClient.bridgeStatus, paired: pairingStore.isPaired),
-                                       line: pairingStore.isPaired
-                                        ? "Open Settings to repair this iPhone’s connection, or pair with your Mac again."
-                                        : "I live on your Mac. Pair this iPhone and I can reach you here.",
+                        AliveCalmState(title: AliveConnection.line(bridgeClient.connection),
+                                       line: bridgeClient.connection.headline.lever
+                                        ?? "Open Settings to repair this iPhone’s connection, or pair with your Mac again.",
                                        actionTitle: "Pair with Mac",
                                        actionHint: "Opens pairing so this iPhone can reconnect to the Mac.") {
                             showPairingRecovery = true
@@ -399,7 +398,7 @@ struct StatusDetailView: View {
             Section {
                 MobileReadingStat(
                     label: "State",
-                    value: AliveConnection.line(for: bridgeClient.bridgeStatus, paired: pairingStore.isPaired),
+                    value: AliveConnection.line(bridgeClient.connection),
                     systemImage: "antenna.radiowaves.left.and.right",
                     tint: bridgeClient.bridgeStatus.color
                 )

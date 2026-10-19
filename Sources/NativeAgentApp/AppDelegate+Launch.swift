@@ -244,7 +244,7 @@ extension AppDelegate {
         Task { @MainActor in
             do { try await NativeAgentAppCoordinator.shared.prepare() } catch { return }
             guard NativeAgentEngine.liveDeviceSync.bridge.recognizesCloudKitRemoteNotification(payload) else { return }
-            await NativeAgentEngine.liveDeviceSync.bridge.handleCloudKitPushWake()
+            await NativeAgentEngine.liveDeviceSync.bridge.handleCloudKitPushWake(payload)
         }
     }
 

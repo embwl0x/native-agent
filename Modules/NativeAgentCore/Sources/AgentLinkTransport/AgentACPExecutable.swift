@@ -88,7 +88,7 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
 
     /// A bounded --version probe, without a shell or inherited app credentials.
     /// No agent conversation or configuration command is run.
-    package func reportedVersion() async throws -> String? {
+    package func reportedVersion(environment: [String: String]) async throws -> String? {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("acp-version-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -96,7 +96,7 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         let pid: pid_t
         do {
             pid = try AgentACPProcess.spawn(executable: path, arguments: ["--version"], directory: directory,
-                environment: AgentHostCommandLines.scrubbedEnvironment(), input: input, output: output,
+                environment: environment, input: input, output: output,
                 approvedExecutable: self)
         } catch AgentACPClient.Failure.unavailable {
             // A program may not implement a version probe.

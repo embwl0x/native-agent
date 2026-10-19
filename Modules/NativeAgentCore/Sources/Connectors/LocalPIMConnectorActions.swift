@@ -2,6 +2,7 @@ import AuthoredCapabilities
 import Foundation
 @preconcurrency import EventKit
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import Privacy
 import MacIntegration
@@ -370,7 +371,7 @@ public enum LocalPIMConnectorActions {
             return permissionEnvelope(
                 actionId: "mac.calendar_create_event",
                 source: "calendar",
-                status: calendarAuthorizationState()
+                status: calendarAuthorizationState(), mode: .write
             )
         }
 
@@ -1050,13 +1051,13 @@ public enum LocalPIMConnectorActions {
             return [
                 "status": .string("probe_needed"),
                 "detail": .string("NativeAgent can request local \(source) access directly from macOS."),
-                "nextStep": .string("Open NativeAgent > Mac Integration and click Grant beside \(source.capitalized) to open the macOS permission prompt."),
+                "remedy": SystemPermissionPreflight.remedy(source) ?? .null,
             ]
         case "needs_permission":
             return [
                 "status": .string("needs_permission"),
                 "detail": .string("macOS has not granted NativeAgent read access to local \(source) data."),
-                "nextStep": .string("Enable \(source.capitalized) access for NativeAgent in System Settings > Privacy & Security."),
+                "remedy": SystemPermissionPreflight.remedy(source) ?? .null,
             ]
         default:
             return [
@@ -1066,21 +1067,17 @@ public enum LocalPIMConnectorActions {
         }
     }
 
-    private static func permissionEnvelope(actionId: String, source: String, status: String) -> JSONValue {
+    private static func permissionEnvelope(actionId: String, source: String, status: String, mode: InlineInteraction.AccessMode? = nil) -> JSONValue {
         // A skill never opens a macOS prompt or asks for a grant: it hands back to her.
         if SkillRunContext.handsBack { return SkillRunContext.handBack("macOS \(source.capitalized) permission") }
-        let message: String
-        if status == "probe_needed" {
-            message = "Open NativeAgent > Mac Integration and click Grant beside \(source.capitalized) so macOS can register the permission request."
-        } else {
-            message = "NativeAgent needs macOS \(source.capitalized) permission before this local read action can run."
-        }
+        let message = "NativeAgent needs \(source.capitalized). Allow it on the permission card."
         return .object([
             "status": .string("needs_permission"),
             "actionId": .string(actionId),
             "source": .string("eventkit"),
             "access": .string(status),
             "message": .string(message),
+            "remedy": SystemPermissionPreflight.remedy(source, mode: mode) ?? .null,
         ])
     }
 

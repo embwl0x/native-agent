@@ -179,17 +179,19 @@ public struct CapabilityLifecycleCommands: Sendable {
             do {
                 let result = try await SwiftNativeToolExecution(root: dataRoot).validateProposal(id: tool.id,
                     capture: input["capture"] == .bool(true), input: input["input"])
-                return VerbOutcome(result.valid, result.valid ? "The exact candidate passed intercepted runtime validation."
+                return VerbOutcome(result.valid, result.valid ? "The supplied inputs passed rehearsal; intercepted replies are not behavioral proof."
                     : "Validation failed: \(result.errors.joined(separator: "; ")).",
                     fields.merging(["validation_errors": .array(result.errors.map(JSONValue.string)),
+                                    "validation_evidence": result.evidence ?? .null,
                                     "capture": result.capture.map(JSONValue.string) ?? .null,
                                     "candidate_digest": result.candidateDigest.map(JSONValue.string) ?? .null]) { $1 })
             } catch { return VerbOutcome(false, "Validation failed: \(error.localizedDescription).", fields) }
         }
         if verb == "tool_approve" {
             do { try await ToolRegistryActions.checkEnable(id: tool.id, dataRoot: dataRoot) }
-            catch let error as NSError where error.domain == "CapabilityLifecycle" {
-                return VerbOutcome(false, error.localizedDescription, fields.merging(["reason": .string("owners_call")]) { $1 })
+            catch let error as ToolFailureError {
+                let failure: [String: JSONValue] = if case .object(let value) = ChatToolOutcome.failure(error: error) { value } else { [:] }
+                return VerbOutcome(false, error.localizedDescription, fields.merging(failure) { $1 })
             } catch { return VerbOutcome(false, error.localizedDescription + Self.retry, fields) }
             // The Tools page's Approve. User's below Full Mac; the door refuses it there.
             guard tool.status != "active" || tool.pendingCandidate else {
@@ -209,8 +211,9 @@ public struct CapabilityLifecycleCommands: Sendable {
                     return VerbOutcome(false, "Tool activation could not be confirmed after reloading the registry." + Self.retry, fields,
                         toolStatus: .init(message: "Tool activation could not be confirmed after reloading the registry.", succeeded: false))
                 }
-            } catch let error as NSError where error.domain == "CapabilityLifecycle" {
-                return VerbOutcome(false, error.localizedDescription, fields.merging(["reason": .string("owners_call")]) { $1 })
+            } catch let error as ToolFailureError {
+                let failure: [String: JSONValue] = if case .object(let value) = ChatToolOutcome.failure(error: error) { value } else { [:] }
+                return VerbOutcome(false, error.localizedDescription, fields.merging(failure) { $1 })
             } catch {
                 let message = formatFailure(error, "turn that tool on")
                 return VerbOutcome(false, Self.forAgent(message, error) + Self.retry, fields,
@@ -249,8 +252,9 @@ public struct CapabilityLifecycleCommands: Sendable {
                     return VerbOutcome(false, "\(tool.name) is not switched off (\(tool.status)); nothing changed.", fields)
                 }
                 status = restored
-            } catch let error as NSError where error.domain == "CapabilityLifecycle" {
-                return VerbOutcome(false, error.localizedDescription, fields.merging(["reason": .string("owners_call")]) { $1 })
+            } catch let error as ToolFailureError {
+                let failure: [String: JSONValue] = if case .object(let value) = ChatToolOutcome.failure(error: error) { value } else { [:] }
+                return VerbOutcome(false, error.localizedDescription, fields.merging(failure) { $1 })
             } catch { return VerbOutcome(false, "Restore failed: \(error.localizedDescription)." + Self.retry, fields) }
             if preview {
                 return VerbOutcome(true, "Would turn \(tool.name) back on as \(status).",
@@ -280,7 +284,7 @@ public struct CapabilityLifecycleCommands: Sendable {
                 result = try await execution.rollback(id: tool.id, version: AppToolExecutor.inputString(input["version"]))
             } catch { return VerbOutcome(false, "\(tool.name) was not rolled back: \(error.localizedDescription).", fields) }
             return VerbOutcome(true, "\(tool.name)'s current and previous versions were swapped. A version without prior admission waits for tool.approve; the owner's off-switch remains.",
-                fields.merging(["recovery": .string("swapped"), "validation": .string(result.valid ? "valid" : "invalid"),
+                fields.merging(["recovery": .string("swapped"), "validation_evidence": result.evidence ?? .null,
                     "validation_errors": .array(result.errors.map(JSONValue.string)),
                     "candidate_digest": result.candidateDigest.map(JSONValue.string) ?? .null]) { $1 })
         }
@@ -326,6 +330,7 @@ public struct CapabilityLifecycleCommands: Sendable {
             return VerbOutcome(false, "\(id) was not filed: \(error.localizedDescription).", fields.merging(["effects": .string("none")]) { $1 })
         }
         var filed = fields.merging(["validation_errors": .array(result.errors.map(JSONValue.string)),
+                                   "validation_evidence": result.evidence ?? .null,
                                    "capture": result.capture.map(JSONValue.string) ?? .null,
                                    "candidate_digest": result.candidateDigest.map(JSONValue.string) ?? .null]) { $1 }
         if let used = result.respelled { filed["argument_notes"] = .array([.string("Used tool_id \(used), the id rule's spelling of \(given).")]) }
@@ -333,7 +338,7 @@ public struct CapabilityLifecycleCommands: Sendable {
             return VerbOutcome(false, "\(id) is filed on the Tools page but failed validation: \(result.errors.joined(separator: "; ")). "
                 + "Fix it and tool.propose again.", filed)
         }
-        return VerbOutcome(true, "\(id) is filed on the Tools page and passed validation. tool.approve activates it (the owner's "
+        return VerbOutcome(true, "\(id) is filed on the Tools page with the supplied inputs rehearsed; this is not behavioral proof. tool.approve activates it (the owner's "
             + "below Full Mac); then it runs as authored.\(id).", filed)
     }
 

@@ -4,6 +4,15 @@ import Foundation
 public enum ChatAttachmentTypeResolver {
     public static let fileByteLimit = 10_000_000
 
+    /// The composer submits one wording for its recordings, including typed context.
+    public static func submittingSpeech(_ attachments: [MultimodalAttachment], text: String) -> [MultimodalAttachment] {
+        attachments.map {
+            var attachment = $0
+            if attachment.utterance != nil { attachment.utterance?.correctedText = text }
+            return attachment
+        }
+    }
+
     public static func typeAndMime(forExtension ext: String) -> (type: String, mime: String)? {
         switch ext.lowercased() {
         case "png":

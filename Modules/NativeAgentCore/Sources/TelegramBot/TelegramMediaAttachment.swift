@@ -11,8 +11,10 @@ public struct TelegramMediaAttachment: Sendable, Codable {
     public let sizeBytes: Int?
     public let bytes: Data?
     public let captureFilename: String?
+    public var utterance: SpeechUtterance?
 
     public var chatTypeAndMime: (type: String, mime: String)? {
+        if utterance != nil { return ("audio", mimeType ?? "audio/ogg") }
         if let mimeType, mimeType.lowercased().hasPrefix("image/") {
             return ("image", mimeType.lowercased())
         }

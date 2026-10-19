@@ -511,9 +511,8 @@ extension AppToolExecutor {
             }
             var result: [String: JSONValue] = [:]
             if actionId == "browser.chrome_setup", !dryRun {
-                let setup = await platform.setUpChrome()
+                let setup = try await platform.setUpChrome()
                 result["folder"] = setup.folder.map { .string($0.path) } ?? .null
-                result["extensions_page_opened"] = .bool(setup.extensionsPageOpened)
                 result["message"] = .string(setup.message)
             }
             let status = await chrome().setupConnectionStatus()
@@ -543,12 +542,11 @@ extension AppToolExecutor {
         case .extensionNotLoaded: connection = "not_yet_connected"
         }
         return [
-            "next": state == .extensionNotLoaded ? .string("raise request_interaction kind=connector target=chrome") : .null,
+            "next": state == .extensionNotLoaded ? .string("app chrome.setup") : .null,
             "connection": .string(connection),
             "connected": .bool(state == .connected),
             "chrome_control_enabled": .bool(enabled),
-            "permissions_changed": .bool(false),
-            "status_note": .string("Only a live connection confirms availability. A prepared folder or previous connection does not prove the extension is currently loaded. Chrome control permission remains unchanged."),
+            "status_note": .string("Only a live connection confirms availability. A prepared folder or previous connection does not prove the extension is currently loaded. Trust and macOS grants still apply."),
         ]
     }
 
@@ -613,13 +611,6 @@ extension AppToolExecutor {
             guard case .object(var failure) = ChatToolOutcome.failure(error: error, tool: actionId) else { throw error }
             failure["effects"] = .string("none")
             failure["provenance"] = .string("raw view · Chrome native messaging read reply; no page was served")
-            if (error as? ChromeControlRuntimeError)?.recoverySuggestion == nil {
-                failure["remedy"] = .object([
-                    "kind": .string("inspect"),
-                    "instruction": .string("The read did not change the page. Resolve the reported prerequisite before reading again."),
-                    "next_call": .null,
-                ])
-            }
             return .object(failure)
         }
     }

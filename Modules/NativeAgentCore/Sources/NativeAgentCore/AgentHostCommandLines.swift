@@ -18,8 +18,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     public static let sessionPlaceholder = "{{session}}"
     public static let replyFilePlaceholder = "{{reply_file}}"
 
-    /// The executable NAME. Resolved in fixed installation directories, never a path stored
-    /// in a row.
+    /// The executable name, resolved through the recipe and the login PATH.
     public let executable: String
     /// The argv for a first message, in its non-interactive/print mode. It ends
     /// with the CLI's documented end-of-options marker before the message, so
@@ -35,8 +34,11 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     /// The CLI, rather than this app, assigns the session in protocol output.
     /// Never substitute a locally invented identity.
     public let capturesThreadID: Bool
-    /// A complete JSON result envelope supplies response and conversation_id.
+    /// A complete JSON result envelope supplies the reply and session.
     public let jsonResultReply: Bool
+    /// Envelope keys for reply, session, status and optional error flag;
+    /// success is the status value that proves a reply.
+    public let resultFields: [String: String]?
     /// Some headless hosts cannot ask for permission to call an MCP tool.
     /// Their command conversation is independent of that optional return path.
     public let automaticMCPProbe: Bool
@@ -55,6 +57,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
 
     public init(executable: String, arguments: [String], continuation: [String] = [],
                 replyFileName: String? = nil, capturesThreadID: Bool = false, jsonResultReply: Bool = false,
+                resultFields: [String: String]? = nil,
                 automaticMCPProbe: Bool = true, stream: Stream? = nil, permissionFlags: PermissionFlags? = nil,
                 timeoutSeconds: Int, documentation: String) {
         self.executable = executable
@@ -63,6 +66,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         self.replyFileName = replyFileName
         self.capturesThreadID = capturesThreadID
         self.jsonResultReply = jsonResultReply
+        self.resultFields = resultFields
         self.automaticMCPProbe = automaticMCPProbe
         self.stream = stream
         self.permissionFlags = permissionFlags
@@ -75,7 +79,8 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     public func capturedThreadID(stdout: String, expected: String? = nil) -> String? {
         guard capturesThreadID else { return nil }
         if jsonResultReply {
-            guard let object = resultObject(stdout), let raw = object["conversation_id"] as? String,
+            guard let fields = resultFields, let key = fields["session"],
+                  let object = resultObject(stdout), let raw = object[key] as? String,
                   let uuid = UUID(uuidString: raw) else { return nil }
             let value = uuid.uuidString.lowercased()
             guard expected == nil || value == expected?.lowercased() else { return nil }
@@ -96,10 +101,16 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         return found
     }
 
-    public func resultReply(stdout: String) -> String? {
-        guard jsonResultReply, let object = resultObject(stdout),
-              object["status"] as? String == "SUCCESS" else { return nil }
-        return object["response"] as? String
+    public func resultReply(stdout: String) -> (reply: String?, failure: String?) {
+        guard jsonResultReply, let fields = resultFields, let reply = fields["reply"],
+              let status = fields["status"], let success = fields["success"],
+              let object = resultObject(stdout) else { return (nil, nil) }
+        let text = object[reply] as? String
+        if object[status] as? String != success || fields["error"].map({ object[$0] as? Bool != false }) == true {
+            let errors = fields["errors"].flatMap { object[$0] as? [String] } ?? []
+            return (nil, ([object[status] as? String, text].compactMap { $0 } + errors).joined(separator: "\n"))
+        }
+        return (text, nil)
     }
 
     /// The whole-output envelope, or in stream form the one `result` event's.
@@ -133,6 +144,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     public enum PermissionFlags: String, Sendable, Equatable, Codable {
         /// `codex -c sandbox_mode=… -c approval_policy=…`.
         case codex
+        case claude
     }
 
     /// One line of live output, for display only; the reply is still read at exit.
@@ -146,7 +158,8 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     /// Retain only reply/identity evidence, so tool chatter cannot crowd out
     /// the closing result. Live text is consumed separately as it arrives.
     public func streamEvent(line: String) -> (retain: Bool, event: StreamEvent?) {
-        guard let stream, let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return (false, nil) }
+        guard let stream else { return (jsonResultReply, nil) }
+        guard let event = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return (false, nil) }
         switch stream {
         case .antigravity:
             let retain = event["event"] as? String == "result"
@@ -210,10 +223,19 @@ public enum AgentHostCommandLines {
             continuation: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
                            "--conversation", AgentHostCommandLine.sessionPlaceholder,
                            "--print=" + AgentHostCommandLine.messagePlaceholder],
-            capturesThreadID: true, jsonResultReply: true, automaticMCPProbe: false, stream: .antigravity, timeoutSeconds: 300,
+            capturesThreadID: true, jsonResultReply: true,
+            resultFields: ["reply": "response", "session": "conversation_id", "status": "status", "success": "SUCCESS"],
+            automaticMCPProbe: false, stream: .antigravity, timeoutSeconds: 300,
             documentation: "https://www.antigravity.google/docs/cli/headless/"),
-        // No claude-code row (10-02): Claude Code is Claude, and a message to
-        // her goes to her inbox, never a headless `claude -p`.
+        "claude-code": AgentHostCommandLine(
+            executable: "claude",
+            arguments: ["-p", "--output-format", "json", "--", AgentHostCommandLine.messagePlaceholder],
+            continuation: ["-p", "--output-format", "json", "--resume", AgentHostCommandLine.sessionPlaceholder,
+                           "--", AgentHostCommandLine.messagePlaceholder],
+            capturesThreadID: true, jsonResultReply: true,
+            resultFields: ["reply": "result", "session": "session_id", "status": "subtype", "success": "success", "error": "is_error", "errors": "errors"],
+            automaticMCPProbe: false, permissionFlags: .claude, timeoutSeconds: 300,
+            documentation: "https://code.claude.com/docs/en/headless"),
         // JSONL thread.started carries the CLI-minted identity. Resume uses
         // that exact UUID, never --last or a guessed private rollout path.
         "codex": AgentHostCommandLine(
@@ -229,30 +251,56 @@ public enum AgentHostCommandLines {
             documentation: "https://learn.chatgpt.com/docs/non-interactive-mode"),
     ]
 
-    /// Fixed, ordered installation locations: what a recipe's search paths are seeded with.
-    // The person's own install folders first, as in a normal shell path: on the 09-19 drive the
-    // Homebrew copy of Codex (0.131, from May) won over the one in ~/.local/bin the person uses.
-    public static let searchPaths = ["~/.local/bin", "~/bin", "/opt/homebrew/bin", "/usr/local/bin",
-        "~/.npm-global/bin", "~/.npm/bin", "~/Library/pnpm", "~/.local/share/pnpm",
-        "~/.bun/bin", "~/.local/share/mise/shims", "~/.asdf/shims", "~/.lmstudio/bin"]
-
-    /// Where a program is looked for, connecting and discovery alike (one
-    /// list, so an offer and its connect agree): a recipe's search paths, then
-    /// the app's own PATH and ~/.cargo/bin. Discovery never runs what it finds.
-    public static func programFolders(_ searchPaths: [String]) -> [String] {
-        var seen: Set<String> = []
-        let path = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
-        return (searchPaths + path + ["~/.cargo/bin"]).filter { seen.insert($0).inserted }
-    }
+    /// Read once per app launch, with the same startup files as a login terminal.
+    public static let loginEnvironment: Result<[String: String], ToolFailureError> = {
+        let shell = getpwuid(getuid()).flatMap { $0.pointee.pw_shell }.map { String(cString: $0) } ?? ""
+        func refused(_ reason: String) -> Result<[String: String], ToolFailureError> {
+            let files = shell.hasSuffix("/zsh") ? "~/.zshenv, ~/.zprofile, ~/.zshrc, ~/.zlogin" : "\(shell)'s login startup files"
+            return .failure(ToolFailureError("Login shell \(shell): \(reason). Repair its startup files, then restart the app to read PATH again.",
+                effects: .none, owner: "login shell \(shell) startup files",
+                tap: "Repair \(files); the app reads PATH again at its next launch", personDecides: true))
+        }
+        guard shell.hasPrefix("/"), access(shell, X_OK) == 0 else { return refused("the account's shell is not executable") }
+        let process = Process(), output = Pipe(), exited = DispatchSemaphore(value: 0)
+        let bytes = OSAllocatedUnfairLock(initialState: Data())
+        process.executableURL = URL(fileURLWithPath: shell)
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        process.arguments = ["-ilc", "printf '\\0%s\\0' \"$PATH\""]
+        process.environment = baseEnvironment()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { _ in exited.signal() }
+        do {
+            let drain = try ProcessPipeDrain(handle: output.fileHandleForReading) { chunk in
+                bytes.withLock { if $0.count < 1024 * 1024 { $0.append(chunk) } }
+            }
+            defer { drain.stopAndWait() }
+            try process.run()
+            try? output.fileHandleForWriting.close()
+            if exited.wait(timeout: .now() + 3) == .timedOut {
+                ProcessTreeReaper.quiesceAndKill(ProcessTreeReaper.snapshot(rootPID: process.processIdentifier))
+                return refused("PATH did not return within three seconds")
+            }
+            drain.stopAndWait()
+            let fields = bytes.withLock { $0.split(separator: 0, omittingEmptySubsequences: false) }
+            guard process.terminationStatus == 0, fields.count >= 3,
+                  let path = String(data: Data(fields[1]), encoding: .utf8), !path.isEmpty else { return refused("no readable PATH returned") }
+            var environment = baseEnvironment()
+            environment["PATH"] = path
+            return .success(environment)
+        } catch { return refused(error.localizedDescription) }
+    }()
 
     public static func resolveExecutable(_ name: String) -> String? {
-        resolveExecutable(name, directories: searchPaths,
+        resolveExecutable(name, directories: [],
                           home: FileManager.default.homeDirectoryForCurrentUser.path)
     }
 
     public static func resolveExecutable(_ name: String, directories: [String], home: String) -> String? {
         guard !name.isEmpty, !name.contains("/") else { return nil }
-        for directory in directories {
+        guard case .success(let environment) = loginEnvironment else { return nil }
+        for directory in directories + (environment["PATH"] ?? "").components(separatedBy: ":") {
             let expanded = directory.hasPrefix("~/") ? home + String(directory.dropFirst()) : directory
             guard expanded.hasPrefix("/") else { continue }
             // Standalone installations use links, sometimes through another
@@ -275,15 +323,19 @@ public enum AgentHostCommandLines {
     /// and answered normally; a variable is added here only when a verified CLI
     /// provably needs it.
     public static func scrubbedEnvironment() -> [String: String] {
+        switch loginEnvironment {
+        case .success(let environment): return environment
+        case .failure: return baseEnvironment()
+        }
+    }
+
+    private static func baseEnvironment() -> [String: String] {
         let source = ProcessInfo.processInfo.environment
         var scrubbed: [String: String] = [:]
         for name in ["PATH", "HOME", "USER", "LANG", "TMPDIR", "TERM"] {
             if let value = source[name] { scrubbed[name] = value }
         }
         for (name, value) in source where name.hasPrefix("LC_") { scrubbed[name] = value }
-        // PATH is how the executable was found in the first place, so it must
-        // not be empty even when this app inherited none.
-        if scrubbed["PATH"]?.isEmpty ?? true { scrubbed["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin" }
         return scrubbed
     }
 }

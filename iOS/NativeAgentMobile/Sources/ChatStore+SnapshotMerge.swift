@@ -22,7 +22,8 @@ extension ChatStore {
                 type: $0.type,
                 mime: $0.mime,
                 base64: $0.base64,
-                byteSize: $0.byteSize
+                byteSize: $0.byteSize,
+                utterance: $0.utterance
             )
         }
         return ChatMessage(
@@ -126,11 +127,17 @@ extension ChatStore {
         if snapshot.id == local.id { return true }
         guard snapshot.role == local.role else { return false }
         if local.role == .assistant {
-            return local.interaction == nil && local.interactionDescriptor == nil
-                && snapshot.interaction == nil && snapshot.interactionDescriptor == nil
-                && ((snapshot.isTerminalReply && local.isTerminalReply)
-                    || (snapshot.completionState == "failed" && local.completionState == "failed"))
-                && local.runId != nil && snapshot.runId == local.runId
+            guard local.interaction == nil && local.interactionDescriptor == nil
+                    && snapshot.interaction == nil && snapshot.interactionDescriptor == nil
+                    && local.runId != nil && snapshot.runId == local.runId else { return false }
+            if (snapshot.isTerminalReply && local.isTerminalReply)
+                || (snapshot.completionState == "failed" && local.completionState == "failed") {
+                return true
+            }
+            // A Mac that publishes no completion state (0.6.6 and earlier):
+            // the same run's row in the same words is the reply already shown.
+            return snapshot.completionState == nil && local.isTerminalReply
+                && snapshotTextMatches(snapshot, local: local)
         }
         if local.role == .user {
             guard publishedAttachmentsMatch(snapshot.attachments, local.attachments) else { return false }

@@ -1077,7 +1077,7 @@ extension SwiftToolDispatcher {
 }
 
 /// Redirects are returned to the caller; no redirected request can carry a credential or change its Trust tier.
-private final class OwnedFetchRedirects: NSObject, URLSessionTaskDelegate, Sendable {
+final class OwnedFetchRedirects: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         completionHandler(nil)

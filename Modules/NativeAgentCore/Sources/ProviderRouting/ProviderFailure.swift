@@ -1,5 +1,7 @@
+import Experiences
 import Foundation
 import NativeAgentCore
+import PersistenceCore
 
 /// 2026-09-18 WHY: adapters translate wire evidence once; recovery and surfaces
 /// consume a failure, never adapter wording. Cancellation is not a failure.
@@ -207,7 +209,8 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         if admitted, let diagnostic = error as? Diagnostic {
             return Diagnostic(cause: diagnostic.cause, detail: diagnostic.detail,
                               deadlineExpired: diagnostic.deadlineExpired, admitted: true,
-                              liveFirstOutputCut: diagnostic.liveFirstOutputCut)
+                              liveFirstOutputCut: diagnostic.liveFirstOutputCut,
+                              repair: diagnostic.repair)
         }
         if error is any ProviderFailureWrapping { return error }
         // Output truncation carries partial prose; routing/configuration failures
@@ -235,15 +238,17 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         /// The provider began a response for this request.
         public let admitted: Bool
         public let liveFirstOutputCut: Bool
+        public let repair: ToolFailureError?
         public init(cause: ProviderFailure, detail: String, deadlineExpired: Bool = false, admitted: Bool = false,
-                    liveFirstOutputCut: Bool = false) {
+                    liveFirstOutputCut: Bool = false, repair: ToolFailureError? = nil) {
             self.cause = cause
             self.detail = String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
             self.deadlineExpired = deadlineExpired
             self.admitted = admitted
             self.liveFirstOutputCut = liveFirstOutputCut
+            self.repair = repair
         }
-        public var errorDescription: String? { cause.errorDescription }
+        public var errorDescription: String? { repair?.message ?? cause.errorDescription }
         public var providerFailureCause: Error { cause }
     }
 
@@ -268,6 +273,50 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
             detail = "\(ns.domain) code=\(ns.code): \(ns.localizedDescription)"
         }
         return String(ContextSecretContentPolicy.redactedFragment(detail).prefix(4096))
+    }
+
+    /// What a failed model call is to her, decided once for every surface. A
+    /// sign-in that is rejected or expired, an account that is not connected
+    /// or a model its account does not serve stays wrong until someone changes
+    /// it: it names that owner and its lever and owes repair. An outage, a
+    /// limit, a timeout, an empty or unreadable reply or a refusal is the
+    /// provider's answer to this request: it owes nothing, and its next call
+    /// shows the model choice. A failure already carrying its repair keeps it.
+    public static func repair(_ error: Error, provider: String, model: String, surface: String,
+                              dataRoot: URL, id: String, evidence: [Experience.Ref] = []) -> ToolFailureError {
+        if let carried = (error as? Diagnostic)?.repair { return carried }
+        let group = "providers." + (ProviderSurfaceGroups.group(for: surface) ?? ProviderSurfaceGroups.chat).id
+        let detail = diagnosticDescription(error)
+        var lever: String?
+        let failure: ToolFailureError
+        if let thrown = error as? ToolFailureError { failure = thrown }
+        else {
+            switch classify(error) {
+            case .authExpired?, .codexCLISessionExpired?:
+                let connection = SwiftNativeProviderRouting.displayName(for: provider)
+                let signIn = NativeOAuthFlow.signInControl(providerID: provider, dataRoot: dataRoot)
+                let owner = connection + " (" + provider + ") saved " + (signIn == nil ? "API key" : "sign-in")
+                let tap = signIn ?? "Providers → Accounts & API keys → \(connection) → Manage → Key → Paste the key here → Save"
+                failure = ToolFailureError("\(owner): \(detail). Ask the person to open \(tap).", effects: .none, owner: owner, tap: tap)
+            case .routingUnavailable?, .modelUnavailable?:
+                let setting = group + (classify(error) == .modelUnavailable ? "_model" : "_account")
+                lever = "setting.set:" + setting
+                failure = ToolFailureError(
+                    "\(provider) · \(model): \(detail). \(setting) chooses what \(surface) runs; set it to one this Mac can serve (setting.get \(setting) lists the choices).",
+                    effects: .none, owner: "setting " + setting,
+                    nextCall: ToolFailureError.call("app", ["action": .string("setting.set"), "args": .object(["setting": .string(setting)])]))
+            default:
+                return ToolFailureError(
+                    "\(provider) · \(model) did not answer: \(detail). Nothing on this Mac is broken and nothing is owed: ask again in a moment, or choose another model in \(group)_model.",
+                    effects: .none,
+                    nextCall: ToolFailureError.call("app", ["action": .string("setting.get"), "args": .object(["setting": .string(group + "_model")])]))
+            }
+        }
+        if let owner = failure.owner, !failure.personDecides {
+            RepairOwed.owe(dataRoot, id: id, kind: .act, evidence: evidence, operation: "model.call:" + provider + ":" + model,
+                owner: owner, words: failure.message, lever: lever, nextCall: failure.nextCall, tap: failure.tap)
+        }
+        return failure
     }
 
     static func wireError(_ object: [String: Any]) -> Diagnostic {

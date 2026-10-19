@@ -81,14 +81,6 @@ public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
 public enum OrganismResidualRepair {
     public static let minimumPressure = 0.30
     public static let quietInterval: TimeInterval = 2 * 60
-    public static let recalibrationPressure = 0.45
-    public static let recalibrationQuietInterval: TimeInterval = 10 * 60
-    /// The preregistered product formula has a hard maximum of 0.6787 when all
-    /// five normalized residuals equal one. A 0.70 gate is therefore
-    /// unreachable theater; 0.60 preserves a deliberately high threshold.
-    public static let dreamPressure = 0.60
-    public static let dreamQuietInterval: TimeInterval = 30 * 60
-    public static let dreamRefractoryInterval: TimeInterval = 24 * 60 * 60
     public static let predictionHalfLife: TimeInterval = 6 * 60 * 60
     /// F4-M1 (2026-07-23): bounded re-check cadence used ONLY when resource
     /// inhibition (thermal / low-power) suppressed an otherwise-eligible wake.
@@ -288,37 +280,12 @@ public enum OrganismResidualRepair {
         let latestEvidenceAt = [trustedIngestionAt, trustedRepairAt].compactMap { $0 }.max()
             ?? fallbackEvidenceAt
         let localQuietUntil = latestEvidenceAt?.addingTimeInterval(quietInterval) ?? now
-        let dreamQuietUntil = latestEvidenceAt?.addingTimeInterval(dreamQuietInterval) ?? now
         let resourceInhibited = resourcePressure != .nominal
         let localEligible = localRepairPressure >= minimumPressure
             && evidenceCount > 0
             && repairableFieldEvidenceCount > 0
         let localReady = localEligible && !resourceInhibited && now >= localQuietUntil
         let localNext = localEligible && !resourceInhibited ? max(now, localQuietUntil) : nil
-
-        let dreamRefractoryUntil = repairState.sleepControl.lastProviderDreamAt?
-            .addingTimeInterval(dreamRefractoryInterval)
-        let dreamCandidateAt = [dreamQuietUntil, dreamRefractoryUntil].compactMap { $0 }.max()
-            ?? dreamQuietUntil
-        let dreamDisposition: OrganismSleepLaneDisposition
-        let dreamNext: Date?
-        let dreamEligible = pressure >= dreamPressure && evidenceCount > 0
-        if !dreamEligible {
-            dreamDisposition = .inactive
-            dreamNext = nil
-        } else if resourceInhibited {
-            dreamDisposition = .resourceInhibited
-            dreamNext = nil
-        } else if now < dreamCandidateAt {
-            dreamDisposition = dreamRefractoryUntil.map { now < $0 } == true
-                ? .refractory : .waitingForQuiet
-            dreamNext = dreamCandidateAt
-        } else {
-            // This is eligibility only. The existing identity-Dream owner must
-            // still enforce its provider lease, budget, trust, and approval path.
-            dreamDisposition = .providerBudgetGateRequired
-            dreamNext = now
-        }
 
         let lanes = [
             OrganismSleepLaneOpportunity(
@@ -330,27 +297,12 @@ public enum OrganismResidualRepair {
                     : .inactive,
                 nextEligibleAt: localNext
             ),
-            OrganismSleepLaneOpportunity(
-                lane: .identityDreamProposal,
-                threshold: dreamPressure,
-                quietInterval: dreamQuietInterval,
-                disposition: dreamDisposition,
-                nextEligibleAt: dreamNext
-            ),
-            OrganismSleepLaneOpportunity(
-                lane: .generatedFrozenRecalibration,
-                threshold: recalibrationPressure,
-                quietInterval: recalibrationQuietInterval,
-                disposition: .inactive
-            ),
         ]
 
         let pendingPredictionDue = ledger.predictions.values
             .filter { $0.status == .pending && $0.dueAt > now }
             .map(\.dueAt)
             .min()
-        // The pressure-driven Dream consumer is retired. Its eligibility is
-        // diagnostic only; only deadlines with live consumers wake the runtime.
         let candidateDeadlines = [localNext, pendingPredictionDue]
             .compactMap { $0 }
             .filter { $0 > now }

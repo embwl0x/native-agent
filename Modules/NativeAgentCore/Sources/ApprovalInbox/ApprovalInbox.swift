@@ -1,4 +1,6 @@
 import AuthoredCapabilities
+import ChatToolParsing
+import Experiences
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
@@ -17,9 +19,8 @@ import TrustCenter
 /// Timestamps are ISO-8601 strings. The `decision`, `resolvedAt`, `decidedBy`,
 /// and `resolutionProvenance` fields stay nil until the request is resolved.
 ///
-/// `executedAction` and `detail` are lossless post-execution fields: saved
-/// outcomes can have different JSON shapes. Unlike `resolvedAt`/`decision`,
-/// which are explicit JSON null on pending records, these are omitted when nil.
+/// `executedAction` preserves the domain's outcome. `detail` is its shared
+/// decision face. Unlike the nullable decision, both are omitted when nil.
 public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var id: String
     public var title: String
@@ -37,6 +38,19 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     /// to hid a live question raised again in a later turn. Nil on rows that
     /// were only ever asked once.
     public var lastRequestedAt: String?  // ISO-8601 or nil
+
+    /// What a person reads about this ask: its reason, else, for an
+    /// owner-review card (a REM lesson, a skill or memory proposal), the
+    /// preview its filer wrote in words. Never a serialized payload. 10-18: a
+    /// REM card's reason is empty on purpose, so the phone's overview showed a
+    /// blank row and Telegram printed the payload as JSON. Not redacted here:
+    /// each surface redacts what it sends.
+    public var readableAsk: String {
+        let reason = self.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !reason.isEmpty { return reason }
+        guard SwiftNativeApprovalInbox.ownerReviewActions.contains(action) else { return "" }
+        return payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     public var resolvedAt: String?       // ISO-8601 or nil
     public var decision: String?         // "approved" | "denied" | "canceled" | nil
     public var decidedBy: String?        // durable human/system decision attribution
@@ -44,7 +58,73 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
     public var remoteResolvable: Bool
     public var localOnly: Bool
     public var executedAction: JSONValue?
-    public var detail: String?
+    private var executionDetail: String?
+    public var cause: String? = nil
+    public var detail: String? {
+        get { executedAction == nil ? executionDetail : decisionExperience.face?.words }
+        set { executionDetail = newValue }
+    }
+
+    public var executionResultClass: ChatToolOutcome.ExactResultClass {
+        guard let executedAction else { return .unknown }
+        guard case .object(let execution) = executedAction,
+              execution["op"] == .string("chat_tool_approval_replay") else {
+            return ChatToolOutcome.exactResultClass(executedAction)
+        }
+        if case .string(let raw)? = execution["resultClass"],
+           let result = ChatToolOutcome.ExactResultClass(rawValue: raw) { return result }
+        guard let status = execution["status"] else { return .unknown }
+        return ChatToolOutcome.exactResultClass(.object(["status": status]))
+    }
+
+    /// The inbox owns the decision. Every reader gets this same expression,
+    /// including old rows whose execution sentence contradicted their receipt.
+    public var decisionExperience: Experience {
+        let ref = Experience.Ref(source: "workflows/approvals/requests.json", id: id)
+        var obligation = Experience.Obligation(to: "person")
+        if decision != nil {
+            obligation.phase = .accepted
+            obligation.evidence = ref
+        } else if status != "pending" {
+            obligation.phase = .letGo
+            obligation.reason = .expired
+        }
+        var fields: [String: JSONValue] = if case .object(let fields)? = executedAction { fields } else { [:] }
+        if fields["detail"] == nil, let executionDetail { fields["detail"] = .string(executionDetail) }
+        let words: String
+        if case .object(let execution)? = executedAction,
+           execution["op"] == .string("chat_tool_approval_replay") {
+            let outcome: String = switch executionResultClass {
+            case .succeeded: "Completed"
+            case .failed: "Failed"
+            case .refused: "Refused"
+            case .cancelled: "Cancelled"
+            case .timeout: "Timed out"
+            case .unknown: "Outcome unconfirmed"
+            }
+            if let preview = execution["resultPreview"] { fields["detail"] = preview }
+            let preview = ChatToolOutcome.explanation(.object(fields)).map { " Result: \($0)" } ?? ""
+            words = (decision == "approved" ? "\(action): \(outcome) after approval."
+                : "\(action): \(decision ?? status). The tool did not run.") + preview
+        } else if executedAction != nil {
+            let value = JSONValue.object(fields)
+            words = [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
+                .compactMap { $0 }.joined(separator: " ")
+        } else {
+            words = executionDetail ?? decision.map { "\(action): \($0)." } ?? readableAsk
+        }
+        // Permission is not adoption. This receipt is written only after the
+        // application completes; false means the lesson was already present.
+        let applied: Bool
+        if action == "rem.proposal", decision == "approved",
+           fields["op"] == .string("rem_proposal_approve"), case .bool? = fields["growthAppended"],
+           !ChatToolOutcome.carriesFailureEvidence(.object(fields)) { applied = true } else { applied = false }
+        return Experience(id: id, kind: .decision, cause: cause.map { [$0] } ?? [], evidence: [ref],
+                          outcome: decision.map { .init(domain: "approvals", status: $0, at: resolvedAt) },
+                          face: .init(words: words, artifacts: []), addressedTo: ["person"],
+                          owes: ["decide": obligation],
+                          claims: applied ? [.init(claim: "applied", evidence: [ref])] : [])
+    }
     public var chatContinuation: JSONValue? = nil
     /// User, 10-03: the one inline card this approval posted into his
     /// conversation (`ApprovalChatCards`): `{sessionId, telegramChatId?, at}`.
@@ -88,7 +168,7 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
         self.remoteResolvable = remoteResolvable
         self.localOnly = localOnly
         self.executedAction = executedAction
-        self.detail = detail
+        self.executionDetail = detail
     }
 }
 
@@ -188,7 +268,8 @@ extension ApprovalRecord {
         } else {
             self.executedAction = nil
         }
-        self.detail = optStr("detail")
+        self.executionDetail = optStr("detail")
+        self.cause = optStr("cause")
         self.chatContinuation = obj["chatContinuation"]
         self.chatCard = obj["chatCard"]
     }
@@ -225,6 +306,7 @@ extension ApprovalRecord {
         if let ea = executedAction {
             obj["executedAction"] = ea
         }
+        if let cause { obj["cause"] = .string(cause) }
         if let d = detail {
             obj["detail"] = .string(d)
         }
@@ -479,7 +561,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
     /// a tool approval, and Telegram still cannot answer them (it needs a card
     /// bound to its own chat). Nothing here widens permissions or autonomy —
     /// those kinds stay in `hardLocalOnlyActions`.
-    nonisolated static let ownerReviewActions: Set<String> = [
+    public nonisolated static let ownerReviewActions: Set<String> = [
         "self_improvement.apply",
         "skill.proposal",
         "rem.proposal",
@@ -551,7 +633,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
 
     @discardableResult
     public func create(_ body: JSONValue) async throws -> ApprovalRecord {
-        let record = try await runSerialized { [persistence, approvalsPath] in
+        let (record, expired) = try await runSerialized { [persistence, approvalsPath] in
             try await Self._createImpl(
                 body: body,
                 persistence: persistence,
@@ -560,6 +642,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             )
         }
         ApprovalLifecycleBus.fire(.init(phase: .requested, record: record))
+        recordFiled(record, expired: expired)
         return record
     }
 
@@ -591,7 +674,87 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         if outcome.created {
             ApprovalLifecycleBus.fire(.init(phase: .requested, record: outcome.record))
         }
-        return outcome
+        // A touched card is born too: births are idempotent, so this mends a gap.
+        recordFiled(outcome.record, expired: outcome.expired)
+        return (outcome.record, outcome.created)
+    }
+
+    /// Id-only birth keeps E0 records readable; cause and face append after it.
+    private static func filed(_ id: String) -> Experience {
+        Experience(id: id, kind: .decision, evidence: [.init(source: "workflows/approvals/requests.json", id: id)],
+                   addressedTo: ["person"], owes: ["decide": .init(to: "person")])
+    }
+
+    /// Recorded after the approvals lock is released. Cards this write aged out let theirs go.
+    private func recordFiled(_ record: ApprovalRecord, expired: [ApprovalRecord]) {
+        recordProjection(record)
+        for expired in expired {
+            recordProjection(expired)
+            ApprovalLifecycleBus.fire(.init(phase: .resolved, record: expired))
+        }
+    }
+
+    private func recordProjection(_ record: ApprovalRecord) {
+        ExperienceStore.record(root, record.id) { store in
+            try await Self.project(record, into: store)
+        }
+        // Later answers settle with the decision; the first rides its continuation.
+        // Without a decision, the inbox lets go of every answer it held.
+        guard record.status != "pending", case .object(let payload) = record.payload else { return }
+        var heards: [JSONValue] = if case .array(let waiting)? = payload["waitingHeards"] { waiting } else { [] }
+        if record.decision == nil, case .object(let origin)? = payload["origin"],
+           case .string(let heard)? = origin["answerExperienceID"], !heards.contains(.string(heard)) {
+            heards.append(.string(heard))
+        }
+        let settle: ExperienceStore.Change = record.decision != nil
+            ? .obligation(key: "answer", phase: .accepted, evidence: .init(source: "workflows/approvals/requests.json", id: record.id))
+            : .letGo(key: "answer", reason: .expired)
+        for case .string(let heard) in heards {
+            ExperienceStore.record(root, heard) { store in
+                guard try await store.experience(heard)?.owes["answer"]?.phase.isSettled == false else { return }
+                try await store.append([settle], to: heard)
+            }
+        }
+    }
+
+    /// The durable domain row is the decision's source, not its advisory copy.
+    /// Reads are projections only; a failed experience write cannot hold a turn.
+    public func decisionsForREM() async throws -> [String: Experience] {
+        let records = try await list(filter: ApprovalFilter(action: "rem.proposal"))
+        var decisions: [String: Experience] = [:]
+        for record in records {
+            guard case .object(let payload) = record.payload,
+                  case .object(let proposal)? = payload["proposal"],
+                  case .string(let id)? = proposal["id"], decisions[id] == nil else { continue }
+            decisions[id] = record.decisionExperience
+        }
+        return decisions
+    }
+
+    private static func project(_ record: ApprovalRecord, into store: ExperienceStore) async throws {
+        let projection = record.decisionExperience
+        try await store.begin(Self.filed(record.id))
+        var changes = projection.cause.map(ExperienceStore.Change.cause)
+        if let face = projection.face { changes.append(.face(face)) }
+        changes += projection.claims.map(ExperienceStore.Change.claim)
+        if let outcome = projection.outcome {
+            changes += [.outcome(outcome), .obligation(key: "decide", phase: .accepted,
+                evidence: projection.owes["decide"]?.evidence)]
+        } else if projection.owes["decide"]?.phase == .letGo {
+            changes.append(.letGo(key: "decide", reason: .expired))
+        }
+        try await store.append(changes, to: record.id)
+    }
+
+    /// Pending rows a capped write no longer holds as pending: aging is the only way out.
+    private static func expired(from before: [JSONValue], to after: [JSONValue]) -> [ApprovalRecord] {
+        let pending = Set(after.compactMap { ApprovalRecord(json: $0) }.filter { $0.status == "pending" }.map(\.id))
+        return before.compactMap { row in
+            guard var record = ApprovalRecord(json: row), record.status == "pending",
+                  !pending.contains(record.id) else { return nil }
+            record.status = "orphaned"
+            return record
+        }
     }
 
     private static func _createOrTouchPendingImpl(
@@ -600,7 +763,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         persistence: any PersistenceCoreProtocol,
         approvalsPath: URL,
         now: Date
-    ) async throws -> (record: ApprovalRecord, created: Bool) {
+    ) async throws -> (record: ApprovalRecord, created: Bool, expired: [ApprovalRecord]) {
       return try await persistence.withFileLock(approvalsPath) {
         var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
         let stamp = Self.isoTimestamp(now)
@@ -609,16 +772,28 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             guard case .string("pending") = obj["status"] ?? .null else { continue }
             guard matchesPending(obj["payload"] ?? .object([:])) else { continue }
             obj["lastRequestedAt"] = .string(stamp)
+            // Every answer waiting on this card: the first rides its origin, each later one is kept here.
+            if case .object(let asked) = body, case .object(let request)? = asked["payload"],
+               case .object(let origin)? = request["origin"], case .string(let heard)? = origin["answerExperienceID"],
+               case .object(var payload)? = obj["payload"] {
+                let first: JSONValue? = if case .object(let kept)? = payload["origin"] { kept["answerExperienceID"] } else { nil }
+                var waiting: [JSONValue] = if case .array(let ids)? = payload["waitingHeards"] { ids } else { [] }
+                if first != .string(heard), !waiting.contains(.string(heard)) {
+                    waiting.append(.string(heard))
+                    payload["waitingHeards"] = .array(waiting)
+                    obj["payload"] = .object(payload)
+                }
+            }
             guard let touched = ApprovalRecord(json: .object(obj)) else { continue }
             items[idx] = .object(obj)
             try await persistence.writeJSON(.array(items), to: approvalsPath)
-            return (touched, false)
+            return (touched, false, [])
         }
         let approval = try Self.makeApprovalRecord(body: body, now: now)
         items.insert(approval.toJSON(), at: 0)
-        items = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now)
-        try await persistence.writeJSON(.array(items), to: approvalsPath)
-        return (approval, true)
+        let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now)
+        try await persistence.writeJSON(.array(capped), to: approvalsPath)
+        return (approval, true, Self.expired(from: items, to: capped))
       }
     }
 
@@ -658,6 +833,9 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             )
         }
         ApprovalLifecycleBus.fire(.init(phase: .resolved, record: record))
+        // The inbox holding the decision is the person's durable acceptance; the
+        // birth goes first in case this resolver got there before the filer.
+        recordProjection(record)
         return record
     }
 
@@ -735,7 +913,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             )
         }
         let stamp = isoTimestamp(now)
-        let approval = ApprovalRecord(
+        var approval = ApprovalRecord(
             id: UUID().uuidString.lowercased(),
             title: codepointPrefix(SkillRunContext.requester.map {
                 let verb = ToolActivityPresentation.title(action)
@@ -754,6 +932,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             localOnly: localOnly
         )
 
+        approval.cause = Experience.currentAct
         return approval
     }
 
@@ -762,7 +941,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         persistence: any PersistenceCoreProtocol,
         approvalsPath: URL,
         now: Date
-    ) async throws -> ApprovalRecord {
+    ) async throws -> (ApprovalRecord, [ApprovalRecord]) {
       let approval = try Self.makeApprovalRecord(body: body, now: now)
       return try await persistence.withFileLock(approvalsPath) {
         var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
@@ -774,9 +953,9 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         // (oldest first) and never a pending row; a store whose whole cap is
         // pending work refuses the create instead of silently discarding a
         // decision nobody made.
-        items = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now)
-        try await persistence.writeJSON(.array(items), to: approvalsPath)
-        return approval
+        let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now)
+        try await persistence.writeJSON(.array(capped), to: approvalsPath)
+        return (approval, Self.expired(from: items, to: capped))
       }
     }
 
@@ -864,6 +1043,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         await ApprovalLifecycleBus.shared.publish(.init(phase: .executed, record: record,
             result: result ?? executedAction))
+        recordProjection(record)
         return record
     }
 

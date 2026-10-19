@@ -158,14 +158,8 @@ public final class ApprovalsFacade {
 extension ApprovalRequest {
     /// The phone's approvals.json row, in the shape the Mac has always sent.
     public init(record: ApprovalRecord) {
-        let outcome = record.executedAction.map(ChatToolOutcome.exactResultClass)
-        let summary = record.executedAction.map { receipt in
-            var fields: [String: JSONValue] = { if case .object(let fields) = receipt { return fields }; return [:] }()
-            if fields["detail"] == nil, let detail = record.detail { fields["detail"] = .string(detail) }
-            let value = JSONValue.object(fields)
-            return [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
-                .compactMap { $0 }.joined(separator: " ")
-        }
+        let outcome = record.executedAction.map { _ in record.executionResultClass }
+        let summary = record.executedAction.flatMap { _ in record.decisionExperience.face?.words }
         self.init(
             id: record.id,
             title: record.title,

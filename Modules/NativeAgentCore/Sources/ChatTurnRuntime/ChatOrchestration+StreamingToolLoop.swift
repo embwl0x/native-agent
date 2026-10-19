@@ -1,4 +1,5 @@
 import ChatToolParsing
+import Experiences
 import ChatSessionWork
 import ToolRegistry
 import Foundation
@@ -107,9 +108,16 @@ extension SwiftNativeTurnEngine {
         // Steered messages reach the queue owner as delivered at the same
         // moment instructions do: the round carrying them produced output.
         var steeringOffers: [ChatTurnSteering.Offer] = []
+        var arrivedItems: [ResidentWake.Item] = []
         func commitDelivery() async throws {
             commitInstructionDelivery?()
             commitInstructionDelivery = nil
+            if let root = remPinsDataRoot, !arrivedItems.isEmpty {
+                guard ResidentWake.shared.accept(dataRoot: root, items: arrivedItems) else {
+                    throw ChatOrchestrationError.underlying("Arrival acceptance could not be saved; it remains owed.")
+                }
+                arrivedItems = []
+            }
             guard let sessionId, !steeringOffers.isEmpty else { return }
             let offers = steeringOffers
             steeringOffers = []
@@ -191,13 +199,14 @@ extension SwiftNativeTurnEngine {
         let compactionSurface = ChatCompactionDistiller.distillSurface
         let distillWorkingNotes: @Sendable (String) async throws -> String? = { [weak self] rendered in
             guard let self else { return nil }
+            let root = self.remPinsDataRoot ?? defaultDataRoot()
+            let operation = "turn.reconcile:" + (TurnTraceContext.turnId ?? runId ?? "unsaved")
+            let owner = "chat/session_state/\(sessionId ?? "")/turn-\(TurnTraceContext.turnId ?? "").json"
+            do {
             let route = try await ProviderTurnChoice.$current.withValue(nil) {
                 try await self.checkedRouteAdmission(for: compactionSurface)
             }
-            return await IntraTurnContextCompaction.withDeadline(
-                seconds: IntraTurnContextCompaction.distillDeadlineSeconds
-            ) {
-                try await ProviderTurnChoice.$current.withValue(nil) {
+            let note = try await ProviderTurnChoice.$current.withValue(nil) {
                 try await LLMCallContext.$admittedModel.withValue(route.modelId) {
                 try await LLMCallContext.$providerId.withValue(route.providerId) {
                 try await LLMCallContext.$serviceTier.withValue(route.serviceTier) {
@@ -213,6 +222,20 @@ extension SwiftNativeTurnEngine {
                 }
                 }
                 }
+            guard !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolFailureError("Working recollection returned no text.", effects: .none)
+            }
+            RepairOwed.settle(root, operation: operation,
+                evidence: .init(source: "turn", id: TurnTraceContext.turnId ?? runId ?? "unsaved"))
+            return note
+            } catch {
+                try Task.checkCancellation()
+                let next = ToolFailureError.call("app", ["action": .string("turn.reconcile"), "args": .object([
+                    "session_id": .string(sessionId ?? ""), "turn_id": .string(TurnTraceContext.turnId ?? "")])])
+                RepairOwed.owe(root, id: UUID().uuidString, kind: .run, operation: operation,
+                    owner: owner, words: "Working recollection failed: \(error.localizedDescription)", nextCall: next)
+                throw ToolFailureError("Working recollection failed; reconcile the saved turn after repairing its model route. \(error.localizedDescription)",
+                    effects: .unknown, owner: owner, nextCall: next)
             }
         }
         var dispatches: [TurnEngineResult.ToolDispatchRecord] = []
@@ -231,8 +254,11 @@ extension SwiftNativeTurnEngine {
         var noProgressGuard = ToolLoopNoProgressGuard()
         var providerCallCount = 0
         var replyTextSettled = false
-        var retryAttempt = 0
-        var retryingLiveFirstOutputCut = false
+        var providerFailurePending = part.log.reversed().compactMap { row -> String? in
+            guard case .object(let entry) = row, case .object(let event)? = entry["event"],
+                  case .string(let type)? = event["type"], ["model", "provider_failure"].contains(type) else { return nil }
+            return type
+        }.first == "provider_failure"
 
         if let restarted {
             let rows = TurnCheckpointScope.resumedRows
@@ -290,7 +316,7 @@ extension SwiftNativeTurnEngine {
 
         func finishIncompleteTurn() async -> TurnEngineResult {
             observed(await finishCompletedTurn(
-                reply: Self.joinedProse(turnInterstitialProse, retainedAnswerProse),
+                reply: Self.joinedProse(turnInterstitialProse, Self.joinedProse(retainedAnswerProse, answerProse)),
                 ctx: ctx, dispatches: dispatches,
                 startNs: startNs, rawLLMResponse: lastRawResponse,
                 providerCallCount: providerCallCount, userMessage: userMessage,
@@ -325,11 +351,33 @@ extension SwiftNativeTurnEngine {
         /// The model round whose calls the next app effects dispatch.
         var round: (calls: [ParsedToolCall], raw: String, codec: TextMarkerCodec?, boundary: LLMToolBoundaryReason?)?
 
+        func providerFailed(_ error: Error) async throws {
+            providerFailurePending = true
+            let id = "provider-reply:" + UUID().uuidString
+            let provider = ctx.providerId ?? LLMCallContext.providerId ?? "unresolved"
+            let failure = ProviderFailure.repair(error, provider: provider, model: ctx.modelId, surface: surface,
+                dataRoot: remPinsDataRoot ?? defaultDataRoot(), id: id)
+            let next = failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+            var calls: [ParsedToolCall] = []
+            if case .object(let call)? = next, case .string(let tool)? = call["tool"], case .object(let input)? = call["input"] {
+                calls = [ParsedToolCall(id: id, name: tool, input: input)]
+            }
+            round = (calls, "", nil, nil)
+            let remedy: JSONValue = if case .object(let shaped) = ChatToolOutcome.failure(error: failure) { shaped["remedy"] ?? .null } else { .null }
+            await progress?(.notice(kind: "provider_failure", text: failure.message))
+            do {
+                try await part.deliver([.object(["type": .string("provider_failure"), "provider": .string(provider),
+                    "model": .string(ctx.modelId), "text": .string(failure.message), "remedy": remedy,
+                    "calls": .array(calls.map { .object(["id": .string($0.id), "name": .string($0.name), "input": .object($0.input)]) })])])
+            } catch { throw TurnEngineError.streamInterrupted(partial: visibleText, underlying: failure) }
+        }
+
         while true {
             if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) {
                 throw stopCarryingPartial()
             }
             guard let effect = try await part.next() else {
+                if providerFailurePending { return await finishIncompleteTurn() }
                 let completed = await finishCompletedTurn(
                     reply: Self.joinedProse(turnInterstitialProse, Self.joinedProse(retainedAnswerProse, answerProse)),
                     ctx: ctx, dispatches: dispatches, startNs: startNs,
@@ -353,7 +401,15 @@ extension SwiftNativeTurnEngine {
                 // The part names calls of this model round; they run verbatim.
                 var batch = [effect]
                 while part.nextIsApp, let more = try await part.next() { batch.append(more) }
-                guard let round else { throw TurnEngineError.turnPartFailed("Its app effects came with no model round to run.") }
+                guard var updatedRound = round else { throw TurnEngineError.turnPartFailed("Its app effects came with no model round to run.") }
+                for item in batch {
+                    if case .object(let call)? = item["call"], call["tool"] == .string("app"),
+                       case .string(let id)? = call["id"], case .object(let input)? = call["input"] {
+                        updatedRound.calls.append(ParsedToolCall(id: id, name: "app", input: input))
+                    }
+                }
+                round = updatedRound
+                let round = updatedRound
                 let indices = batch.compactMap { if case .int(let at)? = $0["index"] { Int(at) } else { nil } }
                 let providerCalls = indices.map { round.calls[$0] }
                 counters.toolRoundCount += 1
@@ -414,7 +470,7 @@ extension SwiftNativeTurnEngine {
                 replyTextSettled = false
                 await progress?(.replyTextSettled(false))
             }
-            _ = await IntraTurnContextCompaction.compactProactivelyIfNeeded(
+            _ = try await IntraTurnContextCompaction.compactProactivelyIfNeeded(
                 conversation: &conversation,
                 turnStartIndex: compactionTurnStart,
                 windowTokens: turnWindowTokens,
@@ -432,7 +488,6 @@ extension SwiftNativeTurnEngine {
             let rawProviderEvents = OSAllocatedUnfairLock<String>(initialState: "")
             let roundBaseVisibleText = visibleText
             let roundBaseRawResponse = lastRawResponse
-            let roundStarted = DispatchTime.now().uptimeNanoseconds
 
             // Only prose can survive an incomplete stream; none of its calls ran.
             func keepPartial() async -> String {
@@ -452,7 +507,7 @@ extension SwiftNativeTurnEngine {
 
             do { try await providerAdmission?() }
             catch is CancellationError { throw stopCarryingPartial() }
-            do {
+            providerStream: do {
                 if let sessionId, !sessionId.isEmpty {
                     let offers = await ChatTurnSteering.shared.drain(
                         sessionId: sessionId, cancelFlagPath: cancelFlagPath)
@@ -467,18 +522,15 @@ extension SwiftNativeTurnEngine {
                     if let root = remPinsDataRoot, !sessionId.hasPrefix("bot-"), PeerDataTaint.current?.isTainted != true,
                        [nil, "self"].contains(ChatToolSessionContext.envelope?.agent),
                        let arrived = ResidentWake.shared.take(dataRoot: root) {
-                        Self.appendStructuredUserNudge(arrived, to: &conversation)
+                        arrivedItems += arrived.items
+                        Self.appendStructuredUserNudge(arrived.text, to: &conversation)
                     }
                 }
                 providerCallCount += 1
                 counters.providerAttemptCount += 1
-                if retryAttempt == 0 {
-                    counters.providerRoundCount += 1
-                    if previousRoundFailed { counters.roundsAfterToolFailureCount += 1 }
-                    previousRoundFailed = false
-                } else {
-                    counters.providerRecoveryCount += 1
-                }
+                counters.providerRoundCount += 1
+                if previousRoundFailed { counters.roundsAfterToolFailureCount += 1 }
+                previousRoundFailed = false
                 // Construction and consumption share the async task-local scope.
                 let providerRoute = ctx.providerId ?? LLMCallContext.providerId
                 let serviceTier = ctx.serviceTier ?? LLMCallContext.serviceTier
@@ -493,7 +545,7 @@ extension SwiftNativeTurnEngine {
                     }
                 }
                 let consumeStream: () async throws -> Void = {
-                    try await ProviderStreamContext.$retryingLiveFirstOutputCut.withValue(retryingLiveFirstOutputCut) {
+                    try await ProviderStreamContext.$retryingLiveFirstOutputCut.withValue(false) {
                     try await ProviderStreamContext.$diagnosticEvent.withValue(captureEvents) {
                     try await ProviderStreamContext.$dispatched.withValue(requestDispatched) {
                     try await LLMCallContext.$purpose.withValue(purpose) {
@@ -600,13 +652,18 @@ extension SwiftNativeTurnEngine {
                 if iterAccumulated.isEmpty, case .outputLengthLimit(let partial) = error as? LLMError {
                     iterAccumulated = partial
                 }
+                if ProviderRecoveryPolicy.isRecoverable(error) || ProviderFailure.classify(error) == .malformedResponse,
+                   !toolCallCodec.roundCalls(streamed: streamedCalls, text: iterAccumulated, schemas: ctx.toolSchemas).isEmpty {
+                    toolBoundaryReason = .interrupted
+                    break providerStream
+                }
                 let kept = await keepPartial()
                 if case .outputLengthLimit = error as? LLMError,
                    LLMCallContext.turnTokenBudget?.exhausted == true {
                     return await finishIncompleteTurn()
                 }
                 if ProviderRecoveryPolicy.isContextOverflow(error) {
-                    let receipt = await IntraTurnContextCompaction.compact(
+                    let receipt = try await IntraTurnContextCompaction.compact(
                         conversation: &conversation, turnStartIndex: compactionTurnStart,
                         windowTokens: turnWindowTokens, pressure: .overflow, distill: distillWorkingNotes)
                     if Task.isCancelled || ChatCancelFlag.isRaised(cancelFlagPath) { throw stopCarryingPartial() }
@@ -625,53 +682,12 @@ extension SwiftNativeTurnEngine {
                         text: IntraTurnContextCompaction.noticeText))
                 } else if case .outputLengthLimit = error as? LLMError {
                     try await observe(.lengthLimit(chars: kept.count), kept: kept)
-                } else if ProviderRecoveryPolicy.isEmptyReply(error) || ProviderRecoveryPolicy.isRecoverable(error) {
-                    retryingLiveFirstOutputCut = retryingLiveFirstOutputCut
-                        || (error as? ProviderFailure.Diagnostic)?.liveFirstOutputCut == true
-                    retryAttempt += 1
-                    let delay = ProviderRecoveryPolicy.retryDelaySeconds(forRetry: retryAttempt, error: error)
-                    let elapsed = Int((DispatchTime.now().uptimeNanoseconds &- roundStarted) / 1_000_000_000)
-                    let emptyReply = ProviderRecoveryPolicy.isEmptyReply(error)
-                    if emptyReply {
-                        counters.emptyReplyRoundCount += 1
-                        try await observe(.emptyReply, kept: kept)
-                    } else if kept.isEmpty {
-                        counters.providerReplayCount += 1
-                        // An empty transport cut replays the identical conversation.
-                        try await observe(.cut(seconds: elapsed, keptChars: 0), applying: false)
-                    } else {
-                        counters.providerContinuationCount += 1
-                        try await observe(.cut(seconds: elapsed, keptChars: kept.count), kept: kept)
-                    }
-                    ProviderRetryTrace.emit(error: error, attempt: retryAttempt,
-                        delaySeconds: delay, mode: kept.isEmpty && !emptyReply ? "replay" : "continuation",
-                        turnRecoveries: counters.providerRecoveryCount, surface: surface)
-                    await progress?(.notice(kind: "provider_retry",
-                        text: ProviderRecoveryPolicy.reconnectStatus(attemptsMade: retryAttempt)))
-                    do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
-                    catch is CancellationError { throw stopCarryingPartial() }
                 } else {
-                    switch ProviderFailure.classify(error) {
-                    case .authExpired, .codexCLISessionExpired, .routingUnavailable, .modelUnavailable:
-                        throw TurnEngineError.streamInterrupted(partial: visibleText, underlying: error)
-                    case .refused:
-                        try await observe(.refused(reason: ProviderFailure.diagnosticDescription(error)), kept: kept)
-                    default:
-                        try await observe(.malformedCall(why: ProviderFailure.diagnosticDescription(error)), kept: kept)
-                    }
+                    try await providerFailed(error)
                 }
                 continue
             }
-            retryAttempt = 0
-            retryingLiveFirstOutputCut = false
-            if toolBoundaryReason == .outputLimit {
-                let kept = await keepPartial()
-                if LLMCallContext.turnTokenBudget?.exhausted == true {
-                    return await finishIncompleteTurn()
-                }
-                try await observe(.lengthLimit(chars: kept.count), kept: kept)
-                continue
-            }
+            providerFailurePending = false
             let iterProse = ToolCallParser.stripProtocolDebris(iterAccumulated)
             let answerText = iterProse.replacingOccurrences(
                 of: #"</?[\p{L}_][\p{L}\p{N}_.:-]*(?:\s[^<>]*)?/?>|<[!?][^>]*>"#, with: "", options: .regularExpression)
@@ -682,11 +698,12 @@ extension SwiftNativeTurnEngine {
                 let raw = rawProviderEvents.withLock { $0 }
                 if !raw.isEmpty { RunawayOutputDetector.writeDiagnostic(raw, reason: "suspicious_reply") }
             }
-            if streamedCalls.isEmpty && !answerText.contains(where: { !$0.isWhitespace }) {
+            if toolBoundaryReason == nil, streamedCalls.isEmpty && !answerText.contains(where: { !$0.isWhitespace }) {
                 saveSuspiciousReply()
                 visibleText = roundBaseVisibleText
                 counters.emptyReplyRoundCount += 1
-                try await observe(.emptyReply)
+                try await providerFailed(ProviderFailure.Diagnostic(cause: .malformedResponse,
+                    detail: "The provider completed without an answer or a tool call."))
                 continue
             }
             let markerCodec = toolCallCodec == .textMarkers
@@ -723,6 +740,9 @@ extension SwiftNativeTurnEngine {
                 saveSuspiciousReply()
                 if let toolBoundaryReason {
                     let kept = await keepPartial()
+                    if toolBoundaryReason == .outputLimit, LLMCallContext.turnTokenBudget?.exhausted == true {
+                        return await finishIncompleteTurn()
+                    }
                     try await observe(.boundary(toolBoundaryReason), kept: kept)
                     continue
                 }

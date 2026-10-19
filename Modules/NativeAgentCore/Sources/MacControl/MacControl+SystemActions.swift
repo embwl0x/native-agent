@@ -393,55 +393,46 @@ extension SwiftNativeMacControl {
         }
         let app = try requestedAppName(body)
         let started = now()
+        var output: [String: JSONValue]
+        let failure: String?
         do {
             try Task.checkCancellation()
-            // `go` without front: running already, or launched behind.
+            // `go` without front reopens or launches behind.
             if body["background"] == .bool(true) {
                 let result = try await appControlAdapter.launchApp(named: app)
                 return MacControlResult(
                     ok: true, action: "focus_app",
-                    output: appControlOutput(result, status: result.launched ? "launched" : "running", verified: false),
+                    output: .object(appControlOutput(result, status: result.launched ? "launched" : "running", verified: false)),
                     error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000)
                 )
             }
             let result = try await appControlAdapter.focusApp(named: app)
-            let resolvedApp = result.bundleIdentifier ?? result.matchedName ?? app
-            let observedFrontmost = await appControlAdapter.isFrontmostApplication(matching: resolvedApp)
             try Task.checkCancellation()
-            let ok = observedFrontmost == true
-            let failureReason: String? = if ok {
-                nil
-            } else if let reason = result.activationFailureReason {
-                reason
-            } else {
-                "activation request returned \(result.activationRequestAccepted.map(String.init) ?? String(result.activated)); target was not observed frontmost"
-            }
-            return MacControlResult(
-                ok: ok,
-                action: "focus_app",
-                output: appControlOutput(
-                    result,
-                    status: ok ? "focused" : "focus_failed",
-                    verified: ok,
-                    activated: ok,
-                    failureReason: failureReason
-                ),
-                error: failureReason,
-                durationMs: Int(now().timeIntervalSince(started) * 1000)
-            )
+            failure = nil
+            output = appControlOutput(result, status: "focused", verified: true)
         } catch {
-            return MacControlResult(
-                ok: false,
-                action: "focus_app",
-                output: .object([
-                    "requested": .string(app),
-                    "status": .string(error is CancellationError ? "cancelled" : "failed"),
-                    "error": .string("\(error)"),
-                ]),
-                error: "\(error)",
-                durationMs: Int(now().timeIntervalSince(started) * 1000)
-            )
+            failure = error.localizedDescription
+            output = [
+                "requested": .string(app),
+                "status": .string(error is CancellationError ? "cancelled" : "failed"),
+                "error": .string(error.localizedDescription),
+            ]
+            if let evidence = error as? ToolFailureError {
+                output["effects"] = .string(evidence.effects.rawValue)
+                if let owner = evidence.owner {
+                    let call = evidence.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+                    output["remedy"] = if evidence.personDecides, let tap = evidence.tap {
+                        Repair.why(owner: owner, tap: tap)
+                    } else { Repair.remedy(owner: owner, nextCall: call, tap: evidence.tap) }
+                } else if let argument = evidence.argumentPath {
+                    output["remedy"] = .object(["kind": .string("correct_arguments"),
+                        "argument_path": .string(argument), "accepted": evidence.accepted.map(JSONValue.string) ?? .null,
+                        "instruction": .string(evidence.message)])
+                }
+            }
         }
+        return MacControlResult(ok: failure == nil, action: "focus_app", output: .object(output),
+            error: failure, durationMs: Int(now().timeIntervalSince(started) * 1000))
     }
 
     /// Her-screen Phase 4 — focus an EXACT process, and optionally one exact
@@ -559,17 +550,18 @@ extension SwiftNativeMacControl {
             throw MacControlError.missingField("url")
         }
         let started = now()
-        let accepted = await openTargetAdapter.requestOpen(url, background: body["background"] == .bool(true))
-        return MacControlResult(
-            ok: accepted,
-            action: "open_target",
-            output: .object([
-                "status": .string(accepted ? "requested" : "request_refused"),
-                "verified": .bool(false),
-            ]),
-            error: accepted ? nil : "Launch Services did not accept the open request",
-            durationMs: Int(now().timeIntervalSince(started) * 1000)
-        )
+        do {
+            var output = try await openTargetAdapter.requestOpen(url, background: body["background"] == .bool(true))
+            output["status"] = .string("requested")
+            output["verified"] = .bool(false)
+            return MacControlResult(ok: true, action: "open_target", output: .object(output),
+                error: nil, durationMs: Int(now().timeIntervalSince(started) * 1000))
+        } catch {
+            return MacControlResult(ok: false, action: "open_target",
+                output: .object(["status": .string("request_refused"), "verified": .bool(false)]),
+                error: "Launch Services could not open \(raw): \(error.localizedDescription)",
+                durationMs: Int(now().timeIntervalSince(started) * 1000))
+        }
     }
 
     func handleQuitApp(_ body: [String: JSONValue]) async throws -> MacControlResult {
@@ -583,11 +575,11 @@ extension SwiftNativeMacControl {
             return MacControlResult(
                 ok: ok,
                 action: "quit_app",
-                output: appControlOutput(
+                output: .object(appControlOutput(
                     result,
                     status: ok ? "quit_requested" : "quit_failed",
                     verified: verified
-                ),
+                )),
                 error: ok ? nil : "quit_app failed for \(app)",
                 durationMs: Int(now().timeIntervalSince(started) * 1000)
             )
@@ -609,26 +601,20 @@ extension SwiftNativeMacControl {
     private func appControlOutput(
         _ result: AppControlRunResult,
         status: String,
-        verified: Bool,
-        activated: Bool? = nil,
-        failureReason: String? = nil
-    ) -> JSONValue {
-        .object([
+        verified: Bool
+    ) -> [String: JSONValue] {
+        [
             "requested": .string(result.requestedName),
             "matched_name": result.matchedName.map { .string($0) } ?? .null,
             "bundle_identifier": result.bundleIdentifier.map { .string($0) } ?? .null,
             "process_identifier": result.processIdentifier.map { .int(Int64($0)) } ?? .null,
             "launched": .bool(result.launched),
-            "activated": .bool(activated ?? result.activated),
-            "activation_request_accepted": result.activationRequestAccepted.map { .bool($0) } ?? .null,
-            "activation_fallback_attempted": .bool(result.activationFallbackAttempted),
-            "activation_fallback_succeeded": .bool(result.activationFallbackSucceeded),
-            "failure_reason": failureReason.map { .string($0) } ?? .null,
+            "activated": .bool(result.activated),
             "terminated": .bool(result.terminated),
             "already_in_desired_state": .bool(result.alreadyInDesiredState),
             "verified": .bool(verified),
             "status": .string(status),
-        ])
+        ]
     }
 
     // MARK: spotlight

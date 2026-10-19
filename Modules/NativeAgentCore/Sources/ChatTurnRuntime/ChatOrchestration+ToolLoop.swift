@@ -74,7 +74,7 @@ extension SwiftNativeTurnEngine {
 
     /// Shared terminal for a loop iteration that produced a final reply (no
     /// executable tool calls): record the completed outcome, run the after-turn
-    /// work when her turn part asked for it (`after`: promises, repeated work,
+    /// work when her turn part asked for it (`after`: promises,
     /// the memory-promotion side channel — without it AdaptiveMemoryPromoter
     /// never sees the user/assistant pair), and build the TurnEngineResult.
     /// `rawLLMResponse` is the turn's accumulated raw output.
@@ -97,7 +97,6 @@ extension SwiftNativeTurnEngine {
         var promotionTicket: UUID?
         if afterTurn {
             await queuePromises(in: reply, dispatches: dispatches, surface: surface)
-            Self.noticeRepeatedWork(dispatches: dispatches, surface: surface, root: remPinsDataRoot, sessionId: sessionId)
             // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold
             // the TurnEngineResult — and therefore the caller's assistant-row persist
             // and output milestone — for the whole promotion, 8-10 s on live bridge

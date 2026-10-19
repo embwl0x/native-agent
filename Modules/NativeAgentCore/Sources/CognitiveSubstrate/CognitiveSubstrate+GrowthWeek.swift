@@ -28,6 +28,7 @@
 //   * BOUNDED. A READOUT, NOT A DASHBOARD. No charts, no trends, no totals.
 
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 
@@ -58,6 +59,7 @@ public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     /// A proposal that aged out unanswered. Not released, not adopted, and not
     /// dressed up as either.
     case expiredUnresolved
+    case unavailable
     /// A REPLAY PASS RAN. A dream night or a consolidation sweep is not a
     /// proposal and never was: it proposes nothing, carries nothing, and
     /// answers nothing. It used to land in `.proposed` because that is where a
@@ -69,7 +71,7 @@ public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     /// and `expiredUnresolved` are deliberately excluded: nothing moved.
     public var isSettled: Bool {
         switch self {
-        case .proposed, .revisionProposed, .expiredUnresolved, .replayed: return false
+        case .proposed, .revisionProposed, .expiredUnresolved, .unavailable, .replayed: return false
         default: return true
         }
     }
@@ -83,7 +85,9 @@ public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     /// line reads <what it is> — <verdict> — <why>, in that order, always.
     public var verdict: String {
         switch self {
-        case .proposed, .revisionProposed, .expiredUnresolved: return "proposed"
+        case .proposed, .revisionProposed: return "proposed"
+        case .expiredUnresolved: return "expired"
+        case .unavailable: return "unavailable"
         case .held: return "held"
         case .approved: return "accepted"
         case .revised: return "revised"
@@ -106,6 +110,7 @@ public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
         case .declined: return "the person declined it"
         case .outOfSet: return "the set was full — capacity, not reconsidered"
         case .expiredUnresolved: return "nobody answered it and it aged out"
+        case .unavailable: return "the decision is unavailable"
         case .replayed: return "no proposal"
         }
     }
@@ -347,15 +352,17 @@ extension CognitiveSubstrate {
         "outcome:\(outcome.rawValue)"
     }
 
-    /// The tag a REM proposal resolution carries, or none while it is still
-    /// open. Nobody signs a REM resolution, so an acceptance is HELD (her own)
-    /// and a rejection is letGo — never the person's approved/declined.
-    func growthOutcomeTagIds(for status: CognitiveSchemaProposalStatus) -> [String] {
-        switch status {
-        case .accepted: return [Self.growthOutcomeTag(.held)]
-        case .rejected: return [Self.growthOutcomeTag(.letGo)]
-        case .proposed: return []
-        }
+    func growthOutcomeTagIds(for decision: Experience?) -> [String] {
+        let outcome: CognitiveGrowthOutcome
+        if let decision {
+            outcome = switch decision.outcome?.status {
+            case "approved": decision.claims.contains { $0.claim == "applied" } ? .approved : .unavailable
+            case "denied": .declined
+            case "canceled": .letGo
+            default: decision.isOpen ? .proposed : .expiredUnresolved
+            }
+        } else { outcome = .unavailable }
+        return [Self.growthOutcomeTag(outcome)]
     }
 
     /// Outcome of a single timeline event, from its tag — or, for rows written
@@ -501,7 +508,8 @@ extension CognitiveSubstrate {
         // An emitted-but-unanswered proposal is not "proposed" in a sentence
         // about what came out of the night — it is still open.
         for outcome in outcomes {
-            counts[outcome.isSettled ? outcome.verdict : "still open", default: 0] += 1
+            let verdict = outcome == .proposed || outcome == .revisionProposed ? "still open" : outcome.verdict
+            counts[verdict, default: 0] += 1
         }
         let noun = outcomes.count == 1 ? "1 proposal" : "\(outcomes.count) proposals"
         if counts.count == 1, let only = counts.first {
@@ -588,13 +596,17 @@ extension CognitiveSubstrate {
     /// resolution in the window settles the row's outcome and everything before
     /// it collapses into a count.
     public func growthWeek(at now: Date? = nil) async -> CognitiveGrowthWeek {
+        growthWeek(from: await developmentalTimelineSnapshot(limit: 240), at: now)
+    }
+
+    public func growthWeek(from timeline: [CognitiveDevelopmentalTimelineEvent], at now: Date? = nil) -> CognitiveGrowthWeek {
         let end = now ?? dependencies.now()
         let start = end.addingTimeInterval(-Self.growthWeekWindow)
         // Ask for generously more than the row cap: a single busy item can
         // produce many events, and the cap applies to ROWS, not events.
         // Phase 5 D: the timeline snapshot already hides opinions and
         // interests when the experiment is off.
-        let events = await developmentalTimelineSnapshot(limit: 240)
+        let events = timeline
             .filter { $0.occurredAt >= start && $0.occurredAt <= end }
             .sorted { lhs, rhs in
                 if lhs.occurredAt != rhs.occurredAt { return lhs.occurredAt < rhs.occurredAt }

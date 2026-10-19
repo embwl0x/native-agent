@@ -1,5 +1,7 @@
 import Foundation
 import PersistenceCore
+import Experiences
+import Privacy
 
 /// Process-wide "already warned about this server" set. `listMCPTools` runs on
 /// every chat turn, so the warning is deduped per server id — loud once, not
@@ -80,9 +82,8 @@ public struct MCPToolDescriptor: Sendable, Equatable {
 ///     servers whose risk is low or already consented.
 public enum MCPToolBridge {
 
-    /// Enumerate MCP tools as bridged descriptors. Best-effort: missing
-    /// files / malformed JSON return `[]` rather than throwing — the chat
-    /// path tolerates an empty list.
+    /// A damaged registry withholds mounted descriptors and owes repair;
+    /// it never supplies a default inventory.
     public static func listMCPTools(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [MCPToolDescriptor] {
@@ -258,24 +259,36 @@ public enum MCPToolBridge {
     // MARK: - File IO
 
     private static func readServers(at url: URL) -> [(id: String, risk: String)] {
-        guard let data = try? Data(contentsOf: url),
-              let parsed = try? JSONSerialization.jsonObject(with: data) else {
+        let dataRoot = url.deletingLastPathComponent().deletingLastPathComponent()
+        let records: [JSONValue]
+        do {
+            let data: Data
+            do { data = try Data(contentsOf: url) }
+            catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [] }
+            records = try SwiftNativeMCPDispatcher.checkedRegistry(JSONValue.parse(data))
+        } catch {
+            let failure = SwiftNativeMCPDispatcher.registryFailure(error.localizedDescription, at: url)
+            let next = failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+                .flatMap { try? NativeAppSecretRedactor.redactArguments($0).serialize(pretty: false) }
+            RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .act,
+                operation: "mcp.registry", owner: url.path, words: NativeAgentSecretRedactor.redactText(failure.message),
+                lever: "mcp.repair", nextCall: next)
             return []
         }
-        guard let arr = parsed as? [[String: Any]] else { return [] }
+        RepairOwed.settle(dataRoot, operation: "mcp.registry", evidence: .init(source: url.path, id: UUID().uuidString))
         var out: [(String, String)] = []
-        out.reserveCapacity(arr.count)
-        for obj in arr {
-            guard let id = obj["id"] as? String, !id.isEmpty else { continue }
-            let status = (obj["status"] as? String) ?? ""
+        out.reserveCapacity(records.count)
+        for record in records {
+            guard let server = MCPServer(json: record) else { continue }
             // Skip records explicitly marked as not yet usable. Match the
             // daemon's surface: only "configured" / "ready" servers count
             // as bridgeable; "needs_setup" / "error" hide.
-            if status == "needs_setup" || status == "error" { continue }
-            let risk = (obj["riskClass"] as? String)
-                ?? (obj["risk_class"] as? String)
-                ?? "network_read"
-            out.append((id, risk))
+            if server.status == "needs_setup" || server.status == "error" { continue }
+            let risk: String
+            if !server.riskClass.isEmpty { risk = server.riskClass }
+            else if case .object(let fields) = record, case .string(let legacy)? = fields["risk_class"] { risk = legacy }
+            else { risk = "network_read" }
+            out.append((server.id, risk))
         }
         return out
     }

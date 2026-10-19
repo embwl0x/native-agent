@@ -78,8 +78,13 @@ extension ExistingCornersSourceProvider {
                 // it; this does not acquire or navigate a tab.
                 var snapshotInput = readerInput
                 guard let chrome else { throw SenseFailure(code: "source_unavailable", message: "The Chrome source is not installed.") }
-                let address = try await chrome().existingPageAddress(host: host,
-                    tabID: ExistingCornersReaders.integer(snapshotInput["tab_id"]))
+                let address: [String: JSONValue]
+                do {
+                    address = try await chrome().existingPageAddress(host: host,
+                        tabID: ExistingCornersReaders.integer(snapshotInput["tab_id"]))
+                } catch let error as ChromeControlRuntimeError {
+                    throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
+                }
                 snapshotInput.merge(address) { supplied, _ in supplied }
                 if snapshotInput["max_nodes"] == nil || snapshotInput["max_nodes"] == .null {
                     snapshotInput["max_nodes"] = .int(150)
@@ -173,11 +178,18 @@ extension ExistingCornersSourceProvider {
                 guard let chrome else {
                     throw SenseFailure(code: "source_unavailable", message: "The Chrome change source is not installed.")
                 }
-                let address = try await chrome().existingPageAddress(host: host, tabID: ExistingCornersReaders.integer(input["tab_id"]))
-                guard case .int(let tab)? = address["tab_id"] else {
-                    throw SenseFailure(code: "source_unavailable", message: "The site has no existing Chrome tab.")
+                let tab: Int64
+                let changes: AsyncThrowingStream<JSONValue, Error>
+                do {
+                    let address = try await chrome().existingPageAddress(host: host, tabID: ExistingCornersReaders.integer(input["tab_id"]))
+                    guard case .int(let resolvedTab)? = address["tab_id"] else {
+                        throw SenseFailure(code: "source_unavailable", message: "The site has no existing Chrome tab.")
+                    }
+                    tab = resolvedTab
+                    changes = try await chrome().pageChanges(host: host, tabID: tab)
+                } catch let error as ChromeControlRuntimeError {
+                    throw SenseFailure(code: "source_unavailable", message: error.localizedDescription, remedy: error.remedy)
                 }
-                let changes = try await chrome().pageChanges(host: host, tabID: tab)
                 let pair = AsyncStream<SenseMaterial>.makeStream(bufferingPolicy: .bufferingNewest(1))
                 let task = Task.detached(priority: .utility) {
                     defer { pair.continuation.finish() }

@@ -2,9 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
+import Experiences
 import Transcripts
 import TurnTrace
 import ProviderRouting
+import Experiences
 
 public enum TurnCheckpointScope {
     @TaskLocal public static var resuming: TurnCheckpoint?
@@ -76,9 +78,28 @@ extension SwiftNativeChatOrchestrationClient {
         }
     }
 
-    public static func settleReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws {
+    /// The reply's door answered for it in the route journal's words:
+    /// `completed` (the destination holds it) or `sent_unconfirmed` (the door
+    /// gave up resending). The phone's `accepted_by_transport` is transport
+    /// evidence only; no obligation is declared there to settle.
+    /// The answer's `deliver:<surface>` settles before the checkpoint that owns
+    /// its redelivery retires: a relaunch between them confirms again through
+    /// the door's own ledger, which never resends. A write that fails is logged
+    /// and never holds the checkpoint.
+    public static func settleReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String, verdict: String) async throws {
         for checkpoint in try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
             where checkpoint.runId == runId && checkpoint.deliveryPending {
+            if let key = checkpoint.owedDelivery(status: "completed")?.key {
+                let settle: ExperienceStore.Change? = switch verdict {
+                case "completed": .obligation(key: key, phase: .accepted)
+                case "sent_unconfirmed": .letGo(key: key, reason: .abandoned)
+                default: nil
+                }
+                if let settle {
+                    let answer = Experience.answer(run: runId)
+                    await ExperienceStore.record(dataRoot, answer) { try await $0.append([settle], to: answer) }.value
+                }
+            }
             try checkpoint.remove(dataRoot: dataRoot)
         }
     }
@@ -129,12 +150,30 @@ extension SwiftNativeChatOrchestrationClient {
             if state != .completed {
                 response.runtimeStatus = state == .waiting ? "waiting on you" : state == .failed ? "failed" : "interrupted"
             }
+            let answerRef = Self.transcriptRef(sessionId, outcome.messageID)
+            let heardID = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.answerExperienceID ?? outcome.turnID
+            // The same birth the turn wrote, so a lost one is restored and a kept one stands.
+            Self.recordAnswer(id: Experience.answer(run: runId), heardID: heardID, evidence: answerRef, state: state,
+                              dataRoot: dataRoot) { [attachments = response.attachments ?? []] in
+                var answer = Experience(id: Experience.answer(run: runId), kind: .answer, cause: [heardID],
+                    evidence: [answerRef], face: Self.face(content, attachments), addressedTo: ["conversation:" + sessionId])
+                let checkpoint = try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: outcome.turnID)
+                if let owed = checkpoint?.owedDelivery(status: state.rawValue) {
+                    answer.addressedTo.append(owed.to)
+                    answer.owes[owed.key] = .init(to: owed.to)
+                }
+                return answer
+            }
             return response
         }
         return nil
     }
 
     func settleTurnCheckpoint(_ terminal: TurnTraceEvent, sessionId: String, runId: String) async throws {
+        if case .object(let payload) = terminal.payload, payload["repairPending"] == .bool(true) {
+            try await turnTraceBus.deliverDurably(terminal)
+            return
+        }
         var checkpoints = try TurnCheckpoint.forSession(dataRoot: dataRoot, sessionId: sessionId)
             .filter { $0.runId == runId }
         for index in checkpoints.indices {
@@ -194,6 +233,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
         request.attachments = try CodexCompletionTranscriptEvidence.decodeAttachments(metadata["attachments"])
         for index in request.attachments.indices {
+            if request.attachments[index].utterance?.audioReference != nil { continue }
             guard let path = request.attachments[index].path else {
                 throw ChatOrchestrationError.underlying("The resumed turn's attachment has no saved file; restore it before resuming.")
             }
@@ -243,6 +283,17 @@ extension SwiftNativeTurnEngine {
         cancelFlagPath: URL? = nil, providerAdmission: (@Sendable () async throws -> Void)? = nil,
         fileAccess: String = "auto", capabilityProfile: String? = nil
     ) async throws -> TurnEngineResult {
+        let heardID = sessionId == nil ? TurnTraceContext.turnId : ChatToolSessionContext.envelope?.answerExperienceID
+        let effectiveProgress: ChatOrchestrationProgressHandler = { [remPinsDataRoot] event in
+            if let root = remPinsDataRoot, let heardID {
+                switch event {
+                case .delta, .toolUse, .toolResult, .notice, .replyTextSettled:
+                    ExperienceStore.record(root, heardID) { try await $0.append([.progress("working")], to: heardID) }
+                case .final, .error: break
+                }
+            }
+            await progress?(event)
+        }
         let saved: DeskContinuation?
         if remPinsDataRoot != nil, let runId, !runId.isEmpty {
             let envelope = TurnEnvelope.current(surface: surface)
@@ -286,7 +337,7 @@ extension SwiftNativeTurnEngine {
                     surface: surface, userMessage: userMessage, sessionId: sessionId,
                     toolSessionId: toolSessionId, runId: runId,
                     llm: llm, tools: tools,
-                    preBuiltContext: preBuiltContext, progress: progress,
+                    preBuiltContext: preBuiltContext, progress: effectiveProgress,
                     cancelFlagPath: cancelFlagPath, providerAdmission: providerAdmission)
                 let reason = result.terminalReason ?? .incomplete
                 let state: DeskContinuation.State

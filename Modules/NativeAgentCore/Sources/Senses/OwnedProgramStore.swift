@@ -168,7 +168,7 @@ public struct OwnedProgramStore: Sendable {
             .sorted { $0.digest < $1.digest }
     }
 
-    /// Every receipt is from the shipped executor with an intercepting host.
+    /// Rehearsal receipts are from the shipped executor with an intercepting host, never behavioral proof.
     /// A seal binds the exact artifact, fixtures, host API and dependency shapes.
     public func bind(_ candidate: Candidate, receipts: [JSONValue], key: Data,
                      captured: JSONValue? = nil) throws -> JSONValue {
@@ -176,7 +176,8 @@ public struct OwnedProgramStore: Sendable {
         guard try load(id: candidate.id, digest: candidate.digest) == candidate else {
             throw SenseFailure(code: "integrity", message: "Candidate changed during validation.")
         }
-        var evidence: [String: JSONValue] = ["domain": .string("owned-program-validation"), "receipts": .array(receipts)]
+        var evidence: [String: JSONValue] = ["domain": .string("owned-program-validation"), "receipts": .array(receipts),
+            "capture": .string("Rehearsed supplied fixtures. Intercepted replies are not behavioral evidence; no other input or branch is proven.")]
         if let captured {
             evidence["capturedFixtures"] = captured
             evidence["capture"] = .string(OwnedProgramFixtures.summary(captured))
@@ -242,8 +243,8 @@ public struct OwnedProgramStore: Sendable {
                 let receipt = await SkillRunContext.$handsBack.withValue(true) {
                     await runner.run(candidate.program, input: input, preview: false, replay: replay, host: interceptor)
                 }
-                receipts.append(receipt)
                 final = receipt.objectValue ?? [:]
+                receipts.append(.object(final.merging(["input": input]) { _, input in input }))
                 if final["status"] == .string("ok") { break }
                 guard !recording, pass < answers.count, final["status"] == .string("stopped"),
                       ["decide", "irreversible", "users_step", "would_card"].contains(final["reason"]?.stringValue ?? ""),
@@ -377,6 +378,7 @@ public struct OwnedProgramStore: Sendable {
 /// The originating app door contributes metadata and the existing Trust gate.
 /// A declaration identifies a dependency; it never admits its execution.
 public protocol OwnedProgramToolHost: OwnedProgramHostProfile {
+    func dependencyRevision(_ dependencies: [String]) throws -> [String]
     func performReach(_ operation: String, arguments: JSONValue) async throws -> JSONValue
     func dependencyShape(_ id: String) -> JSONValue?
     func dependencyPin(_ id: String) -> String?
@@ -419,6 +421,7 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
     public nonisolated func secretLine(_ text: String) -> Bool { base.secretLine(text) }
     public nonisolated func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence { base.evidence(receipt) }
     public nonisolated func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { base.receiptField(key, in: receipt) }
+    public nonisolated func answer(_ receipt: JSONValue) -> JSONValue { base.answer(receipt) }
     public nonisolated func primitiveAction(_ operation: String) -> OwnedProgramAction? { base.primitiveAction(operation) }
 
     public func perform(_ input: [String: JSONValue]) async -> JSONValue {
@@ -488,19 +491,11 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
 
     public static func summary(_ fixtures: JSONValue) -> String {
         let calls = fixtures.arrayValue?.flatMap { $0.objectValue?["calls"]?.arrayValue ?? [] } ?? []
-        var reads = 0, intercepted: [String: Int] = [:]
-        for call in calls {
-            let fields = call.objectValue ?? [:], result = fields["result"]?.objectValue ?? [:]
-            let operation = fields["operation"]?.stringValue ?? "call"
-            if result["captured"] == .bool(true) || result["result"]?.objectValue?["captured"] == .bool(true) {
-                let question = fields["args"]?.objectValue?["question"]?.stringValue
-                let label = question.map { (try? JSONValue.string($0).serialize(pretty: false)) ?? "" }
-                let entry = operation + (label.map { "(\($0))" } ?? "") + " => " + ((try? fields["result"]?.serialize(pretty: false)) ?? "null")
-                intercepted[entry, default: 0] += 1
-            } else { reads += 1 }
+        let intercepted = calls.filter {
+            let result = $0.objectValue?["result"]?.objectValue ?? [:]
+            return result["captured"] == .bool(true) || result["result"]?.objectValue?["captured"] == .bool(true)
         }
-        let details = intercepted.sorted { $0.key < $1.key }.map { $0.key + ($0.value == 1 ? "" : " (\($0.value))") }
-        return "Captured 1 run: \(reads) data reads; \(intercepted.values.reduce(0, +)) intercepted" + (details.isEmpty ? "." : ": " + details.joined(separator: "; "))
+        return "Rehearsed supplied input: \(calls.count - intercepted.count) data reads; \(intercepted.count) intercepted. Intercepted replies are not behavioral evidence; no other input or branch is proven."
     }
 
     private func consume(_ operation: String, arguments: JSONValue) throws -> JSONValue {

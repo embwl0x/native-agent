@@ -52,7 +52,7 @@ extension HerScreen {
         }
         let chats = bridgeChats(dataRoot: dataRoot)
         let identity = AgentContactIdentity(dataRoot: dataRoot)
-        let contacts = contacts(dataRoot: dataRoot, identity: identity)
+        let contacts = contacts(identity: identity, usable: AgentWorkspacePorts.current.tools.usableAgentLanes(dataRoot: dataRoot))
         var out: [String: String] = [:]
         let health = AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
         for agent in Set(agents.map { $0.lowercased() }) {
@@ -63,7 +63,7 @@ extension HerScreen {
             if health[agent]?.resolves(record) == true { continue }
             let receipt = unwrap(record.receipt)
             if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) { continue }
-            let heard = thread(contact, dataRoot: dataRoot, identity: identity, scope: nil)?.heard
+            let heard = thread(contact, dataRoot: dataRoot, identity: identity)?.heard
             let inbound = chats.filter { $0.who == contact.id || contact.agents.contains($0.who) || $0.who == record.name.lowercased() }
                 .compactMap(\.heard).max()
             if max(heard ?? .distantPast, inbound ?? .distantPast) > record.updatedAt { continue }
@@ -437,7 +437,7 @@ extension HerScreen {
     }
 
     /// "mail 3 unread of 12 (4m ago)" from the last inbox read anyone made; bare "mail" before one.
-    static func mailPulse(now: Date) -> String { HerMailStatus.shared.pulse(now: now) }
+    static func mailPulse(dataRoot: URL, now: Date) -> String { HerMailStatus.shared.pulse(dataRoot: dataRoot, now: now) }
 
     // MARK: Pieces
 
@@ -568,16 +568,32 @@ extension HerScreen {
 package final class HerMailStatus: @unchecked Sendable {
     package static let shared = HerMailStatus()
     private let lock = NSLock()
-    private var last: (at: Date, total: Int64, unread: Int64?)?
+    private var last: (root: String, at: Date, total: Int64, unread: Int64?)?
+    private var previews: (root: String, at: Date, text: String)?
 
-    package func note(_ result: JSONValue) {
-        guard case .object(let row) = result, row["status"] == .string("completed"), case .int(let total)? = row["inbox_total"] else { return }
+    package func note(_ result: JSONValue, dataRoot: URL) {
+        guard case .object(let row) = result, row["status"] == .string("completed") else { return }
+        if case .array(let messages)? = row["messages"] {
+            let text = messages.prefix(4).compactMap { message -> String? in
+                guard case .object(let message) = message, case .string(let subject)? = message["subject"],
+                      case .string(let sender)? = message["sender"] else { return nil }
+                return HerScreen.clip(sender, 28) + " — " + HerScreen.clip(subject, 70)
+            }.joined(separator: "; ")
+            lock.withLock { previews = (dataRoot.standardizedFileURL.path, Date(), text) }
+        }
+        guard case .int(let total)? = row["inbox_total"] else { return }
         let unread: Int64? = if case .int(let n)? = row["inbox_unread"] { n } else { nil }
-        lock.withLock { last = (Date(), total, unread) }
+        lock.withLock { last = (dataRoot.standardizedFileURL.path, Date(), total, unread) }
     }
 
-    func pulse(now: Date) -> String {
-        guard let last = lock.withLock({ last }) else { return "mail" }
+    func pulse(dataRoot: URL, now: Date) -> String {
+        guard let last = lock.withLock({ last }), last.root == dataRoot.standardizedFileURL.path else { return "mail" }
         return "mail " + (last.unread.map { "\($0) unread of \(last.total)" } ?? "\(last.total)") + " (\(HerScreen.age(now.timeIntervalSince(last.at))) ago)"
+    }
+
+    func notable(dataRoot: URL, now: Date) -> String? {
+        guard AgentWorkspaceReadiness.allows(tool: "mail_search"), AgentWorkspaceReadiness.ready(tool: "mail_search"),
+              let previews = lock.withLock({ previews }), previews.root == dataRoot.standardizedFileURL.path, !previews.text.isEmpty else { return nil }
+        return "Last Mail read (\(HerScreen.age(now.timeIntervalSince(previews.at))) ago); up to 4 previews, not a current inbox scan: " + previews.text
     }
 }

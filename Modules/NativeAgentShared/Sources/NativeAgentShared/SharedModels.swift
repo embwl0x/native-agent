@@ -67,8 +67,9 @@ public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
     public var name: String?
     public var byteSize: Int
     public var path: String?
+    public var utterance: SpeechUtterance?
 
-    public init(id: String = UUID().uuidString, type: String, base64: String, mime: String, name: String? = nil, byteSize: Int = 0, path: String? = nil) {
+    public init(id: String = UUID().uuidString, type: String, base64: String, mime: String, name: String? = nil, byteSize: Int = 0, path: String? = nil, utterance: SpeechUtterance? = nil) {
         self.id = id
         self.type = type
         self.base64 = base64
@@ -76,6 +77,7 @@ public struct MultimodalAttachment: Identifiable, Codable, Hashable, Sendable {
         self.name = name
         self.byteSize = byteSize
         self.path = path
+        self.utterance = utterance
     }
 }
 

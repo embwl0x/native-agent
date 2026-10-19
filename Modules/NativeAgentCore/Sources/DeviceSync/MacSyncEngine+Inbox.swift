@@ -540,6 +540,7 @@ extension MacSyncEngine {
                         peerCreatedAt: peerCreatedAt,
                         dataRoot: PersistenceCore.defaultDataRoot()
                     )
+                    sync.bridge.notePhoneContact(at: peerCreatedAt)
                 } catch {
                     nativeLog("[MacSyncEngine] could not persist signed peer evidence for %@: %@",
                           action.msgId, error.localizedDescription)
@@ -956,6 +957,7 @@ extension MacSyncEngine {
                         peerCreatedAt: peerCreatedAt,
                         dataRoot: actionStateRoot
                     )
+                    sync.bridge.notePhoneContact(at: peerCreatedAt)
                 } catch {
                     nativeLog("[MacSyncEngine] could not persist CloudKit action peer evidence for %@: %@",
                           action.msgId, error.localizedDescription)

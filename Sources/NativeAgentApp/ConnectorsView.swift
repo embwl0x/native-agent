@@ -269,9 +269,18 @@ enum WorkspaceAddOutcome: Equatable {
 struct ConnectorsView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    @State private var workspaceName = ""
-    @State private var workspacePath = ""
-    @State private var workspaceWritable = false
+    private var workspaceName: String {
+        get { appModel.editDraft("workspace:new:workspaceName", seed: "") }
+        nonmutating set { appModel.setEditDraft(newValue, for: "workspace:new:workspaceName") }
+    }
+    private var workspacePath: String {
+        get { appModel.editDraft("workspace:new:workspacePath", seed: "") }
+        nonmutating set { appModel.setEditDraft(newValue, for: "workspace:new:workspacePath") }
+    }
+    private var workspaceWritable: Bool {
+        get { appModel.editDraft("workspace:new:workspaceWritable", seed: false) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "workspace:new:workspaceWritable") }
+    }
     @State private var workspaceQuery = ""
     @State private var workspaceSearchState: SharedFolderSearchState = .notSearched
     // PATCH-2026-05-07: connector-wizard-b ConnectorWizard sheet per card
@@ -426,14 +435,14 @@ struct ConnectorsView: View {
             ConnectorsCard {
                 VStack(alignment: .leading, spacing: 12) {
                     ConnectorsField(title: "Name") {
-                        TextField("", text: $workspaceName)
+                        TextField("", text: appModel.editBinding("workspace:new:workspaceName", seed: ""))
                             .accessibilityLabel("Folder name")
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                     }
                     ConnectorsField(title: "Folder") {
                         HStack(spacing: 8) {
-                            TextField("", text: $workspacePath)
+                            TextField("", text: appModel.editBinding("workspace:new:workspacePath", seed: ""))
                                 .accessibilityLabel("Folder path")
                                 .textFieldStyle(.roundedBorder)
                                 .font(ShellType.label)
@@ -442,7 +451,7 @@ struct ConnectorsView: View {
                                 .font(ShellType.labelMedium)
                         }
                     }
-                    Toggle("Let me write to it", isOn: $workspaceWritable)
+                    Toggle("Let me write to it", isOn: appModel.editBinding("workspace:new:workspaceWritable", seed: false))
                         .font(ShellType.label)
                     Button(isAddingWorkspace ? "Adding…" : "Share this folder") {
                         Task { await addWorkspace() }
@@ -615,6 +624,8 @@ struct ConnectorsView: View {
     @MainActor
     private func addWorkspace() async {
         guard !isAddingWorkspace, !cleanWorkspaceName.isEmpty, !cleanWorkspacePath.isEmpty else { return }
+        let draftName = workspaceName
+        let draftPath = workspacePath
         let name = cleanWorkspaceName
         let path = cleanWorkspacePath
         let writable = workspaceWritable
@@ -622,10 +633,11 @@ struct ConnectorsView: View {
         defer { isAddingWorkspace = false }
 
         let outcome = await appModel.addWorkspaceWithReceipt(name: name, path: path, writable: writable)
-        if case .verified = outcome {
-            workspaceName = ""
-            workspacePath = ""
-            workspaceWritable = false
+        if case .verified = outcome,
+           workspaceName == draftName, workspacePath == draftPath, workspaceWritable == writable {
+            for field in ["workspaceName", "workspacePath", "workspaceWritable"] {
+                appModel.clearEditDraft("workspace:new:" + field)
+            }
         }
         connectorStatusMessage = ConnectorsStatusMessagePresentation.workspaceAdd(
             name: name,

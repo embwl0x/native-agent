@@ -40,18 +40,23 @@ extension HerScreen {
 
     /// Newest first, from the 12 most recently written transcripts of the
     /// last week (helpers' own sessions left out).
-    static func doorLines(dataRoot: URL, now: Date) -> [DoorLine] {
+    static func doorFiles(dataRoot: URL, now: Date) -> [URL] {
         let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
-        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+        return ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
             .filter { $0.hasSuffix(".jsonl") && !$0.hasPrefix("bot-") }
             .compactMap { name -> (path: String, at: Int)? in
                 var info = stat()
                 guard lstat(dir + "/" + name, &info) == 0, now.timeIntervalSince1970 - Double(info.st_mtimespec.tv_sec) < 7 * 86_400 else { return nil }
                 return (dir + "/" + name, info.st_mtimespec.tv_sec)
             }
-            .sorted { $0.at > $1.at }.prefix(12)
+            .sorted { ($0.at, $0.path) > ($1.at, $1.path) }.prefix(12).map { URL(fileURLWithPath: $0.path) }
+    }
+
+    static func doorLines(dataRoot: URL, now: Date) -> [DoorLine] {
+        let files = doorFiles(dataRoot: dataRoot, now: now)
+        let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
         DoorIndex.shared.keep(only: Set(files.map(\.path)), in: dir + "/")
-        return files.flatMap { transcript(URL(fileURLWithPath: $0.path)).lines }.sorted { $0.at > $1.at }
+        return files.flatMap { transcript($0).lines }.sorted { $0.at > $1.at }
     }
 
     /// Each transcript's door lines (its last 30) and when she last answered
@@ -214,11 +219,11 @@ extension HerScreen {
     /// bridge conversation, and when, one line each, the chat she is in left
     /// out. The words open in the room, not here: home rides turns another
     /// agent steers too. Nothing when "Remember across conversations" is off.
-    static func elsewhereRows(dataRoot: URL, scope: String, person: String, now: Date) -> [String] {
+    static func elsewhereRows(_ world: HerWorld, dataRoot: URL, scope: String, person: String, now: Date) -> [String] {
         guard MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return [] }
         var doors: Set<String> = []
-        let peers = peerNames(dataRoot)
-        let newest = doorLines(dataRoot: dataRoot, now: now).filter {
+        let peers = Dictionary(uniqueKeysWithValues: world.routes.map { ($0.id, $0.name) })
+        let newest = world.doors.filter {
             $0.session != scope && doors.insert($0.door == "bridge" ? $0.session : $0.door).inserted
         }.prefix(5)
         var rows = newest.map { line in

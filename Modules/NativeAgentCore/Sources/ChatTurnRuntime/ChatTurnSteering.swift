@@ -5,9 +5,14 @@ import Desk
 import Transcripts
 import TurnTrace
 
-/// A queued message the person chose to Steer into the turn already working
-/// (third conversation pass, item 5; a choice, not automatic, since User
-/// 2026-10-04 — a send while she works waits in the queue until he steers it).
+/// A message sent while she works goes straight to the turn already working
+/// in that conversation (User 2026-10-18, on every door; it replaces the
+/// 2026-10-04 rule that it waited in the queue until he steered it). It stays
+/// queued until her turn takes it, and runs as its own turn if her turn never
+/// does. Steer offers it again by hand, for one her turn could not take yet.
+/// Only a turn answering the same door takes it: one transcript can be shared
+/// by two doors (Telegram's /resume of a Mac chat), and a message is answered
+/// where it was sent.
 ///
 /// An offer made here is picked up by the running loop at its next tool boundary, BEFORE the
 /// model chooses another action, and delivered as ordinary text in that round's
@@ -37,11 +42,13 @@ public actor ChatTurnSteering {
         public internal(set) var enqueuedRunID: String?
         public internal(set) var receivingTurnID: String?
 
-        public init(id: String, text: String, envelope: TurnEnvelope, origin: ChatMessageOrigin?) {
+        /// `runID`: the run its queued turn would write it under, so either one writes it once.
+        public init(id: String, text: String, envelope: TurnEnvelope, origin: ChatMessageOrigin?, runID: String? = nil) {
             self.id = id
             self.text = text
             self.envelope = envelope
             self.origin = origin
+            self.enqueuedRunID = runID
         }
     }
 
@@ -76,6 +83,8 @@ public actor ChatTurnSteering {
         let token: UUID
         let turnId: String
         let dataRoot: URL
+        /// Where its reply goes; nil for the Mac's own conversation.
+        let door: ChatToolSessionContext.ReplyRoute?
         /// This turn's persister cannot be replaced by another door.
         let persist: Persister?
     }
@@ -98,11 +107,12 @@ public actor ChatTurnSteering {
     /// must not deliver it — the queue reconciles its identity before replay.
     @discardableResult
     public func openTurn(
-        sessionId: String, turnId: String, dataRoot: URL, persist: Persister? = nil
+        sessionId: String, turnId: String, dataRoot: URL, door: ChatToolSessionContext.ReplyRoute? = nil,
+        persist: Persister? = nil
     ) -> UUID? {
         guard !sessionId.isEmpty else { return nil }
         let token = TurnAdmission.token ?? UUID()
-        open[sessionId] = OpenTurn(token: token, turnId: turnId, dataRoot: dataRoot, persist: persist)
+        open[sessionId] = OpenTurn(token: token, turnId: turnId, dataRoot: dataRoot, door: door, persist: persist)
         noteTurnActivity(for: dataRoot, at: Date())
         return token
     }
@@ -185,7 +195,7 @@ public actor ChatTurnSteering {
               residentWakeIsFree(dataRoot: dataRoot, nextFreeAt: nextFreeAt),
               let wake = ResidentWake.shared.claim(dataRoot: dataRoot, prepared: items) else { return nil }
         open[ResidentWake.session] = OpenTurn(token: token, turnId: TurnTraceContext.turnId ?? token.uuidString,
-                                            dataRoot: dataRoot, persist: nil)
+                                            dataRoot: dataRoot, door: nil, persist: nil)
         noteTurnActivity(for: dataRoot, at: Date())
         return wake
     }
@@ -196,7 +206,9 @@ public actor ChatTurnSteering {
     public func offer(_ offer: Offer, sessionId: String,
                       onDelivered: (@MainActor @Sendable (Offer, Bool) async -> Bool)? = nil,
                       onReturned: (@MainActor @Sendable (Offer) async -> Void)? = nil) -> Bool {
-        guard let turn = open[sessionId] else { return false }
+        let door = offer.envelope.deliveryRoute
+        guard let turn = open[sessionId], turn.door?.surface == door?.surface,
+              turn.door?.destinationId == door?.destinationId, turn.door?.threadId == door?.threadId else { return false }
         var queue = pending[sessionId] ?? []
         guard queue.count < Self.maxPending, !queue.contains(where: { $0.id == offer.id }) else { return false }
         queue.append(offer)
@@ -234,7 +246,7 @@ public actor ChatTurnSteering {
         // remove or Send next can't race the write.
         reserved[sessionId] = queue.map {
             var offer = $0
-            offer.enqueuedRunID = UUID().uuidString
+            offer.enqueuedRunID = offer.enqueuedRunID ?? UUID().uuidString
             return offer
         }
         var gone: Set<String> = []

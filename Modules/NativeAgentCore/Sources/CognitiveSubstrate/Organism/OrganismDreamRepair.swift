@@ -206,28 +206,24 @@ public struct OrganismDreamRepairSummary: Codable, Sendable, Equatable {
 public struct OrganismDreamRepairState: Codable, Sendable, Equatable {
     public var receiptCount: Int
     public var lastReceipt: OrganismDreamRepairReceipt?
-    public var sleepControl: OrganismSleepControlState
 
     public init(
         receiptCount: Int = 0,
-        lastReceipt: OrganismDreamRepairReceipt? = nil,
-        sleepControl: OrganismSleepControlState = .empty
+        lastReceipt: OrganismDreamRepairReceipt? = nil
     ) {
         self.receiptCount = max(0, receiptCount)
         self.lastReceipt = lastReceipt
-        self.sleepControl = sleepControl
     }
 
     private enum CodingKeys: String, CodingKey {
-        case receiptCount, lastReceipt, sleepControl
+        case receiptCount, lastReceipt
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.init(
             receiptCount: try container.decodeIfPresent(Int.self, forKey: .receiptCount) ?? 0,
-            lastReceipt: try container.decodeIfPresent(OrganismDreamRepairReceipt.self, forKey: .lastReceipt),
-            sleepControl: try container.decodeIfPresent(OrganismSleepControlState.self, forKey: .sleepControl) ?? .empty
+            lastReceipt: try container.decodeIfPresent(OrganismDreamRepairReceipt.self, forKey: .lastReceipt)
         )
     }
 
@@ -307,8 +303,7 @@ public enum OrganismDreamRepair {
             nextField,
             OrganismDreamRepairState(
                 receiptCount: state.receiptCount + 1,
-                lastReceipt: receipt,
-                sleepControl: state.sleepControl
+                lastReceipt: receipt
             )
         )
     }
@@ -371,8 +366,7 @@ public enum OrganismDreamRepair {
             nextField,
             OrganismDreamRepairState(
                 receiptCount: state.receiptCount + 1,
-                lastReceipt: receipt,
-                sleepControl: state.sleepControl
+                lastReceipt: receipt
             )
         )
     }

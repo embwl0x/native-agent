@@ -199,8 +199,6 @@ struct MacIntegrationView: View {
     /// Trust's one Mac tab: Chrome control and Mac control lead, the per-app
     /// grants follow. Off where this view stands alone.
     var showsMacControl = false
-    /// Mac control's unsaved edits, held by Trust's page across tab switches.
-    var macControlDraft: Binding<TrustMacControlPolicy?>? = nil
     @Environment(\.scenePhase) private var scenePhase
     @State private var permissions: [String: MacIntegrationPermission] = [:]
     @State private var isLoading: Bool = true
@@ -243,7 +241,7 @@ struct MacIntegrationView: View {
                     AdvancedSection(title: "Chrome control") {
                         ChromeControlPermissionsView()
                     }
-                    MacControlPermissionsView(draft: macControlDraft)
+                    MacControlPermissionsView()
                 }
                 Text("Choose which Mac apps and features I can read from or use. Contacts, Mail, Messages and Notes start with read on and write off; turn on write to let me send or change anything there. Changes apply right away.")
                     .font(ShellType.label)

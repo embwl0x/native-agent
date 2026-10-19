@@ -146,15 +146,17 @@ public struct ProposalValidationResult: Sendable, Equatable, Codable {
     public var errors: [String]
     public var candidateDigest: String?
     public var capture: String?
+    public var evidence: JSONValue?
     /// The id it was filed under, when the id rule respelled the one given.
     public var respelled: String?
 
-    public init(valid: Bool, autoPromotable: Bool, errors: [String], candidateDigest: String? = nil, capture: String? = nil) {
+    public init(valid: Bool, autoPromotable: Bool, errors: [String], candidateDigest: String? = nil, capture: String? = nil, evidence: JSONValue? = nil) {
         self.valid = valid
         self.autoPromotable = autoPromotable
         self.errors = errors
         self.candidateDigest = candidateDigest
         self.capture = capture
+        self.evidence = evidence
     }
 }
 
@@ -318,7 +320,7 @@ public actor SwiftNativeToolExecution {
             guard var fields = current, fields["candidateDigest"] == .string(candidate.digest) else {
                 throw ToolExecutionError.invalidProposal("A newer candidate replaced this validation")
             }
-            fields["candidateValidation"] = .string(result.valid ? "valid" : "invalid")
+            fields["candidateValidation"] = .string(result.valid ? "rehearsed" : "invalid")
             fields["validationErrors"] = .array(result.errors.map(JSONValue.string))
             if fields["status"] != .string("active") { fields["validationStatus"] = fields["candidateValidation"] }
             return fields
@@ -352,14 +354,14 @@ public actor SwiftNativeToolExecution {
             }
             let matches = row["candidateDigest"] != nil
                 ? row["candidateDigest"] == .string(candidate.digest) && row["candidatePrior"] == candidate.prior
-                    && row["candidateSelection"] == OwnedProgramStore.selection(rows[index]) && row["candidateValidation"] == .string("valid")
+                    && row["candidateSelection"] == OwnedProgramStore.selection(rows[index]) && row["candidateValidation"] == .string("rehearsed")
                 : row["codeFingerprint"] == .string(candidate.digest)
-                    && OwnedProgramStore.selection(rows[index]) == OwnedProgramStore.selection(tool.toJSON()) && row["validationStatus"] == .string("valid")
+                    && OwnedProgramStore.selection(rows[index]) == OwnedProgramStore.selection(tool.toJSON()) && row["validationStatus"] == .string("rehearsed")
             guard matches else { throw ToolExecutionError.invalidProposal("The candidate, selected version or off-switch changed; propose and validate again") }
             row.merge(Self.fields(candidate.manifest)) { $1 }
             row["status"] = .string("active"); row["phase"] = .string("active")
             row["codeFingerprint"] = .string(candidate.digest); row["activePath"] = .string(path)
-            row["validationStatus"] = .string("valid"); row["admission"] = .object(admission)
+            row["validationStatus"] = .string("rehearsed"); row["admission"] = .object(admission)
             for field in ["manifestSignature", "signedAt", "signatureVersion"] { row[field] = admission[field] }
             row["promotedAt"] = .string(stamp); row["updatedAt"] = .string(stamp)
             rows[index] = .object(row); value = .array(rows)
@@ -379,6 +381,8 @@ public actor SwiftNativeToolExecution {
     }
 
     private func runSelectedTool(id: String, input: JSONValue, requiredFingerprint: String) async throws -> JSONValue {
+        guard let host = OwnedProgramInvocation.host else { throw ToolExecutionError.invalidProposal("Authored execution requires the originating app door") }
+        let catalogRevision = try abilities.revision()
         guard let row = try await SwiftNativeToolRegistry(root: root).getTool(id: id) else { throw ToolExecutionError.proposalNotFound(id) }
         guard row.status == "active" else { throw SenseFailure(code: "not_active", message: "\(id) is \(row.status); enable its exact JS version before running it.") }
         let pinned = requiredFingerprint
@@ -390,9 +394,10 @@ public actor SwiftNativeToolExecution {
         let candidate: OwnedProgramStore.Candidate
         do { candidate = try store.load(id: id, digest: pinned) }
         catch { throw SenseFailure(code: "integrity", message: "The admitted candidate is unreadable: \(error.localizedDescription)") }
+        let revision = try catalogRevision + host.dependencyRevision(candidate.program.dependencies)
         try await checkAdmission(candidate, row: row)
         try checkDependencies(candidate)
-        guard let host = OwnedProgramInvocation.host else { throw ToolExecutionError.invalidProposal("Authored execution requires the originating app door") }
+        let binding = OwnedProgramRunner.Binding(revision: revision)
         if let problem = input.schemaProblem(schema: candidate.program.schema) {
             throw SenseFailure(code: "bad_input", message: "Tool input \(problem.path) must be \(problem.expected).")
         }
@@ -402,14 +407,20 @@ public actor SwiftNativeToolExecution {
         }
         let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), host: host, abilityID: id)
         let profile = ToolHost(base: host, candidate: candidate, broker: broker, dataRoot: root,
-            admission: { try await self.checkSelected(candidate, pinned: pinned) })
+            admission: {
+                try await binding.check(self.abilities.revision() + host.dependencyRevision(candidate.program.dependencies)) {
+                    try await self.checkSelected(candidate, pinned: pinned)
+                }
+            })
         let helper = SenseHostLocator.helperURL, dataRoot = root
         let runner = OwnedProgramRunner(helperURL: helper, dataRoot: dataRoot) { scratch in
             try SenseSandboxProfile.build(reach: SenseReach(), helperURL: helper, scratch: scratch,
                 dataRoot: dataRoot, personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot))
         }
         var result = Self.fields(await runner.run(candidate.program, input: input, preview: false, replay: nil, host: profile))
-        await broker.close()
+        // A watch leaves one receipt for all its frames, however it ended.
+        let watched = await broker.close()
+        if !watched.isEmpty { result["watch"] = watched.count == 1 ? watched[0] : .array(watched) }
         result["toolId"] = .string(id); result["version"] = .string(candidate.digest)
         result["codeFingerprint"] = .string(candidate.digest)
         if result["status"] == .string("stopped") {
@@ -434,7 +445,8 @@ public actor SwiftNativeToolExecution {
 
     public func checkAdmission(_ candidate: OwnedProgramStore.Candidate, row: ToolRecord) async throws {
         let fields = Self.fields(row.toJSON())
-        guard Self.fields(candidate.manifest).allSatisfy({ fields[$0.key] == $0.value }),
+        guard Self.fields(candidate.manifest).allSatisfy({ fields[$0.key] == $0.value
+            || $0.key == "learned" && Self.fields(fields[$0.key] ?? .null)["declared"] == $0.value }),
               row.codeFingerprint == candidate.digest, row.permissions == candidate.program.permissions,
               fields["inputSchema"] == candidate.program.schema,
               fields["actions"] == .array(candidate.program.dependencies.map(JSONValue.string)),
@@ -480,8 +492,15 @@ public actor SwiftNativeToolExecution {
         guard let host = OwnedProgramInvocation.host else {
             throw SenseFailure(code: "door_unavailable", message: "This turn has no app door, so the tool's app-action dependencies could not be checked; nothing ran. Run it from a chat turn.")
         }
-        guard candidate.program.dependencies.allSatisfy({ host.dependencyMatches($0, Self.fields(candidate.dependencyShapes)[$0]) }) else {
-            throw SenseFailure(code: "stale_dependency", message: "An app-action dependency changed. Propose and validate against its current shape.")
+        for action in candidate.program.dependencies where !host.dependencyMatches(action, Self.fields(candidate.dependencyShapes)[action]) {
+            let before = Self.fields(candidate.dependencyShapes)[action] ?? .null
+            let after = host.dependencyShape(action) ?? .null
+            let fields = JSONValue.differences(before, after).map { $0.isEmpty ? "contract" : $0 }.joined(separator: ", ")
+            let file = AbilityStore.File(id: candidate.id, kind: .tool, metadata: ["record": candidate.manifest],
+                body: candidate.program.source, pathExtension: "js")
+            throw ToolFailureError("Dependency \(action) changed at \(fields). Saved: \(try before.serialize(pretty: false)); current: \(try after.serialize(pretty: false)). Revise \(candidate.id) version \(candidate.digest) with tool.propose, validate and approve against this contract, then repeat the failed operation.",
+                effects: .none, owner: "part \(candidate.id) version \(candidate.digest) > candidate.dependencyShapes.\(action) > \(fields)",
+                nextCall: try abilities.repairCall(file))
         }
     }
 
@@ -503,13 +522,13 @@ public actor SwiftNativeToolExecution {
             if !admitted {
                 for key in ["admission", "manifestSignature", "signedAt", "signatureVersion"] { selected.removeValue(forKey: key) }
                 if selected["status"] != .string("disabled") { selected["status"] = .string("proposed"); selected["phase"] = .string("proposed") }
-                selected["validationStatus"] = .string("valid")
             }
             selected["updatedAt"] = .string(Self.isoTimestamp(Date()))
             previous.metadata["record"] = .object(selected)
             try abilities.write(previous)
         }
-        return ProposalValidationResult(valid: true, autoPromotable: false, errors: [], candidateDigest: target.digest)
+        return ProposalValidationResult(valid: true, autoPromotable: false, errors: [], candidateDigest: target.digest,
+            evidence: AbilityStore.validationEvidence(previous.metadata["proof"], fixtures: Self.fields(previous.metadata["candidate"] ?? .null)["fixtures"]))
     }
 
     public func rollbackPreview(id: String, version: String?) async throws -> (version: String, status: String, ownerOff: Bool) {

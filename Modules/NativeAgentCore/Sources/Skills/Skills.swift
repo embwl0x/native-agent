@@ -422,17 +422,9 @@ public final class SwiftNativeSkillsClient: SkillsClient {
     public func validateRoutine(name: String, key: Data,
         execute: @Sendable (OwnedProgramStore.Candidate) async throws -> JSONValue) async throws -> JSONValue {
         let candidate = try await routineCandidate(name: name)
-        let proof: JSONValue
-        do {
-            proof = try await execute(candidate)
-            guard try routineStore.proof(candidate, key: key) == proof else { throw SkillsError.invalidScript("Validation proof changed.") }
-            guard !(proof.objectValue?["receipts"]?.arrayValue ?? []).isEmpty else { throw SkillsError.invalidScript("Validation returned no runtime receipts.") }
-        }
-        catch {
-            // The candidate stands through a failed validation (OwnedProgramStore.validate
-            // says why); the refusal names what to fix, and the next save replaces it.
-            throw error
-        }
+        let proof = try await execute(candidate)
+        guard try routineStore.proof(candidate, key: key) == proof else { throw SkillsError.invalidScript("Validation proof changed.") }
+        guard !(proof.objectValue?["receipts"]?.arrayValue ?? []).isEmpty else { throw SkillsError.invalidScript("Validation returned no runtime receipts.") }
         let receipts = proof.objectValue?["receipts"]?.arrayValue ?? []
         return try await mutateRegistry { rows in
             guard let index = rows.firstIndex(where: { $0.objectValue?["id"] == .string(candidate.id) }),
@@ -440,9 +432,10 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                   (row["candidateDigest"] ?? row["codeFingerprint"]) == .string(candidate.digest) else {
                 throw SkillsError.invalidScript("A newer revision replaced this validation. Validate that candidate.")
             }
-            row["candidateValidation"] = .string("valid")
+            row["candidateValidation"] = .string("rehearsed")
             rows[index] = .object(row)
-            return .object(["status": .string("ok"), "digest": .string(candidate.digest), "validation": .string("valid"),
+            return .object(["status": .string("ok"), "digest": .string(candidate.digest), "validation": .string("rehearsed"),
+                            "validation_evidence": AbilityStore.validationEvidence(proof, fixtures: candidate.fixtures),
                             "capture": proof.objectValue?["capture"] ?? .null,
                             "effects": .string("none"), "receipts": .array(receipts.map { .object(($0.objectValue ?? [:]).filter { $0.key != "journal" }) })])
         }
@@ -475,7 +468,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 throw SkillsError.invalidScript("Dependency \(id) changed or its app door is unavailable. Validate against its current shape.")
             }
         }
-        guard let script = manifest["script"], current["candidateValidation"] == .string("valid") else {
+        guard let script = manifest["script"], current["candidateValidation"] == .string("rehearsed") else {
             throw SkillsError.invalidScript("Validate the exact routine candidate before enabling it.")
         }
         var admitted = current
@@ -529,7 +522,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             throw SkillsError.unknownSkill(name)
         }
         let row = entry.row
-        var result = row.filter { ["id", "name", "description", "triggers", "signature", "origin", "admission", "overrides", "suspended"].contains($0.key) }
+        var result = row.filter { ["id", "name", "description", "triggers", "signature", "origin", "admission", "overrides", "suspended", "learned", "validation_evidence"].contains($0.key) }
         result["status"] = .string("ok"); result["skill_status"] = row["status"] ?? .null
         result["runnable"] = .bool(entry.isRunnable)
         result["digest"] = row["codeFingerprint"] ?? .null
@@ -562,6 +555,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                 script.removeValue(forKey: "source"); pending["script"] = .object(script)
             }
             pending["digest"] = candidateDigest; pending["validation"] = row["candidateValidation"] ?? .null
+            pending["validation_evidence"] = row["candidate_validation_evidence"]
             if source { pending["fixtures"] = candidate.fixtures }
             result["candidate"] = .object(pending)
         }
@@ -582,17 +576,16 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         try await deleteSkill(id: rawId)
     }
 
-    /// Compare the kept action contracts without changing the ability.
-    public func pinActions(_ entry: InstalledSkillInventory.Entry, digest: String, pins: [String: String]) async throws -> [String] {
-        guard let row = try SkillsRegistry.decode(abilities.registry(kind: .skill))
-            .first(where: { $0.objectValue?["id"] == .string(entry.id) })?.objectValue,
-              SkillScript.isRunnable(row), row["codeFingerprint"] == .string(digest) else {
+    /// The actions whose kept contract no longer fits (`fits`), without changing the ability.
+    public func pinActions(_ entry: InstalledSkillInventory.Entry, digest: String, ids: [String],
+                           fits: @Sendable (String, JSONValue?) -> Bool) async throws -> [String] {
+        let row = entry.row
+        guard SkillScript.isRunnable(row), row["codeFingerprint"] == .string(digest) else {
             throw SkillsError.stateNotAllowed(name: entry.id, state: "not runnable", requirement: "an admitted script")
         }
         let held: [String: JSONValue] = if case .object(let pin)? = row["actionPin"], pin["digest"] == row["scriptDigest"],
             case .object(let actions)? = pin["actions"] { actions } else { [:] }
-        let wanted = pins.mapValues(JSONValue.string)
-        return Set(held.keys).union(wanted.keys).filter { held[$0] != wanted[$0] }.sorted()
+        return Set(held.keys).union(ids).filter { !fits($0, held[$0]) }.sorted()
     }
 
     /// Distinct clean inputs and world-stop upgrade signals under this admission.
@@ -757,18 +750,23 @@ public final class SwiftNativeSkillsClient: SkillsClient {
                         _ = try CapabilityLifecycle.preservingOwnerOff(current, before: current, ownerAuthorized: ownerAuthorized, enabling: true)
                     }
                 }
-            } catch let error as NSError where error.domain == "CapabilityLifecycle" {
-                return (false, error.localizedDescription, fields.merging(["reason": .string("owners_call")]) { $1 })
+            } catch let error as ToolFailureError {
+                let remedy = error.owner.map { owner in
+                    if error.personDecides, let tap = error.tap { return Repair.why(owner: owner, tap: tap) }
+                    return Repair.remedy(owner: owner, nextCall: error.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: error.tap)
+                }
+                return (false, error.localizedDescription, fields.merging(["reason": .string("owners_call"),
+                    "remedy": remedy ?? .null]) { $1 })
             } catch { return (false, error.localizedDescription + retry, fields) }
         }
         let personaBodies = personaRoot.appendingPathComponent("skills/bodies").standardizedFileURL.path + "/"
         let builtIn = source == "persona_body"
             || (SkillMutation.pyStrOptional(row["bodyPath"])?.hasPrefix(personaBodies) ?? false)
-        if verb != "enable", builtIn, !ownerAuthorized {
+        let override = row["overrides"] == .string("built_in")
+        if verb != "enable", builtIn, !ownerAuthorized, !(override && fullMac) {
             return (false, "\(skill) is built in: it ships with the app in persona/skills, so switching it off or deleting it is the owner's. Ask them.", fields)
         }
-        let override = row["overrides"] == .string("built_in")
-        if override, ["disable", "delete", "quarantine", "rollback"].contains(verb), !ownerAuthorized {
+        if override, ["disable", "delete", "quarantine", "rollback"].contains(verb), !ownerAuthorized, !fullMac {
             return (false, "\(skill) is your version of a built-in, so switching it off or deleting it is the owner's. Ask them. "
                 + "Changing its active version is the owner's too.", fields)
         }
@@ -789,7 +787,7 @@ public final class SwiftNativeSkillsClient: SkillsClient {
             var reviewed: String?
             var fields = fields
             if row["candidateDigest"] != nil || row["script"]?.objectValue?["entry"] == .string("run"),
-               row["candidateValidation"] != .string("valid") {
+               row["candidateValidation"] != .string("rehearsed") {
                 return (false, "Validate \(skill)'s exact candidate with skill.validate before enabling it.", fields)
             }
             if let script = row["script"], !SkillScript.admitted(row)
@@ -898,12 +896,13 @@ public final class SwiftNativeSkillsClient: SkillsClient {
         try preflightPackSkills(items, installID: installID, packID: packID)
         for item in items {
             let script = try SkillScript.normalized(item["script"])
+            // Each dependency's whole contract, so an additive change to it still fits.
             var pins: [String: JSONValue] = [:]
             for case .string(let id) in script.objectValue?["actions"]?.arrayValue ?? [] {
-                guard let pin = OwnedProgramInvocation.host?.dependencyPin(id) else {
+                guard let contract = OwnedProgramInvocation.host?.dependencyShape(id) else {
                     throw SkillsError.invalidScript("Pack routine dependency \(id) is unavailable. Install through the app's Skills lifecycle.")
                 }
-                pins[id] = .string(pin)
+                pins[id] = contract
             }
             var fields = item
             fields["id"] = .string(Self.packSkillID(item))

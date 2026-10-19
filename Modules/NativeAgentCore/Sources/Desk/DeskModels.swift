@@ -1238,10 +1238,9 @@ public struct DeskItem: Sendable, Equatable {
 /// provider, a sibling item, a verification run. Real, worth showing, NOT
 /// his to clear.
 public enum OwnerAttentionPolicy {
-    /// An approval waits on him while it is pending, whatever the case of
-    /// its saved status.
-    public static func approvalWaits(status: String) -> Bool {
-        status.lowercased() == "pending"
+    /// A person's approval waits while pending; the agent's own decisions do not.
+    public static func approvalWaits(status: String, agentOwned: Bool) -> Bool {
+        !agentOwned && status.lowercased() == "pending"
     }
 
     /// A nonterminal row whose `waitingOn` starts with the owner: "owner",
@@ -1254,14 +1253,14 @@ public enum OwnerAttentionPolicy {
         return ["owner", "user", "human"].contains(party) || party == OwnerName.shared.first()
     }
 
-    /// A card asks him while it is pending, is not a system-health notice,
+    /// A card asks him while unresolved (reading is not resolving), is not a system-health notice,
     /// and offers a choice: a linked approval, or an action beyond reading
     /// and filing it. A note that only tells him something (severity info,
     /// e.g. what she decided as boss) never waits.
     public static func inboxAsks(pending: Bool, systemLane: Bool, severity: String, linkedApproval: Bool,
                                  actionIDs: [String]) -> Bool {
         guard pending, !systemLane, severity.lowercased() != "info" else { return false }
-        return severity.lowercased() == "actionable" || linkedApproval
+        return linkedApproval
             || actionIDs.contains { !["view", "read", "archive", "dismiss"].contains($0.lowercased()) }
     }
 }

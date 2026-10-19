@@ -105,10 +105,6 @@ public struct AppControlRunResult: Sendable, Equatable {
     public let processIdentifier: Int32?
     public let launched: Bool
     public let activated: Bool
-    public let activationRequestAccepted: Bool?
-    public let activationFallbackAttempted: Bool
-    public let activationFallbackSucceeded: Bool
-    public let activationFailureReason: String?
     public let terminated: Bool
     public let alreadyInDesiredState: Bool
 
@@ -119,10 +115,6 @@ public struct AppControlRunResult: Sendable, Equatable {
         processIdentifier: Int32?,
         launched: Bool,
         activated: Bool,
-        activationRequestAccepted: Bool? = nil,
-        activationFallbackAttempted: Bool = false,
-        activationFallbackSucceeded: Bool = false,
-        activationFailureReason: String? = nil,
         terminated: Bool,
         alreadyInDesiredState: Bool = false
     ) {
@@ -132,10 +124,6 @@ public struct AppControlRunResult: Sendable, Equatable {
         self.processIdentifier = processIdentifier
         self.launched = launched
         self.activated = activated
-        self.activationRequestAccepted = activationRequestAccepted
-        self.activationFallbackAttempted = activationFallbackAttempted
-        self.activationFallbackSucceeded = activationFallbackSucceeded
-        self.activationFailureReason = activationFailureReason
         self.terminated = terminated
         self.alreadyInDesiredState = alreadyInDesiredState
     }
@@ -1096,18 +1084,7 @@ public final class SystemAppControlAdapter: Sendable {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
         #if canImport(AppKit)
-        let result = try await Self.focusAppOnMain(named: query)
-        // Preserve the cold-launch settling window after activation and its
-        // diagnostics; the caller still independently verifies the outcome.
-        let resolvedApp = result.bundleIdentifier ?? result.matchedName ?? query
-        var observedFrontmost = await isFrontmostApplication(matching: resolvedApp)
-        var looks = 0
-        while !observedFrontmost, looks < 16 {
-            try await Task.sleep(nanoseconds: 500_000_000)
-            observedFrontmost = await isFrontmostApplication(matching: resolvedApp)
-            looks += 1
-        }
-        return result
+        return try await Self.openAppOnMain(named: query, front: true)
         #else
         throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
@@ -1117,7 +1094,7 @@ public final class SystemAppControlAdapter: Sendable {
         let query = normalizedAppQuery(name)
         guard !query.isEmpty else { throw MacControlError.missingField("app") }
         #if canImport(AppKit)
-        return try await Self.launchAppOnMain(named: query)
+        return try await Self.openAppOnMain(named: query, front: false)
         #else
         throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
@@ -1130,16 +1107,6 @@ public final class SystemAppControlAdapter: Sendable {
         return try await Self.quitAppOnMain(named: query)
         #else
         throw MacControlError.appControlFailed("AppKit unavailable on this platform")
-        #endif
-    }
-
-    public func isFrontmostApplication(matching name: String) async -> Bool {
-        let query = normalizedAppQuery(name)
-        guard !query.isEmpty else { return false }
-        #if canImport(AppKit)
-        return await Self.isFrontmostApplicationOnMain(matching: query)
-        #else
-        return false
         #endif
     }
 
@@ -1159,165 +1126,55 @@ public final class SystemAppControlAdapter: Sendable {
 
     #if canImport(AppKit)
     @MainActor
-    private static func isFrontmostApplicationOnMain(matching query: String) -> Bool {
-        guard let frontmost = NSWorkspace.shared.frontmostApplication else { return false }
-        return application(frontmost, matches: query)
-    }
-
-    @MainActor
     private static func isApplicationRunningOnMain(matching query: String) -> Bool {
         (try? runningApplications(matching: query).isEmpty) == false
     }
 
-    private static func application(_ app: NSRunningApplication, matches query: String) -> Bool {
-        let name = app.localizedName ?? ""
-        let bundle = app.bundleIdentifier ?? ""
-        return name.caseInsensitiveCompare(query) == .orderedSame
-            || bundle.caseInsensitiveCompare(query) == .orderedSame
-    }
-
     @MainActor
-    private static func launchAppOnMain(named query: String) async throws -> AppControlRunResult {
+    private static func openAppOnMain(named query: String, front: Bool) async throws -> AppControlRunResult {
         try Task.checkCancellation()
-        if let running = try runningApp(matching: query) {
+        let running = try runningApp(matching: query)
+        guard let url = try running?.bundleURL ?? applicationURL(matching: query) else {
+            throw ToolFailureError("app_not_found: \(query)", argumentPath: "name",
+                accepted: "An installed app's exact name, bundle identifier or .app path.", effects: .none)
+        }
+        // Only a request to come forward reopens a running app; one already
+        // running in the background is left exactly as it is.
+        if let running, !front {
             return runResult(requested: query, app: running, launched: false, activated: false, terminated: false)
         }
-        guard let url = try applicationURL(matching: query) else {
-            throw MacControlError.appControlFailed("app_not_found: \(query)")
+        // Opening a running bundle delivers its reopen event, just like the Dock.
+        // Workspace also owns the cooperative activation hand-off.
+        let app = try await openApplication(at: url, activates: front)
+        if front { try await observeActivation(of: app.processIdentifier) }
+        try Task.checkCancellation()
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        let activated = front && frontmost?.processIdentifier == app.processIdentifier
+        if front && !activated {
+            throw ToolFailureError("Workspace opened \(url.path) with activation requested; after waiting up to 1.5 seconds for activation, the frontmost app is \(frontmost?.localizedName ?? "none") (pid: \(frontmost?.processIdentifier ?? 0)), not \(query) (pid: \(app.processIdentifier)).",
+                effects: .occurred, owner: "macOS application activation", tap: "Dock > \(app.localizedName ?? query)")
         }
-        let launched = try await openApplication(at: url, activates: false)
-        return runResult(requested: query, app: launched, fallbackURL: url, launched: true, activated: false, terminated: false)
+        return runResult(requested: query, app: app, fallbackURL: url,
+            launched: running == nil, activated: activated, terminated: false)
     }
 
     @MainActor
-    private static func focusAppOnMain(named query: String) async throws -> AppControlRunResult {
+    private static func observeActivation(of pid: Int32) async throws {
+        let (events, signal) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let center = NSWorkspace.shared.notificationCenter
+        let observer = center.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil, queue: nil) { notification in
+            if (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier == pid {
+                signal.yield(())
+            }
+        }
+        defer { center.removeObserver(observer); signal.finish() }
+        // Register before reading so activation cannot fall between the read and the wait.
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier != pid else { return }
+        _ = await raceAgainstTimeout(seconds: 1.5) {
+            for await _ in events { break }
+        }
         try Task.checkCancellation()
-        if let running = try runningApp(matching: query) {
-            guard MacDriverContext.binding?.allowsEmission == true else {
-                throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
-            }
-            // macOS 14+ cooperative activation: the app in front (often this
-            // one) must yield, or the request is accepted and then ignored.
-            if #available(macOS 14.0, *) { NSApplication.shared.yieldActivation(to: running) }
-            let activationRequestAccepted = running.activate(options: [.activateAllWindows])
-            var fallbackAttempted = false
-            var fallbackSucceeded = false
-            var fallbackFailure: String?
-
-            if !activationRequestAccepted {
-                if let bundleURL = running.bundleURL {
-                    fallbackAttempted = true
-                    do {
-                        _ = try await openApplication(at: bundleURL)
-                        fallbackSucceeded = true
-                    } catch {
-                        fallbackFailure = "NSWorkspace.openApplication fallback failed: \(error)"
-                    }
-                } else {
-                    fallbackFailure = "NSWorkspace.openApplication fallback unavailable: target has no bundle URL"
-                }
-            }
-
-            var activated = try await waitUntilFrontmost(pid: running.processIdentifier)
-            // macOS can accept an activate() and still not switch. Opening the
-            // running app through the workspace is the request it honors.
-            if !activated, !fallbackAttempted, let bundleURL = running.bundleURL {
-                fallbackAttempted = true
-                do {
-                    _ = try await openApplication(at: bundleURL)
-                    fallbackSucceeded = true
-                    activated = try await waitUntilFrontmost(pid: running.processIdentifier)
-                } catch {
-                    fallbackFailure = "NSWorkspace.openApplication fallback failed: \(error)"
-                }
-            }
-            let failureReason = activated ? nil : activationFailureReason(
-                activationRequestAccepted: activationRequestAccepted,
-                fallbackAttempted: fallbackAttempted,
-                fallbackSucceeded: fallbackSucceeded,
-                fallbackFailure: fallbackFailure
-            )
-            return runResult(
-                requested: query,
-                app: running,
-                launched: false,
-                activated: activated,
-                activationRequestAccepted: activationRequestAccepted,
-                activationFallbackAttempted: fallbackAttempted,
-                activationFallbackSucceeded: fallbackSucceeded,
-                activationFailureReason: failureReason,
-                terminated: false
-            )
-        }
-        guard let url = try applicationURL(matching: query) else {
-            throw MacControlError.appControlFailed("app_not_found: \(query)")
-        }
-        let launched = try await openApplication(at: url)
-        try Task.checkCancellation()
-        guard MacDriverContext.binding?.allowsEmission == true else {
-            throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
-        }
-        if #available(macOS 14.0, *) { NSApplication.shared.yieldActivation(to: launched) }
-        let activationRequestAccepted = launched.activate(options: [.activateAllWindows])
-        let activated = try await waitUntilFrontmost(pid: launched.processIdentifier)
-        let failureReason = activated ? nil : activationFailureReason(
-            activationRequestAccepted: activationRequestAccepted,
-            fallbackAttempted: false,
-            fallbackSucceeded: false,
-            fallbackFailure: nil
-        )
-        return runResult(
-            requested: query,
-            app: launched,
-            fallbackURL: url,
-            launched: true,
-            activated: activated,
-            activationRequestAccepted: activationRequestAccepted,
-            activationFailureReason: failureReason,
-            terminated: false
-        )
-    }
-
-    @MainActor
-    private static func waitUntilFrontmost(pid: Int32) async throws -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .milliseconds(1_500))
-        repeat {
-            try Task.checkCancellation()
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return true }
-            if clock.now >= deadline { return false }
-            try await Task.sleep(for: .milliseconds(50))
-        } while true
-    }
-
-    private static func activationFailureReason(
-        activationRequestAccepted: Bool,
-        fallbackAttempted: Bool,
-        fallbackSucceeded: Bool,
-        fallbackFailure: String?
-    ) -> String {
-        var steps: [String] = []
-        // loginwindow frontmost = the screensaver (or a lock) owns the display
-        // and nothing can come frontmost over it. Say so FIRST and name the
-        // tools that clear it: Agent read the generic failure on 2026-08-22 as
-        // "activation policy / connector not wired" when the Mac was simply on
-        // its screensaver — which her own mac_wake / mac_nudge clear (User: "the
-        // screen is never locked, it's a screensaver and she can get through it").
-        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == MacWakeGuard.loginWindowBundleID {
-            steps.append("display_obstructed: loginwindow is frontmost (the screensaver layer) — call mac_wake / mac_nudge to clear it, then retry; no app can be activated over it")
-        }
-        steps.append("NSRunningApplication.activate returned \(activationRequestAccepted)")
-        if fallbackAttempted {
-            steps.append(
-                fallbackSucceeded
-                    ? "NSWorkspace.openApplication fallback completed"
-                    : (fallbackFailure ?? "NSWorkspace.openApplication fallback did not complete")
-            )
-        } else if let fallbackFailure {
-            steps.append(fallbackFailure)
-        }
-        steps.append("target was not observed frontmost within 1.5 seconds")
-        return steps.joined(separator: "; ")
     }
 
     @MainActor
@@ -1363,20 +1220,27 @@ public final class SystemAppControlAdapter: Sendable {
     }
 
     @MainActor
-    private static func openApplication(at url: URL, activates: Bool = true) async throws -> NSRunningApplication {
+    private static func openApplication(at url: URL, activates: Bool) async throws -> NSRunningApplication {
+        try Task.checkCancellation()
         guard MacDriverContext.binding?.allowsEmission == true else {
-            throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
+            throw ToolFailureError(MacAttentionSessionStore.driverRefusal, effects: .none,
+                owner: "Mac attention", tap: "NativeAgent Mac chat > composer controls > Let [agent name] use the Mac",
+                personDecides: true)
         }
         return try await withCheckedThrowingContinuation { continuation in
             let config = NSWorkspace.OpenConfiguration()
             config.activates = activates
+            config.allowsRunningApplicationSubstitution = false
             NSWorkspace.shared.openApplication(at: url, configuration: config) { app, error in
                 if let error {
-                    continuation.resume(throwing: MacControlError.appControlFailed(error.localizedDescription))
+                    let cause = error as NSError
+                    continuation.resume(throwing: ToolFailureError("\(cause.domain) (\(cause.code)): \(cause.localizedDescription)",
+                        effects: .unknown, owner: "macOS Launch Services", tap: "Finder > \(url.path) > Open"))
                 } else if let app {
                     continuation.resume(returning: app)
                 } else {
-                    continuation.resume(throwing: MacControlError.appControlFailed("launch returned no application for \(url.path)"))
+                    continuation.resume(throwing: ToolFailureError("Workspace returned no application for \(url.path)",
+                        effects: .unknown, owner: "macOS Launch Services", tap: "Finder > \(url.path) > Open"))
                 }
             }
         }
@@ -1389,7 +1253,9 @@ public final class SystemAppControlAdapter: Sendable {
             $0.bundleURL?.standardizedFileURL.path ?? $0.bundleIdentifier ?? "pid:\($0.processIdentifier)"
         })
         guard identities.count <= 1 else {
-            throw MacControlError.appControlFailed("app_query_ambiguous: use an exact app name or bundle identifier")
+            let candidates = running.map { "\($0.localizedName ?? "unnamed") [\($0.bundleIdentifier ?? "no bundle id")] \($0.bundleURL?.path ?? "pid:\($0.processIdentifier)")" }.sorted().joined(separator: "; ")
+            throw ToolFailureError("app_query_ambiguous: \(query) matches \(candidates). Choose an exact app name, bundle identifier or .app path.",
+                argumentPath: "name", accepted: candidates, effects: .none)
         }
         return running.first
     }
@@ -1446,7 +1312,13 @@ public final class SystemAppControlAdapter: Sendable {
             if isApplicationBundle(url) { return url }
         }
         let name = query.hasSuffix(".app") ? String(query.dropLast(4)) : query
-        return try MacAppIndex.shared.apps().first {
+        let apps: [MacAppIndex.App]
+        do { apps = try MacAppIndex.shared.apps() }
+        catch {
+            throw ToolFailureError(error.localizedDescription, effects: .none,
+                owner: "macOS Spotlight app index", tap: "System Settings > Spotlight")
+        }
+        return apps.first {
             $0.bundleID?.caseInsensitiveCompare(query) == .orderedSame
                 || $0.name.caseInsensitiveCompare(name) == .orderedSame
                 || $0.url.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(name) == .orderedSame
@@ -1469,10 +1341,6 @@ public final class SystemAppControlAdapter: Sendable {
         fallbackURL: URL? = nil,
         launched: Bool,
         activated: Bool,
-        activationRequestAccepted: Bool? = nil,
-        activationFallbackAttempted: Bool = false,
-        activationFallbackSucceeded: Bool = false,
-        activationFailureReason: String? = nil,
         terminated: Bool
     ) -> AppControlRunResult {
         let name = app.localizedName ?? fallbackURL?.deletingPathExtension().lastPathComponent
@@ -1484,10 +1352,6 @@ public final class SystemAppControlAdapter: Sendable {
             processIdentifier: app.processIdentifier,
             launched: launched,
             activated: activated,
-            activationRequestAccepted: activationRequestAccepted,
-            activationFallbackAttempted: activationFallbackAttempted,
-            activationFallbackSucceeded: activationFallbackSucceeded,
-            activationFailureReason: activationFailureReason,
             terminated: terminated
         )
     }
@@ -1497,22 +1361,29 @@ public final class SystemAppControlAdapter: Sendable {
 public struct SystemOpenTargetAdapter: Sendable {
     public init() {}
 
-    public func requestOpen(_ url: URL, background: Bool) async -> Bool {
+    public func requestOpen(_ url: URL, background: Bool) async throws -> [String: JSONValue] {
         #if canImport(AppKit)
-        return await Self.requestOpenOnMain(url, background: background)
+        return try await Self.requestOpenOnMain(url, background: background)
         #else
-        return false
+        throw MacControlError.appControlFailed("AppKit unavailable on this platform")
         #endif
     }
 
     #if canImport(AppKit)
     @MainActor
-    private static func requestOpenOnMain(_ url: URL, background: Bool) async -> Bool {
-        guard MacDriverContext.binding?.allowsEmission == true else { return false }
-        guard background else { return NSWorkspace.shared.open(url) }
+    private static func requestOpenOnMain(_ url: URL, background: Bool) async throws -> [String: JSONValue] {
+        try Task.checkCancellation()
+        guard MacDriverContext.binding?.allowsEmission == true else {
+            throw MacControlError.appControlFailed(MacAttentionSessionStore.driverRefusal)
+        }
         let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = false
-        return (try? await NSWorkspace.shared.open(url, configuration: configuration)) != nil
+        configuration.activates = !background
+        let app = try await NSWorkspace.shared.open(url, configuration: configuration)
+        return [
+            "matched_name": app.localizedName.map(JSONValue.string) ?? .null,
+            "bundle_identifier": app.bundleIdentifier.map(JSONValue.string) ?? .null,
+            "process_identifier": .int(Int64(app.processIdentifier)),
+        ]
     }
     #endif
 }

@@ -708,8 +708,7 @@ public final class WorkStatusPublication {
             let board = await engine.desk.loadBoard(includeOverview: true)
             let overview = board.overview!
             let waiting = overview.unavailable.isEmpty ? overview.needsYouCount : nil
-            publishAttention(waiting, overview.unavailable.isEmpty && overview.omittedNeedsYou == 0
-                ? Dictionary(grouping: overview.needsYou, by: \.reference.kind).mapValues(\.count) : nil)
+            publishAttention(waiting, overview.unavailable.isEmpty ? overview.needsYouCounts : nil)
             if let items = board.deskState?.items { await engine.deviceSync?.evaluateNeedsUser(items: items) }
             if #available(macOS 27, *) { await publishWidgetStatus(board, engine: engine, name: displayName(), waiting: waiting, reload: reloadWidget) }
         } while workStatusDirty

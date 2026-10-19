@@ -18,6 +18,7 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
+import ChatToolRuntime
 import ToolRegistry
 
 /// Process-wide, stat-validated line count for chat transcript JSONL files.
@@ -220,13 +221,18 @@ public enum CodexCompletionTranscriptEvidence {
                 mime: mime,
                 name: name.isEmpty ? nil : name,
                 byteSize: Int(byteSize),
-                path: path
+                path: path,
+                utterance: try object["utterance"].map { try JSONDecoder().decode(SpeechUtterance.self, from: $0.serializedData(pretty: false)) }
             )
         }
     }
 }
 
 extension SwiftNativeChatOrchestrationClient {
+    nonisolated static func attachmentURL(dataRoot: URL, runId: String, index: Int) -> URL {
+        dataRoot.appendingPathComponent("chat/attachments/\(runId)/\(index)")
+    }
+
     /// Tool results are live-turn data, not durable context. Persist only a
     /// bounded, redacted receipt so tool_catalog/read_file/bash outputs cannot
     /// inflate every future transcript read. The full value remains available
@@ -931,6 +937,49 @@ extension SwiftNativeChatOrchestrationClient {
         return changed.count
     }
 
+    /// Only an exact transport reference from the original speaker can replace
+    /// a transcript face. The audio and every recognition hypothesis stay put.
+    public func correctSpeechTranscript(sessionId: String, reference: String, text: String) async throws -> Bool {
+        let sessionId = try Self.resolveSessionId(sessionId)
+        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
+        guard FileManager.default.fileExists(atPath: path.path) else { return false }
+        ChatSessionIndexFile.beginTranscriptIndexSync(at: path)
+        defer { ChatSessionIndexFile.endTranscriptIndexSync(at: path) }
+        let changed = try await persistence.withFileLock(path) {
+            var (rows, report) = try await self.persistence.readJSONLReporting(path)
+            guard report.isClean else { throw ChatOrchestrationError.underlying("Repair the unreadable conversation before correcting its transcript.") }
+            var changed = false
+            for index in rows.indices {
+                guard case .object(var row) = rows[index], row["role"] == .string("user"),
+                      case .object(var metadata)? = row["metadata"],
+                      case .array(var attachments)? = metadata["attachments"] else { continue }
+                for item in attachments.indices {
+                    guard case .object(var attachment) = attachments[item], let evidence = attachment["utterance"] else { continue }
+                    var utterance = try JSONDecoder().decode(SpeechUtterance.self, from: evidence.serializedData(pretty: false))
+                    guard utterance.correctionReferences?.contains(reference) == true else { continue }
+                    let oldFace = utterance.face
+                    utterance.correctedText = text
+                    attachment["utterance"] = try JSONValue.parse(JSONEncoder().encode(utterance))
+                    attachments[item] = .object(attachment)
+                    if case .string(let content)? = row["content"], content.hasSuffix(oldFace) {
+                        row["content"] = .string(String(content.dropLast(oldFace.count)) + utterance.face)
+                    }
+                    changed = true
+                }
+                metadata["attachments"] = .array(attachments)
+                row["metadata"] = .object(metadata)
+                rows[index] = .object(row)
+            }
+            if changed { try Self.writeJSONLAtomically(rows, to: path) }
+            return changed
+        }
+        if changed {
+            await bumpSessionTranscriptGeneration(sessionId: sessionId)
+            NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: sessionId)
+        }
+        return changed
+    }
+
     public func enqueueUserMessage(
         message: String,
         sessionId: String?,
@@ -1025,7 +1074,7 @@ extension SwiftNativeChatOrchestrationClient {
 
     /// A failed read leaves the enqueue unresolved; only a clean locked scan
     /// can prove absence and permit queue replay to append a new user row.
-    static func steeringMessageCommitted(
+    public static func steeringMessageCommitted(
         message: String, sessionId: String, runId: String,
         dataRoot: URL, persistence: any PersistenceCoreProtocol
     ) async throws -> Bool {
@@ -1160,6 +1209,9 @@ extension SwiftNativeChatOrchestrationClient {
                     "name": .string(a.name ?? ""),
                     "byteSize": .int(Int64(a.byteSize)),
                 ]
+                if let utterance = a.utterance {
+                    item["utterance"] = try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(utterance))
+                }
                 if let path = a.path?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !path.isEmpty {
                     item["path"] = .string(path)
@@ -1168,7 +1220,7 @@ extension SwiftNativeChatOrchestrationClient {
                           let bytes = Data(base64Encoded: a.base64) else {
                         throw ChatOrchestrationError.underlying("Couldn't save this turn's attachment for restart recovery.")
                     }
-                    let path = dataRoot.appendingPathComponent("chat/attachments/\(runId)/\(index)")
+                    let path = Self.attachmentURL(dataRoot: dataRoot, runId: runId, index: index)
                     try await SwiftNativePersistenceCore().writeDataAtomicDurable(bytes, to: path)
                     item["path"] = .string(path.path)
                 }
@@ -1259,7 +1311,8 @@ extension SwiftNativeChatOrchestrationClient {
                 verifiedUserId: live.verifiedUserId,
                 commandSignatureVerified: live.commandSignatureVerified,
                 deliveryRoute: live.deliveryRoute,
-                declaredRemote: live.declaredRemote
+                declaredRemote: live.declaredRemote,
+                answerExperienceID: live.answerExperienceID
             )
         }()
         metadata["envelope"] = turnEnvelope.persistedMetadata()
@@ -1312,6 +1365,15 @@ extension SwiftNativeChatOrchestrationClient {
             let writtenFiles = ChatWrittenFileArtifacts.files(from: result.toolDispatches)
             if !writtenFiles.isEmpty {
                 metadata["outputFiles"] = .array(writtenFiles.map(\.reference))
+            }
+            // What the turn left changed in the world: her next turn here starts from it.
+            // It started when it was first accepted, before any relaunch it resumed
+            // across; a turn with no checkpoint never resumed, so its own clock is its life.
+            let turn = outcomeTurnID ?? TurnTraceContext.turnId
+            let accepted = turn.flatMap { try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: safeSessionId, turnId: $0) }?.acceptedAt
+            if let world = await ChatWrittenFileArtifacts.world(from: result.toolDispatches,
+                    since: accepted ?? persistedAt.addingTimeInterval(-Double(result.elapsedMs) / 1000), dataRoot: dataRoot) {
+                metadata["world"] = world
             }
         }
         // Where this assistant row's working commentary ends and its answer
@@ -1439,6 +1501,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
         guard appended else { return nil }
+        ChatHistoryIndex.absorb(path, dataRoot: dataRoot)
         if role == "user" {
             do {
                 _ = try await OutcomeFeedbackStore(
@@ -1645,39 +1708,24 @@ extension SwiftNativeChatOrchestrationClient {
     /// Carry the compaction outcome so the window cursor does not rewrite the
     /// same prefix again, and the transcript bytes the compactor read so the
     /// turn's history selects from them instead of reading the file again.
-    /// Only cancellation aborts this preparation.
+    /// `progress` is the turn's own live state: a wait on a recollection says
+    /// so there, in words, on every door that shows the turn.
     func prepareSessionHistoryForTurn(
         sessionId: String,
         model: String,
         surface: String,
-        runId: String
-    ) async throws(CancellationError) -> (compacted: Bool, transcript: Data?) {
-        var outcome: ChatSessionCompactionOutcome?
-        do {
-            outcome = try await compactSessionBeforeContextIfNeeded(
-                sessionId: sessionId, model: model, surface: surface, runId: runId
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            // 2026-09-05: compaction is a BACKSTOP, not a precondition. Killing
-            // the turn here spent the user's turn on a failure nothing about
-            // this turn depended on: the history window cursor already bounds
-            // the replayed prefix, so an oversized session still assembles a
-            // bounded prompt, and the aging lane retries the fold later. Trace
-            // it and carry on with compactionRanThisTurn = false.
-            TurnTraceBus.fireFromContext(
-                kind: "compaction.backstop_failed", surface: surface,
-                payload: .object(["message": .string(message)])
-            )
-        }
+        runId: String,
+        progress: ChatOrchestrationProgressHandler? = nil
+    ) async throws -> (compacted: Bool, transcript: Data?) {
+        let outcome = try await compactSessionBeforeContextIfNeeded(
+            sessionId: sessionId, model: model, surface: surface, runId: runId, progress: progress
+        )
         // The append may have crossed the aging boundary. Scheduling is not
         // awaited and cannot fail the turn; cancellation above never schedules.
         scheduleTranscriptAgingIfNeeded(
             sessionId: sessionId, model: model, surface: surface, runId: runId
         )
-        return (outcome?.compacted ?? false, outcome?.transcript)
+        return (outcome.compacted, outcome.transcript)
     }
 
     @discardableResult
@@ -1685,7 +1733,8 @@ extension SwiftNativeChatOrchestrationClient {
         sessionId: String,
         model: String,
         surface: String,
-        runId: String?
+        runId: String?,
+        progress: ChatOrchestrationProgressHandler? = nil
     ) async throws -> ChatSessionCompactionOutcome {
         try await compactSession(
             sessionId: sessionId,
@@ -1694,9 +1743,16 @@ extension SwiftNativeChatOrchestrationClient {
             runId: runId,
             providerID: LLMCallContext.providerId,
             trigger: "auto_threshold",
-            force: false
+            force: false,
+            progress: progress
         )
     }
+
+    /// What a turn shows while it waits on a recollection. "waiting" in the
+    /// kind is what every door reads as the waiting phase, which never ages
+    /// into "stalled" — a full distill takes minutes and is not a stall.
+    static let compactionWaitNoticeKind = "context_compaction_waiting"
+    static let compactionWaitNoticeText = "Compacting this chat\u{2026}"
 
     /// Explicit user-requested compaction through the same canonical owner as
     /// automatic pre-turn compaction. `force` bypasses only the automatic
@@ -1730,7 +1786,8 @@ extension SwiftNativeChatOrchestrationClient {
         runId: String?,
         providerID: String?,
         trigger: String,
-        force: Bool
+        force: Bool,
+        progress: ChatOrchestrationProgressHandler? = nil
     ) async throws -> ChatSessionCompactionOutcome {
         let compactor = ChatSessionAutocompactor(
             dataRoot: dataRoot,
@@ -1740,7 +1797,7 @@ extension SwiftNativeChatOrchestrationClient {
         let transcript = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
         ChatSessionIndexFile.beginTranscriptIndexSync(at: transcript)
         defer { ChatSessionIndexFile.endTranscriptIndexSync(at: transcript) }
-        let outcome = try await compactor.compactIfNeeded(
+        var outcome = try await compactor.compactIfNeeded(
             sessionId: sessionId,
             model: model,
             surface: surface,
@@ -1756,24 +1813,25 @@ extension SwiftNativeChatOrchestrationClient {
         if outcome.compacted {
             await bumpSessionTranscriptGeneration(sessionId: outcome.sessionId)
         }
-        // Fire-and-forget LLM distillation of the mechanical summary. Only when
-        // distill is enabled AND a backup was taken (both encoded in the outcome
-        // via a non-nil summaryRowId/backupPath). Never delays or fails the turn;
-        // any distiller failure leaves the mechanical summary standing.
-        if autocompactionConfig.distillEnabled,
-           let rowId = outcome.summaryRowId,
-           let backupPath = outcome.backupPath {
+        // A pending recollection must finish before it becomes this turn's history.
+        // That wait is the turn's own (User, 2026-10-19: it may wait, it has to
+        // say so), so it shows on the turn the moment it begins.
+        var pending = outcome
+        if pending.summaryRowId != nil {
+            await progress?(.notice(kind: Self.compactionWaitNoticeKind, text: Self.compactionWaitNoticeText))
+        }
+        while let rowId = pending.summaryRowId,
+           let backupPath = pending.backupPath {
             let dataRoot = self.dataRoot   // let/Sendable — nonisolated capture
             let llm = self.llm
             let clock = self.clock
-            let messagesReplaced = outcome.messagesReplaced
-            Task.detached(priority: .background) {
+            let messagesReplaced = pending.messagesReplaced
                 let distiller = ChatSessionAgingConsolidation.makeAgingDistiller(
                     dataRoot: dataRoot,
                     llm: llm,
                     now: clock
                 )
-                await distiller.distill(
+                let ready = await distiller.distill(
                     sessionId: sessionId,
                     summaryRowId: rowId,
                     backupPath: backupPath,
@@ -1782,7 +1840,16 @@ extension SwiftNativeChatOrchestrationClient {
                     surface: surface,
                     runId: runId
                 )
-            }
+                try Task.checkCancellation()
+                guard ready else {
+                    throw ToolFailureError("Recollection is unavailable; original turns are retained. Repair this compaction before continuing.",
+                        effects: .none, owner: "chat/messages/\(sessionId).jsonl; providers.memory_and_mind_model",
+                        nextCall: ToolFailureError.call("app", ["action": .string("chat.compact"),
+                            "args": .object(["session_id": .string(sessionId)])]))
+                }
+                pending = try await compactor.compactIfNeeded(sessionId: sessionId, model: model,
+                    surface: surface, runId: runId, providerID: providerID, trigger: trigger, pendingOnly: true)
+                if let bytes = pending.transcript { outcome = outcome.carrying(bytes) }
         }
         return outcome
     }

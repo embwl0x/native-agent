@@ -1164,6 +1164,9 @@ extension SwiftToolDispatcher {
         environmentOverride: [String: String]? = nil,
         closeStandardInput: Bool = false,
         reapDescendantsOnExit: Bool = false,
+        // A command tool (shell, bash): the call completed once the command
+        // ran, and its exit code, output and timeout are the command's answer.
+        exitIsAnswer: Bool = false,
         // Each stdout line as it is written, for a caller that shows progress
         // live. The envelope is unchanged. Agent-host command runs only.
         onStdoutLine: (@Sendable (String) -> Void)? = nil
@@ -1372,7 +1375,8 @@ extension SwiftToolDispatcher {
                     : nil
                 let exitCode = maskedExitCode ?? processExitCode
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-                let status = cancelled.isSet ? "cancelled" : timedOut.isSet ? "timed_out" : (exitCode == 0 ? "completed" : "failed")
+                let status = cancelled.isSet ? "cancelled" : exitIsAnswer ? "completed"
+                    : timedOut.isSet ? "timed_out" : (exitCode == 0 ? "completed" : "failed")
 
                 var auditEntry: [String: Any] = [
                     "toolName": toolName,
@@ -1439,13 +1443,18 @@ extension SwiftToolDispatcher {
                     "audit_path": .string(auditURL.path),
                 ]
                 if let maskedExitCode {
-                    envelope["reason"] = .string("masked_subcommand_exit")
-                    envelope["detail"] = .string("The process exited 0, but its output reported EXIT: \(maskedExitCode). Treating the tool call as failed.")
+                    if !exitIsAnswer { envelope["reason"] = .string("masked_subcommand_exit") }
+                    envelope["detail"] = .string("The process exited 0, but its output reported EXIT: \(maskedExitCode)"
+                        + (exitIsAnswer ? ", so exit_code is \(maskedExitCode)." : ". Treating the tool call as failed."))
                     envelope["masked_exit_detected"] = .bool(true)
                     envelope["masked_exit_code"] = .int(Int64(maskedExitCode))
                 }
+                // What a person reads on the row: it ran, and what it answered.
+                if exitIsAnswer {
+                    envelope["summary"] = .string("Ran · exit \(exitCode)" + (timedOut.isSet ? " · timed out after \(clampedTimeout) s" : ""))
+                }
                 if timedOut.isSet {
-                    envelope["reason"] = .string("watchdog_timeout")
+                    if !exitIsAnswer { envelope["reason"] = .string("watchdog_timeout") }
                     envelope["detail"] = .string("The process exceeded the effective \(clampedTimeout)-second builder timeout and its process tree was terminated.")
                 }
                 if !resolvedCompatRewrites.isEmpty {
@@ -1628,7 +1637,8 @@ extension SwiftToolDispatcher {
             cwd: cwd,
             timeoutSeconds: timeout,
             sourcePayloadForAudit: cmd,
-            dataRoot: dataRoot
+            dataRoot: dataRoot,
+            exitIsAnswer: true
         )
     }
 
@@ -1656,7 +1666,8 @@ extension SwiftToolDispatcher {
             cwd: cwd,
             timeoutSeconds: timeout,
             sourcePayloadForAudit: cmd,
-            dataRoot: dataRoot
+            dataRoot: dataRoot,
+            exitIsAnswer: true
         )
     }
 

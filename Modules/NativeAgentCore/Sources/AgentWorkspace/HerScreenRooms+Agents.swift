@@ -68,14 +68,15 @@ extension HerScreen {
     }
 
     static func jobState(_ job: DelegationJobProjection, now: Date) -> String {
+        let stalled = job.stalled(at: now)
         if deliveredLive(job), let done = job.completedAt.flatMap(date) { return "✓ delivered live " + age(now.timeIntervalSince(done)) }
         guard let done = job.completedAt.flatMap(date) else {
             let started = (job.startedAt ?? job.claimedAt ?? job.createdAt).flatMap(date)
-            return (job.stalled ? "✗ stalled" : "⟳ running") + (started.map { " " + age(now.timeIntervalSince($0)) } ?? "")
+            return (stalled ? "✗ stalled" : "⟳ running") + (started.map { " " + age(now.timeIntervalSince($0)) } ?? "")
         }
         let failed = job.executionError != nil || job.deliveryOutcome == "failed_before_answer"
             || ["failed", "failed_before_answer", "error", "interrupted", "failed_hung", "stalled", "spawn_failed", "timed_out", "timeout", "cancelled", "canceled"].contains((job.runStatus ?? job.status ?? job.state ?? "").lowercased())
-        return (job.stalled ? "✗ stalled " : failed ? "✗ failed " : "✓ done ") + age(now.timeIntervalSince(done))
+        return (stalled ? "✗ stalled " : failed ? "✗ failed " : "✓ done ") + age(now.timeIntervalSince(done))
             + (job.deliveryOutcome == "lost" ? " · reply lost" : ["unknown", "sent_unconfirmed"].contains(job.deliveryOutcome ?? "") ? " · delivery unconfirmed" : "")
     }
 

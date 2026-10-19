@@ -28,9 +28,10 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
     public func renderPNG(
         shot: MacScreenShot,
         placements: [MacScreenMarkerPlacement],
+        secretFrames: [MacAXFrame],
         downscale: Double
     ) -> Data? {
-        guard let source = shot.cgImage else { return nil }
+        guard let source = shot.cgImage, shot.bounds.w > 0, shot.bounds.h > 0 else { return nil }
         let factor = max(0.05, min(downscale, 1.0))
         let width = max(1, Int((Double(shot.pixelWidth) * factor).rounded()))
         let height = max(1, Int((Double(shot.pixelHeight) * factor).rounded()))
@@ -47,6 +48,15 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
 
         context.interpolationQuality = .high
         context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        context.setFillColor(gray: 0.08, alpha: 1)
+        for frame in secretFrames {
+            let x = (frame.x - shot.bounds.x) * Double(width) / shot.bounds.w
+            let y = (frame.y - shot.bounds.y) * Double(height) / shot.bounds.h
+            let w = frame.w * Double(width) / shot.bounds.w
+            let h = frame.h * Double(height) / shot.bounds.h
+            context.fill(CGRect(x: x, y: Double(height) - y - h, width: w, height: h).integral)
+        }
 
         // Marker scale: tie the badge to the IMAGE's own size so a 1x window
         // capture and a 2x retina capture look the same to the eye.
@@ -151,6 +161,7 @@ public struct UnavailableMacScreenImageRenderer: MacScreenImageRenderer {
     public func renderPNG(
         shot: MacScreenShot,
         placements: [MacScreenMarkerPlacement],
+        secretFrames: [MacAXFrame],
         downscale: Double
     ) -> Data? { nil }
 }

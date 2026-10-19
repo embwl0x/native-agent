@@ -215,9 +215,11 @@ struct SettingsViewFull: View {
             lastSyncedAt: iCloudSyncEngine.shared.lastTransportDeliveryAt
         )
         return AliveSection("Connection") {
-            AliveValueRow(label: "State",
-                         value: AliveConnection.line(for: bridgeClient.bridgeStatus, paired: pairingStore.isICloudSigned))
-            AliveDivider()
+            // The connection is three facts, each with who can fix it and how.
+            ForEach(bridgeClient.connection.facts, id: \.label) { item in
+                AliveConnectionFactLine(label: item.label, fact: item.fact)
+                AliveDivider()
+            }
             AliveValueRow(label: "Last synced", value: StatusConnectionPresentation.cardValue(for: snapshotState),
                          emphasized: StatusConnectionPresentation.needsAttention(snapshotState))
             if let repairResult { AliveNote(repairResult) }
@@ -226,7 +228,7 @@ struct SettingsViewFull: View {
                 AliveNote(detail)
             }
             AliveDivider()
-            if bridgeClient.bridgeStatus != .online {
+            if !bridgeClient.connection.holds {
                 repairConnectionRow
                 AliveTapRow(title: "Pair with Mac") { showRePairSheet = true }
                 AliveDivider()

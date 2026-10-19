@@ -33,6 +33,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
     private var mutationGeneration = 0
     private var appliedMutationGeneration = 0
     private var available = false
+    private(set) var restorationTask: Task<Void, Never>?
     private let file = URL.applicationSupportDirectory.appendingPathComponent("phone-places.json")
     private let location = CLLocationManager()
     private var newName: String?
@@ -50,7 +51,7 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         location.desiredAccuracy = kCLLocationAccuracyHundredMeters
         alwaysAllowed = location.authorizationStatus == .authorizedAlways
         let file = file
-        Task {
+        restorationTask = Task {
             do {
                 let restored = try await Task.detached(priority: .utility) {
                     guard FileManager.default.fileExists(atPath: file.path) else { return State() }
@@ -81,6 +82,9 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         let next = try await task.value
         guard generation > appliedMutationGeneration else { return }
         appliedMutationGeneration = generation
+        for pending in state.pending where !next.pending.contains(where: { $0.event.id == pending.event.id }) {
+            iCloudBridge.shared.stopDeliveryNudges(for: pending.event.id)
+        }
         state = next; places = next.places
     }
 
@@ -231,7 +235,8 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
         for pending in state.pending.prefix(8) {
             guard pending.pairing == AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests) else { return }
             guard state.pending.contains(where: { $0.event.id == pending.event.id }),
-                  state.places.contains(where: { $0.id == pending.event.placeID && $0.enabled }) else { continue }
+                  state.places.contains(where: { $0.id == pending.event.placeID && $0.enabled }),
+                  !iCloudBridge.shared.isAwaitingMacAcceptance(pending.event.id) else { continue }
             do {
                 _ = try await iCloudBridge.shared.sendChatMessage(id: pending.event.id,
                     text: String(decoding: try JSONEncoder().encode(pending.event), as: UTF8.self),
@@ -247,8 +252,23 @@ final class PhonePlaces: NSObject, ObservableObject, @preconcurrency CLLocationM
                             }
                         }
                     })
-                try await save { $0.pending.removeAll { $0.event.id == pending.event.id } }
             } catch { errorMessage = "Place events are waiting to sync: \(error.localizedDescription)"; return }
+        }
+    }
+
+    func ownsDelivery(_ id: String) -> Bool {
+        state.pending.contains { $0.event.id == id }
+    }
+
+    func acceptDelivery(_ id: String) async -> Bool {
+        await restorationTask?.value
+        guard ownsDelivery(id) else { return true }
+        do {
+            try await save { $0.pending.removeAll { $0.event.id == id } }
+            return true
+        } catch {
+            errorMessage = "Place acceptance could not be saved: \(error.localizedDescription)"
+            return false
         }
     }
 

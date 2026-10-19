@@ -86,6 +86,8 @@ public struct SkillInfo: Identifiable, Sendable {
         let code = script.removeValue(forKey: "source")
         let source = JSONValue.object(["description": .string(skill.description), "status": .string(state),
             "version": version ?? .null, "validation": validation, "versions": fields["versions"] ?? .null,
+            "validation_evidence": candidate["validation_evidence"] ?? fields["validation_evidence"] ?? .null,
+            "learned": fields["learned"] ?? .null,
             "script": .object(script),
             "fixtures": candidate["fixtures"] ?? fields["fixtures"] ?? .array([])])
         let preview = try? source.serialize(pretty: true)
@@ -105,9 +107,9 @@ public enum InstalledSkillInventory {
         let state = state.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if version == "runtime" {
             guard hasCandidate else { return "No exact JS candidate is available for review. Read Tools census." }
-            guard validationStatus == "valid" else { return "Validate this exact candidate with skill.validate before installing it." }
+            guard validationStatus == "rehearsed" else { return "Validate this exact candidate with skill.validate before installing it." }
         }
-        guard state == "drafted" || validationStatus == "valid" else {
+        guard state == "drafted" || validationStatus == "rehearsed" else {
             let shownState = state.isEmpty ? "missing" : state
             return "Only a drafted skill can be installed from this review sheet. This skill is currently \(shownState)."
         }
@@ -265,18 +267,19 @@ public enum SkillScript {
                 params[name] = type
             }
         }
-        guard case .array(let listed)? = raw["actions"], listed.count <= actionLimit else {
-            throw refuse("actions lists the app action ids it may call, at most \(actionLimit).")
+        let listed: [JSONValue]
+        switch raw["actions"] {
+        case nil, .null?: listed = []
+        case .array(let items)?: listed = items
+        default: throw refuse("actions lists app action ids, like memory.recall.")
         }
+        // A name that is no action id (a built-in like app.read, a ledger's "read shell") is not a dependency.
         var actions: [String] = []
         for item in listed {
             guard case .string(let spelled) = item else { throw refuse("each action is an app action id, like memory.recall.") }
-            guard let id = dependencyID(spelled) else {
-                throw refuse("\(spelled) is not an app action dependency. actions lists IDs such as memory.recall; "
-                    + "app.read, app.find, app.log, app.expect, app.expect_fail, app.decide and app.step are built in. Use actions:[] for helpers alone.")
-            }
-            if !actions.contains(id) { actions.append(id) }
+            if let id = dependencyID(spelled), !actions.contains(id) { actions.append(id) }
         }
+        guard actions.count <= actionLimit else { throw refuse("A script calls at most \(actionLimit) app actions.") }
         // Labelled steps say how many there are; `of` is needed only without them.
         let labelled: Int64 = if case .array(let labels)? = raw["steps"] { Int64(labels.count) } else { 0 }
         let of: Int64
@@ -306,9 +309,23 @@ public enum SkillScript {
     /// contents of strings left out. The runner's own verbs aren't actions;
     /// an id it builds at run time, or names in a string, can't be seen here,
     /// and the run's allowlist still stops it.
+    /// The app actions a script's code calls, app.<page>.<action>(…), read
+    /// outside its strings and comments.
+    public static func calledActions(_ source: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"\bapp\s*\.\s*(\w+)\s*\.\s*(\w+)\s*\("#) else { return [] }
+        let code = codeMask(source)
+        var found: [String] = []
+        for match in regex.matches(in: code, range: NSRange(code.startIndex..., in: code)) {
+            let parts = (1...2).compactMap { Range(match.range(at: $0), in: code).map { String(code[$0]) } }
+            guard parts.count == 2, !verbs.contains(parts[0]) else { continue }
+            let id = parts.joined(separator: ".").lowercased()
+            if !found.contains(id) { found.append(id) }
+        }
+        return found
+    }
+
     public static func undeclared(_ script: JSONValue) -> [String] {
-        guard case .object(let fields) = script, let source = string(fields["source"]),
-              let regex = try? NSRegularExpression(pattern: #"\bapp\s*\.\s*(\w+)\s*\.\s*(\w+)\s*\("#) else { return [] }
+        guard case .object(let fields) = script, let source = string(fields["source"]) else { return [] }
         let code = codeMask(source)
         let declared = Set(strings(fields["actions"]))
         var found: [String] = []
@@ -320,13 +337,7 @@ public enum SkillScript {
                 if !found.contains(call) { found.append(call) }
             }
         }
-        for match in regex.matches(in: code, range: NSRange(code.startIndex..., in: code)) {
-            let parts = (1...2).compactMap { Range(match.range(at: $0), in: code).map { String(code[$0]) } }
-            guard parts.count == 2, !verbs.contains(parts[0])
-            else { continue }
-            let id = parts.joined(separator: ".").lowercased()
-            if !declared.contains(id), !found.contains(id) { found.append(id) }
-        }
+        for id in calledActions(source) where !declared.contains(id) && !found.contains(id) { found.append(id) }
         return found
     }
 

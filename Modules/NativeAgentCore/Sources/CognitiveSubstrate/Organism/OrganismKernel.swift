@@ -225,12 +225,6 @@ public actor OrganismKernel {
             // counting again from zero.
             wakefulnessFatigue = 0
         }
-        if bounded.kind == .dreamCompleted {
-            // Conservative provider-budget accounting: the organism receives
-            // this signal only after the canonical Dream owner commits. A
-            // pressure proposal by itself never advances the refractory gate.
-            dreamRepairState.sleepControl.lastProviderDreamAt = ingestedAt
-        }
         signalCount += 1
         // Quiet physiology follows when the signal reached this organism, not
         // an untrusted/delayed source timestamp. The anchor is monotonic so an

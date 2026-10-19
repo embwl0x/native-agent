@@ -4,6 +4,8 @@ import NativeAgentCore
 import PersistenceCore
 
 public enum SlackConnectorActions {
+    public static let searchTokenTap = "Advanced > Connectors > Slack > Add your Slack tokens > Bot or user token (xoxp-… with search:read), then Next > Save"
+    public static let searchTokenInstruction = "Slack search needs a user token with search:read. Ask the person to open " + searchTokenTap + "."
     public static let credentialKeys = ["access_token", "oauth_token", "token", "bot_token"]
     public static func apiURL(_ method: String) -> URL {
         if let raw = ProcessInfo.processInfo.environment["NATIVE_AGENT_SLACK_LOOPBACK_API"],
@@ -457,13 +459,20 @@ public enum SlackConnectorActions {
             let fix: String? = switch error {
             case "not_authed", "invalid_auth", "token_revoked", "account_inactive": "The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
             case "missing_scope": "The owner must add \((response["needed"] as? String) ?? "the required scope") in the Slack app settings, then sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
-            case "not_allowed_token_type": "Slack search needs a user token with search:read. The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
+            case "not_allowed_token_type": searchTokenInstruction
             case "channel_not_found": "No channel by that name or id; app {action:\"slack.channels\"} shows them."
             case "not_in_channel": "The bot isn't in that channel; invite it there with /invite first."
             case "ratelimited": "Slack is rate limiting; wait a minute before trying again."
             default: nil
             }
             if let fix { obj["fix"] = .string(fix) }
+            if action == "slack.search_messages",
+               ["not_authed", "invalid_auth", "token_revoked", "account_inactive", "missing_scope", "not_allowed_token_type"].contains(error) {
+                obj["effects"] = .string("none")
+                obj["fix"] = .string(searchTokenInstruction)
+                obj["remedy"] = Repair.remedy(owner: "Slack search.messages authorization: user token with search:read",
+                    nextCall: nil, tap: searchTokenTap)
+            }
         }
         return redactReceipt(.object(obj))
     }

@@ -29,6 +29,8 @@ public enum PermissionPosture: Sendable {
 /// shared remote. Destructive is what cannot be undone on his side of it, and
 /// always asks a person; Safe changes nothing on his side.
 public enum PermissionLaw {
+    public static let fullMacContract = "Under Full Mac I make changes without asking. Permanent deletion still asks you every time, a request an untrusted agent steered is held to Work mode, and a tool you blocked stays blocked. macOS permissions and account setup still ask."
+
     public static func posture(_ policy: [String: JSONValue]) -> PermissionPosture {
         if SwiftNativeSecurityCenter.fullMacActive(policy: policy) { return .fullMac }
         if case .string(let level)? = policy["permissionLevel"], ["strict", "locked_down"].contains(level) { return .readOnly }
@@ -41,7 +43,7 @@ public enum PermissionLaw {
     /// under Full Mac only his explicit `blocked`. Both SecurityCenter (with the
     /// facts it already resolved) and Trust's by-name and Workshop answers use it.
     public static func answer(tool: String, input: [String: JSONValue]?, policy: [String: JSONValue],
-                              saved: [String: JSONValue], dataRoot: URL) -> (toolClass: ToolClass, law: String, level: String) {
+                              saved: [String: JSONValue], dataRoot: URL) -> (toolClass: ToolClass, law: String, level: String, reason: String, remedy: JSONValue?) {
         let roots = SwiftNativeSecurityCenter.trustedWorkspaceRoots(
             policy: policy, filePolicy: SwiftNativeSecurityCenter.object(policy["filePolicy"]), dataRoot: dataRoot)
         let capabilities = input.map { SwiftNativeSecurityCenter.profile(tool: SwiftNativeSecurityCenter.policyToolName(tool),
@@ -50,23 +52,53 @@ public enum PermissionLaw {
     }
 
     static func answer(tool: String, input: [String: JSONValue]?, policy: [String: JSONValue], saved: [String: JSONValue],
-                       dataRoot: URL, roots: [URL], capabilities: Set<String>?) -> (toolClass: ToolClass, law: String, level: String) {
+                       dataRoot: URL, roots: [URL], capabilities: Set<String>?) -> (toolClass: ToolClass, law: String, level: String, reason: String, remedy: JSONValue?) {
         // Steering caps the posture: a turn an untrusted peer steered is judged as Work at most.
-        let posture = CapabilityLifecycle.writeRefusal != nil && posture(policy) == .fullMac ? .work : posture(policy)
+        let peer = CapabilityLifecycle.turnWriteCheck()()
+        let capped = peer != nil && posture(policy) == .fullMac
+        let posture = capped ? .work : posture(policy)
         let (toolClass, law) = judge(tool: tool, input: input, posture: posture, dataRoot: dataRoot, roots: roots, capabilities: capabilities)
         let name = SwiftNativeSecurityCenter.policyToolName(tool)
-        guard posture != .fullMac else {
-            return (toolClass, law, SwiftNativeTrustCenter.hasExplicitBlockOverride(name, overrides: saved) ? "blocked" : law)
-        }
         let bundle: [String: JSONValue] = ["autonomyOverrides": .object(saved), "autonomyDefault": .string(law)]
-        let level = SwiftNativeTrustCenter.moreRestrictiveAutonomy(
-            law, SwiftNativeTrustCenter.autonomyForTool(name, policy: bundle, capabilities: capabilities ?? []))
+        var level = posture == .fullMac
+            ? (SwiftNativeTrustCenter.hasExplicitBlockOverride(name, overrides: saved) ? "blocked" : law)
+            : SwiftNativeTrustCenter.moreRestrictiveAutonomy(
+                law, SwiftNativeTrustCenter.autonomyForTool(name, policy: bundle, capabilities: capabilities ?? []))
         // An app door action that runs its old tool's code in process keeps
         // the level saved on that tool: the stricter of the two stands.
-        guard name == "app", let input, let action = AppActionBinding.action(input: input) else { return (toolClass, law, level) }
-        return (toolClass, law, action.savedTrustKeys.reduce(level) {
-            SwiftNativeTrustCenter.moreRestrictiveAutonomy($0, SwiftNativeTrustCenter.autonomyForTool($1, policy: bundle))
-        })
+        let keys = name == "app" ? input.flatMap { AppActionBinding.action(input: $0) }?.savedTrustKeys ?? [] : []
+        if posture != .fullMac {
+            level = keys.reduce(level) { SwiftNativeTrustCenter.moreRestrictiveAutonomy($0, SwiftNativeTrustCenter.autonomyForTool($1, policy: bundle)) }
+        }
+        let names = [name] + keys + Array(capabilities ?? []) + [GatedToolNameContext.rawSpelling(of: name)].compactMap { $0 }
+        var entries = Set(names.compactMap { SwiftNativeTrustCenter.explicitAutonomyEntry($0, overrides: saved) }
+            .filter { $0.level == level }.map(\.pattern))
+        if level == "blocked" {
+            entries.formUnion(saved.keys.filter { key in key != "default" && saved[key] == .string("blocked")
+                && names.contains { SwiftNativeTrustCenter.fnmatch(name: $0, pattern: key) } })
+        }
+        if entries.isEmpty, level != law { entries.insert("default") }
+        let owner = "trust/policy.json"
+        let mode = posture == .fullMac ? "Full Mac" : posture == .readOnly ? "Safe" : "Work mode"
+        var reason = "\(owner): \(mode) judges \(tool) as \(toolClass), autonomy=\(level)."
+        if !entries.isEmpty { reason += " Saved entry: " + entries.sorted().map { "toolAutonomy[\($0)]=\(level)" }.joined(separator: ", ") + "." }
+        if capped, let peer { reason += " Full Mac is capped to Work mode by \(peer.message)" }
+        let remedy: JSONValue?
+        if !entries.isEmpty, level != "auto" {
+            var taps = entries.sorted().map { "Trust > Access and policy > Saved tool permissions > \($0) > Use posture" }
+            if law != "auto", toolClass != .destructive {
+                if capped, let tap = peer?.tap { taps.append(tap) }
+                else if !capped { taps.append("Trust > Access and policy > Access") }
+            }
+            remedy = Repair.why(owner: owner + " " + entries.sorted().map { "toolAutonomy[\($0)]" }.joined(separator: ", "),
+                tap: taps.joined(separator: "; "))
+        } else if capped, toolClass != .destructive, let peer, let tap = peer.tap, level == law {
+            remedy = Repair.why(owner: peer.owner ?? owner, tap: tap)
+        } else if level != "auto" {
+            remedy = Repair.why(owner: "Trust posture: \(mode)", tap: toolClass == .destructive
+                ? "Today > approval card > Approve or Decline" : capped ? "Trust > Connected agents" : "Trust > Access and policy > Access")
+        } else { remedy = nil }
+        return (toolClass, law, level, reason, remedy)
     }
 
     /// The one judgment: the call's class, and the level its class, its reach
@@ -313,6 +345,12 @@ extension SwiftNativeTrustCenter {
         _ toolName: String,
         overrides: [String: JSONValue]
     ) -> String? {
+        explicitAutonomyEntry(toolName, overrides: overrides)?.level
+    }
+
+    nonisolated static func explicitAutonomyEntry(
+        _ toolName: String, overrides: [String: JSONValue]
+    ) -> (pattern: String, level: String)? {
         let tool = toolName.trimmingCharacters(in: .whitespaces)
         guard !tool.isEmpty else { return nil }
         func level(_ jv: JSONValue?) -> String? {
@@ -320,7 +358,7 @@ extension SwiftNativeTrustCenter {
                   unifiedPolicyAutonomyLevels.contains(s) else { return nil }
             return s
         }
-        if let exact = level(overrides[tool]) { return exact }
+        if let exact = level(overrides[tool]) { return (tool, exact) }
 
         var globs: [(pattern: String, level: String)] = []
         for (pat, value) in overrides {
@@ -340,7 +378,7 @@ extension SwiftNativeTrustCenter {
             }
             return a.pattern < b.pattern
         }
-        return globs[0].level
+        return globs[0]
     }
 
     /// Restrictiveness ranking over `unifiedPolicyAutonomyLevels`. An

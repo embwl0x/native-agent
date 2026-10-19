@@ -314,7 +314,7 @@ extension SwiftNativeTurnEngine {
         if let receiptStrip, let evidence = try? JSONValue.parse(Data(receiptStrip.utf8)) {
             SwiftToolDispatcher.consumePersistedHistoryEvidence(evidence)
         }
-        let historyParts = [renderedHistory, receiptStrip].compactMap { $0 }
+        let historyParts = [renderedHistory, SessionHistoryPromptRenderer.worldRecord(from: prior), receiptStrip].compactMap { $0 }
         let historyBlock = historyParts.isEmpty ? nil : historyParts.joined(separator: "\n\n")
         trace.setCount("history.prompt.sourceBytes", priorStats.sourceBytes)
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)

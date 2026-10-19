@@ -6,6 +6,7 @@ import PersistenceCore
 import StandingBots
 import ProviderRouting
 import ChatOrchestration
+import Experiences
 
 extension NativeAgentEngine {
     public func deviceHelpersSnapshot() async throws -> MobileHelpersSnapshot {
@@ -13,15 +14,28 @@ extension NativeAgentEngine {
         return try await Task.detached(priority: .utility) {
             let records = try BotsShelfRecord.read(root: root)
             let running = try BotRunQueue(dataRoot: root).activeOrQueuedIDs()
-            let threads = try AgentContactThreads.mobileThreads(root: root)
+            let threads = try await AgentContactThreads.mobileThreads(root: root)
+            let store = ExperienceStore.at(root)
             var snapshot = MobileHelpersSnapshot()
-            snapshot.helpers = records.prefix(100).map { record in
-                MobileHelperRow(id: record.id, name: record.definition.name,
+            for record in records.prefix(100) {
+                var row = MobileHelperRow(id: record.id, name: record.definition.name,
                     status: running.contains(record.id) ? "Running or queued" : record.state,
                     paused: record.definition.paused,
                     canPause: record.definition.cadence != .manual || record.definition.eventTrigger != nil || record.definition.paused)
+                if let latest = record.entries.filter({ $0.runtimeStatus == .completed }).max(by: { $0.runAt < $1.runAt }) {
+                    row.resultID = latest.id.uuidString
+                    row.resultPreview = try await store.experience(latest.id.uuidString)?.face.map {
+                        MobileDeskProjectionBounds.clipped($0.words, to: 160)
+                    }
+                }
+                snapshot.helpers.append(row)
             }
-            snapshot.agents = threads.prefix(100).map(\.agent)
+            snapshot.agents = threads.prefix(100).map {
+                var row = $0.agent
+                row.experienceIDs = row.experiences?.map(\.id)
+                row.experiences = nil
+                return row
+            }
             snapshot.truncated = records.count > 100 || threads.count > 100
             return snapshot
         }.value
@@ -93,6 +107,15 @@ extension NativeAgentEngine {
                 runID = try await BotRunConversation.enqueueRequestedCheck(botID: id, dataRoot: root)
             }
             var result = try helperReceipt(store.get(id))
+            if let resultID = payload["result_id"] {
+                guard let resultID = UUID(uuidString: resultID) else { throw HelperRemoteError.invalid }
+                let entry = try ShelfStore(dataRoot: root).entry(resultID)
+                guard entry.botId == id else { throw HelperRemoteError.invalid }
+                let experiences = ExperienceStore.at(root)
+                _ = try await experiences.projection()
+                guard let experience = try await experiences.experience(resultID.uuidString) else { throw HelperRemoteError.stale }
+                result["result"] = String(decoding: try JSONEncoder().encode(experience.mobile), as: UTF8.self)
+            }
             if let runID { result["run_id"] = runID.uuidString; result["message"] = "Run queued." }
             return result
         default: throw HelperRemoteError.invalid
@@ -102,7 +125,7 @@ extension NativeAgentEngine {
     public func deviceAgentThreadAction(action: String, payload: [String: String]) async throws -> [String: String] {
         let root = dataRoot
         guard let id = payload["id"] else { throw HelperRemoteError.invalid }
-        let threads = try await Task.detached(priority: .utility) { try AgentContactThreads.mobileThreads(root: root) }.value
+        let threads = try await Task.detached(priority: .utility) { try await AgentContactThreads.mobileThreads(root: root) }.value
         guard threads.contains(where: { $0.agent.id == id }) else { throw HelperRemoteError.contact }
         var refreshed = threads
         if action == "send_agent_message" {
@@ -112,7 +135,7 @@ extension NativeAgentEngine {
             if let failure = await sendContactMessage(agent: id, text: text, session: session, root: root) {
                 return ["status": "error", "message": failure]
             }
-            refreshed = try await Task.detached(priority: .utility) { try AgentContactThreads.mobileThreads(root: root) }.value
+            refreshed = try await Task.detached(priority: .utility) { try await AgentContactThreads.mobileThreads(root: root) }.value
         }
         guard let thread = refreshed.first(where: { $0.agent.id == id }) else { throw HelperRemoteError.contact }
         return ["status": "ok", "thread": String(decoding: try JSONEncoder().encode(thread), as: UTF8.self)]

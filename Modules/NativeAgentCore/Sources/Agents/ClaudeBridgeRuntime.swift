@@ -554,57 +554,39 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
         case .authorized:
             break
         }
-        // Any authenticated call on her lane is Claude live — a chat message,
-        // a tool read, a state check — not only an agent_message. The contact
-        // health reads `claude-live` beside her inbox (10 minutes); the home
-        // PEOPLE row said her messages waited for a next session mid-conversation.
-        if path.hasPrefix("/claude/") { AgentContactRoutes.markClaudeLive(dataRoot: host.dataRoot) }
         if routeAgentContact(conn: conn, method: method, path: path, headers: headers, body: body) { return }
 
-        switch path {
-        case "/claude/state", "/codex/state", "/omp/state":
+        let components = path.dropFirst().split(separator: "/", maxSplits: 1).map(String.init)
+        let lane = components.first ?? ""
+        let operation = path.hasPrefix("/standing_views") ? path : components.count == 2 ? "/" + components[1] : path
+        let principal = bridgeCallerPrincipal(headers: headers)
+        if let peerID = principal?.peerID { AgentPeerStore(dataRoot: host.dataRoot).recordProof(peerID: peerID, inbound: true) }
+
+        switch operation {
+        case "/state":
             guard method == "GET" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleState(conn: conn)
-        case "/claude/message":
+            handleState(conn: conn, path: path)
+        case "/message":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleMessage(conn: conn, body: body, defaultSender: "claude", headers: headers)
-        case "/codex/message":
+            handleMessage(conn: conn, body: body, defaultSender: lane, headers: headers)
+        case "/tool":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleMessage(conn: conn, body: body, defaultSender: "codex", headers: headers)
-        case "/omp/message":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            handleMessage(conn: conn, body: body, defaultSender: "omp", headers: headers)
-        case "/claude/tool":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            handleTool(conn: conn, body: body, lane: "claude", headers: headers)
-        case "/codex/tool":
-            guard method == "POST" else {
-                writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
-                return
-            }
-            handleTool(conn: conn, body: body, lane: "codex", headers: headers)
-        case "/codex/reply", "/claude/reply":
+            handleTool(conn: conn, body: body, headers: headers)
+        case "/reply":
             guard method == "POST",
                   let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                   let session = json["session_id"] as? String,
                   let request = json["request_id"] as? String,
-                  let principal = bridgeCallerPrincipal(headers: headers,
-                      lane: path == "/claude/reply" ? "claude" : "codex") else {
+                  let principal else {
                 writeJSON(conn, status: 400, obj: ["error": "invalid_caller_result_request"])
                 return
             }
@@ -646,19 +628,19 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
                     writeJSON(conn, status: 200, obj: receipt)
                 }
             }
-        case "/claude/organism/debug", "/codex/organism/debug":
+        case "/organism/debug":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleOrganismDebug(conn: conn, body: body)
-        case "/codex/live", "/omp/live":
+            handleOrganismDebug(conn: conn, body: body, path: path)
+        case "/live":
             guard method == "POST" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
             }
-            handleAgentLive(conn: conn, body: body, agent: String(path.dropFirst().prefix { $0 != "/" }))
-        case "/claude/events", "/codex/events":
+            handleAgentLive(conn: conn, body: body, agent: lane)
+        case "/events":
             guard method == "GET" else {
                 writeJSON(conn, status: 405, obj: ["error": "method_not_allowed"])
                 return
@@ -682,7 +664,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     }
 
 
-    private func handleOrganismDebug(conn: NWConnection, body: Data) {
+    private func handleOrganismDebug(conn: NWConnection, body: Data, path: String) {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             writeJSON(conn, status: 400, obj: ["error": "invalid_json"])
             return
@@ -785,7 +767,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             workTask.cancel()
             self.writeJSON(conn, status: 504, obj: [
                 "error": "work_timeout",
-                "path": "/claude/organism_debug",
+                "path": path,
                 "seconds": Self.readWorkDeadlineSeconds,
             ])
         }
@@ -824,7 +806,7 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
     }
 
     private func handleMessage(conn: NWConnection, body: Data, defaultSender: String, headers: [String: String]) {
-        guard let principal = bridgeCallerPrincipal(headers: headers, lane: defaultSender) else {
+        guard let principal = bridgeCallerPrincipal(headers: headers) else {
             writeJSON(conn, status: 403, obj: ["error": "invalid_peer_identity"])
             return
         }
@@ -835,20 +817,15 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
 
     // MARK: - /claude/tool
 
-    /// The listener authenticated the bearer, so every route of a lane —
-    /// message, tool and reply alike — binds it to that lane's own contact
-    /// (`PeerTrust.contact(forLane:)`): its turn is trusted exactly when the
-    /// person elevated that contact. A lane with no contact stays anonymous;
-    /// claimed peers keep their own identity.
-    private func bridgeCallerPrincipal(headers: [String: String], lane: String) -> AgentBridgePrincipal? {
-        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: host.dataRoot, authenticatedLane: lane)
+    /// Only the door's own authenticated key carries its identity and grant.
+    private func bridgeCallerPrincipal(headers: [String: String]) -> AgentBridgePrincipal? {
+        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: host.dataRoot)
         guard !principal.replyOnly,
               !AgentBridgePrincipal.claimsIdentity(headers: headers) || principal.peerID != nil else { return nil }
         return principal
     }
 
-    private func handleTool(conn: NWConnection, body: Data, lane: String, headers: [String: String]) {
-        let surface = BridgeLane.bridgeSurfaceName(forSender: lane)
+    private func handleTool(conn: NWConnection, body: Data, headers: [String: String]) {
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             writeJSON(conn, status: 400, obj: ["error": "invalid_json"])
             return
@@ -857,10 +834,11 @@ public final class ClaudeBridgeRuntime: @unchecked Sendable, BridgeHTTPServer, C
             writeJSON(conn, status: 400, obj: ["error": "missing_name"])
             return
         }
-        guard let principal = bridgeCallerPrincipal(headers: headers, lane: lane) else {
+        guard let principal = bridgeCallerPrincipal(headers: headers) else {
             writeJSON(conn, status: 401, obj: ["error": "unauthorized"])
             return
         }
+        let surface = principal.surface
         let context = json["session_id"] as? String
         let request = json["request_id"] as? String
         if json["session_id"] != nil || json["request_id"] != nil {
@@ -1113,7 +1091,7 @@ extension ClaudeBridgeRuntime {
 }
 
 extension ClaudeBridgeRuntime {
-    func handleState(conn: NWConnection) {
+    func handleState(conn: NWConnection, path: String) {
         // Same WorkLatch + asyncAfter bound as handleMessage/handleTool: exactly
         // one of the work Task and the deadline writes the response.
         let workLatch = WorkLatch()
@@ -1133,7 +1111,7 @@ extension ClaudeBridgeRuntime {
             workTask.cancel()
             self.writeJSON(conn, status: 504, obj: [
                 "error": "work_timeout",
-                "path": "/claude/state",
+                "path": path,
                 "seconds": Self.readWorkDeadlineSeconds,
             ])
         }

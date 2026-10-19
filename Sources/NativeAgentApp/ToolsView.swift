@@ -979,6 +979,13 @@ private struct AuthoredToolsSection: View {
             .font(ShellType.caption)
             .foregroundStyle(NativeAgentShell.secondary)
 
+            if case .object(let fields)? = tool.extras,
+               let evidence = try? JSONValue.object(fields.filter { ["validation_evidence", "candidate_validation_evidence", "learned"].contains($0.key) }).serialize(pretty: true) {
+                DisclosureGroup("Evidence and learned use") {
+                    Text(evidence).font(ShellType.code).textSelection(.enabled)
+                }
+            }
+
             if let permissions = tool.permissions, !permissions.isEmpty {
                 Text("Permissions: \(permissions.joined(separator: ", "))")
                     .font(ShellType.label)

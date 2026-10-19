@@ -149,6 +149,7 @@ struct PersistedAttachmentRecord: Codable, Hashable {
     var name: String?
     var byteSize: Int64?
     var path: String?
+    var utterance: SpeechUtterance?
 }
 
 struct ChatTranscriptSnapshot: Identifiable, Codable, Hashable, Sendable {

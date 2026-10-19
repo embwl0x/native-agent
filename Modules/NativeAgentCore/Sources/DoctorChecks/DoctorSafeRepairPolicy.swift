@@ -36,22 +36,22 @@ public enum DoctorSafeRepairPolicy {
     ) -> [String] {
         var seen = Set<String>()
         return checks.compactMap { check in
-            let liveRepair = executableLiveIDs.contains(check.id)
-                || (check.id.hasPrefix("live.") && check.repair_available == true)
+            let liveRepair = executableLiveIDs.contains(check.checkID)
+                || (check.checkID.hasPrefix("live.") && check.repair_available == true)
             let scopeAllowsRepair = switch scope {
             case .automatic, .onboarding:
-                automaticCoreIDs.contains(check.id)
-                    || (scope == .automatic && executableLiveIDs.contains(check.id)
-                        && !buttonOnlyLiveIDs.contains(check.id))
-                    || (check.id == "live.embedding_download"
+                automaticCoreIDs.contains(check.checkID)
+                    || (scope == .automatic && executableLiveIDs.contains(check.checkID)
+                        && !buttonOnlyLiveIDs.contains(check.checkID))
+                    || (check.checkID == "live.embedding_download"
                         && check.detail.hasPrefix("A resumable memory model transfer"))
             case .button: true
             }
             guard isAdverse(check.status) || isOAuthRefresh(check),
-                  liveRepair || isSafeCoreRepair(check),
-                  check.id != "persona_engine" || scope == .button,
+                  liveRepair || check.repair_available == true || isSafeCoreRepair(check),
+                  check.checkID != "persona_engine" || scope == .button,
                   scopeAllowsRepair else { return nil }
-            let id = check.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            let id = check.checkID.trimmingCharacters(in: .whitespacesAndNewlines)
             return !id.isEmpty && seen.insert(id).inserted ? id : nil
         }
     }
@@ -90,7 +90,7 @@ public enum DoctorSafeRepairPolicy {
     }
 
     private static func isOAuthRefresh(_ check: CheckResult) -> Bool {
-        check.id == "oauth_token_expiry" && check.repair == oauthRefreshInstruction
+        check.checkID == "oauth_token_expiry" && check.repair == oauthRefreshInstruction
     }
 
     private static func normalized(_ value: String?) -> String {

@@ -147,9 +147,7 @@ enum TrustGuardrailSummary {
         switch state {
         case .fullMac:
             value = "Changes without asking"
-            // Sending has its own row below; this one is changes only.
-            detail = "Under Full Mac I make changes without asking. "
-                + "macOS permissions and account setup still ask."
+            detail = PermissionLaw.fullMacContract
             tone = .danger
         case .unavailable:
             value = "Not available"

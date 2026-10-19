@@ -57,12 +57,14 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         case none
         case readOnly
         case allow
+        case invalid
 
         init(_ fileAccess: String) {
             switch fileAccess.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             case "workspace", "auto", "full": self = .allow
             case "read_only", "readonly", "read-only": self = .readOnly
-            default: self = .none
+            case "none": self = .none
+            default: self = .invalid
             }
         }
     }
@@ -74,6 +76,8 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
     static func sharedFileAccess(_ requested: String) -> String {
         let saved = UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto"
         let savedMode = Mode(saved), requestedMode = Mode(requested)
+        if savedMode == .invalid { return "invalid saved chatFileAccess: \(saved)" }
+        if requestedMode == .invalid { return "invalid request fileAccess: \(requested)" }
         if savedMode == .none || requestedMode == .none { return "none" }
         if requestedMode == .readOnly { return "read_only" }
         return savedMode == .readOnly ? "auto" : saved
@@ -193,7 +197,7 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         switch mode {
         case .allow:
             return false
-        case .none:
+        case .none, .invalid:
             if Self.blockedExact.contains(lower) { return true }
             for p in Self.blockedPrefixes where lower.hasPrefix(p) { return true }
         case .readOnly:
@@ -218,7 +222,12 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         return !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func fileAccessRefusal(tool: String, input: [String: JSONValue]) -> AutonomyGateError? {
+    private func fileAccessRefusal(tool: String, input: [String: JSONValue]) -> ToolFailureError? {
+        let source = "effective request fileAccess=\(fileAccess); saved chatFileAccess=\(UserDefaults.standard.string(forKey: "chatFileAccess") ?? "auto")"
+        if mode == .invalid {
+            return ToolFailureError("\(source) is unrecognized; no file access was inferred.", argumentPath: "request.fileAccess",
+                accepted: "auto, workspace, full, read_only, readonly, read-only, none", effects: .none)
+        }
         let action = ToolNameAliases.foldedTools[tool] ?? tool
         let read = ["files.read", "files.list", "files.info", "files.excerpt", "files.grep"].contains(action)
         let write = ["files.write", "files.copy", "files.move", "files.trash"].contains(action)
@@ -229,16 +238,10 @@ final class FileAccessGatedDispatcher: ToolDispatchClient, PreApprovalToolValida
         if (read || write), withinReach("path", write: write && action != "files.copy"),
            !["files.copy", "files.move"].contains(action) || withinReach("destination", write: true) { return nil }
         if isPathfulReadUnderNoFileAccess(tool: tool, input: input) {
-            return AutonomyGateError.toolDenied(
-                reason: "fileAccess=none blocks \(tool) with an explicit path; "
-                    + "call it with no path to read what is on screen"
-            )
+            return ToolFailureError("\(source) blocks \(tool) with an explicit path. The request issuer must resubmit with file access; changing the requested operation to a screen read would not repair this file read.", effects: .none)
         }
         if isBlocked(tool) {
-            // Name the ACTUAL mode — this gate also fires for read_only, and
-            // the old hardcoded "fileAccess=none" string lied in that case.
-            let modeName = mode == .readOnly ? "read_only" : "none"
-            return AutonomyGateError.toolDenied(reason: "fileAccess=\(modeName) blocks \(tool)")
+            return ToolFailureError("\(source) blocks \(tool). The request issuer must change its fileAccess restriction; the person's saved access is controlled by Trust > Access and policy > Access.", effects: .none)
         }
         return nil
     }
@@ -414,7 +417,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                         for await event in events where event.record.id == approval { return event }
                         throw CancellationError()
                     }
-                    if event.phase != .executed {
+                    if event.phase != .executed, event.record.decision == "approved" {
                         for await settled in events where settled.phase == .executed && settled.record.id == approval {
                             event = settled
                             break
@@ -424,8 +427,14 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                     result = event.record.decision == "approved" ? event.result
                         ?? .object(["status": .string("failed"), "reason": .string("card_outcome_unavailable"),
                             "detail": .string("The approved action returned no outcome; check its receipt before continuing.")])
-                        : .object(["status": .string("failed"), "reason": .string("declined"),
-                            "detail": .string("The owner declined this call; nothing ran."), "effects": .string("none")])
+                        : .object(["status": .string("failed"), "reason": .string(event.record.status == "orphaned" ? "approval_expired" : "declined"),
+                            "detail": .string("workflows/approvals/requests.json card \(approval): status=\(event.record.status), decision=\(event.record.decision ?? "unanswered"). Nothing ran; the part is no longer waiting."), "effects": .string("none")])
+                    if event.record.status == "orphaned", case .object(var fields) = result {
+                        fields["remedy"] = .object(["kind": .string("correct_arguments"),
+                            "instruction": .string("This card expired; revise or withdraw the work, or request it again if still needed."),
+                            "next_call": .object(["tool": .string(tool), "input": .object(input)])])
+                        result = .object(fields)
+                    }
                 }
                 await ApprovalLifecycleBus.shared.finish(id)
                 if let need = InlineInteractionNeed.interaction(in: result) {
@@ -488,9 +497,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         // no-filer deny), exactly like an autonomy-level requireApproval.
         if envelope.decision == .block {
             try? await securityCenter.record(envelope)
-            throw AutonomyGateError.toolDenied(
-                reason: envelope.primaryReason
-            )
+            throw AutonomyGateError.toolDenied(reason: envelope.primaryReason, remedy: envelope.remedy)
         }
 
         // SecurityCenter judged this exact call once (its roots, profile,
@@ -529,10 +536,17 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             guard verdict == .verified else {
                 let reason = "approved_replay_evidence_unverified: \(verdict.rawValue) "
                     + "(\(tool) replay claimed approval \(replay.approvalID))"
+                    + ". Authority: workflows/approvals/requests.json and effect_spends.json. Inspect this card's execution receipt and the effect owner's state before any new request; a missing or unreadable spend does not prove nothing ran."
                 try? await securityCenter.record(
                     Self.securityEnvelope(envelope, decision: .block, reason: reason)
                 )
-                throw AutonomyGateError.toolDenied(reason: reason)
+                let store = verdict == .spendUnavailable || verdict == .notSpentByExecutor ? "effect_spends.json" : "requests.json"
+                let path = (peerDirectoryDataRoot ?? defaultDataRoot()).appendingPathComponent("workflows/approvals/" + store).path
+                let remedy: JSONValue = .object(["kind": .string("inspect"),
+                    "instruction": .string("Inspect approval \(replay.approvalID) in requests.json and effect_spends.json, then reconcile the effect owner's receipt. This replay did not run; the earlier effect is unknown. Reading these files does not establish the outcome or authorize a resend."),
+                    "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("files.read"),
+                        "args": .object(["path": .string(path)])])])])
+                return .object(["status": .string("failed"), "reason": .string(reason), "effects": .string("unknown"), "remedy": remedy])
             }
             approvedReplayAuthorizes = true
         } else {
@@ -635,7 +649,14 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             let approvedAsk: Bool
             if case .requireApproval = mapped { approvedAsk = approvedReplayAuthorizes }
             else { approvedAsk = false }
-            autonomyDecision = approvedAsk ? .allow : mapped
+            if approvedAsk { autonomyDecision = .allow }
+            else {
+                switch mapped {
+                case .requireApproval: autonomyDecision = .requireApproval(reason: envelope.autonomyReason ?? "autonomy=\(guardResult.autonomy)")
+                case .deny: autonomyDecision = .deny(reason: envelope.autonomyReason ?? "autonomy=\(guardResult.autonomy)")
+                case .allow: autonomyDecision = .allow
+                }
+            }
         }
         // Deny outranks every ask; a security .ask outranks autonomy allow
         // (the external-send gate exists precisely to force a human look).
@@ -681,39 +702,9 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             decision = autonomyDecision
             securityAsked = false
         }
-        // 2026-09-15 — A PEER TURN ASKS; IT DOES NOT REFUSE.
-        //
-        // User's ruling: a peer gets the whole Agent, and when another agent
-        // asks her for something destructive her existing behaviour IS the
-        // safety — she comes to him and asks. So an effect verb on a peer turn
-        // does not lose a tool and does not get a wall of refusal text: it
-        // takes the same route a Trust-gated action takes, the person's own
-        // permission card, with the peer named as the requester. Approve and
-        // it runs. A peer the person elevated in Trust → Connected agents
-        // never reaches here at all — its turns run on `chat` (User's ruling).
-        //
-        // Placed AFTER the security/autonomy decision so it can only ever
-        // narrow `.allow` to `.requireApproval` or name the peer on an ask; a
-        // deny stays a deny.
-        //
-        // Sol, 2026-09-15: EXCEPT on a post-approval replay. The executor
-        // re-dispatches an approved call with `approvedReplay` and no filer,
-        // and the surface is still `agent-bridge` — so asking again here
-        // turned the person's own Approve into "approval required, no filer
-        // is available", and nothing a peer asked for could ever finish. Both
-        // exemptions are the inbox-verified ones resolved above, bound to this
-        // tool, surface, body and origin; neither is a claim from tool input.
-        //
-        // 2026-09-15, from the live peer proof: an effect that the ORIGIN gates
-        // had already downgraded to `.ask` arrived here as
-        // `.requireApproval("security ask: remote origin has no trust root")`,
-        // not `.allow` — so the card the person read named neither the peer nor
-        // the thing being asked for. A generic ask on a peer turn (a security
-        // one, or the law's for a destructive call) is the SAME question in
-        // worse words, so the peer reason replaces it; a deny keeps its own.
-        // USER: "Full Mac is full mac." An allowed connect stays allowed: below
-        // Full Mac the SecurityCenter already asks (other_app_settings_write),
-        // and the exact executable is still bound and re-checked at launch.
+        // 09-15 ruling: a peer turn asks; it does not refuse. Elevation is
+        // the person's alone. A Trust deny stands; only a verified replay
+        // answers the same card, and Full Mac keeps an allowed connect allowed.
         let peerReasonMayReplace: Bool
         if case .deny = decision { peerReasonMayReplace = false } else { peerReasonMayReplace = true }
         let protectedAction = PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: envelope.capabilities,
@@ -823,7 +814,7 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             return result
         case .deny(let reason):
             try? await securityCenter.record(Self.securityEnvelope(envelope, decision: .block, reason: reason))
-            throw AutonomyGateError.toolDenied(reason: reason)
+            throw AutonomyGateError.toolDenied(reason: reason, remedy: envelope.remedy)
         case .requireApproval(let gateReason):
             // A switch User turned off refuses before any card, whatever the
             // posture: a card never asks for what the switch would refuse.
@@ -831,25 +822,21 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 let root = peerDirectoryDataRoot ?? defaultDataRoot()
                 let store = root == defaultDataRoot() ? MacIntegrationPermissionStore.shared : MacIntegrationPermissionStore(dataRoot: root)
                 if let refusal = try await SwiftToolDispatcher.switchRefusal(integration: gate.integration, mode: gate.mode, store: store) {
-                    return Self.refusedBeforeRunning(refusal)
+                    return ChatToolOutcome.refusedBeforeRunning(refusal)
                 }
             }
             // A skill's step never files a card: it hands back to her.
             if SkillRunContext.handsBack, !AuthoredToolEffects.admissionOnly { return SkillRunContext.handBack(ApprovalActionText.reason(gateReason, tool: tool)) }
-            // THE CARD'S WORDS. A tool that writes into another program's own
-            // settings owes the person the exact file, the exact entry and the
-            // exact access BEFORE they press anything, and "autonomy=confirm"
-            // says none of that. Only the implementation knows them, so it is
-            // asked here; every existing tool answers nil and keeps the gate's
-            // reason unchanged.
+            // Preserve the deciding rule alongside the implementation's disclosure.
             var reason = ApprovalActionText.reason(gateReason, tool: tool)
+            if let cause = envelope.autonomyReason, !reason.contains(cause) { reason += " " + cause }
             if tool.hasPrefix("fetch."), case .string(let raw)? = input["url"], let url = URL(string: raw) {
                 let method = Self.jsonString(input["method"])?.uppercased() ?? "GET"
                 reason = "\(method) \(url.host ?? "")\(url.path) through \(tool). \(reason)"
             } else if let validating = inner as? any PreApprovalToolValidating,
                let disclosed = await validating.approvalCardReason(
                 tool: tool, input: input, surface: surface) {
-                reason = disclosed
+                reason = disclosed + " " + reason
             }
             // Nothing the implementation would have refused outright is worth a
             // person's click. The inner dispatcher runs its own cheap, certain
@@ -857,17 +844,19 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             // — and a refusal here comes back to the model as an ordinary tool
             // error, with no approval filed (2026-09-13, the 0.4.12 drive: two
             // bot_create calls raised a card and only then failed on cadence).
-            let primitiveCall = AuthoredToolEffects.call?.tool == tool
+            // A part's hand on its watched window is answered by Screen
+            // control's card first, as act is.
+            let primitiveCall = AuthoredToolEffects.call?.tool == tool && !AuthoredToolEffects.handOperations.contains(tool)
             if !primitiveCall, !AuthoredToolEffects.admissionOnly, let validating = inner as? any PreApprovalToolValidating {
                 let refusal = await ChatToolSessionContext.$verifiedSessionId.withValue(
                     verifiedSessionId ?? ChatToolSessionContext.verifiedSessionId
                 ) {
                     await validating.preApprovalRefusal(tool: tool, input: input, surface: surface)
                 }
-                if let refusal { return Self.refusedBeforeRunning(refusal) }
+                if let refusal { return ChatToolOutcome.refusedBeforeRunning(refusal) }
             } else if !primitiveCall, !AuthoredToolEffects.admissionOnly, let validating = inner as? any PureToolArgumentValidating,
                       let refusal = await validating.argumentRefusal(tool: tool, input: input) {
-                return Self.refusedBeforeRunning(refusal)
+                return ChatToolOutcome.refusedBeforeRunning(refusal)
             }
             let ownsACPConnectCard: Bool
             if tool == "agent_connect", case .string(let name)? = input["name"],
@@ -945,6 +934,10 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
                 )
                 if case .object(let fields) = pending, fields["not_run_status"] == nil {
                     pending = ToolNotRunStatus.approvalFiled.reporting(pending)
+                }
+                if let remedy = envelope.remedy, case .object(var fields) = pending {
+                    fields["remedy"] = remedy
+                    pending = .object(fields)
                 }
                 if StandingBotContinuity.isHelperTurn { ChatTurnExecution.current?.keepApproval(id: approvalId, pending) }
                 return pending
@@ -1161,13 +1154,6 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
             surface: surface,
             input: input
         )
-    }
-
-    /// Refused before it ran or a card was filed: nothing changed.
-    private static func refusedBeforeRunning(_ refusal: JSONValue) -> JSONValue {
-        guard case .object(var fields) = refusal, fields["effects"] == nil else { return refusal }
-        fields["effects"] = .string("none")
-        return .object(fields)
     }
 
     private static func jsonString(_ raw: JSONValue?) -> String? {

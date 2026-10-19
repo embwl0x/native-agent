@@ -138,11 +138,7 @@ struct ContentView: View {
                             // Agent, 2026-09-02: a rail dot is a promise about the
                             // page under it. Today's dot reads what Today's header
                             // reads: the one Needs you count.
-                            .filter { item in
-                                item.normalized == .activity
-                                    ? (appModel.ownerWaitingCount ?? 0) > 0
-                                    : sidebarBadgeCount(for: item) > 0
-                            }
+                            .filter { $0.normalized == .activity && (appModel.ownerWaitingCount ?? 0) > 0 }
                             .map(\.normalized)
                     )
                 )
@@ -554,21 +550,6 @@ struct ContentView: View {
         showFirstRunOnboarding = true
     }
 
-    // PATCH-2026-06-06: command-palette — sidebar badge counts for the
-    // "needs your eyes" tabs. .activity stays the combined inbox/approvals
-    // queue; .executions surfaces currently-running executions. Skills/MCP
-    // have no pending count yet, so they return 0.
-    private func sidebarBadgeCount(for item: SidebarItem) -> Int {
-        switch item {
-        case .activity:
-            return appModel.pendingActivityCount
-        case .desk:
-            return 0
-        default:
-            return 0
-        }
-    }
-
     private func applyNavigationDestination(_ destination: NativeAgentNavigationDestination) {
         switch destination {
         case .activity(let section):
@@ -594,7 +575,7 @@ struct ContentView: View {
                 return
             }
             // A route names the page, not the tab: land on the page's first
-            // tab (the multimodal notice must open Trust, not Mac integration).
+            // tab. SettingsLink chooses a requested tab after routing.
             if let first = SidebarItem.shellFirstTab(for: target) {
                 UserDefaults.standard.set(first, forKey: ShellRailTab.storageKey(target))
             }

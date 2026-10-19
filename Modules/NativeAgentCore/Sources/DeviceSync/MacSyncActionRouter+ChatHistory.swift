@@ -36,7 +36,7 @@ extension MacSyncActionRouter {
         func response(_ rows: [DeviceSyncTranscriptRow], start: Int) throws -> [String: String] {
             let data = try MobileSnapshotBuilder.encoder().encode(rows)
             return ["status": "ok", "ok": "true", "messages": String(decoding: data, as: UTF8.self),
-                    "hasOlder": String(start > 0)]
+                    "hasOlder": String(messages[..<start].contains(where: \.isPersonVisible))]
         }
         func fits(_ response: [String: String]) throws -> Bool {
             let body = try sync.engine.actionResponse(response, for: action)
@@ -47,7 +47,11 @@ extension MacSyncActionRouter {
         }
         var start = end
         var rows: [DeviceSyncTranscriptRow] = []
-        while start > max(0, end - limit) {
+        var taken = 0
+        while start > 0, taken < limit {
+            // A row that is hers alone is skipped, not counted: it still
+            // anchors paging (an older phone may hold its id) but is not shown.
+            guard messages[start - 1].isPersonVisible else { start -= 1; continue }
             var row = DeviceSyncTranscriptRow(message: messages[start - 1])
             var candidate = try response([row] + rows, start: start - 1)
             if try !fits(candidate) {
@@ -65,6 +69,7 @@ extension MacSyncActionRouter {
             }
             rows.insert(row, at: 0)
             start -= 1
+            taken += 1
         }
         return try response(rows, start: start)
     }

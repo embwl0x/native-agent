@@ -206,6 +206,35 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         await connectorActionsProvider()
     }
 
+    private func providerFailure(_ error: Error, surface: String, provider: String? = nil) -> Error {
+        if error is ToolFailureError { return error }
+        if case .invalidRequest = error as? ProviderRoutingError { return error }
+        if case .invalidResponse = error as? ProviderRoutingError { return error }
+        let cause = ProviderFailure.classify(error)
+        guard [.authExpired, .codexCLISessionExpired, .routingUnavailable, .modelUnavailable].contains(cause) else { return error }
+        let detail = ProviderFailure.diagnosticDescription(error)
+        var account = cause == .codexCLISessionExpired ? "codex" : provider
+        var signIn = cause == .authExpired || cause == .codexCLISessionExpired
+        if let failure = error as? LLMError {
+            switch failure {
+            case .notConfigured(let id) where id != "router", .authRejected(let id, _): account = id; signIn = true
+            default: break
+            }
+        }
+        if signIn, let account {
+            let control = ["openai", "anthropic", "moonshot", "kimi-code", "openrouter"].contains(account)
+                ? "Manage > Key > Paste the key here > Save" : "Sign in"
+            return ToolFailureError(detail, effects: .none, owner: "Providers > \(account) > credentials",
+                tap: "Providers > Accounts & API keys > \(account) > \(control)")
+        }
+        guard let root = runLedgerDataRoot else { return error }
+        let owner = root.appendingPathComponent("providers").path + " > surfaces.json (\(surface).model), active.json (\(surface)), pending-surface-configuration.json, registry.json"
+        return ToolFailureError(detail, effects: .none, owner: owner,
+            nextCall: ToolFailureError.call("app", ["action": .string("codex.invoke"), "args": .object([
+                "cwd": .string(root.path), "context": .string("Provider configuration: \(owner). Failure: \(detail)"),
+                "text": .string("Repair the named provider configuration for the failed Workshop operation. Read the named routing files and retained model catalog; preserve original bytes in new sibling backups before editing. Correct only the evidenced malformed or incompatible routing fields. Preserve credentials, unrelated surfaces and authority. If the selected model is no longer offered, explicitly select an offered model on the same account for the intended operation and report that change. Do not sign in, change Trust, read persona or memories, delete retained state, build, test, install or restart. Report changed fields and remaining failure; a builder response does not prove the failed operation works.")])]))
+    }
+
     public func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String) {
         // Admit the complete execution tuple from one checked generation. The
         // shared LLM client may reread authority to detect corruption, but the
@@ -226,7 +255,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
                 throw CancellationError()
             }
-            throw WorkshopExecutionError.plannerFailure("provider routing unavailable")
+            throw providerFailure(error, surface: routingSurface)
         }
         // Read through the vocabulary bridge, not a raw subscript: a router
         // conformer whose snapshot is still keyed `missions` would otherwise
@@ -236,7 +265,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             ?? routingSnapshot.preferences["chat"]
         guard let preference,
               !preference.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw WorkshopExecutionError.plannerFailure("provider routing unavailable")
+            throw providerFailure(ProviderFailure.routingUnavailable, surface: routingSurface)
         }
         let resolvedModel = preference.model
         let resolvedEffort = preference.reasoningEffort
@@ -321,10 +350,10 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             // Cancellation propagates via typed `CancellationError` (from
             // cooperative `Task.checkCancellation` / `Task.sleep`) or
             // `NSURLErrorDomain` + `NSURLErrorCancelled` (from URLSession
-            // cancellation). All other errors map to `WorkshopExecutionError.plannerFailure`.
+            // cancellation). Other errors retain their owner's repair evidence.
             // BLOCKING #4 (wave-24-amendment): if the outer task was cancelled
             // but the underlying throw is some other error type, honor the
-            // cancellation before wrapping as plannerFailure.
+            // cancellation before passing the failure through.
             try Task.checkCancellation()
             let nsError = error as NSError
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
@@ -342,7 +371,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
                     dataRoot: ledgerRoot
                 )
             }
-            throw WorkshopExecutionError.plannerFailure(String(describing: error))
+            throw providerFailure(error, surface: routingSurface, provider: resolvedProvider)
         }
     }
 }

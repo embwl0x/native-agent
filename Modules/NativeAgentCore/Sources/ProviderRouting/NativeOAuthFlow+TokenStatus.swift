@@ -521,6 +521,22 @@ extension NativeOAuthFlow {
         public let error: String?
     }
 
+    /// The person's control for signing a direct OAuth provider in again, named
+    /// as the Providers page shows it for the saved credential's state
+    /// (OAuthSignInPresentation reads the same `signInStatus`).
+    public static func signInControl(providerID: String, dataRoot: URL) -> String? {
+        let button: (id: String, card: String, short: String)? = switch providerID {
+        case "openai_oauth_direct", "codex": ("openai_oauth_direct", "ChatGPT", "ChatGPT")
+        case "anthropic_oauth_direct": (providerID, "Anthropic", "Claude")
+        case "xai_oauth_direct": (providerID, "xAI", "xAI Grok")
+        default: nil
+        }
+        return button.map { button in
+            "Providers → Sign in, reconnect or add an account → " + button.card + " → "
+                + (signInStatus(providerID: button.id, dataRoot: dataRoot).isSignedIn ? "Re-authenticate " : "Sign in with ") + button.short
+        }
+    }
+
     public static func signInStatus(providerID: String, dataRoot: URL) -> SignInStatus {
         if providerID == "anthropic_oauth_direct" {
             switch NativeOAuthFlow.anthropicOAuthCredentialState(dataRoot: dataRoot) {

@@ -33,9 +33,6 @@ package enum ChatWorkspaceBinding {
         func liveHealth(dataRoot: URL) -> [String: AgentLocalHealth] {
             AgentContactHealth.read(dataRoot: dataRoot)
         }
-        func refreshHealth(dataRoot: URL) {
-            Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
-        }
         func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord] {
             let store = AgentConversationStore(dataRoot: dataRoot)
             return try locked ? store.records() : store.recordsUnlocked()
@@ -161,7 +158,7 @@ package enum ChatWorkspaceBinding {
                 }
             }
             if !SlackConnectorActions.canSearch(dataRoot: dataRoot) {
-                tools["slack_search_messages"] = "Slack search needs a user token with search:read. The owner can sign in to Slack by requesting a setup card in chat or opening Connectors in Advanced view."
+                tools["slack_search_messages"] = SlackConnectorActions.searchTokenInstruction
             }
             return tools
         }

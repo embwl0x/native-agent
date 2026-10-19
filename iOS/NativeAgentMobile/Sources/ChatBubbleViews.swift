@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import NativeAgentShared
+import QuickLook
 
 // MARK: - Bubble
 
@@ -18,6 +19,8 @@ struct BubbleView: View, Equatable {
     var isLiveTurn = false
     @State private var images: [(summary: ChatAttachmentSummary, image: UIImage)] = []
     @State private var attachmentCountWithoutPreview = 0
+    @State private var audioPreview: URL?
+    @State private var audioError: String?
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.message == rhs.message && lhs.streamingHint == rhs.streamingHint
@@ -37,6 +40,28 @@ struct BubbleView: View, Equatable {
                 ForEach(images, id: \.summary.id) { attachment in
                     AttachmentImagePreview(summary: attachment.summary, image: attachment.image)
                 }
+                ForEach(message.attachments.filter {
+                    $0.type == "audio" && ($0.base64 != nil || $0.utterance?.audioReference == "iphone-recording:\($0.id)")
+                }) { attachment in
+                    Button("Play recording", systemImage: "waveform") {
+                        Task {
+                            do {
+                                audioPreview = try await Task.detached(priority: .utility) {
+                                    if let raw = attachment.base64 {
+                                        let recording = MultimodalAttachment(id: attachment.id, type: "audio", base64: raw,
+                                            mime: attachment.mime ?? "audio/x-caf")
+                                        return try MobileLocalStorage.retainRecording(recording)
+                                    }
+                                    let url = try MobileLocalStorage.recordingURL(id: attachment.id)
+                                    _ = try url.checkResourceIsReachable()
+                                    return url
+                                }.value
+                                audioError = nil
+                            } catch { audioError = error.localizedDescription }
+                        }
+                    }
+                }
+                if let audioError { Text(audioError).foregroundStyle(.secondary) }
                 if attachmentCountWithoutPreview > 0 {
                     HStack(spacing: 6) {
                         Image(systemName: "photo.fill")
@@ -85,6 +110,7 @@ struct BubbleView: View, Equatable {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.trailing, isUser && !dynamicTypeSize.isAccessibilitySize ? 24 : 0)
+        .quickLookPreview($audioPreview)
         .task(id: message.attachments) {
             let prepared = await ChatAttachmentPresentation.shared.images(in: message.attachments)
             guard !Task.isCancelled else { return }

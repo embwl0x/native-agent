@@ -3,6 +3,7 @@ import CoreServices
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import os
 
 /// KNOWN AGENTS ARE DATA.
 ///
@@ -52,7 +53,7 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public let description: String
     /// Matched case-insensitively, alongside `id` and `displayName`.
     public let aliases: [String]
-    /// Historical setup markers; discovery uses executable files and Launch Services only.
+    /// Program or application paths, never profile directories.
     public let installMarkers: [String]
     public var configPath: String
     public let format: Format
@@ -84,6 +85,11 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public var a2a: A2A? = nil
     /// Where its program is looked for, in order (`resolveExecutable`).
     public var searchPaths: [String] = []
+    /// Additional program names used as installation evidence, never launched.
+    public var executables: [String]? = nil
+    public var discoveryWords: [String]? = nil
+    /// Host settings that allow only this connection's two messaging tools.
+    public var messagingPermissionsPath: String? = nil
     /// The window labels a desktop chat is driven by (`DesktopChatRoute`).
     public var desktopChat: DesktopChat? = nil
     /// The labels Grok Bot's routine import is driven by.
@@ -91,29 +97,106 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
     public enum Route: String, Sendable, Codable { case acp, a2a, dotIPC = "chatgpt-dot-ipc", grokBot = "grok-bot", desktopChat = "desktop-chat", commandLine = "command-line", mcpSettingsOnly = "mcp-settings-only" }
     public var route: Route { declaredRoute ?? (acp != nil ? .acp : commandLine != nil ? .commandLine : .mcpSettingsOnly) }
 
-    public var isInstalled: Bool {
-        isInstalled(applicationExists: { Self.applicationURL($0) != nil }, executable: resolveExecutable)
+    public struct Installation: Sendable {
+        public let applicationURL: URL?
+        public let executables: [String: String]
+        public let environment: [String: String]
+        public let transports: [Route]
+        public let evidence: [String]
+        public let locations: [URL]
+        public let failure: ToolFailureError?
+
+        public func launchEnvironment() throws -> [String: String] {
+            if let failure { throw failure }
+            return environment
+        }
     }
 
-    /// Where its programs are looked for: its search paths, then the app's
-    /// PATH and ~/.cargo/bin (`AgentHostCommandLines.programFolders`).
-    public var programFolders: [String] { AgentHostCommandLines.programFolders(searchPaths) }
+    private static let installations = OSAllocatedUnfairLock(initialState: [String: (AgentHostRow, Installation)]())
+    static func installationsChanged() { installations.withLock { $0.removeAll() } }
+
+    /// One binding for discovery, connection and launch, until an installation edge.
+    public var installation: Installation {
+        Self.installations.withLock { cache in
+            if let (row, binding) = cache[id], row == self { return binding }
+            let markers = installMarkers.map(AgentHostDirectory.expand)
+            let apps = bundleIDs.compactMap(Self.applicationURL)
+                + markers.filter { $0.hasSuffix(".app") && Self.isInstalledProgram($0) }.map { URL(fileURLWithPath: $0) }
+            let directories = (searchPaths + (acp?.environment["PATH"] ?? "").components(separatedBy: ":").filter { !$0.isEmpty }).map(AgentHostDirectory.expand) + markers.filter {
+                programNames.contains(URL(fileURLWithPath: $0).lastPathComponent)
+            }.map { URL(fileURLWithPath: $0).deletingLastPathComponent().path }
+            var environment: [String: String]
+            switch AgentHostCommandLines.loginEnvironment {
+            case .success(let login):
+                environment = login.merging(acp?.environment ?? [:]) { _, declared in declared }
+                environment["PATH"] = (directories + (login["PATH"] ?? "").components(separatedBy: ":")).joined(separator: ":")
+            case .failure: environment = [:]
+            }
+            let programs = Dictionary(uniqueKeysWithValues: programNames.compactMap { name in
+                AgentHostCommandLines.resolveExecutable(name, directories: directories,
+                    home: FileManager.default.homeDirectoryForCurrentUser.path).map { (name, $0) }
+            })
+            let evidence = apps.map { "application: " + $0.path } + programs.values.sorted().map { "executable: " + $0 }
+                + markers.filter(Self.isInstalledProgram).map { "installMarkers: " + $0 }
+            let required = acp?.executable ?? commandLine?.executable
+            let failure: ToolFailureError?
+            if case .failure(let error) = AgentHostCommandLines.loginEnvironment, !programNames.isEmpty { failure = error }
+            else if let required, programs[required] == nil {
+                failure = ToolFailureError("\(displayName)'s \(route.rawValue) transport needs the missing command \(required).",
+                    effects: .none, owner: "\(displayName) installation",
+                    tap: "Install \(required) (\(documentation)), then Agents > \(displayName) > Verify", personDecides: true)
+            } else { failure = nil }
+            let paths = (environment["PATH"] ?? "").components(separatedBy: ":") + directories
+            var locations = (paths + paths.flatMap { directory in programNames.map { directory + "/" + $0 } }
+                + markers + apps.map(\.path) + Array(programs.values)
+                + programs.values.map { URL(fileURLWithPath: $0).deletingLastPathComponent().path })
+                .filter { $0.hasPrefix("/") }.map { URL(fileURLWithPath: $0) }
+            for var entry in locations {
+                while entry.path != "/" {
+                    var info = stat()
+                    if lstat(entry.path, &info) == 0, info.st_mode & S_IFMT == S_IFLNK { locations.append(entry.deletingLastPathComponent()) }
+                    entry.deleteLastPathComponent()
+                }
+            }
+            let binding = Installation(applicationURL: apps.first, executables: programs, environment: environment,
+                transports: failure == nil && (route != .mcpSettingsOnly || settingsSupported) ? [route] : [],
+                evidence: evidence, locations: locations, failure: failure)
+            cache[id] = (self, binding)
+            return binding
+        }
+    }
+
+    public var isInstalled: Bool { !installation.evidence.isEmpty }
+    public var installationEvidence: [String] { installation.evidence }
+
+    private static func isInstalledProgram(_ path: String) -> Bool {
+        let url = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return false }
+        if info.st_mode & S_IFMT == S_IFREG { return FileManager.default.isExecutableFile(atPath: url.path) }
+        guard info.st_mode & S_IFMT == S_IFDIR, url.pathExtension == "app",
+              let bundle = Bundle(url: url), bundle.infoDictionary?["CFBundlePackageType"] as? String == "APPL",
+              let program = bundle.executableURL else { return false }
+        return stat(program.path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG
+            && FileManager.default.isExecutableFile(atPath: program.path)
+    }
+
+    var programNames: [String] { Array(Set((executables ?? []) + [acp?.executable, commandLine?.executable].compactMap { $0 })).sorted() }
+
+    public var installationCheck: String {
+        installation.failure?.message ?? ("agents/recipes/\(id).json host: bundleIDs=\(bundleIDs), executables=\(programNames), installMarkers=\(installMarkers)"
+            + "; searchPaths=\(searchPaths). Install a declared program/app or correct these fields with agent.recipe_write, then agent.verify."
+        )
+    }
 
     /// The named program, found in this recipe's program folders.
     public func resolveExecutable(_ name: String) -> String? {
-        AgentHostCommandLines.resolveExecutable(name, directories: programFolders,
-                                                home: FileManager.default.homeDirectoryForCurrentUser.path)
+        installation.executables[name]
     }
 
     static func applicationURL(_ id: String) -> URL? {
         (LSCopyApplicationURLsForBundleIdentifier(id as CFString, nil)?.takeRetainedValue() as? [URL])?
-            .first { FileManager.default.fileExists(atPath: $0.path) }
-    }
-
-    func isInstalled(applicationExists: (String) -> Bool, executable: (String) -> String?) -> Bool {
-        if let acp { return executable(acp.executable) != nil }
-        return bundleIDs.contains(where: applicationExists)
-            || commandLine.map { executable($0.executable) != nil } == true
+            .first { isInstalledProgram($0.path) }
     }
 
     public var expandedConfigPath: String { AgentHostDirectory.expand(configPath) }
@@ -173,7 +256,7 @@ public enum AgentHostDirectory {
     /// The name this app's entry carries in another agent's configuration. One
     /// fixed product name, never a persona name, so a person reading their own
     /// settings file can tell which app put it there.
-    public static var entryName: String { InstallPaths.current.agentHostEntryName }
+    public static var entryName: String { InstallPaths.current.agentHostEntryName() }
 
     /// The environment variables the entry sets and `nativeagent-link` reads.
     /// The secret is an ENVIRONMENT value and never a command-line argument:
@@ -240,6 +323,10 @@ public enum AgentHostDirectory {
     /// THE SEED, and only that: `AgentRecipeStore` writes each row into
     /// agents/recipes/<id>.json, and every reader takes `rows`, the recipes.
     static let seed: [AgentHostRow] = [
+        AgentHostRow(id: "omp", displayName: "OMP", description: "The local OMP bridge lane.",
+            aliases: ["oh-my-pi"], installMarkers: [], configPath: "", format: .sessionMCP,
+            restartRequired: false, restartNote: "The running bridge binds this lane to its contact; no restart is needed.",
+            documentation: "", executables: ["omp"]),
         AgentHostRow(id: "chatgpt-dot", displayName: "ChatGPT Dot",
             description: "Your ChatGPT agent, distinct from Codex. In-house messaging checks the running app and Dot's current conversation before sending.",
             aliases: ["dot", "openai dot", "chatgpt agent"], installMarkers: [],
@@ -284,7 +371,7 @@ public enum AgentHostDirectory {
             displayName: "Claude Code",
             description: "A coding assistant that works in the terminal.",
             aliases: ["claude code", "claude-code", "claudecode", "claude cli", "cc"],
-            installMarkers: ["~/.claude", "~/.local/bin/claude", "/opt/homebrew/bin/claude",
+            installMarkers: ["~/.local/bin/claude", "/opt/homebrew/bin/claude",
                              "/usr/local/bin/claude", "~/.claude/local/claude"],
             configPath: "~/.claude.json",
             format: .jsonMCPServers,
@@ -299,7 +386,7 @@ public enum AgentHostDirectory {
             displayName: "Codex",
             description: "A coding agent that can work on projects on this Mac.",
             aliases: ["codex cli", "codex-cli", "openai codex"],
-            installMarkers: ["~/.codex", "~/.local/bin/codex", "/opt/homebrew/bin/codex",
+            installMarkers: ["~/.local/bin/codex", "/opt/homebrew/bin/codex",
                              "/usr/local/bin/codex"],
             configPath: "~/.codex/config.toml",
             format: .codexTOML,
@@ -316,26 +403,26 @@ public enum AgentHostDirectory {
             documentation: "https://www.antigravity.google/docs/mcp"),
         AgentHostRow(
             id: "claude-desktop", displayName: "Claude Desktop", description: "A chat app for talking with Claude.", aliases: ["claude app"],
-            installMarkers: ["/Applications/Claude.app", "~/Applications/Claude.app", "~/Library/Application Support/Claude"],
+            installMarkers: ["/Applications/Claude.app", "~/Applications/Claude.app"],
             configPath: "~/Library/Application Support/Claude/claude_desktop_config.json", format: .jsonMCPServers,
             restartRequired: true, restartNote: "Quit Claude Desktop completely and reopen it to load the new connection.",
             documentation: "https://code.claude.com/docs/en/mcp", bundleIDs: ["com.anthropic.claudefordesktop"],
             configPaths: ["~/Library/Application Support/Claude/claude_desktop_config.json"]),
         AgentHostRow(
             id: "lm-studio", displayName: "LM Studio", description: "An app for running and chatting with local models.", aliases: ["lmstudio"],
-            installMarkers: ["/Applications/LM Studio.app", "~/.lmstudio"],
+            installMarkers: ["/Applications/LM Studio.app"],
             configPath: "~/.lmstudio/mcp.json", format: .jsonMCPServers,
             restartRequired: false, restartNote: "No restart needed; LM Studio loads connections when this file is saved.",
             documentation: "https://lmstudio.ai/blog/lmstudio-v0.3.17", bundleIDs: ["ai.elementlabs.lmstudio"]),
         AgentHostRow(
             id: "cursor", displayName: "Cursor", description: "A code editor with an AI assistant.", aliases: ["cursor global"],
-            installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app", "~/.cursor"],
+            installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app"],
             configPath: "~/.cursor/mcp.json", format: .jsonMCPServers,
             restartRequired: true, restartNote: "Restart Cursor to load the new connection.",
             documentation: "https://cursor.com/docs/mcp", bundleIDs: ["com.todesktop.230313mzl4w4u92"], configPaths: ["~/.cursor/mcp.json"]),
         AgentHostRow(
             id: "cursor-workspace", displayName: "Cursor Workspace", description: "An AI coding assistant connected to one project folder.", aliases: ["cursor project"],
-            installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app", "~/.cursor"],
+            installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app"],
             configPath: ".cursor/mcp.json", format: .jsonMCPServers,
             restartRequired: true, restartNote: "Reopen the selected folder in Cursor to load the new connection.",
             documentation: "https://cursor.com/docs/mcp", requiresWorkspace: true, bundleIDs: ["com.todesktop.230313mzl4w4u92"]),
@@ -348,20 +435,20 @@ public enum AgentHostDirectory {
             settingsSupported: false),
         AgentHostRow(
             id: "gemini-cli", displayName: "Gemini CLI (Legacy)", description: "The older Gemini CLI connection. Use Antigravity CLI for Gemini.", aliases: ["Gemini CLI"],
-            installMarkers: ["~/.gemini", "/opt/homebrew/bin/gemini", "~/.local/bin/gemini"],
+            installMarkers: ["/opt/homebrew/bin/gemini", "~/.local/bin/gemini"],
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://geminicli.com/docs/tools/mcp-server/", settingsSupported: false,
             configPaths: ["~/.gemini/settings.json"]),
         AgentHostRow(
             id: "zed", displayName: "Zed", description: "A code editor with a built-in agent panel.", aliases: [],
-            installMarkers: ["/Applications/Zed.app", "~/.config/zed"],
+            installMarkers: ["/Applications/Zed.app"],
             configPath: "~/.config/zed/settings.json", format: .jsonContextServers,
             restartRequired: false, restartNote: "No app restart is needed; check the connection in Zed's AI settings.",
             documentation: "https://zed.dev/docs/ai/mcp", bundleIDs: ["dev.zed.Zed"], configPaths: ["~/.config/zed/settings.json"]),
         AgentHostRow(
             id: "goose", displayName: "Goose", description: "A local assistant for coding and other tasks.", aliases: ["goose cli"],
-            installMarkers: ["/Applications/Goose.app", "~/.config/goose", "~/.local/bin/goose"],
+            installMarkers: ["/Applications/Goose.app", "~/.local/bin/goose"],
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://github.com/agentclientprotocol/registry/blob/main/goose/agent.json",
@@ -372,7 +459,7 @@ public enum AgentHostDirectory {
         AgentHostRow(
             id: "hermes", displayName: "Hermes", description: "A local agent with its own memory, tools and models.",
             aliases: ["hermes agent", "nous hermes"],
-            installMarkers: ["/Applications/Hermes.app", "~/.hermes", "~/.local/bin/hermes"],
+            installMarkers: ["/Applications/Hermes.app", "~/.local/bin/hermes"],
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
@@ -381,7 +468,12 @@ public enum AgentHostDirectory {
         var row = row
         row.acp = AgentHostACP.seed[row.id]
         row.commandLine = AgentHostCommandLines.seed[row.id]
-        if row.acp != nil || row.commandLine != nil { row.searchPaths = AgentHostCommandLines.searchPaths }
+        row.discoveryWords = ["claude-code": ["claude"], "codex": ["codex"], "cursor": ["cursor"],
+            "zed": ["zed"], "lm-studio": ["lmstudio", "ollama"], "muse": ["muse", "endo"],
+            "grok-bot": ["grok"], "gemini-cli": ["gemini"], "antigravity-cli": ["antigravity"],
+            "goose": ["goose"], "hermes": ["hermes"], "chatgpt-dot": ["dot"]][row.id]
+        if row.id == "claude-code" { row.executables = ["claude"] }
+        if row.id == "antigravity-cli" { row.messagingPermissionsPath = "~/.gemini/antigravity-cli/settings.json" }
         return row
     }
 

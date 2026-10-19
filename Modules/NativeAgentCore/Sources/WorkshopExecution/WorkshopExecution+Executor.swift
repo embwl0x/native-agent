@@ -1169,6 +1169,8 @@ public actor WorkshopExecutorLoop {
         if let error = object["error"], error != .null { failed = true }
         if case .int(let code)? = object["exit_code"], code != 0 { failed = true }
         if case .double(let code)? = object["exit_code"], code != 0 { failed = true }
+        // A command the watchdog cut did not finish its step, whatever it exited with.
+        if case .bool(true)? = object["timed_out"] { failed = true }
         guard failed || cancelled else {
             return (WorkshopStepOutcome.successStatus, "")
         }

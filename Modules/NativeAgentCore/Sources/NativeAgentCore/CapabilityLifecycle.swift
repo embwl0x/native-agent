@@ -18,12 +18,12 @@ public enum CapabilityLifecycle {
 
     /// Capture existing turn provenance; the returned check reads current trust.
     /// Storage stays below chat; no bound turn means no peer steering.
-    public static var turnWriteCheck: @Sendable () -> (@Sendable () -> String?) {
+    public static var turnWriteCheck: @Sendable () -> (@Sendable () -> ToolFailureError?) {
         get { provenanceLock.withLock { provenance } }
         set { provenanceLock.withLock { provenance = newValue } }
     }
     private static let provenanceLock = NSLock()
-    nonisolated(unsafe) private static var provenance: @Sendable () -> (@Sendable () -> String?) = { { nil } }
+    nonisolated(unsafe) private static var provenance: @Sendable () -> (@Sendable () -> ToolFailureError?) = { { nil } }
 
     public static var ownerTrusts: @Sendable (String) -> Bool {
         get { provenanceLock.withLock { peerTrust } }
@@ -38,16 +38,17 @@ public enum CapabilityLifecycle {
     }
     nonisolated(unsafe) private static var keepTrust: @Sendable (URL) -> Bool = { _ in false }
 
-    public static var writeRefusal: String? { turnWriteCheck()() }
+    public static var writeRefusal: String? { turnWriteCheck()()?.message }
 
-    public static func peerRefusal(_ who: String) -> String {
-        "This turn was steered by \(who), so it cannot change senses, tools or skills or capture material for growth. Ask the person to start a fresh turn and read the source again for this change."
+    public static func peerRefusal(_ who: String, tap: String?) -> ToolFailureError {
+        ToolFailureError("This turn was steered by \(who), so it cannot change senses, tools or skills or capture material for growth. "
+            + (tap.map { "Only the person can elevate this source at \($0); the pending work keeps its provenance." }
+               ?? "The saved steer has no authenticated contact binding. It cannot be elevated by renaming it; obtain a new request through an authenticated connected agent, or let the work go."),
+            effects: .none, owner: "peer \(who) (not elevated)", tap: tap, personDecides: true)
     }
 
     public static func requireWrite() throws {
-        if let refusal = writeRefusal {
-            throw NSError(domain: "CapabilityLifecycle", code: 403, userInfo: [NSLocalizedDescriptionKey: refusal])
-        }
+        if let refusal = turnWriteCheck()() { throw refusal }
     }
 
     /// Admission of code is separate from the owner's off-switch.
@@ -59,6 +60,8 @@ public enum CapabilityLifecycle {
     }
 
     public static func requiresOwnerToEnable(isOff: Bool, disabledBy: String?) -> Bool {
+        // Off with no affirmative "agent" attribution is the owner's off (older
+        // records carry none): failing closed keeps his switch his.
         disabledBy != "agent" && (isOff || disabledBy != nil)
     }
 

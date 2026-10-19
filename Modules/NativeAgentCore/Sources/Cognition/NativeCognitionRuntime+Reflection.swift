@@ -31,43 +31,33 @@ extension NativeCognitionRuntime {
     /// A4.6 (clause 4): reflection is tissue downstream of the canonical
     /// dream/REM commit, exactly like replay — not a 6h poll pretending to
     /// notice it. Called from the somatic handler AFTER the replay await, so
-    /// reflection sees post-replay substrate state. Single-flight: a signal
-    /// arriving while a reflection is in flight is dropped — the material is
-    /// durable and the daily integrity sweep (or the next commit) catches it.
+    /// reflection sees post-replay substrate state. Each caller retains its
+    /// committed material while awaiting the existing single-flight owner.
     /// Budget/enabled/reservation gating stays inside `runReflectionIfDue`;
     /// this path adds no new unattended-LLM authority. Gated to the live app
     /// body so alternate-root runtimes never fire provider work.
-    func scheduleEventDrivenReflection(reason: String) {
-        guard !isFlushedForTermination else { return }
+    func scheduleEventDrivenReflection(reason: String, material: [String: CognitiveReflectionCause]) async {
+        while let task = reflectionEventTask {
+            await task.value
+            guard !Task.isCancelled else { return }
+        }
+        guard !isFlushedForTermination, !Task.isCancelled else { return }
         guard usesLiveAppBody else { return }
-        guard reflectionEventTask == nil else { return }
         reflectionEventTask = Task { [weak self] in
-            await self?.runEventDrivenReflection(reason: reason)
+            await self?.runEventDrivenReflection(reason: reason, material: material)
         }
     }
 
-    private func runEventDrivenReflection(reason: String) async {
+    private func runEventDrivenReflection(reason: String, material: [String: CognitiveReflectionCause]) async {
         defer { reflectionEventTask = nil }
         guard !isFlushedForTermination, !Task.isCancelled else { return }
         let outcome = await runReflectionIfDue(
             llm: host.backgroundLLMClient(dataRoot: dataRoot, cognition: self),
             reason: reason,
+            material: material,
             demand: .spontaneous
         )
         await reportLoopOutcome(loopId: "cognition_reflection", outcome: outcome)
-    }
-
-    /// Newest dream_diary entry, bounded, with the entry's own identity beside
-    /// it. Nil when there is no diary, no entry, or an empty one — the prompt
-    /// then reads exactly as it did before.
-    private func latestDreamMaterial() async -> (excerpt: String, provenance: String)? {
-        guard let entries = try? await DreamDiaryReader(dataRoot: dataRoot).entriesSince(nil),
-              let newest = entries.last,
-              let content = newest.content
-        else { return nil }
-        let text = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return nil }
-        return (String(text.prefix(600)), "dream_diary/\(newest.filename ?? newest.date)")
     }
 
     /// `demand` decides what the call has to earn. `.spontaneous` (the loops and
@@ -77,6 +67,7 @@ extension NativeCognitionRuntime {
     public func runReflectionIfDue(
         llm: any LLMClient,
         reason: String,
+        material: [String: CognitiveReflectionCause]? = nil,
         demand: CognitiveReflectionDemand = .requested,
         sameSourceCooldown: TimeInterval? = nil
     ) async -> CognitiveBackgroundRunOutcome {
@@ -88,11 +79,6 @@ extension NativeCognitionRuntime {
         case .allowed: break
         }
         let request: CognitiveReflectionRequest
-        // Read the diary ONCE: both the excerpt and its provenance come from
-        // the same entry, and a second read could land on a different night.
-        let dreamMaterial = reason.hasSuffix(":dreamCompleted")
-            ? await latestDreamMaterial()
-            : nil
         // Take the lease BEFORE planning: planning sets the in-flight
         // reservation, and a lease refusal after it would strand that
         // reservation and refuse every reflection until it expires.
@@ -104,14 +90,7 @@ extension NativeCognitionRuntime {
         switch await substrate.planReflectionChecked(
             reason: reason,
             demand: demand,
-            // A dreamCompleted reflection is a reflection ON a dream. The
-            // substrate cannot read dream_diary, so the prompt showed her only
-            // her own state preview and asked her to reflect on a night she was
-            // never shown. Hand it a bounded excerpt of the newest entry.
-            materialExcerpt: dreamMaterial?.excerpt,
-            // …and the takeaway keeps WHICH night it was: the diary entry's own
-            // identity travels with the request (Astra audit 2026-09-11, 7).
-            materialProvenance: dreamMaterial?.provenance,
+            material: material,
             sameSourceCooldown: sameSourceCooldown
         ) {
         case .admitted(let planned):
@@ -306,7 +285,7 @@ extension NativeCognitionRuntime {
         request: CognitiveReflectionRequest,
         llm: any LLMClient
     ) async -> CognitiveBackgroundRunOutcome {
-        let result: String
+        let result: CognitiveReflectionJudgment
         // User, 2026-09-13: every model-consuming lane resolves through its
         // Providers group. Reflection used to call on `CognitiveConfiguration`'s
         // stored model — a hardcoded Anthropic id — which is a route chosen in
@@ -342,12 +321,15 @@ extension NativeCognitionRuntime {
         }
         do {
             let system = try await cognitiveReflectionSystemPrompt(surface: request.surface)
-            result = try await llm.complete(
+            let raw = try await llm.complete(
                 prompt: request.prompt,
                 system: system,
                 model: routedModel,
                 surface: request.surface, purpose: "reflection"
             )
+            try Task.checkCancellation()
+            result = try JSONDecoder().decode(CognitiveReflectionJudgment.self, from: Data(raw.utf8))
+            try result.validate(material: request.material)
         } catch let error as CognitiveReflectionPersonaError {
             await substrate.recordReceipt(
                 kind: "reflection.persona_load_failed",
@@ -384,7 +366,8 @@ extension NativeCognitionRuntime {
 
         if let failure = await settleReflectionResult(
             request: request,
-            resultSummary: result,
+            resultSummary: result.reflection,
+            judgment: result,
             rejection: "reflection result was not accepted by the substrate",
             persistenceFailure: "reflection integrated but receipt persistence failed"
         ) { return failure }
@@ -397,6 +380,7 @@ extension NativeCognitionRuntime {
     private func settleReflectionResult(
         request: CognitiveReflectionRequest,
         resultSummary: String,
+        judgment: CognitiveReflectionJudgment? = nil,
         cancelled: Bool = false,
         rejection: String,
         persistenceFailure: String
@@ -407,7 +391,8 @@ extension NativeCognitionRuntime {
             request: request,
             resultSummary: resultSummary,
             provider: request.provider,
-            cancelled: cancelled
+            cancelled: cancelled,
+            judgment: judgment
         ) else { return .failed(rejection) }
         do {
             try await substrate.persistReflectionResultChecked(receipt)

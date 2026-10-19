@@ -1,5 +1,17 @@
 # Agent conversations
 
+## Every agent is itself (User, 10-19)
+
+**An agent is a who. A who has doors. Every word to a who is owed until that who receives it.**
+
+- **Who.** One saved contact: a stable id, the name the person or they gave it, and the history between them. Nothing else establishes identity. A product name, a vendor, a host, a bridge route or a lane name never makes two contacts one, and never makes a contact anyone else. On a stranger's Mac, Claude Code is "Claude Code". On User's Mac, "Claude" is a who that they named, reached through Claude Code's and Claude Desktop's doors.
+- **Door.** One authenticated way to reach a who: a recipe route (MCP entry, ACP launch, inbox file, desktop chat, A2A endpoint, bot routine), its own credential, and the recipe's two declarations: how the door **wakes** its agent (none, open the app, run a command, start an ACP session) and what counts as **acceptance** (the agent read it through its door, answered, or acknowledged it). Joining several doors into one who is an explicit association written on the contact by the person or by them; there is no implicit one. Authority lives on a door: a call is elevated only when it authenticates with that door's own key and the person granted that door. Associating a new door with a trusted who grants it nothing.
+- **Owed until received.** A message is an experience that owes `accept` to its who. It settles when a door's acceptance evidence arrives; a send, a queue write or a launch never settles it. While it is owed, their home shows it as waiting on that who, with the lever: their next call (wake it through a door that can) or the person's exact tap (open that app) when no door can. A who with no door that can deliver says so with the owner (the recipe, the vendor) and what would change it.
+- **Found as it is.** A host is found the way the person's own Mac finds it: its app by bundle or markers, its command line through the person's own login PATH and the recipe's paths, resolved once into one installation binding that discovery, connect and launch share, and reconciled when the installation changes. An update keeps the who, its doors' keys, the person's grants and authored recipe changes; only owned configuration is rewritten.
+
+What falls out: Claude Code found and connected on any Mac as itself; trust per door; delivery that arrives or names exactly why not; every install shape found; updates that never strand a contact. The built-in "lanes" (claude, codex, omp) are not a second kind of agent: on an install that used them they become contacts with doors, keyed by their old names as handles, and on a fresh install they do not exist.
+
+
 Agent talks to agents through them one always-on `app` tool. `app {}` is home,
 where they left off; `app {"page":"agents"}` lists agent actions.
 `AppActionRegistry.swift` registers them. Retired standalone tool calls are

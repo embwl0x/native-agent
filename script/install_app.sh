@@ -334,11 +334,18 @@ pkill -f "$APP_DEST/Contents/Resources/native_agentd.py" 2>/dev/null || true
 # first waits up to 20s for the turn to finish (applicationShouldTerminate),
 # then the 3s drain.
 APP_PROCESS_PATTERN="$(printf '%s' "$APP_DEST/Contents/MacOS/NativeAgentApp" | sed 's/[][\.^$*+?(){}|]/\\&/g')([[:space:]].*)?"
-osascript - "$APP_DEST" <<'APPLESCRIPT' 2>/dev/null || true
-on run argv
-  tell application (item 1 of argv) to quit
-end run
-APPLESCRIPT
+# Quit the running process itself, by pid. A quit addressed by name or bundle
+# path goes through LaunchServices, which can resolve it to another copy
+# (/Applications/NativeAgent.app) or to the dead unit a bundle swap leaves, so
+# the quit reached nothing and the app was force-stopped (2026-10-18: every
+# rollback SIGTERMed the replacement after a quit by name).
+_quit_nativeagent() { # $1 = pgrep -fx pattern for the executable
+  local pid
+  for pid in $(pgrep -fx "$1" 2>/dev/null); do
+    osascript -l JavaScript -e "ObjC.import('AppKit'); \$.NSRunningApplication.runningApplicationWithProcessIdentifier($pid).terminate" >/dev/null 2>&1 || true
+  done
+}
+_quit_nativeagent "$APP_PROCESS_PATTERN"
 quit_deadline=$((SECONDS + 30))
 while pgrep -fx "$APP_PROCESS_PATTERN" >/dev/null 2>&1 && (( SECONDS < quit_deadline )); do
   sleep 0.1
@@ -490,7 +497,7 @@ if [[ "$INSTALL_READY" == "1" ]]; then
 fi
 
 echo "[install_app.sh] replacement failed authenticated readiness verification." >&2
-osascript -e 'tell application "NativeAgent" to quit' 2>/dev/null || true
+_quit_nativeagent "$APP_PROCESS_PATTERN"
 rollback_deadline=$((SECONDS + 5))
 while pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
     && (( SECONDS < rollback_deadline )); do

@@ -744,6 +744,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
     private struct ChatToolApprovalReplay: Sendable {
         let toolName: String
         let surface: String
+        let fileAccess: String
         let input: [String: JSONValue]
         let sessionId: String?
         let telegramChatId: String?
@@ -800,9 +801,11 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 correlationId: correlationId
             )
             : nil
+        let fileAccess = if case .string(let mode)? = payload["fileAccess"] { mode } else { "auto" }
         return ChatToolApprovalReplay(
             toolName: toolName,
             surface: surface,
+            fileAccess: fileAccess,
             input: input,
             sessionId: sessionId,
             telegramChatId: chatId,
@@ -814,7 +817,8 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 verifiedChatId: chatId,
                 verifiedUserId: verifiedUserId,
                 deliveryRoute: replyRoute,
-                declaredRemote: origin["declaredRemote"] == .bool(true) ? true : nil
+                declaredRemote: origin["declaredRemote"] == .bool(true) ? true : nil,
+                answerExperienceID: Self.nonEmptyPayloadString(origin["answerExperienceID"])
             )
         )
     }
@@ -1140,17 +1144,12 @@ public struct ApprovalTransactionCoordinator: Sendable {
         }
 
         do {
-            // Raw built-in bridge approvals retain their original file-access
-            // envelope after the person resolves the card.
-            let isBuiltInBridge = ["codex-bridge", "claude-bridge"].contains(
-                replay.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            )
             let tools = effects.toolDispatchClient(
                 enforceAppAutonomy: false
             )
             let gated = makeGatedToolDispatchClient(
                 tools: tools,
-                fileAccess: isBuiltInBridge ? "read_only" : "auto",
+                fileAccess: replay.fileAccess,
                 approvalFiler: nil,
                 dataRoot: dataRoot,
                 verifiedSessionId: replay.sessionId,
@@ -1217,7 +1216,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
                 toolName: replay.toolName, surface: replay.surface, result: result)
             try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                 rec.id, executedAction: receipt.action,
-                detail: "\(replay.toolName) executed after approval: \(receipt.preview)", result: result)
+                detail: "", result: result)
             if let refreshed = try? await SwiftNativeApprovalInbox(root: dataRoot).get(rec.id) {
                 await ensureChatToolApprovalOutcomeReceipt(from: refreshed, dataRoot: dataRoot, continuation: continuation)
             }
@@ -1288,17 +1287,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         let recordedStatus = Self.jsonString(executedAction, "status")
         let normalizedStatus = (recordedStatus ?? "outcome_unknown")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let resultClass: ChatToolOutcome.ExactResultClass = {
-            if let raw = Self.jsonString(executedAction, "resultClass"),
-               let recorded = ChatToolOutcome.ExactResultClass(rawValue: raw) {
-                return recorded
-            }
-            // Legacy execution annotations retained status, not the original
-            // result envelope. That typed field is the available evidence;
-            // diagnostic prose and a clipped preview cannot reconstruct it.
-            guard let status = recordedStatus else { return .unknown }
-            return ChatToolOutcome.exactResultClass(.object(["status": .string(status)]))
-        }()
+        let resultClass = rec.executionResultClass
         // THE SAME TRUTH THE ENVELOPE CARRIES (2026-09-13). Spelling-matching
         // the status word got this backwards in both directions: an
         // `outcome_unknown` annotation read ok=false (a failure that never
@@ -1323,10 +1312,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         case .failed, .refused: outcomeDescription = "Failed"
         case .succeeded: outcomeDescription = "Completed"
         }
-        let statusSummary = decision == "approved"
-            ? "\(outcomeDescription) after approval (\(rec.id)); status=\(normalizedStatus)."
-            : "Approval \(rec.id) was \(decision). The tool did not run; status=\(normalizedStatus)."
-        let prose = resultPreview.map { "\(statusSummary) Result: \($0)" } ?? statusSummary
+        let prose = rec.decisionExperience.face?.words ?? ""
         // 2026-09-13, the 0.4.12 drive: a bot_create that failed after Approve
         // showed NOTHING in the transcript — the failure lived in metadata
         // alone. Both readers (ToolPillPresentation.outcome and the shell row)

@@ -17,8 +17,7 @@ import PersistenceCore
 // placeholder, and nothing here runs on a turn.
 //
 // The window starts at THIS BUILD's launch (DoctorWindowFloor) and is named in
-// the row, so a verdict always describes the build that is running. Rates over
-// a handful of turns are shown but not graded — see `minimumRateTurns`.
+// the row. Rates and variety describe that window without grading her health.
 //
 // Wording comes only from the bounded `cognitiveCue` field, retained even when
 // the snapshot is truncated. Missing or clipped wording is not measured.
@@ -38,23 +37,9 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
     private let maximumDayFiles = 7
     /// The conversational surfaces whose capsule observations are counted.
     private let capsuleSurfaces: Set<String> = ["chat", "telegram", "ios"]
-    /// One felt word above this share of all felt words is vocabulary collapse.
-    private let feltWarnPercent = 25.0
-    private let feltFailPercent = 40.0
     /// The Sound line that says her phrasing has gone stale.
     private let rutMarker = "let the moment pick the word"
-    private let rutWarnPercent = 20.0
-    private let rutFailPercent = 40.0
-    /// Below this many turns the RATES above are reported but not graded. The
-    /// measurement window now opens at this build's launch, so a freshly
-    /// relaunched app legitimately has a handful of turns — and "the rut line
-    /// is on 100% of turns" over two turns is a number, not a finding. Every
-    /// figure is still shown; only the verdict waits for enough evidence.
-    private let minimumRateTurns = 20
-    /// Inner-line variety, judged only once there are enough turns to judge.
-    private let innerVarietyFloor = 6
-    private let innerVarietyMinimumTurns = 100
-    /// A chemical dimension this close to a rail is stuck, not expressive.
+    /// Report the chemistry's distance from its rails without grading it.
     private let pinnedHigh = 0.98
     private let pinnedLow = 0.02
     private let chemistryDimensions = ["agency", "confidence", "coherence", "warmth"]
@@ -137,8 +122,11 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             }
         }
 
-        if !summary.unreadableDays.isEmpty {
-            return CheckResult(
+        if let day = summary.unreadableDays.first {
+            let file = root.appendingPathComponent("turn_traces/\(day).jsonl")
+            return CheckResult(source: file.path,
+                nextCall: ToolFailureError.fileRepairCall(file, dataRoot: root,
+                    shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."),
                 id: id, title: title, status: "fail",
                 detail: "\(summary.unreadableDays.count) turn-trace day file(s) exist but could"
                     + " not be read (\(summary.unreadableDays.joined(separator: ", ")))."
@@ -150,7 +138,9 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
 
         let chemistry = readChemistry()
         if case .unreadable(let reason) = chemistry {
-            return CheckResult(
+            return CheckResult(source: "cognition/organism_state.json",
+                nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("cognition/organism_state.json"), dataRoot: root,
+                    shape: "This JSON object retains organism state, including a chemicalState object with finite numeric agency, confidence, coherence and warmth values. Recover only values supported by the retained bytes."),
                 id: id, title: title, status: "fail",
                 detail: "data/cognition/organism_state.json exists but \(reason)."
                     + " Her chemistry is UNMEASURED, which is a finding about this row's"
@@ -173,16 +163,15 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         let coverageDetail = coverageParts.isEmpty ? "" : " " + coverageParts.joined(separator: "; ") + "."
 
         if summary.isEmptyFeed {
-            return CheckResult(
+            return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
                 id: id, title: title, status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — no turn-trace day files under"
                     + " data/turn_traces. "
-                    + chemistryLine(chemistry).sentence,
-                repair: chemistryLine(chemistry).repair
+                    + chemistryLine(chemistry).sentence
             )
         }
         guard !eligibleTurns.isEmpty else {
-            return CheckResult(
+            return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
                 id: id, title: title,
                 status: "unmeasured",
                 detail: "UNMEASURED \(window.describedAs) — \(summary.daysPresent.count)"
@@ -190,19 +179,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     + " in window, but none on a capsule surface"
                     + " (\(capsuleSurfaces.sorted().joined(separator: "/")))."
                     + " Nothing about her subconscious can be measured. "
-                    + chemistryLine(chemistry).sentence + coverageDetail,
-                repair: chemistryLine(chemistry).repair
+                    + chemistryLine(chemistry).sentence + coverageDetail
             )
-        }
-
-        var status = "ok"
-        var repairs: [String] = []
-        var harms: [String] = []
-        func raise(_ level: String, harm: String? = nil) {
-            if level == "fail" { status = "fail" }
-            else if level == "warn", status != "fail" { status = "warn" }
-            else if level == "unmeasured", status == "ok" { status = "unmeasured" }
-            if let harm { harms.append(harm) }
         }
 
         var parts: [String] = [window.describedAs]
@@ -217,12 +195,6 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     percent, judged, capsuleSurfaces.sorted().joined(separator: "/")
                 )
             )
-            if judged < minimumRateTurns {
-                parts.append(
-                    "below the \(minimumRateTurns)-turn floor, so the rates in this row are"
-                        + " MEASURED but NOT judged"
-                )
-            }
         } else {
             parts.append("capsule attachment UNMEASURED — no eligible turn could be judged")
         }
@@ -251,21 +223,6 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     feltTotal, feltTurns, feltCounts.count, top.key, share
                 )
             )
-            if feltTurns < minimumRateTurns {
-                // Reported above, deliberately ungraded.
-            } else if share > feltFailPercent {
-                raise("fail", harm: "Her felt vocabulary has collapsed onto one word.")
-                repairs.append(
-                    "\"\(top.key)\" carries \(Int(share.rounded()))% of her felt vocabulary."
-                        + " The felt lane has collapsed onto one word."
-                )
-            } else if share > feltWarnPercent {
-                raise("warn", harm: "Her felt vocabulary is narrowing.")
-                repairs.append(
-                    "\"\(top.key)\" is over \(Int(feltWarnPercent))% of her felt vocabulary —"
-                        + " range is narrowing."
-                )
-            }
         } else {
             parts.append("felt vocabulary UNMEASURED — no turn yielded a readable feeling line")
         }
@@ -279,61 +236,29 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     percent, soundTurns
                 )
             )
-            if soundTurns < minimumRateTurns {
-                // Reported above, deliberately ungraded.
-            } else if percent > rutFailPercent {
-                raise("fail", harm: "Her Sound channel reports persistent echoing in her phrasing.")
-                repairs.append(
-                    "Her own Sound channel says the phrasing is echoing on"
-                        + " \(Int(percent.rounded()))% of turns. The rut is the steady state,"
-                        + " not an occasional nudge."
-                )
-            } else if percent > rutWarnPercent {
-                raise("warn", harm: "Her Sound channel reports recurring echoing in her phrasing.")
-            }
         } else {
             parts.append("Sound line UNMEASURED — no turn yielded a readable Sound line")
         }
 
         // 4. Inner-line variety.
-        if innerTurns >= innerVarietyMinimumTurns {
+        if innerTurns > 0 {
             parts.append("\(innerLines.count) distinct Inner line(s) over \(innerTurns) turn(s)")
-            if innerLines.count < innerVarietyFloor {
-                raise("warn", harm: "Her inner voice is repeating instead of responding to the conversation.")
-                repairs.append(
-                    "Only \(innerLines.count) distinct Inner line(s) across \(innerTurns) turns —"
-                        + " the inner voice is repeating rather than responding."
-                )
-            }
-        } else if innerTurns > 0 {
-            parts.append(
-                "\(innerLines.count) distinct Inner line(s) over \(innerTurns) turn(s) —"
-                    + " below the \(innerVarietyMinimumTurns)-turn floor, so variety is"
-                    + " reported but NOT judged"
-            )
         } else {
             parts.append("Inner line NOT MEASURED — no turn yielded complete Inner wording")
         }
 
-        // 5. Organism chemistry. A fresh mind starts at rest (0 is where it begins, not a
-        // stuck rail), so like the rates above it is graded only past the turn floor.
+        // 5. Organism chemistry is a reading, including values at a rail.
         let chemLine = chemistryLine(chemistry)
         parts.append(chemLine.sentence)
-        if let level = chemLine.level, level == "fail" || eligibleTurns.count >= minimumRateTurns {
-            raise(level)
-            if let repair = chemLine.repair { repairs.append(repair) }
-        }
 
         if !coverageParts.isEmpty {
             parts.append(contentsOf: coverageParts)
             // A bounded read is coverage, not a fault; the detail names it.
         }
 
-        return CheckResult(
-            id: id, title: title, status: status,
-            detail: parts.joined(separator: "; ") + ".",
-            harm: harms.isEmpty ? nil : harms.joined(separator: " "),
-            repair: repairs.isEmpty ? nil : repairs.joined(separator: " ")
+        return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
+            id: id, title: title, status: chemLine.level ?? "ok",
+            detail: parts.joined(separator: "; ") + "."
         )
     }
 
@@ -382,16 +307,15 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
 
     private func chemistryLine(
         _ chemistry: Chemistry
-    ) -> (sentence: String, level: String?, repair: String?) {
+    ) -> (sentence: String, level: String?) {
         switch chemistry {
         case .unmeasured(let reason):
             return (
                 "organism chemistry UNMEASURED — \(reason)",
-                nil,
-                nil
+                "unmeasured"
             )
         case .unreadable(let reason):
-            return ("organism chemistry UNREADABLE — \(reason)", "fail", nil)
+            return ("organism chemistry UNREADABLE — \(reason)", "unmeasured")
         case .measured(let dimensions):
             let rendered = dimensions
                 .sorted { $0.key < $1.key }
@@ -405,15 +329,13 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             if !missing.isEmpty {
                 sentence += " (\(missing.joined(separator: "/")) absent from the file, unjudged)"
             }
-            guard !pinned.isEmpty else { return (sentence, missing.isEmpty ? nil : "unmeasured", nil) }
+            guard !pinned.isEmpty else { return (sentence, missing.isEmpty ? nil : "unmeasured") }
             let named = pinned
                 .map { String(format: "%@=%.3f", $0.key, $0.value) }
                 .joined(separator: ", ")
             return (
                 sentence + "; PINNED at a rail: \(named)",
-                "unmeasured",
-                "A chemical dimension parked at 0 or 1 has stopped carrying information."
-                    + " Pinned: \(named)."
+                "unmeasured"
             )
         }
     }

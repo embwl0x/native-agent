@@ -24,29 +24,7 @@ extension ChatView {
 
     func toggleVoice() {
         if voiceInput.isListening {
-            let listeningSession = voiceSessionId
-            Task { @MainActor in
-                let result = await voiceInput.stopListeningResult()
-                // The stop suspends; the person may have moved to another
-                // conversation while it flushed. That conversation's composer
-                // is not this dictation's to write (2026-09-06).
-                guard listeningSession == appModel.activeChatSessionId,
-                      voiceSessionId == listeningSession
-                else {
-                    voiceSessionId = ""
-                    voiceDraftBeforeListening = ""
-                    return
-                }
-                let final = result.transcriptForSubmission
-                if final.isEmpty {
-                    text = voiceDraftBeforeListening
-                    showToast(result.userFacingFailureMessage ?? "No speech detected")
-                } else {
-                    text = composeVoiceDraft(final)
-                }
-                voiceDraftBeforeListening = ""
-                voiceSessionId = ""
-            }
+            Task { @MainActor in _ = await finishDictation() }
         } else {
             // Starting to talk ends her talking. Opening the microphone while
             // playback is still running means she is speaking into her own
@@ -66,6 +44,7 @@ extension ChatView {
             let startSessionId = appModel.activeChatSessionId
             let startGeneration = voiceGeneration
             Task {
+                if !voiceSessionId.isEmpty { _ = await finishDictation() }
                 let granted = await voiceInput.requestPermission()
                 guard granted else {
                     // requestPermission already set a specific errorMessage
@@ -97,7 +76,27 @@ extension ChatView {
         }
     }
 
+    func finishDictation() async -> Bool {
+        let listeningSession = voiceSessionId
+        let stoppedGeneration = voiceGeneration
+        let wasListening = voiceInput.isListening
+        let result = await voiceInput.stopListeningResult()
+        guard listeningSession == appModel.activeChatSessionId,
+              voiceSessionId == listeningSession,
+              stoppedGeneration == voiceGeneration else { return false }
+        let accepted = ChatComposerSupport.finishDictation(
+            result, wasListening: wasListening, base: &voiceDraftBeforeListening,
+            draft: &text, attachments: &pendingAttachments,
+            attachment: voiceInput.attachment, showToast: showToast)
+        voiceSessionId = ""
+        return accepted
+    }
+
     func captureScreen() {
+        if !voiceSessionId.isEmpty {
+            Task { @MainActor in if await finishDictation() { captureScreen() } }
+            return
+        }
         guard !isCapturing else { return }
         // 2026-09-06: a screenshot send is a send, so it takes the send latch
         // too. Admission suspends before it marks the session busy, so a
@@ -105,7 +104,7 @@ extension ChatView {
         // capture button live — the screenshot was admitted as a second turn.
         guard !isSubmittingSend else { return }
         guard appModel.engine.trust.policy?.multimodalPolicy?.screen_capture == true else {
-            showToast("Enable screen capture in Trust → Multimodal Capabilities")
+            showToast("Enable screen capture in Trust → Features → Multimodal")
             return
         }
         guard !appModel.isBusy && !appModel.isChatStreaming else {

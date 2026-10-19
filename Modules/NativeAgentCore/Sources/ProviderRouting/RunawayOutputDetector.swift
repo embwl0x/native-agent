@@ -47,6 +47,8 @@ public struct RunawayOutputDetector: Sendable {
     /// Where the text after the last complete call starts being checked.
     private var gapStart = 0
     private var bytes: [UInt8] = []
+    private var released = 0
+    private var committed = ""
 
     /// Everything fed so far.
     public private(set) var text = ""
@@ -65,6 +67,7 @@ public struct RunawayOutputDetector: Sendable {
     public mutating func feed(_ delta: String) -> Bool {
         guard toolBoundary == nil else { return true }
         text += delta
+        if !endsAtToolBoundary { committed += delta }
         var rest = Substring(delta)
         while let nl = rest.unicodeScalars.firstIndex(of: "\n") {
             pending += Substring(rest.unicodeScalars[..<nl])
@@ -80,7 +83,7 @@ public struct RunawayOutputDetector: Sendable {
             bytes.append(contentsOf: delta.utf8)
             if scanToolBlocks() { return true }
         }
-        if let firstHeader {
+        if let firstHeader, firstHeader < (openBlock?.start ?? Int.max) {
             return setToolBoundary(.fabricatedResult, "fabricated tool-result header", at: firstHeader)
         }
         return false
@@ -108,13 +111,9 @@ public struct RunawayOutputDetector: Sendable {
                     return false
                 }
                 let end = close + open.close.utf8.count
+                if let firstHeader, firstHeader >= open.start && firstHeader < end { self.firstHeader = nil }
                 openBlock = nil
                 blockCursor = end
-                // An example inside a code fence is prose, not a call (Sol).
-                let fenced = fenceStarts.prefix { $0 <= open.start }.count % 2 != 0
-                let pendingFence = open.start >= lineStart
-                    && pending.trimmingCharacters(in: .whitespaces).hasPrefix("```")
-                if fenced != pendingFence { continue }
                 let block = String(decoding: bytes[open.start..<end], as: UTF8.self)
                 // Runaway repeats are byte-identical; only the outer edges
                 // are trimmed, so "red fox" and "redfox" stay different (Sol).
@@ -134,6 +133,9 @@ public struct RunawayOutputDetector: Sendable {
                 blockCount += 1
                 lastBlockEnd = end
                 gapStart = end
+                commitProse(through: open.start)
+                committed += block
+                released = end
             } else {
                 // After a complete call, a result she writes herself or a long
                 // run of prose with no new call ends the reply there, so the
@@ -149,8 +151,16 @@ public struct RunawayOutputDetector: Sendable {
                 }
                 guard let (start, tag, close) = opens.min(by: { $0.0 < $1.0 }) else {
                     blockCursor = max(blockCursor, bytes.count - "<tool_use".utf8.count)
+                    if blockCount == 0 { commitProse(through: proseEnd) }
                     return false
                 }
+                if let firstHeader, start >= firstHeader { return false }
+                // An example inside a code fence is prose, not a call.
+                if isFenced(at: start) {
+                    blockCursor = start + tag.utf8.count
+                    continue
+                }
+                if blockCount == 0 { commitProse(through: start) }
                 openBlock = (start, close)
                 blockCursor = start + tag.utf8.count
             }
@@ -206,12 +216,61 @@ public struct RunawayOutputDetector: Sendable {
         return true
     }
 
-    /// After `feed(delta)`: the part of `delta` the reply keeps, which is all
-    /// of it unless the tool boundary falls at or before its end.
-    public func keptPart(of delta: String) -> String {
-        guard let toolBoundary else { return delta }
-        let start = text.utf8.count - delta.utf8.count
-        return String(decoding: delta.utf8.prefix(max(0, toolBoundary - start)), as: UTF8.self)
+    /// Prose can stream; a possible call opener and everything inside it stay
+    /// here until its closing tag commits the frame. Gaps after calls wait too.
+    private var proseEnd: Int {
+        let markers = ["<invoke", "<tool_use", "<function_calls>", "</function_calls>", Self.fabricatedHeader]
+        let held = stride(from: min(Self.fabricatedHeader.utf8.count, bytes.count), to: 0, by: -1).first { length in
+            markers.contains { bytes.suffix(length).elementsEqual($0.utf8.prefix(length)) && length <= $0.utf8.count }
+        } ?? 0
+        return min(bytes.count - held, firstHeader ?? bytes.count)
+    }
+
+    private func isFenced(at offset: Int) -> Bool {
+        let fenced = fenceStarts.prefix { $0 <= offset }.count % 2 != 0
+        let pendingFence = offset >= lineStart && pending.trimmingCharacters(in: .whitespaces).hasPrefix("```")
+        return fenced != pendingFence
+    }
+
+    private mutating func commitProse(through end: Int) {
+        let end = min(end, firstHeader ?? end)
+        guard end > released else { return }
+        // Containers frame a batch on the wire, not a call. Strip them only
+        // between calls; parameter bytes and quoted examples stay untouched.
+        var cursor = released
+        while let start = Self.find("<", in: bytes, from: cursor), start < end {
+            committed += String(decoding: bytes[cursor..<start], as: UTF8.self)
+            let wrapper = ["<function_calls>", "</function_calls>"].first {
+                start + $0.utf8.count <= end && bytes[start..<start + $0.utf8.count].elementsEqual($0.utf8)
+            }
+            cursor = start + (wrapper?.utf8.count ?? 1)
+            if wrapper == nil || isFenced(at: start) { committed += String(decoding: bytes[start..<cursor], as: UTF8.self) }
+        }
+        committed += String(decoding: bytes[cursor..<end], as: UTF8.self)
+        released = end
+    }
+
+    /// Drain only newly committed bytes, including frames begun in prior deltas.
+    public mutating func takeCommittedText() -> String {
+        if !endsAtToolBoundary {
+            let end = min(toolBoundary ?? text.utf8.count, firstHeader ?? text.utf8.count)
+            let start = text.utf8.count - committed.utf8.count
+            committed = String(decoding: committed.utf8.prefix(max(0, end - start)), as: UTF8.self)
+        }
+        defer { committed = "" }
+        return committed
+    }
+
+    /// A terminal discards only the uncommitted frame, never its predecessors.
+    public mutating func finish() -> String {
+        let suffix = String(decoding: bytes[proseEnd...], as: UTF8.self)
+        let unfinishedOpener = suffix.count > 1 && suffix.hasPrefix("<")
+            && !["<function_calls>", "</function_calls>"].contains(suffix)
+        if endsAtToolBoundary, toolBoundaryReason == nil, openBlock != nil || unfinishedOpener {
+            _ = setToolBoundary(.incompleteCall, "unfinished tool call", at: lastBlockEnd)
+        }
+        if endsAtToolBoundary, toolBoundaryReason == nil, blockCount == 0 { commitProse(through: bytes.count) }
+        return takeCommittedText()
     }
 
     private static let diagnosticLock = OSAllocatedUnfairLock(initialState: ())

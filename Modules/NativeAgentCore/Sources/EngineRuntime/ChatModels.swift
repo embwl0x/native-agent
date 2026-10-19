@@ -1,3 +1,4 @@
+import AgentWorkspace
 import Dispatcher
 import ApprovalInbox
 import Privacy
@@ -101,6 +102,16 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
 }
 
 public typealias NativeAppChatMessage = ChatMessage
+
+extension ChatMessage {
+    /// A wake input she wrote to herself (what changed, what she carries):
+    /// hers, recorded for her, never the person's words. Her acts on the
+    /// person's behalf (a draft she sends for him) are not this.
+    public var isHerOwnTurnInput: Bool {
+        role == "user" && metadata?.origin?.agent == "self" && metadata?.origin?.authored == "agent"
+            && metadata?.origin?.surface == ResidentWake.session
+    }
+}
 
 public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
     /// Shared transcript vocabulary for an approval awaiting a human decision.
@@ -368,6 +379,11 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         try c.encodeIfPresent(providerRefusalDraft, forKey: .providerRefusalDraft)
         try c.encodeIfPresent(partial, forKey: .partial)
         try c.encodeIfPresent(cancelled, forKey: .cancelled)
+        // How the turn ended is the phone's proof that a saved row IS the
+        // reply it already shows (same run, terminal): without these the
+        // snapshot row and the live bubble both stayed on the phone.
+        try c.encodeIfPresent(completionState, forKey: .completionState)
+        try c.encodeIfPresent(failureWork, forKey: .failureWork)
         try c.encodeIfPresent(kind, forKey: .kind)
         try c.encodeIfPresent(toolName, forKey: .toolName)
         try c.encodeIfPresent(resultSummary, forKey: .resultSummary)
@@ -399,6 +415,7 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
     public var name: String?
     public var byteSize: Int64
     public var path: String?
+    public var utterance: SpeechUtterance?
 
     public init(id: String, type: String, mime: String, name: String?, byteSize: Int64, path: String? = nil) {
         self.id = id; self.type = type; self.mime = mime; self.name = name; self.byteSize = byteSize; self.path = path
@@ -423,6 +440,11 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
         self.mime = mime ?? "application/octet-stream"
         self.name = name
         self.path = path
+        if let evidence = o["utterance"] {
+            guard let bytes = try? evidence.serializedData(pretty: false),
+                  let utterance = try? JSONDecoder().decode(SpeechUtterance.self, from: bytes) else { return nil }
+            self.utterance = utterance
+        }
         switch o["byteSize"] {
         case .int(let n)?: byteSize = n
         case .double(let d)?: byteSize = Int64(exactly: d) ?? 0
@@ -441,7 +463,7 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
         }
         return out
     }
-    enum CodingKeys: String, CodingKey { case id, type, mime, name, byteSize, path }
+    enum CodingKeys: String, CodingKey { case id, type, mime, name, byteSize, path, utterance }
 }
 
 // ChatSession, RuntimeHealth, RunRecord, MemoryRecord moved to NativeAgentShared.
@@ -504,7 +526,9 @@ private func chatRowInt(_ value: JSONValue?) -> Int? {
     }
 }
 
-extension ChatMessage: DeviceSyncTranscriptMessage {}
+extension ChatMessage: DeviceSyncTranscriptMessage {
+    public var isPersonVisible: Bool { !isHerOwnTurnInput }
+}
 
 extension ChatMessage: MacChatRetryMessage {
     public var retryOrigin: ChatMessageOrigin? {

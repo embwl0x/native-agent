@@ -45,16 +45,9 @@ struct ContentView: View {
         case chat, activity, memories, desk, more
     }
 
-    private var activityBadgeCount: Int {
-        ActivityScreenPresentation.counts(
-            storedApprovals: approvalsStore.hasLoadedSnapshot ? approvalsStore.pendingCount : nil,
-            snapshotApprovals: sync.approvals,
-            storedInbox: inboxStore.hasLoadedSnapshot ? inboxStore.activeCount : nil,
-            snapshotInbox: sync.inboxItems,
-            memoryProposals: sync.memoryProposals,
-            trainingProposals: sync.trainingProposals,
-            promotionCandidates: sync.promotionCandidates
-        ).total
+    private var activityBadgeCount: Int? {
+        guard let overview = sync.workOverview, overview.unavailable.isEmpty else { return nil }
+        return overview.needsYouCount
     }
 
     /// Parse `-initialTab <name>` from process arguments.  Legacy names route
@@ -138,7 +131,7 @@ struct ContentView: View {
                     Label("Activity", systemImage: "tray")
                     .environment(\.symbolVariants, .none)
                 }
-                .badge(activityBadgeCount)
+                .badge(activityBadgeCount.flatMap { $0 > 0 ? String($0) : nil })
                 .tag(Tab.activity)
 
             MemoryView()
@@ -215,6 +208,13 @@ struct ContentView: View {
                     activeInboxItems: inboxStore.items,
                     pendingApprovalIDs: Set(approvalsStore.approvals.filter { $0.status.lowercased() == "pending" }.map(\.id))
                 )
+            }
+        }
+        .onChange(of: activityBadgeCount, initial: true) { _, count in
+            Task {
+                // An unavailable count has no badge, just as on the tab.
+                do { try await UNUserNotificationCenter.current().setBadgeCount(count ?? 0) }
+                catch { NSLog("[Activity] badge update failed: %@", error.localizedDescription) }
             }
         }
         .onChange(of: sync.inboxItems) { _, _ in
@@ -340,16 +340,11 @@ enum NativeAgentActivityNotificationCleaner {
         let userInfo: [AnyHashable: Any]
     }
 
-    struct PruningResult {
-        let notificationIDsToRemove: [String]
-        let badgeCount: Int
-    }
-
     static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord], pendingApprovalIDs: Set<String>) async {
         let activeItemIDs = Set(activeInboxItems.filter { $0.isUnread }.map(\.id))
         let center = UNUserNotificationCenter.current()
         let delivered = await center.deliveredNotifications()
-        let result = pruningResult(
+        let idsToRemove = notificationIDsToRemove(
             activeItemIDs: activeItemIDs,
             pendingApprovalIDs: pendingApprovalIDs,
             deliveredNotifications: delivered.map {
@@ -360,36 +355,28 @@ enum NativeAgentActivityNotificationCleaner {
             }
         )
 
-        if !result.notificationIDsToRemove.isEmpty {
-            center.removeDeliveredNotifications(withIdentifiers: result.notificationIDsToRemove)
-        }
-
-        if #available(iOS 16.0, *) {
-            try? await center.setBadgeCount(result.badgeCount)
-        } else {
-            await MainActor.run {
-                UIApplication.shared.applicationIconBadgeNumber = result.badgeCount
-            }
+        if !idsToRemove.isEmpty {
+            center.removeDeliveredNotifications(withIdentifiers: idsToRemove)
         }
     }
 
-    static func pruningResult(
+    static func notificationIDsToRemove(
         activeInboxItems: [InboxItemRecord],
         pendingApprovalIDs: Set<String>,
         deliveredNotifications: [DeliveredNotification]
-    ) -> PruningResult {
-        pruningResult(
+    ) -> [String] {
+        notificationIDsToRemove(
             activeItemIDs: Set(activeInboxItems.filter { $0.isUnread }.map(\.id)),
             pendingApprovalIDs: pendingApprovalIDs,
             deliveredNotifications: deliveredNotifications
         )
     }
 
-    private static func pruningResult(
+    private static func notificationIDsToRemove(
         activeItemIDs: Set<String>,
         pendingApprovalIDs: Set<String>,
         deliveredNotifications: [DeliveredNotification]
-    ) -> PruningResult {
+    ) -> [String] {
         var removeIDs: [String] = []
 
         for notification in deliveredNotifications {
@@ -417,10 +404,7 @@ enum NativeAgentActivityNotificationCleaner {
             removeIDs.append(notification.identifier)
         }
 
-        return PruningResult(
-            notificationIDsToRemove: removeIDs,
-            badgeCount: activeItemIDs.count + pendingApprovalIDs.count
-        )
+        return removeIDs
     }
 
     private static func normalizedNativeAgentInfo(_ userInfo: [AnyHashable: Any]) -> [AnyHashable: Any] {

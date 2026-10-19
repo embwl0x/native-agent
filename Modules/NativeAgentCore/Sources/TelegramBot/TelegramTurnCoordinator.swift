@@ -69,6 +69,9 @@ public actor TelegramTurnCoordinator {
     }
 
     private struct QueuedTurn: Sendable {
+        /// The turn it runs as, known while it waits so her active turn can
+        /// write it under that run if it takes it first.
+        var id = UUID()
         let updateId: Int
         let text: String
         let acknowledgementMessageId: Int?
@@ -252,6 +255,7 @@ public actor TelegramTurnCoordinator {
     /// callback binding). Completion removes the exact generation
     /// automatically, so ingress never needs an unstructured cleanup watcher.
     public func startTrackedTurn(
+        id: UUID = UUID(),
         destination: TelegramDestination,
         text: String,
         priority: TaskPriority? = nil,
@@ -260,6 +264,7 @@ public actor TelegramTurnCoordinator {
         guard !isShuttingDown, activeTurns[destination] == nil else { return nil }
         pausedQueueDestinations.remove(destination)
         return launchTurn(
+            id: id,
             destination: destination,
             text: text,
             priority: priority,
@@ -268,6 +273,7 @@ public actor TelegramTurnCoordinator {
     }
 
     private func launchTurn(
+        id: UUID = UUID(),
         destination: TelegramDestination,
         text: String,
         priority: TaskPriority? = nil,
@@ -275,7 +281,6 @@ public actor TelegramTurnCoordinator {
         onStart: (@Sendable () async -> Void)? = nil,
         continuationID: Int? = nil
     ) -> (id: UUID, task: Task<Void, Never>) {
-        let id = UUID()
         let task = Task(priority: priority) { [weak self] in
             await onStart?()
             await operation(id)
@@ -343,6 +348,7 @@ public actor TelegramTurnCoordinator {
 
     @discardableResult
     func enqueueTrackedTurn(
+        turnId: UUID = UUID(),
         updateId: Int,
         destination: TelegramDestination,
         text: String,
@@ -354,6 +360,7 @@ public actor TelegramTurnCoordinator {
             return nil
         }
         let queued = QueuedTurn(
+            id: turnId,
             updateId: updateId,
             text: text,
             acknowledgementMessageId: acknowledgementMessageId,
@@ -514,6 +521,7 @@ public actor TelegramTurnCoordinator {
         let next = queue.removeFirst()
         queuedTurns[destination] = queue.isEmpty ? nil : queue
         _ = launchTurn(
+            id: next.id,
             destination: destination,
             text: next.text,
             priority: .userInitiated,

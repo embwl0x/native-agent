@@ -4,8 +4,22 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import ToolRegistry
 
 extension BuiltInToolSchemaFactory {
+    func inboxOptionsSchema() -> JSONValue {
+        let root = PersistenceCore.defaultDataRoot()
+        let handles = ((try? AgentPeerStore(dataRoot: root).list()) ?? []).flatMap { $0.handles ?? [] }
+        let keys = Set(handles.flatMap { AgentConversationRouting.supportedOptions(agent: $0, dataRoot: root) ?? [] })
+        return obj([("type", .string("object")), ("additionalProperties", .bool(false)), ("properties", .object(
+            Dictionary(uniqueKeysWithValues: keys.map { key in
+                let property = ["fast", "pair_reviewer"].contains(key) ? boolSchema()
+                    : key == "timeout_seconds" ? intSchema("Door's run limit, 60–3600 seconds.", minimum: 60, maximum: 3600)
+                    : strSchema("Declared by the contact's inbox door.")
+                return (key, property)
+            })))])
+    }
+
     private static let canonicalContextExpandSchema = LLMToolSchema(
         name: "context_expand",
         toolClass: .read,
@@ -104,7 +118,6 @@ extension BuiltInToolSchemaFactory {
                 description: "Read public http(s) privately, without a browser, signed-in session or consent. Returns readable text, requested/final URL, content type, extraction outcome and omissions from the 1 MB response bound (32 MB for a PDF). HTML, text and PDF text stay available for tool-output paging; other binary formats are unsupported. source_receipt.path locates the limited-retention JSON receipt; read_file requires normal file permissions. A missing receipt proves neither an empty source nor a need to refetch. Use for research/search-result/public-page reads; use Chrome for signed-in pages or interaction.",
                 parametersJSON: params(properties: [
                     ("url", strSchema("Public http(s) URL to read.")),
-                    ("query", strSchema("Optional words to bring matching sections first when a long page needs paging. All other sections remain available.")),
                 ], required: ["url"])
             ),
             requestedSchema(
@@ -115,9 +128,12 @@ extension BuiltInToolSchemaFactory {
                     properties: [
                         ("path", strSchema("Workspace-relative path such as 'project/file.txt', a repo-relative path only when a verified source checkout exists, or an absolute/~/ path under a Trust Center workspace root. Persona files must use app persona.doc or persona.read. In Full Mac mode, /documents/<name> maps to the current user's ~/Documents/<name>.")),
                         ("match", strSchema("Glob for a folder path, e.g. '*-r4-*.png'.")),
+                        ("query", strSchema("Search the whole text source for complete lines containing every whitespace-separated term, case-insensitively. Returns records with line positions and full-source coverage, in source order. Pages fit 24000 serialized bytes; a larger single record is refused, never split. Continue only with next; max_bytes and offset are byte-mode arguments.")),
+                        ("start_line", intSchema("Search continuation's 1-based source line; omit initially and copy next unchanged.")),
+                        ("max_lines", intSchema("Matching lines per search page, default 80, capped at 240.")),
                         ("max_bytes", intSchema("Optional source byte window: capped at 64 KiB in workspace mode or 200,000 bytes in Full Mac. This is a file-read limit, not a one-response guarantee: large results are delivered through tool_result_page. UTF-8 characters stay whole; use at least 4 bytes to ensure progress.")),
                         ("offset", intSchema("Byte offset, default 0. Continue with returned next arguments; positive offsets require version and a UTF-8 boundary.")),
-                        ("version", strSchema("Omit or empty initially. Copy from next for continuation. file_changed means restart at offset 0 without version; never concatenate windows from different versions.")),
+                        ("version", strSchema("Omit initially; copy next unchanged. file_changed means restart without version at offset 0 (bytes) or start_line 1 (search); never combine versions.")),
                     ],
                     required: ["path"]
                 )
@@ -401,13 +417,13 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(
                 name: "tool_result_page",
                 toolClass: .read,
-                description: "Read a result retained this turn without repeating its action. Only results marked full_result_retained:true are eligible; inline results are not retained. Follow next_call to Continue with the same result, position, query and mode. continue:true alone selects the sole retained result before any read. Exact result_handle/page also works. Query puts matching sections first without dropping others. Read-only, redacted; expires at turn end.",
+                description: "Read a result retained this turn without repeating its action. Only full_result_retained:true results are eligible. Follow next_call; continue:true alone selects the sole retained result. Exact result_handle/page also works. Query selects only matching records in source order, with positions and retained-response coverage; it cannot search unread source content. For files and logs, use files.read with query to search the source. Read-only, redacted; expires at turn end.",
                 parametersJSON: params(
                     properties: [
                         ("result_handle", nullableRecallField(strSchema("Opaque handle from the bounded_tool_result receipt."))),
                         ("continue", nullableRecallField(boolSchema("Continue this turn's last successful read; page is ignored; omit query/raw. result_handle explicitly changes result. Before any read, starts the sole retained result or asks you to choose."))),
                         ("page", nullableRecallField(intSchema("Zero-based whole-number page index. Omit, null, blank or false starts at 0; follow next_page while has_more is true. Keep query and raw unchanged while paging."))),
-                        ("query", nullableRecallField(strSchema("Optional words to find within the saved result. Keep the same query while paging; start at page 0 when changing it."))),
+                        ("query", nullableRecallField(strSchema("Select records containing every whitespace-separated term, case-insensitively. Keep query while paging; start at page 0 when changing it. Empty reads all records."))),
                         ("raw", nullableRecallField(boolSchema("Exact original bytes instead of sections, only for reconstruction or oversized values. Separate 8000-byte pages may split sentences/JSON; concatenate from page 0 through raw_page_count pages."))),
                         ("session_id", nullableRecallField(strSchema("Current chat session id; the tool loop auto-fills this."))),
                     ],
@@ -508,13 +524,13 @@ extension BuiltInToolSchemaFactory {
                             ("type", .string("object")),
                             ("description", .string("Executable routine; a candidate runs only after validation and exact-code enable.")),
                             ("properties", obj([
-                                ("source", strSchema("Sync-only: define function run(input) using synchronous app.* calls and return plain JSON; async functions and Promises are unsupported. At most 524288 bytes. input is frozen JSON. Execution never loads an instruction body.")),
+                                ("source", strSchema("Sync-only: define function run(input) using synchronous app.* calls and return plain JSON; async functions and Promises are unsupported. Each call returns the tool's own data with call (its action id) and effects (none, occurred, partial or unknown); a reader with a structured form gives it (mac.look: detail.controls with role, label, handle and frame). A call that fails throws an AppError with e.reason, e.effects, e.call and e.receipt, which the code may catch and go on; a shell command that ran returns exit_code, stdout, stderr and timed_out as data whatever its exit code. A write goes on the version of the page the run read, none if it read none. host.state.get() and host.state.set(value) keep this part's own JSON between runs. At most 524288 bytes. input is frozen JSON. Execution never loads an instruction body.")),
                                 ("params", looseObjectSchema("Each input name to its type or {type, description}: string, int, number, bool, list or object; a trailing ? marks it optional. Include descriptions explaining the inputs. Params arrive frozen as `input` (e.g. input.name).")),
-                                ("actions", stringArraySchema("Only app action IDs, e.g. memory.recall for app.memory.recall(). app.read, app.find, app.log, app.expect, app.expect_fail, app.decide and app.step are built in; use [] for helpers alone. Grants no permissions.", minItems: 0, maxItems: 50)),
+                                ("actions", stringArraySchema("Optional: what it calls is read off the code's app.<page>.<action>(…) calls at save, and the save answers with that list. List only an action id the code reaches dynamically. Grants no permissions.", minItems: 0, maxItems: 50)),
                                 ("steps", stringArraySchema("Optional label for each step.", maxItems: 50, maxItemLength: 160)),
                                 ("of", intSchema("How many steps it has; leave it out when steps labels them.", minimum: 1, maximum: 50)),
                             ])),
-                            ("required", .array([.string("source"), .string("actions")])),
+                            ("required", .array([.string("source")])),
                         ])),
                         ("fixtures", obj([("type", .string("array")),
                             ("description", .string("Omit fixtures to record one safe run during skill.validate, supplying input there when params require it; capture:true also requests recording. Reads run live and their answers are kept; effects, nested tools and app.decide return visible placeholders. Later validation replays the sealed capture. Or supply input, calls:[{operation,args,result}], answers:[] and expected returned JSON; operation is app.<action>, read or find, decision replies go in answers, and expected matches the full return.")),
@@ -563,7 +579,7 @@ extension BuiltInToolSchemaFactory {
                         ("offset", intSchema("Continuation event offset; copy from next_call.")),
                         ("before", strSchema("Continuation anchor timestamp; copy from next_call to keep the same window.")),
                         ("view", enumStringSchema(["receipts", "shapes", "usage", "model_calls"], "Use receipts for compact tool.dispatch end receipts across all conversations unless session_id is explicit; non-read actions precede reads. shapes requires turn_id and trace; returns only action ids, argument keys/types and times for model-chosen app calls, excluding skill runs; scan_truncated means incomplete, including envelope truncation. usage sums recorded model calls across all conversations, defaults since to today, and reports missing measurements and retention coverage. Omit for all event kinds.")),
-                        ("trace", strSchema("For shapes, the wake signal's exact turn_traces/<yyyy-MM-dd>.jsonl file; reads only that day.")),
+                        ("trace", strSchema("For shapes or receipt_id, the exact turn_traces/<yyyy-MM-dd>.jsonl file; reads the complete day.")),
                         ("by", enumStringSchema(["model", "surface", "day"], "Usage grouping; default model. day uses local calendar dates.")),
                         ("effects_only", boolSchema("Successful non-read receipts with bounded target/effect previews; excludes previews and explicit no-effect results. Does not prove effects still persist.")),
                         ("since", strSchema("today (local midnight) or an ISO-8601 timestamp with Z or an offset. Reads the complete retained time window without tail scan limits; response pagination still applies.")),
@@ -574,6 +590,7 @@ extension BuiltInToolSchemaFactory {
                         ("session_id", strSchema("Optional exact chat session filter. Includes sibling events from turns belonging to that session.")),
                         ("sessionId", strSchema("Compatibility alias for session_id.")),
                         ("turn_id", strSchema("Optional exact turn id filter.")),
+                        ("receipt_id", strSchema("Exact dispatch receipt id, including from an expired result handle; reads retained evidence without repeating the operation.")),
                         ("fields", stringArraySchema("Optional payload keys; requires turn_id or completed_turns. Up to 16 keys, 80 characters each; values share an 8 KiB cap.", minItems: 1, maxItems: 16, maxItemLength: 80)),
                     ],
                     required: []
@@ -603,6 +620,13 @@ extension BuiltInToolSchemaFactory {
                     ],
                     required: ["objective"]
                 )
+            ),
+            requestedSchema(
+                name: "market_configure", toolClass: .write,
+                description: "Update nonsecret market configuration, preserving existing credentials. file is markets or tradingview. fields accepts watchlists (object of symbol arrays) for markets, scanner_endpoint/watchlist_endpoint HTTPS URLs on www.tradingview.com or scanner.tradingview.com (port 443) for tradingview. Malformed bytes are preserved privately before an explicitly requested replacement; credentials are never returned.",
+                parametersJSON: params(properties: [("file", strSchema("markets or tradingview")),
+                    ("fields", .object(["type": .string("object")])),
+                    ("replace_unreadable", boolSchema("Explicitly rebuild malformed configuration from supplied fields, keeping original bytes in a private backup."))], required: ["file", "fields"])
             ),
             requestedSchema(
                 name: "market_status",
@@ -637,13 +661,13 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(
                 name: "market_quote",
                 toolClass: .read,
-                description: "Live quotes (price, % change, volume) for symbols or a whole watchlist in one call. Read-only. A named provider is used alone and its failure reported; without one, tradingview is tried, then yahoo, and the answering provider and failures are reported.",
+                description: "Live quotes (price, % change, volume) for symbols or a whole watchlist in one call. Read-only. Uses only the chosen provider, default tradingview; failures are reported without switching providers.",
                 parametersJSON: params(
                     properties: [
                         ("symbol", strSchema("Ticker, or several separated by commas: \"AAPL, MSFT\". EXCHANGE:SYM for TradingView when a bare one isn't found. FX: EURUSD or FX:EURUSD for TradingView; EURUSD=X for Yahoo. Yahoo JPY=X means USDJPY and is translated for TradingView.")),
                         ("symbols", stringArraySchema("Ticker list.")),
                         ("watchlist", strSchema("A local watchlist name from market_watchlists; quotes all its symbols.")),
-                        ("provider", enumStringSchema(["tradingview", "yahoo", "tv", "yfinance"], "tradingview or yahoo, used alone; omit to try tradingview then yahoo.")),
+                        ("provider", enumStringSchema(["tradingview", "yahoo", "tv", "yfinance"], "tradingview or yahoo, used alone; default tradingview.")),
                     ],
                     required: []
                 )
@@ -1508,7 +1532,7 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(
                 name: "claude_message",
                 toolClass: .send,
-                description: "Send Claude (Claude Code on this Mac) a message; it lands in her inbox and she reads it in her live session. New work: conversation_mode=new, topic, no conversation_id. Follow-up: resume + her returned conversationId, no topic.",
+                description: "Send the contact a message through its live inbox door. New work: conversation_mode=new, topic, no conversation_id. Follow-up: resume + its returned conversationId, no topic.",
                 parametersJSON: params(
                     properties: [
                         ("text", strSchema("The message to the agent — full prose, no markdown headers needed. Be specific about the requested work or review.")),
@@ -1563,6 +1587,7 @@ extension BuiltInToolSchemaFactory {
                         ("text", strSchema("The question or task for Codex. Be specific; Codex is a fresh subprocess and only knows the context you provide.")),
                         ("context", strSchema("Optional preface: what you were doing, what failed, file paths, errors, and desired outcome.")),
                         ("cwd", strSchema("Working directory for Codex. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
+                        ("skip_git_repo_check", boolSchema("Allow a focused file repair in a folder outside a Git repository. Sandbox and Trust still apply.")),
                         ("timeout_seconds", intSchema("Maximum blocking wait. Default 600 seconds. Prefer codex_message rather than raising this for long repo work.")),
                         ("commit_hash", strSchema("Optional git commit hash to anchor the context.")),
                         ("model", obj([
@@ -2101,15 +2126,15 @@ extension BuiltInToolSchemaFactory {
             requestedSchema(
                 name: "delegation_status",
                 toolClass: .read,
-                description: "Read advanced bridge/swarm evidence. Prefer agent_read for ordinary agent replies: both use this same retained bridge evidence, so calling both is not independent confirmation. By default lists bridge jobs for the agent (Claude Code), Codex, and OMP with real lifecycle timestamps and current-build delivery uncertainty. Set message_id to the exact accepted messageId to find its recorded work, including batched Codex jobs. For a native swarm, set agent='swarm' and its exact run_id: returns compact report descriptors; select report_id to page one retained worker/synthesis report, never rerunning work. Discarded original text is not recoverable. Bridge stall_basis='none' means unmeasurable, not verified healthy.",
+                description: "Read retained inbox-door or swarm evidence. Prefer agent_read for ordinary conversations; reading both is not independent confirmation. message_id selects exact accepted-message evidence. For a swarm, set agent='swarm' and run_id, then report_id to page retained text without rerunning work. Discarded text is not recoverable; stall_basis='none' means unmeasurable.",
                 parametersJSON: params(
                     properties: [
                         ("limit", intSchema("Bridge jobs per page: default 8, max 12. With agent='swarm' and report_id: retained text characters per page, default/max 2000.")),
                         ("offset", intSchema("Bridge result offset, or character offset within the selected swarm report. Follow next_offset; omit on first page.")),
-                        ("agent", strSchema("Optional bridge filter: claude, codex, omp/kimi. Omit for all bridges. Set swarm with exact run_id to inspect a native swarm receipt.")),
+                        ("agent", strSchema("Optional saved contact or retained inbox-door handle. Omit for every retained door; swarm with run_id reads a swarm receipt.")),
                         ("message_id", obj([
                             ("type", .array([.string("string"), .string("null")])),
-                            ("description", .string("Bridge mode only: exact accepted messageId from claude.say, codex_message, or omp_message, up to 160 characters. Filters recorded identities before paging; never matches topic or filename. Omit, null, or empty for ordinary listing. Missing evidence does not prove work never ran.")),
+                            ("description", .string("Exact messageId from the contact's send receipt, up to 160 characters. Filters recorded identities before paging; never matches topic or filename. Omit for ordinary listing. Missing evidence does not prove work never ran.")),
                         ])),
                         ("run_id", strSchema("Required only for agent='swarm': exact id returned by agent_swarm. This is an identifier, never a file path.")),
                         ("report_id", obj([
@@ -2756,6 +2781,15 @@ extension BuiltInToolSchemaFactory {
                 )
             ),
         ]
-        return schemas
+        let root = PersistenceCore.defaultDataRoot()
+        let peers = (try? AgentPeerStore(dataRoot: root).list()) ?? []
+        return schemas.map { schema in
+            guard let schema, let handle = ToolNameAliases.agentHandle(schema.name) else { return schema }
+            guard let who = peers.first(where: { ($0.handles ?? []).contains(handle) }),
+                  AgentConversationDelivery.lane(for: "peer:" + who.id, dataRoot: root) != nil else { return nil }
+            return LLMToolSchema(name: schema.name, toolClass: schema.toolClass,
+                description: "Message \(who.name) through its saved door; acceptance remains owed until its reader or run accepts it.",
+                parametersJSON: schema.parametersJSON, deferLoading: schema.deferLoading)
+        }
     }
 }

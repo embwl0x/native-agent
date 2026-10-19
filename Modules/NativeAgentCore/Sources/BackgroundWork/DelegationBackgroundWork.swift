@@ -167,16 +167,20 @@ public struct DelegationBackgroundWork: Sendable {
                         try await reconcileAdverseRollups(dataRoot: dataRoot, jobs: jobs)
                     }
                     catch { nativeLog("Delegation rollup reconciliation failed: %@", error.localizedDescription) }
+                    let contacts = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
                     for peer in Set(read.jobs.map(\.agent)).union(["codex", "omp", "claude"]).sorted() {
                         let owed = read.jobs.filter { $0.agent == peer && $0.replyOwed }
                         let key = "delivery-residue|" + peer
                         if owed.isEmpty {
                             try? await HarnessQueue.resolve(key: key, note: "No saved answers remain owed.", dataRoot: dataRoot)
                         } else {
-                            let name = DelegationOutcomeCard.displayName(source: peer, agent: peer)
+                            // The contact's own name, the one agent.contacts shows, never a reshaped id.
+                            let id = peer.hasPrefix("peer:") ? String(peer.dropFirst(5)) : peer
+                            let name = contacts.first { $0.id == id }?.name ?? DelegationOutcomeCard.displayName(source: peer, agent: peer)
                             _ = try? await HarnessQueue.file(HarnessFinding(key: key,
                                 title: "Replies owed to " + name,
-                                summary: "\(owed.count) saved replies to \(name) remain owed — settle or let go.",
+                                summary: "\(owed.count) saved replies to \(name) remain owed: the call that asked for each can no longer take it. "
+                                    + "Wait on one with desk.wait {handle, on: <its id on this item>}, or let it go with repair.let_go {id, reason}.",
                                 owner: .agent, refs: try Self.replyRefs(owed), source: .loop), dataRoot: dataRoot, refreshRefs: true)
                         }
                         do {

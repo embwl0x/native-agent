@@ -417,6 +417,9 @@ public enum MacDriverContext {
     /// cursor, keys, focus or screen. Off unless the action said so.
     @TaskLocal public static var background = false
     @TaskLocal static var inputStartCount = 0
+    /// A watch's own binding keeps a pressed key down across its hands, until
+    /// its key-up, its end or the person's input releases it (MacScreenWatch).
+    @TaskLocal static var holdsAcrossCalls = false
 }
 
 public final class MacDriverBinding: @unchecked Sendable {
@@ -948,5 +951,5 @@ public actor MacAttentionSessionStore {
         }
     }
 
-    public static let driverRefusal = "human_takeover: the person used the Mac, so this action stopped. Under Full Mac, act again when they ask; otherwise wait until they return control with Let agent use Mac."
+    public static let driverRefusal = "human_takeover: the person used the Mac, so this action stopped. Under Full Mac, your next act reacquires control; otherwise ask them to use NativeAgent Mac chat > composer controls > Let [agent name] use the Mac."
 }

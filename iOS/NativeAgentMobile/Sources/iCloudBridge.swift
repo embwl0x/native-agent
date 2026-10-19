@@ -188,7 +188,19 @@ final class iCloudBridge: ObservableObject {
         lastMacConfirmationAt = timestamp
     }
 
-    /// Reads the Mac's presence beat (nothing pushes it) into the confirmation.
+    /// The key the account's Mac pairing record held when last read, with the
+    /// phone key it was read against. A reading counts only for that phone
+    /// key: whatever installs a new one (a push, KVS, a paste, a repair)
+    /// voids it until the next read.
+    struct MacPairingKeyReading: Equatable {
+        let recordKey: Data
+        let phoneKey: Data
+    }
+    @Published private(set) var macPairingKey: MacPairingKeyReading?
+
+    /// Reads the Mac's presence beat (nothing pushes it) into the confirmation,
+    /// and the key the account's pairing record holds: a beat under this
+    /// phone's key may be an old record of a Mac that has since changed keys.
     func readMacPresence() async {
         guard pairingStore?.isRepairingConnection != true,
               let secret = pairingStore?.iCloudPairingSecret else { return }
@@ -197,6 +209,9 @@ final class iCloudBridge: ObservableObject {
            setupGeneration == generation, pairingStore?.iCloudPairingSecret == secret,
            pairingStore?.isRepairingConnection != true {
             recordMacConfirmation(at: seen)
+        }
+        if let published = await deviceTransport?.peekPairingSecret(), setupGeneration == generation {
+            macPairingKey = MacPairingKeyReading(recordKey: published, phoneKey: secret)
         }
     }
 
@@ -242,6 +257,99 @@ final class iCloudBridge: ObservableObject {
     // re-drains coalesce; per-message delivery is already atomic in the transport).
     private var deviceDrainInFlight = false
     private var deviceDrainQueued = false
+    // Delivery ownership contains record identities, never a second copy of
+    // the request. Existing chat/action wait owners decide whether it is live.
+    private var deliveryNudges: [String: String] = [:]
+    private var deliveryNudgeKey: String?
+    private var deliveryNudgeTask: Task<Void, Never>?
+
+    func deliveryPairingDidChange(from secret: Data?) {
+        if let secret { userDefaults.removeObject(forKey: "mobile.icloud.unaccepted.\(keyDigest(secret))") }
+        resumeDeliveryNudges()
+    }
+
+    private func resumeDeliveryNudges() {
+        let secret = pairingStore?.iCloudPairingSecret
+        let key = secret.map { "mobile.icloud.unaccepted.\(keyDigest($0))" }
+        if deliveryNudgeKey != key {
+            if let deliveryNudgeKey { userDefaults.removeObject(forKey: deliveryNudgeKey) }
+            deliveryNudgeTask?.cancel()
+            deliveryNudgeTask = nil
+            deliveryNudgeKey = key
+            deliveryNudges = key.flatMap { userDefaults.dictionary(forKey: $0) as? [String: String] } ?? [:]
+        }
+        guard deviceTransport is CloudKitDeviceTransport, let secret, let key else { return }
+        guard deliveryNudgeTask == nil, !deliveryNudges.isEmpty else { return }
+        let generation = setupGeneration
+        deliveryNudgeTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(8)) } catch { return }
+            guard let self, self.setupGeneration == generation,
+                  self.pairingStore?.iCloudPairingSecret == secret,
+                  let transport = self.deviceTransport as? CloudKitDeviceTransport else { return }
+            // The handle owns the sleeping deadline, never the delivery it wakes.
+            self.deliveryNudgeTask = nil
+            let chat = ChatStore.shared
+            await chat.restorationTask?.value
+            await PhonePlaces.shared.restorationTask?.value
+            guard self.setupGeneration == generation, self.deliveryNudgeKey == key,
+                  self.pairingStore?.iCloudPairingSecret == secret else { return }
+            self.deliveryNudges = self.deliveryNudges.filter { _, correlation in
+                if let exchange = chat.pendingExchanges[correlation], !exchange.isExpired { return true }
+                return PhonePlaces.shared.ownsDelivery(correlation)
+                    || iCloudSyncEngine.shared._sendInFlight || ActionResponseWaiters.shared.isWaiting(correlation)
+            }
+            self.persistDeliveryNudges()
+            guard !self.deliveryNudges.isEmpty else { return }
+            await self.dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
+            _ = await self.drainDeviceTransport()
+            for (record, correlation) in self.deliveryNudges {
+                guard self.setupGeneration == generation, self.deliveryNudgeKey == key,
+                      self.pairingStore?.iCloudPairingSecret == secret else { return }
+                guard self.deliveryNudges[record] == correlation else { continue }
+                do {
+                    try await transport.resignalMessage(named: record)
+                    guard self.setupGeneration == generation, self.deliveryNudges[record] == correlation,
+                          self.pairingStore?.iCloudPairingSecret == secret else { continue }
+                    self.kvs.set(UUID().uuidString, forKey: KVSKey.newMessageInDrive)
+                    await PairingStore.synchronizeKVSWithTimeout()
+                } catch {
+                    guard self.setupGeneration == generation, self.deliveryNudgeKey == key,
+                          self.pairingStore?.iCloudPairingSecret == secret else { return }
+                    self.syncStatus = "Waiting for Mac acceptance — delivery nudge failed: \(error.localizedDescription)"
+                }
+            }
+            self.resumeDeliveryNudges()
+        }
+    }
+
+    private func persistDeliveryNudges() {
+        guard let deliveryNudgeKey else { return }
+        userDefaults.set(deliveryNudges, forKey: deliveryNudgeKey)
+        if deliveryNudges.isEmpty {
+            deliveryNudgeTask?.cancel()
+            deliveryNudgeTask = nil
+        }
+    }
+
+    /// Called only after direction, target and HMAC verification.
+    private func acceptDelivery(_ message: BridgeMessage) async -> Bool {
+        guard let correlation = message.correlationID else { return true }
+        let generation = setupGeneration
+        let secret = pairingStore?.iCloudPairingSecret
+        guard await PhonePlaces.shared.acceptDelivery(correlation), setupGeneration == generation,
+              pairingStore?.iCloudPairingSecret == secret else { return false }
+        stopDeliveryNudges(for: correlation)
+        return true
+    }
+
+    func stopDeliveryNudges(for correlation: String) {
+        deliveryNudges = deliveryNudges.filter { $0.value != correlation }
+        persistDeliveryNudges()
+    }
+
+    func isAwaitingMacAcceptance(_ correlation: String) -> Bool {
+        deliveryNudges.values.contains(correlation)
+    }
     /// The bridge's deduplication receipt is durable state, but tests may
     /// provide an isolated suite so a replay proof never observes or changes a
     /// developer's real phone receipt history.
@@ -501,13 +609,16 @@ final class iCloudBridge: ObservableObject {
             )
         }
 
+        resumeDeliveryNudges()
         deviceIncomingSetupTask = Task {
             await iCloudSyncEngine.shared.enableCloudKitSnapshotCache()
             guard setupGeneration == generation else { return }
-            await transport.observeIncoming { [weak self = self] msg in
+            _ = await transport.observeIncoming { [weak self = self] msg in
                 guard await self?.setupGeneration == generation else { return false }
                 return await self?.handleIncomingFromTransport(msg) ?? false
             }
+            guard setupGeneration == generation else { return }
+            _ = await transport.drainIncoming()
         }
         Task {
             await deviceIncomingSetupTask?.value
@@ -577,6 +688,7 @@ final class iCloudBridge: ObservableObject {
     @objc private nonisolated func cloudKitAppDidBecomeActive(_ note: Notification) {
         Task { @MainActor in
             guard let transport = self.deviceTransport else { return }
+            self.resumeDeliveryNudges()
             let ready = await transport.ensurePushSubscriptions()
             await self.publishVisualNotificationCapability(
                 ready: ready && transport.presentsVisualNotifications,
@@ -701,14 +813,24 @@ final class iCloudBridge: ObservableObject {
         // attachment envelopes use the transport's encrypted CKAsset path when
         // they exceed the inline record budget. The same signature is verified.
         if let ck = deviceTransport {
+            resumeDeliveryNudges()
+            let recordName = msg.metadata?[NAChatMessageCodec.recordIDMetadataKey] ?? msg.id
+            deliveryNudges[recordName] = msg.metadata?["actionId"] ?? msg.id
+            persistDeliveryNudges()
             do {
                 try await ck.send(msg)
             } catch {
+                if !(error is DeviceSyncSendOutcomeUnknown) {
+                    deliveryNudges.removeValue(forKey: recordName)
+                    persistDeliveryNudges()
+                }
+                resumeDeliveryNudges()
                 if case .account(let failure) = error as? DeviceSyncError {
                     recordAccountFailure(failure)
                 }
                 throw error
             }
+            resumeDeliveryNudges()
             lastSyncAt = Date()
             syncStatus = "Sending via CloudKit"
             onTransportSucceeded?()
@@ -770,8 +892,10 @@ final class iCloudBridge: ObservableObject {
         messageHandlers[id] = onMessage
         // KVS progress channel stays on KVS for now (progress-over-CK is a
         // follow-up); only the message data-plane cuts over in CK-3b.
-        dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
-        dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)
+        Task {
+            await dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
+            await dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)
+        }
         // CK-3b: with CloudKit active, the forwarder is already registered (at
         // transport birth); re-drain to pull anything that arrived before this
         // handler existed. Legacy Drive scan runs otherwise.
@@ -1038,6 +1162,8 @@ final class iCloudBridge: ObservableObject {
         // remain owed even after a long offline interval. Stable signed result
         // timestamps preserve identical-payload retries; seen IDs prevent replay.
         let isRequestedResult = kind == "notification" && msg.metadata?["userInfo.source"] == "requested_result"
+        // A signed acknowledgement settles what this phone still owes, however late it lands.
+        guard await acceptDelivery(msg), generation == setupGeneration else { return false }
         if kind != "icloud_action_response",
            !isRequestedResult,
            abs(Date().timeIntervalSince(msg.timestamp)) > 24 * 60 * 60 {
@@ -1220,10 +1346,10 @@ final class iCloudBridge: ObservableObject {
             let noticeChanged = changedKeys == nil || changedKeys?.contains(KVSKey.chatNoticeLatest) == true
             let driveChanged = changedKeys == nil || changedKeys?.contains(KVSKey.newMessageInDrive) == true
             if progressChanged {
-                self.dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
+                await self.dispatchLatestKVSChatProgress(key: KVSKey.chatProgressLatest)
             }
             if noticeChanged {
-                self.dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)
+                await self.dispatchLatestKVSChatProgress(key: KVSKey.chatNoticeLatest)
             }
             // CK-5: drain ONLY on the once-per-message nudge (newMessageInDrive),
             // NEVER on progressChanged. The stream fires chatProgressLatest on every
@@ -1241,9 +1367,9 @@ final class iCloudBridge: ObservableObject {
         }
     }
 
-    private func dispatchLatestKVSChatProgress(key: String) {
-        guard !messageHandlers.isEmpty else { return }
+    private func dispatchLatestKVSChatProgress(key: String) async {
         guard let secret = pairingStore?.iCloudPairingSecret else { return }
+        let generation = setupGeneration
         guard let data = kvs.data(forKey: key) else { return }
 
         let decoder = JSONDecoder()
@@ -1251,7 +1377,6 @@ final class iCloudBridge: ObservableObject {
         guard let msg = try? decoder.decode(BridgeMessage.self, from: data) else {
             return
         }
-        guard !seenKVSProgressMessageIDs.contains(msg.id) else { return }
         guard msg.sender == "mac" else { return }
         guard msg.verifySignature(secret: secret) else {
             syncStatus = "Mac progress rejected — pairing out of sync"
@@ -1270,6 +1395,10 @@ final class iCloudBridge: ObservableObject {
             return
         }
 
+        guard await acceptDelivery(msg), generation == setupGeneration,
+              pairingStore?.iCloudPairingSecret == secret else { return }
+        guard !seenKVSProgressMessageIDs.contains(msg.id) else { return }
+        guard !messageHandlers.isEmpty else { return }
         recordSeenKVSProgressMessageID(msg.id)
         PhoneTurnActivity.shared.receive(msg)
         lastSyncAt = Date()
@@ -1308,6 +1437,10 @@ final class iCloudBridge: ObservableObject {
         }
         deferredThisRun = []
         deviceTransport = nil  // CK-3b: drop the transport; setup() re-resolves it
+        deliveryNudgeTask?.cancel()
+        deliveryNudgeTask = nil
+        deliveryNudgeKey = nil
+        deliveryNudges = [:]
         deviceDrainInFlight = false  // CK-3c
         deviceDrainQueued = false
         driveURL = nil

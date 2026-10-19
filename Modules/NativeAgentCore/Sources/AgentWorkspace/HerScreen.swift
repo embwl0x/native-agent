@@ -1,3 +1,4 @@
+import Experiences
 import AuthoredCapabilities
 import AppKit
 import CoreGraphics
@@ -18,9 +19,8 @@ import NativeAgentShared
 /// Her home screen (2026-09-23, her-screen plan Phase 1): the agent's own
 /// world as one laid-out text page, the way a desktop is a picture for a
 /// person. Sections in the layout's order (ui/layout.json), one line per
-/// thing, a state on every line. Everything is read from the owners' own
-/// files on demand: no watcher, no network, no transcript, never the chat
-/// she is in.
+/// thing, a state on every line. Owner events keep the retained picture
+/// current; drawing it never acquires another domain.
 package enum HerScreen {
     enum Target { case action(AgentWorkspaceAction), page(String) }
 
@@ -36,12 +36,6 @@ package enum HerScreen {
         var next: [String: Int] = [:]
 
         mutating func slug(id: String, name: String) -> String {
-            // A built-in lane's name is its id, always; a peer holding it moves.
-            if HerScreen.builtIns.contains(id) {
-                slugs = slugs.filter { $0.value.id != id && $0.key != id }
-                slugs[id] = .init(id: id, name: name)
-                return id
-            }
             if let (key, entry) = slugs.first(where: { $0.value.id == id }) {
                 if entry.name != name { slugs[key]?.name = name }
                 return key
@@ -51,7 +45,7 @@ package enum HerScreen {
             base = base.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
             if base.isEmpty { base = "agent" }
             var candidate = base, suffix = 2
-            while slugs[candidate] != nil || HerScreen.reserved.contains(candidate) || HerScreen.builtIns.contains(candidate) {
+            while slugs[candidate] != nil || HerScreen.reserved.contains(candidate) {
                 candidate = base + "-\(suffix)"; suffix += 1
             }
             slugs[candidate] = .init(id: id, name: name)
@@ -118,7 +112,7 @@ package enum HerScreen {
         "home": .home, "people": .people(page: 0), "conversations": .conversations(page: 0),
         "windows": .openPlaces, "arrivals": .arrivals, "work": .workOverview
     ]
-    static let builtIns: Set<String> = ["claude", "codex", "omp"]
+    static let builtIns: Set<String> = []
     static let reserved: Set<String> =
         Set(placeNames.keys).union(views.keys).union(AgentWorkspaceEnvironment.destinations.map(\.id)).union(["crew", "crews", "delegations", "elsewhere"])
 
@@ -249,7 +243,7 @@ package enum HerScreen {
     /// Home reads the shared world, shows what changed since she last looked
     /// (CHANGED, newest first), and her looking advances that. `markSeen:
     /// false` is User's Agent view reading the same page without looking.
-    static func home(dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation], windows: [String] = [], notable: String? = nil,
+    static func home(dataRoot: URL, scope: String, browserPages: [AgentWorkspaceLocation], windows: [String] = [],
                      now: Date = Date(), markSeen: Bool = true) async -> String {
         let (agent, person) = names(dataRoot)
         let world = await readWorld(dataRoot, now: now)
@@ -288,9 +282,9 @@ package enum HerScreen {
         if baseline { marks.merge(shown) { a, _ in a } }
         let changed = changes(since: seen, now: marks, excluding: scope)
         if !baseline { marks.merge(shown) { a, _ in a } }
-        if markSeen { Self.markSeen(dataRoot, marks: marks, now: now) }
+        if markSeen, world.pending.isEmpty { Self.markSeen(dataRoot, marks: marks, now: now) }
 
-        var header = [agent.uppercased(), "Snapshot as of " + now.formatted(.iso8601)]
+        var header = [agent.uppercased(), "Snapshot as of " + now.formatted(.iso8601), freshness(world, now: now)]
         if let idle { header.append(idle < 300 ? person + " here" : person + " away " + age(idle)) }
         let defaults = UserDefaults.standard
         if let mode = defaults.string(forKey: "nativeagent.viewMode") { header.append(mode.capitalized + " view") }
@@ -300,7 +294,8 @@ package enum HerScreen {
         }
 
         let desk = deskRows(world, person: person, now: now)
-        let (people, peopleNeeds, peopleMore) = peopleRows(world, dataRoot: dataRoot, now: now, scope: scope)
+        let owed = await owedRows(dataRoot, person: person, now: now)
+        let (people, peopleNeeds, peopleMore, _) = peopleRows(world, dataRoot: dataRoot, now: now, scope: scope)
         let (helpers, helpersMore) = helperRows(world, dataRoot: dataRoot, person: person, now: now)
 
         // Her home's sections in the layout's order, as the window's view
@@ -310,17 +305,18 @@ package enum HerScreen {
         var rows: [String: [String]] = [:]
         for name in blocks {
             switch name {
-            case "notable": rows[name] = notable.map { section("NOTABLE TODAY", ["Supplied highlight; not a daily activity log.", $0]) } ?? []
+            case "notable": rows[name] = HerMailStatus.shared.notable(dataRoot: dataRoot, now: now).map { section("LAST MAIL READ", [$0]) } ?? []
             case "changed":
                 rows[name] = section("CHANGED", ["Tracked home records since last look; not all activity."] + changed.prefix(5).map { "● " + clip($0, 70) } + (changed.count > 5 ? ["+\(changed.count - 5) more"] : []))
             case "waits":
                 rows[name] = section(person.uppercased() + " WAITS", ["Desk, approvals and inbox asks; calendar, reminders and mail not read here."] + desk.needs
-                    + (desk.more > 0 ? ["+\(desk.more) more waiting on \(person) · item \"desk\""] : []) + ownerRows(world, now: now))
+                    + (desk.more > 0 ? ["+\(desk.more) more waiting on \(person) · item \"desk\""] : []) + ownerRows(world, now: now) + owed.his)
             case "queue":
-                rows[name] = section("MY QUEUE", ["Queued Desk steps, reviews and handoffs; not all autonomous activity."] + queueRows(world, dataRoot: dataRoot, person: person, now: now)
+                rows[name] = section("MY QUEUE", ["Queued Desk steps, reviews and handoffs; not all autonomous activity."] + (await queueRows(world, dataRoot: dataRoot, person: person, now: now))
                     + (world.moments > 0 ? [pad("moments", 10) + "\(world.moments) waiting for my review · app memory.moments"] : [])
                     + (world.reviews.count > 0 ? [pad("memories", 10) + "\(world.reviews.count)\(world.reviews.capped ? "+" : "") to review"] : [])
                     + harnessRow(world)
+                    + owed.hers
                     + peopleNeeds)
             case "working": rows[name] = section("WORKING", ["Crew run records; not all background work."] + crewRows(world, dataRoot: dataRoot, now: now))
             case "open":
@@ -329,8 +325,8 @@ package enum HerScreen {
                     + (windows.count > 3 ? " +\(windows.count - 3)" : "") + " · item \"windows\""]))
             case "people": rows[name] = section("PEOPLE", ["Contacts, recorded exchanges and helper health; no full Doctor check."] + columns(people) + (peopleMore > 0 ? ["+\(peopleMore) more · item \"people\""] : []) + world.found)
             case "helpers": rows[name] = section("HELPERS", ["Definitions, latest shelf results and run queue; not full run history."] + columns(helpers) + (helpersMore > 0 ? ["+\(helpersMore) more · item \"helpers\""] : []))
-            case "senses": rows[name] = section("MY SENSES", ["Registered abilities and recent changes; no sensory observation."] + (await sensesRows(dataRoot: dataRoot, now: now)))
-            case "elsewhere": rows[name] = section("ELSEWHERE", ["Latest speakers across recent transcripts; not a complete activity log."] + elsewhereRows(dataRoot: dataRoot, scope: scope, person: person, now: now))
+            case "senses": rows[name] = section("MY SENSES", ["Registered abilities and recent changes; no sensory observation."] + world.senses)
+            case "elsewhere": rows[name] = section("ELSEWHERE", ["Latest speakers across recent transcripts; not a complete activity log."] + elsewhereRows(world, dataRoot: dataRoot, scope: scope, person: person, now: now))
             case "places":
                 // Places always show: pulse where an owner has a cheap number, the bare
                 // name otherwise (mail has no cached status; calendar and reminders
@@ -350,7 +346,7 @@ package enum HerScreen {
                     }
                     browser += " \(browserPages.count) tab\(browserPages.count == 1 ? "" : "s"): " + tabs.joined(separator: ", ")
                 }
-                let pulses = ["mail": mailPulse(now: now), "calendar": lifePulse("calendar", now: now), "desk": desk.pulse,
+                let pulses = ["mail": mailPulse(dataRoot: dataRoot, now: now), "calendar": lifePulse("calendar", now: now), "desk": desk.pulse,
                               "browser": browser, "reminders": lifePulse("reminders", now: now)]
                 // Gmail shows once it is connected (User's Gmail is read through Apple Mail).
                 let places = layout.shown("places", profile: profile).map { AppDoorNames.resolve($0.name) }.filter { $0 != "gmail" || AgentWorkspaceReadiness.ready(tool: "gmail_search") }
@@ -395,7 +391,7 @@ package enum HerScreen {
             lines += block
         }
         lines.append(rule)
-        lines.append("Open any name: app {item:\"desk.4\"} / \"claude\" / \"mail\"; text or fields go in args. Also: windows, people, conversations, arrivals, work, mac. Find here: app {page:\"home\", find:\"…\"}.")
+        lines.append("Open any name: app {item:\"desk.4\"} / \"mail\"; text or fields go in args. Also: windows, people, conversations, arrivals, work, mac. Find here: app {page:\"home\", find:\"…\"}.")
         return lines.joined(separator: "\n")
     }
 
@@ -460,10 +456,8 @@ package enum HerScreen {
     /// item or its parts; an execution still live for it keeps it active).
     struct DeskSplit { var waiting: [DeskItem] = []; var active: [DeskItem] = []; var parked: [DeskItem] = []; var quietDays: Int? }
 
-    static func deskSplit(_ state: DeskState, dataRoot: URL, now: Date) async -> DeskSplit {
+    static func deskSplit(_ state: DeskState, live: Set<String>, now: Date) -> DeskSplit {
         let plan = DeskSequencing.compute(state, now: now)
-        let live = Set(await SwiftNativeWorkshopRunner(root: dataRoot).listAll()
-            .filter { DeskParking.executionIsLive(status: $0.status) }.compactMap(\.deskHandle))
         let open = state.topLevel.filter { !$0.status.isTerminal && $0.project != MyQueue.project }.sorted { $0.updatedAt > $1.updatedAt }
         var split = DeskSplit()
         for item in open {
@@ -475,6 +469,37 @@ package enum HerScreen {
         split.quietDays = split.parked.compactMap { DeskParking.lastTouch($0, in: state) }.max()
             .map { Int(now.timeIntervalSince($0) / 86_400) }
         return split
+    }
+
+    /// Repair owed (User 10-18: never "I can't fix it"): each no that named its
+    /// owner stays here, with its lever, until that operation works again or
+    /// she lets it go. Hers in MY QUEUE; the person's, with his exact control, in his waits.
+    static func owedRows(_ dataRoot: URL, person: String, now: Date) async -> (hers: [String], his: [String]) {
+        let open: [Experience]
+        do { open = try await ExperienceStore.at(dataRoot).projection() }
+        catch { return (["Repairs owed are unavailable: \(error.localizedDescription) · experiences/experiences.sqlite"], []) }
+        var hers: [String] = [], his: [String] = []
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        for act in open.sorted(by: { $0.at > $1.at }) {
+            guard let owed = act.owes["repair"], !owed.phase.isSettled else { continue }
+            func claim(_ name: String) -> String? {
+                act.claims.first { $0.claim.hasPrefix(name + ": ") }.map { String($0.claim.dropFirst(name.count + 2)) }
+            }
+            let when = (iso.date(from: act.at) ?? ISO8601DateFormatter().date(from: act.at)).map { " " + age(now.timeIntervalSince($0)) } ?? ""
+            let what = clip(claim("operation") ?? "a call", 30) + " refused" + when + " by " + clip(claim("owner") ?? "?", 60)
+            let release = " · or let go: app {action:\"repair.let_go\", args:{id:\"\(act.id)\", reason}}"
+            if owed.to == "person" {
+                his.append(pad("repair", 10) + what + " · ask \(person): " + (claim("tap") ?? "?")
+                    + (claim("next_call").map { " · " + $0 } ?? "") + release)
+            } else {
+                hers.append(pad("repair", 10) + what + " · " + clip(act.face?.words ?? "", 120) + " · " + (claim("next_call") ?? "read the act")
+                    + release)
+            }
+        }
+        let cap = 4
+        return (Array(hers.prefix(cap)) + (hers.count > cap ? ["+\(hers.count - cap) more repairs owed"] : []),
+                Array(his.prefix(cap)) + (his.count > cap ? ["+\(his.count - cap) more for \(person)"] : []))
     }
 
     /// Approvals and inbox cards asking him: his to decide (the Desk's Needs
@@ -528,10 +553,11 @@ package enum HerScreen {
     }
 
     /// Saved contacts and usable built-in lanes, as on the Agents page.
-    static func contacts(dataRoot: URL, identity: AgentContactIdentity, mergeIdentities: Bool = true) -> [Contact] {
+    static func contacts(identity: AgentContactIdentity, usable: Set<String>, mergeIdentities: Bool = true) -> [Contact] {
         var contacts: [Contact] = []
         for peer in identity.peers {
             guard let id = peer["id"], let name = peer["name"] else { continue }
+            if let who = peer["who"], identity.peers.contains(where: { $0["id"] == who }) { continue }
             // Two routes can share a name: the Grok Mac app and the Grok routine.
             let kind: String? = switch peer["transport"] {
             case "desktop", "desktopChat": "desktop app"
@@ -540,16 +566,12 @@ package enum HerScreen {
             }
             contacts.append(.init(id: "peer:" + id, name: name, builtIn: false, kind: kind))
         }
-        let usable = AgentWorkspacePorts.current.tools.usableAgentLanes(dataRoot: dataRoot)
-        for (id, name) in [("claude", "Claude"), ("codex", "Codex"), ("omp", "Omp")] where usable.contains(id) {
-            contacts.append(.init(id: id, name: name, builtIn: true, kind: nil))
-        }
         guard mergeIdentities else { return contacts }
         var seen: Set<String> = []
         return contacts.sorted { $0.builtIn && !$1.builtIn }.compactMap { contact in
             let brain = identity.canonical(contact.id)
             guard seen.insert(brain).inserted else { return nil }
-            return Contact(id: contact.id, name: brain == "claude" ? "Claude" : brain == "codex" ? "Codex" : contact.name,
+            return Contact(id: contact.id, name: contact.name,
                            builtIn: contact.builtIn, kind: contact.kind, agents: identity.members(contact.id))
         }
     }
@@ -566,13 +588,9 @@ package enum HerScreen {
     }
 
     /// A contact's own session, as the chat it talks to her in: when it
-    /// last spoke there, and whether hers is the newest line. The chat she
-    /// is in (`scope`) is in front of her, not news about them.
-    static func thread(_ contact: Contact, dataRoot: URL, identity: AgentContactIdentity, scope: String?) -> BridgeChat? {
+    /// last spoke there, and whether hers is the newest line.
+    static func thread(_ contact: Contact, dataRoot: URL, identity: AgentContactIdentity) -> BridgeChat? {
         let owner = contact.builtIn ? contact.id : String(contact.id.dropFirst(5))
-        guard !identity.owners(owner).contains(where: {
-            scope?.hasPrefix(ContactThread.prefix(owner: $0)) == true
-        }) else { return nil }
         guard let tail = try? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536, identity: identity) else { return nil }
         guard let last = tail.last else { return nil }
         return BridgeChat(id: ContactThread.session(owner: owner), who: contact.id, title: "", at: last.at,
@@ -595,7 +613,7 @@ package enum HerScreen {
             let message: String? = if case .string(let id)? = record.readInput?["message_id"] { id } else { nil }
             if ["sending", "waiting"].contains(record.phase) {
                 if let message, let at = answered[message] { text = "✓ replied " + age(now.timeIntervalSince(at)) }
-                else if record.phase == "waiting", AgentWorkspacePorts.current.conversations.liveHandOff(record) { text = "✓ delivered " + ago }
+                else if record.phase == "waiting", AgentWorkspacePorts.current.conversations.liveHandOff(record) { text = "… awaiting acceptance " + ago }
                 else { text = "… waiting " + age(now.timeIntervalSince(record.operationStartedAt ?? record.updatedAt)) }
             } else if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) {
                 text = "? asks for input " + ago; asks = true
@@ -620,34 +638,38 @@ package enum HerScreen {
         return (text, asks)
     }
 
-    static func peopleRows(_ world: HerWorld, dataRoot: URL, now: Date, scope: String? = nil, limit: Int = 8) -> (cells: [(name: String, state: String)], needs: [String], more: Int) {
+    static func peopleRows(_ world: HerWorld, dataRoot: URL, now: Date, scope: String? = nil, limit: Int = 8) -> (cells: [(name: String, state: String)], needs: [String], more: Int, health: Set<String>) {
         let (records, contacts, answered) = (world.records, world.contacts, world.answered)
-        let jobs = DelegationStatusProjector(configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
-            .allJobsWithAvailability(now: now).jobs
-        let rows = contacts.map { contact -> (Contact, (text: String, asks: Bool), Date) in
+        let rows = contacts.map { contact -> (Contact, (text: String, asks: Bool), Date, String?) in
             let record = latest(contact, records: records)
-            let chat = thread(contact, dataRoot: dataRoot, identity: world.identity, scope: scope)
-            let health = world.health[record?.agent ?? contact.id] ?? world.health[contact.id]
+            let owner = contact.builtIn ? contact.id : String(contact.id.dropFirst(5))
+            let inFront = world.identity.owners(owner).contains { scope?.hasPrefix(ContactThread.prefix(owner: $0)) == true }
+            let chat = inFront ? nil : world.threads[contact.id]
+            let healthID = world.healthID(for: contact, record: record), health = world.health[healthID]
             let exchangeAt = record?.exchanges?.last?.settledAt ?? record?.operationStartedAt ?? record?.updatedAt ?? .distantPast
             if health?.problem == nil,
-               let job = jobs.first(where: { $0.agent == contact.id || contact.agents.contains($0.agent) }),
+               let job = world.jobs.first(where: { $0.agent == contact.id || contact.agents.contains($0.agent) }),
                let at = (job.completedAt ?? job.startedAt ?? job.createdAt).flatMap(date),
                at > max(exchangeAt, chat?.at ?? .distantPast) {
-                return (contact, (jobState(job, now: now), false), at)
+                return (contact, (jobState(job, now: now), false), at, nil)
             }
             return (contact, state(contact, record: record, chat: chat, answered: answered, now: now,
                                    health: health),
-                    max(record?.updatedAt ?? .distantPast, chat?.at ?? .distantPast))
+                    max(record?.updatedAt ?? .distantPast, chat?.at ?? .distantPast), healthID)
         }.sorted { $0.2 > $1.2 }
         var cells: [(name: String, state: String)] = [], needs: [String] = []
+        var health: Set<String> = []
         withNames(dataRoot) { book in
-            for (contact, state, _) in rows {
+            for (contact, state, _, healthID) in rows {
                 let slug = book.slug(id: contact.id, name: contact.name)
                 if state.asks { needs.append(pad(slug, 10) + "asks for input") }
-                if cells.count < limit { cells.append((slug, state.text)) }
+                if cells.count < limit {
+                    cells.append((slug, state.text))
+                    if let healthID { health.insert(healthID) }
+                }
             }
         }
-        return (cells, needs, max(0, rows.count - limit))
+        return (cells, needs, max(0, rows.count - limit), health)
     }
 
     /// Grok Bot's answers arrive as their own chat turn; its request file
@@ -758,7 +780,7 @@ package enum HerScreen {
 
     // MARK: - Small readers
 
-    private static func sensesRows(dataRoot: URL, now: Date, full: Bool = false) async -> [String] {
+    static func sensesRows(dataRoot: URL, now: Date, full: Bool = false) async -> [String] {
         let abilities = await AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: now)
         guard let registry = SensesHub.shared.registry else { return [abilities, "have: senses not connected yet"] }
         async let records = registry.all()

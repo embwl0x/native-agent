@@ -18,6 +18,7 @@
 
 import Foundation
 import SwiftUI
+import NativeAgentShared
 
 @MainActor
 public struct iOSSystemToast: Identifiable, Sendable, Equatable {
@@ -261,7 +262,7 @@ struct MacStatusChip: View {
         } label: {
             Group {
                 if speaksAsAgent {
-                    Text(AliveConnection.line(for: status, paired: pairingStore.isPaired))
+                    Text(AliveConnection.line(bridgeClient.connection))
                         .font(.subheadline)
                         .foregroundStyle(AlivePalette.secondary)
                         .lineLimit(1)
@@ -279,9 +280,9 @@ struct MacStatusChip: View {
             .frame(minWidth: 44, minHeight: 44)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Mac connection: \(AliveConnection.line(for: status, paired: pairingStore.isPaired))")
+        .accessibilityLabel("Mac connection: \(AliveConnection.line(bridgeClient.connection))")
         .popover(isPresented: $showDetail) {
-            MacStatusDetail(status: status, paired: pairingStore.isPaired,
+            MacStatusDetail(status: status, connection: bridgeClient.connection,
                             lastSeenAt: bridgeClient.lastSeenAt, lastSyncAt: sync.lastSyncAt)
                 .presentationCompactAdaptation(.popover)
         }
@@ -308,32 +309,11 @@ enum MacStatusChipPresentation {
         case .connecting: return "Connecting"
         }
     }
-
-    static func explanation(for status: BridgeStatus) -> String {
-        switch status {
-        case .iCloudAccountAttention:
-            return "iCloud sign-in needs attention on this iPhone (Settings → Apple Account); messages can't be sent or received until it's fixed"
-        case .online:
-            return "The Mac checked in recently through iCloud. If it goes offline, new messages may wait until it returns."
-        case .awaitingMacActivity:
-            return "iCloud is available, but this phone has not received any activity from the Mac yet. Messages may wait until the Mac checks in."
-        case .offline:
-            return "This iPhone cannot reach iCloud right now, so nothing can be sent or received."
-        case .macUnreachable:
-            return "The paired Mac connection has not recovered. The Mac is unavailable, or iCloud may be unavailable. Messages may wait until the connection returns."
-        case .deviceOffline:
-            return "This iPhone has no network connection. That is a local outage, not a Mac problem — messages are queued and send themselves when it returns."
-        case .stale:
-            return "The Mac has gone quiet. What you see may be out of date, and a new message may sit waiting."
-        case .connecting:
-            return "Still establishing the iCloud link. Give it a moment."
-        }
-    }
 }
 
 private struct MacStatusDetail: View {
     let status: BridgeStatus
-    let paired: Bool
+    let connection: NAPhoneConnection
     let lastSeenAt: Date?
     let lastSyncAt: Date?
 
@@ -341,15 +321,14 @@ private struct MacStatusDetail: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
                 Circle().fill(status.color).frame(width: 9, height: 9)
-                Text(AliveConnection.line(for: status, paired: paired))
+                Text(AliveConnection.line(connection))
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            Text(paired ? MacStatusChipPresentation.explanation(for: status)
-                 : "Pair this iPhone with your Mac and I can reach you here.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            // The three facts, never one: what holds, what waits on whom.
+            ForEach(connection.facts, id: \.label) { item in
+                AliveConnectionFactLine(label: item.label, fact: item.fact)
+            }
             if let lastSeenAt {
                 LabeledContent("Mac last seen") {
                     Text(lastSeenAt, style: .relative).foregroundStyle(.secondary)

@@ -1,5 +1,6 @@
 import Privacy
 import ChatOrchestration
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -370,10 +371,15 @@ public struct CodexCompletionLifecycle: Sendable {
 
     public func reconciliationRows() async throws -> [(id: String, digest: String, status: String, response: ChatResponse?, route: AgentBridgeCompletionRoute?, routeSettled: Bool, principal: String?)] {
         var rows: [(String, String, String, ChatResponse?, AgentBridgeCompletionRoute?, Bool, String?)] = []
+        let open = Set(((try? await ExperienceStore.at(dataRoot).open()) ?? []).map(\.id))
         for path in try stateURLs() where !Self.isCorruptTombstone(path) {
             guard let state = try await loadState(path) else { continue }
             let decision = CodexCompletionLifecycleProjection(state)
             guard let status = decision.status else { continue }
+            // One still owed from before its delivery was an experience becomes one
+            // here, and an open one whose settlement was written but not projected settles.
+            let terminal = ["delivered", "let_go"].contains(status)
+            if !terminal || open.contains(state.deliveryId) { Self.project(state, dataRoot: dataRoot, born: !terminal) }
             rows.append((state.deliveryId, state.requestDigest, status, state.response, state.route, decision.routeSettled, state.principal))
         }
         return rows
@@ -821,6 +827,25 @@ public struct CodexCompletionLifecycle: Sendable {
         }
         let value = try JSONValue.parse(JSONEncoder().encode(state))
         try await persistence.writeJSON(value, to: url)
+        Self.project(state, dataRoot: dataRoot)
+    }
+
+    /// The reply a completion owes its asker is one experience under its
+    /// delivery id, moved here at every write of its state: owed once there is
+    /// an answer, accepted when delivered, let go when its owner lets it go.
+    private static func project(_ state: State, dataRoot: URL, born: Bool = true) {
+        let status = CodexCompletionLifecycleProjection(state).status
+        guard let status, state.response != nil || ["failed_before_answer", "let_go", "delivered"].contains(status) else { return }
+        let phase: Owed.Phase = switch status {
+        case "delivered": .accepted
+        case "let_go": .letGo(.abandoned)
+        default: .owed
+        }
+        let who = state.principal.map { "agent:" + $0 }
+            ?? state.route.map { "route:" + $0.surface } ?? "route:unknown"
+        var evidence = [Experience.Ref(source: "codex-completion-lifecycle", id: state.deliveryId)]
+        if let run = state.response?.runId ?? state.responseRunId { evidence.append(.init(source: "run", id: run)) }
+        Owed.record(dataRoot, id: state.deliveryId, kind: .message, key: "deliver", to: who, phase: phase, evidence: evidence, born: born)
     }
 
     private static func requireDigest(_ state: State, _ digest: String) throws {

@@ -8,12 +8,9 @@ import TurnTrace
 enum TurnObservation {
     enum Kind {
         case lengthLimit(chars: Int)
-        case cut(seconds: Int, keptChars: Int)
         case boundary(LLMToolBoundaryReason)
         case malformedCall(why: String)
-        case emptyReply
         case announcedNoCall
-        case refused(reason: String)
         case contextFull
         case restarted(stepsDone: Int, unknownStep: Int?)
         /// Her turn part failed and the stem swapped it back; never model-visible.
@@ -27,12 +24,14 @@ enum TurnObservation {
         switch kind {
         case .lengthLimit(let chars):
             happened = "Your reply reached the provider's length limit after \(chars) characters; no calls from that reply ran."
-        case .cut(let seconds, let chars):
-            happened = "The stream was cut after \(seconds) seconds with \(chars) characters kept; no calls from that reply ran."
         case .boundary(let reason):
             switch reason {
             case .outputLimit:
-                happened = "Your reply reached the provider's length limit; no calls from that reply ran."
+                happened = "Your reply reached the provider's length limit; complete calls were kept and the unfinished suffix was discarded."
+            case .incompleteCall:
+                happened = "Your reply ended inside a tool call; complete calls were kept and the unfinished suffix was discarded."
+            case .interrupted:
+                happened = "The provider stream was interrupted; complete calls were kept and the unfinished suffix was discarded."
             case .repeatedBlock:
                 happened = "Your reply repeated a tool call and was cut before the repetition."
             case .repeatedAction:
@@ -46,12 +45,8 @@ enum TurnObservation {
             }
         case .malformedCall(let why):
             happened = "The tool call was malformed: \(line(why)); no calls from that reply ran."
-        case .emptyReply:
-            happened = "Nothing came back; answer or act."
         case .announcedNoCall:
             happened = "Your reply announced work without a tool call or an answer; answer or act."
-        case .refused(let reason):
-            happened = "The provider refused: \(line(reason)); give your answer from what you have."
         case .contextFull:
             happened = "The working context was full and has been trimmed; finish your answer from what you have."
         case .restarted(let steps, let unknown):

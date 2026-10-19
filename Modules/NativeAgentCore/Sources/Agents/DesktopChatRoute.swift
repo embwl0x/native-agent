@@ -123,7 +123,6 @@ import PersistenceCore
             catch { return failed("\(appName)'s window matched its recipe's alternates, but the recipe could not take them: \(error). Nothing was proven.") }
         }
         let now = written ?? recipe
-        AgentPeerStore(dataRoot: dataRoot).recordRoundTrip(peerID: peerID, workspace: "dry run", recipe: now)
         var result: [String: JSONValue] = ["status": .string(written == nil ? "passed" : "repaired"), "dry_run": .bool(true), "sent": .bool(false),
             "agent": .string("peer:" + peerID), "transport": .string("desktopChat"), "recipe_version": .int(Int64(now.recipeVersion)),
             "checked": .array(Self.selectors.keys.sorted().map(JSONValue.string)),
@@ -196,10 +195,6 @@ import PersistenceCore
 
     private func perform(_ text: String, peerID: String, plan: [String: JSONValue], dataRoot: URL) async -> JSONValue {
         let name = AgentBridgeRuntime.configuredNames(dataRoot: dataRoot).agent
-        guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else {
-            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                            "detail": .string(Blocker.offline.detail(name, app: appName))])
-        }
         guard !Self.busy else {
             return .object(["status": .string("busy"), "sent": .bool(false), "completed": .bool(false),
                             "detail": .string("\(appName) is still answering the previous message. Nothing was sent.")])
@@ -616,16 +611,17 @@ import PersistenceCore
     /// A minimized chat takes no clicks, and a closed one has nothing to click:
     /// un-minimize it, or reopen the app to bring its window back.
     func showWindow() async throws {
+        let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty ? [] : try windows()
         var restored = false
-        for window in try windows() where AX.attribute(window, kAXMinimizedAttribute) as? Bool == true {
+        for window in existing where AX.attribute(window, kAXMinimizedAttribute) as? Bool == true {
             restored = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse) == .success || restored
         }
         if restored { try await Task.sleep(for: .milliseconds(600)) }
-        guard try !windows().contains(where: hasLog) else { return }
+        guard !existing.contains(where: hasLog) else { return }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { throw Blocker.offline }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
-        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+        _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
         do { try await until(seconds: 8) { try windows().contains(where: hasLog) } }
         catch { throw (try? windows())?.isEmpty == false ? Mismatch(key: "log", wanted: ui.log) : Blocker.window as any Error }
     }

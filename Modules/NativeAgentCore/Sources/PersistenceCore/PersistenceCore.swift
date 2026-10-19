@@ -75,8 +75,12 @@ extension CapabilityLifecycle {
         if ownerOff, !ownerAuthorized {
             if enabling {
                 let name = current?["name"]?.stringValue ?? current?["id"]?.stringValue ?? "this ability"
-                throw NSError(domain: "CapabilityLifecycle", code: 403, userInfo: [NSLocalizedDescriptionKey:
-                    "The owner turned \(name) off; they turn it back on. Ask them."])
+                let id = current?["id"]?.stringValue ?? name
+                let tap = current?["inputSchema"] != nil ? "Tools > \(name) > Approve"
+                    : current?["corner"] != nil ? "Senses > \(name) > switch (senses.switch.\(id))"
+                    : "Skills > \(name) > Review > Install"
+                throw ToolFailureError("\(name)'s retained record has disabledBy=owner. Only the person can turn it back on at \(tap).",
+                    effects: .none, owner: "abilities/\(id) > record.disabledBy=owner", tap: tap, personDecides: true)
             }
             for field in [key, "phase", "enabledAt"] + retirementFields {
                 row[field] = current?[field]

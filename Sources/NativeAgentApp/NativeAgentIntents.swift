@@ -201,7 +201,7 @@ struct NativeAgentApprovalsIntent: AppIntent {
     func perform() async throws -> some IntentResult & ProvidesDialog {
         try await NativeAgentAppCoordinator.shared.prepare()
         let approvals = try await NativeAgentEngine.live.approvals.list()
-        let pending = approvals.filter { $0.status == "pending" }.count
+        let pending = WorkOverviewRead.waitingApprovals(approvals).count
         return .result(dialog: "\(pending) NativeAgent approval\(pending == 1 ? "" : "s") pending.")
     }
 }

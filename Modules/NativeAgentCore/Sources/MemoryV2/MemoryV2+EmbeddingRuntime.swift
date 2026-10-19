@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -387,7 +388,115 @@ private extension NSLock {
 }
 
 extension SwiftNativeMemoryV2 {
+    public func installActionIndex(paths: [URL], notifications: [Notification.Name],
+                                   source: @escaping @Sendable () async throws -> [String]) {
+        guard actionIndexSource == nil else { return }
+        actionIndexSource = source
+        actionIndexWatcher = FileChangeWatcher(paths: paths) { [weak self] _ in
+            Task { await self?.requestActionIndexUpdate() }
+        }
+        observeActionIndexChanges(notifications)
+        requestActionIndexUpdate()
+    }
+
+    private nonisolated func observeActionIndexChanges(_ notifications: [Notification.Name]) {
+        actionIndexObservers.withLock { tokens in
+            tokens = notifications.map { name in
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
+                    Task { await self?.requestActionIndexUpdate() }
+                }
+            }
+        }
+    }
+
+    /// Coalesce owner changes, including changes arriving while a batch embeds.
+    /// No request waits for an epoch rebuild and no timer drives this work.
+    public func requestActionIndexUpdate() {
+        guard actionIndexSource != nil else { return }
+        actionIndexDirty = true
+        guard actionIndexUpdate == nil else { return }
+        actionIndexUpdate = Task(priority: .utility) {
+            defer { actionIndexUpdate = nil }
+            while actionIndexDirty {
+                actionIndexDirty = false
+                do {
+                    try await warmUpEmbedder()
+                    guard let source = actionIndexSource, let epoch = embeddingEpoch() else { return }
+                    let texts = try await source()
+                    _ = try await fillActionIndex(texts, epoch: epoch, prune: true)
+                    actionIndexFailure = nil
+                } catch {
+                    actionIndexFailure = error.localizedDescription
+                    nativeLog("[action-index] update failed: %@", error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private static func actionTextHash(_ text: String) -> String {
+        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public func indexedActionVectors(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
+        try await ensureCanonicalAttachment()
+        guard let storage, let epoch = embeddingEpoch() else { throw MemoryV2Error.storageUnavailable }
+        var indexed = try await storage.underlyingStorage().actionEmbeddings(epoch: epoch)
+        if indexed.isEmpty {
+            // A find while the index is first being built waits for it, as one.
+            requestActionIndexUpdate()
+            await actionIndexUpdate?.value
+            indexed = try await storage.underlyingStorage().actionEmbeddings(epoch: epoch)
+        }
+        guard !indexed.isEmpty else {
+            if let actionIndexFailure {
+                throw MemoryV2Error.underlying("The MemoryV2 action index for epoch \(epoch.rawValue) could not be built: \(actionIndexFailure)")
+            }
+            throw MemoryV2Error.underlying("The MemoryV2 action index for epoch \(epoch.rawValue) is being built.")
+        }
+        let hashes = texts.map(Self.actionTextHash)
+        let vectors: [String: [Float]]
+        if hashes.allSatisfy({ indexed[$0] != nil }) { vectors = indexed }
+        else { vectors = try await fillActionIndex(texts, epoch: epoch, prune: false) }
+        return MemoryEmbeddingBatch(epoch: epoch, vectors: hashes.compactMap { vectors[$0] })
+    }
+
+    /// One writer for background updates and a just-added action's first find.
+    /// Only in-flight work lives in RAM; completed vectors are read from SQLite.
+    private func fillActionIndex(_ texts: [String], epoch: MemoryEmbeddingEpoch,
+                                 prune: Bool) async throws -> [String: [Float]] {
+        let byHash = Dictionary(texts.map { (Self.actionTextHash($0), $0) }, uniquingKeysWith: { first, _ in first })
+        let prior = actionIndexWrite
+        let writing = Task {
+            _ = await prior?.result
+            try await ensureCanonicalAttachment()
+            guard let storage else { throw MemoryV2Error.storageUnavailable }
+            let disk = await storage.underlyingStorage()
+            let dimensions = embedder?.dimensions
+            let indexed = try await disk.actionEmbeddings(epoch: epoch).filter { $0.value.count == dimensions }
+            let missing = byHash.keys.filter { indexed[$0] == nil }.sorted()
+            let batch = try await embedForDerivedContextWithEpoch(missing.map { byHash[$0]! })
+            guard batch.epoch == epoch, embeddingEpoch() == epoch else {
+                requestActionIndexUpdate()
+                throw MemoryV2Error.underlying("The MemoryV2 action index changed epoch while updating.")
+            }
+            guard batch.vectors.count == missing.count,
+                  batch.vectors.allSatisfy({ !$0.isEmpty && $0.count == dimensions && $0.allSatisfy(\.isFinite) && $0.contains(where: { $0 != 0 }) }) else {
+                throw MemoryV2Error.underlying("The MemoryV2 action index received unusable vectors from the memory-search model.")
+            }
+            let written = Dictionary(uniqueKeysWithValues: zip(missing, batch.vectors))
+            try await disk.writeActionEmbeddings(written, epoch: epoch, retaining: prune ? Set(byHash.keys) : nil)
+            return indexed.merging(written) { _, new in new }
+        }
+        actionIndexWrite = writing
+        // Only the tail in flight is held: a finished fill's vectors live in SQLite.
+        defer { if actionIndexWrite == writing { actionIndexWrite = nil } }
+        let vectors = try await writing.value
+        if !prune { requestActionIndexUpdate() }
+        return vectors
+    }
+
     public func warmUpEmbeddingsAtLaunch() async {
+        defer { requestActionIndexUpdate() }
         guard let snapshot = embeddingRuntimeSnapshot() else {
             nativeLog("[embedding-warmup] SKIP: embeddingRuntimeSnapshot() returned nil — memoryV2 actor not initialized yet?")
             OrganPulse.record("embedding_warmup", .skipped, note: "memory store not attached")

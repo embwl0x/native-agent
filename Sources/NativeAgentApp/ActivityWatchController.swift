@@ -8,7 +8,7 @@ enum ActivityCaptureIssueNotificationPresentation {
         guard issue.severity == .critical else { return nil }
         return (
             title: "Activity capture needs attention",
-            body: "A capture-stop or data-retention failure was recorded. Open Trust Center → Activity Capture to review it."
+            body: "A capture-stop or data-retention failure was recorded. Open Trust → Features → Activity Capture to review it."
         )
     }
 }
@@ -19,7 +19,8 @@ extension ActivityWatchController {
         errorCause: { UserFacingError.cause($0, action: $1) },
         criticalIssueNotifier: { issue in
             guard let notification = ActivityCaptureIssueNotificationPresentation.notification(for: issue) else { return }
-            NativeAgentNotifications.post(title: notification.title, body: notification.body)
+            NativeAgentNotifications.post(title: notification.title, body: notification.body,
+                userInfo: [NativeAgentNotificationRoute.pageKey: "trust/features"])
         }
     )
 }

@@ -67,7 +67,8 @@ extension AppToolExecutor {
     func doorSenseRead(corner: SenseCorner, item: String, input: [String: JSONValue]) async throws -> JSONValue? {
         guard try await SenseDoor.selectedRecord(for: corner) != nil else { return nil }
         guard let perform = AppDoorReentry.perform else {
-            return Self.failure("door_unavailable", "Read this corner from a chat turn.")
+            return Self.doorRefusal("door_unavailable", "Read this corner from a chat turn.",
+                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         var args: [String: JSONValue] = if case .object(let args)? = input["args"] { args } else { [:] }
         if item.hasPrefix("{"), case .object(let fields) = try JSONValue.parse(Data(item.utf8)) {
@@ -328,7 +329,7 @@ extension AppToolExecutor {
                 "result": result, "provenance": .string(provenance.line(now: Date()))])
         case .page(var page, let provenance):
             guard page.corner == record.corner, page.text.utf8.count <= NativePage.maximumTextBytes else {
-                return Self.senseAttributed(Self.failure("bad_output", "The sense returned an invalid page after its act."), record: record)
+                return Self.senseAttributed(Self.failure("bad_output", "The sense returned an invalid page after its act.", extra: ["effects": .string("unknown")]), record: record)
             }
             if !record.verbsEnabled || record.origin == .shared {
                 for index in page.things.indices { page.things[index].verbs = page.things[index].verbs.filter(record.verbs.contains) }
@@ -341,7 +342,7 @@ extension AppToolExecutor {
                 materialRef: view.materialRef, readInput: view.readInput, capturedMaterial: captured)
             return .string(SenseDoor.render(page, provenance: provenance))
         case .failed(let failure):
-            return Self.senseAttributed(Self.failure(failure.code, failure.message + " Check the corner before repeating the act."), record: record)
+            return Self.senseAttributed(Self.failure(failure.code, failure.message + " Check the corner before repeating the act.", extra: ["effects": .string("unknown")]), record: record)
         }
     }
 

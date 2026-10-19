@@ -36,6 +36,9 @@ public enum ToolRegistryActions {
         let rollback = rollbackVersion(tool.toJSON()).map(JSONValue.string) ?? .null
         return .object(["id": .string(tool.id), "name": .string(tool.name), "status": .string(tool.status),
             "description": .string(tool.description), "dropped": .bool(false),
+            "validation_evidence": row["validation_evidence"] ?? .null,
+            "candidate_validation_evidence": row["candidate_validation_evidence"] ?? .null,
+            "learned": row["learned"] ?? .null,
             "versions": .object(["current": row["codeFingerprint"] ?? .null, "candidate": row["candidateDigest"] ?? .null,
                 "last_clean": row["lastCleanVersion"] ?? .null,
                 "retained": .array(rollback == .null ? [] : [.object(["digest": rollback])]),

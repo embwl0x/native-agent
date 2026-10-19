@@ -8,6 +8,7 @@ public enum HerScreenPreview {
         AgentWorkspaceScreenPreview.tabs(layout, profile: profile)
     }
     public static let watchedPaths = AgentWorkspaceScreenPreview.watchedPaths
+    public static let didChange = AgentWorkspaceScreenPreview.didChange
 
     public static func glance(dataRoot: URL, scope: String) async -> String? {
         await AgentWorkspacePorts.$binding.withValue(ChatWorkspaceBinding.ports) {

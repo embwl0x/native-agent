@@ -1,9 +1,12 @@
 import SwarmRuns
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import ProviderRouting
+import CognitiveSubstrate
+import Transcripts
 
 // USER.md is owned by MemoryV2 and lives in the active persona root beside
 // SOUL/VOICE/GROWTH. REM reads the full persona for context, but approval
@@ -271,7 +274,7 @@ public actor REMConsolidator {
             // Marker-skip still runs the staging catch-up: legacy-imported or
             // previously-unstaged pending rows must not wait a week for an
             // approval card.
-            await stagePendingUnstagedRows(store)
+            try await stagePendingUnstagedRows(store, resolver: ChatSessionRecollections.ExperienceResolver(dataRoot: dataRoot))
             let report = REMReport(
                 proposalsGenerated: 0,
                 evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
@@ -297,6 +300,26 @@ public actor REMConsolidator {
         // (2) Read the inclusive local-day window once for eligibility and LLM input.
         let since = DreamDiaryReader.startOfLocalDay(now, daysBefore: 7)
         let entries = try await DreamDiaryReader(dataRoot: dataRoot).entriesSince(since)
+        let sourceRefs = Set(entries.flatMap { $0.content.map { DreamEntryProvenance.sources(in: $0) } ?? [] })
+        let resolver = ChatSessionRecollections.ExperienceResolver(dataRoot: dataRoot)
+        let resolved = try await resolver.resolve(for: Array(sourceRefs), includingSourceRows: true)
+        let identities = resolved.identities
+        var reflectionMaterial = try await DreamEntryProvenance.resolveSources(sourceRefs, dataRoot: dataRoot,
+            messages: resolved.messages)
+        for entry in entries {
+            if let content = entry.content {
+                let sources = DreamEntryProvenance.sources(in: content)
+                var cause = CognitiveReflectionCause(text: content,
+                    sources: sources, material: reflectionMaterial)
+                cause.sourcePeerIds = CognitiveReflectionCause.unionPeerIds([DreamEntryProvenance.peerIds(in: content)]
+                    + sources.map { reflectionMaterial[$0]?.sourcePeerIds })
+                reflectionMaterial["dream_diary/\(entry.filename ?? "\(entry.date).md")"] = cause
+            }
+        }
+        // Every diary read by REM contributes to its conclusions' trust, cited or not.
+        let sourcePeers = CognitiveReflectionCause.unionPeerIds(entries.map {
+            reflectionMaterial["dream_diary/\($0.filename ?? "\($0.date).md")"]?.sourcePeerIds
+        })
 
         // (3) Distill via LLM under the Agent-persona-bypass: REM gets the
         // FULL untruncated persona (SOUL + VOICE + GROWTH + USER + AGENTS)
@@ -312,20 +335,11 @@ public actor REMConsolidator {
         let pickedModel = await router.modelStringForSurface("rem")
         let bypassSystem = Self.remBypassSystemPrompt(contextDocs: contextDocs)
         var rawProposals: [REMProposal] = []
-        // 2026-09-17: TOO LITTLE MATERIAL IS A NORMAL OUTCOME, NOT AN ERROR.
-        // A young root with one diary day cannot produce a proposal — every
-        // candidate is dropped at the evidence floor in (4) below — but the
-        // distillation still ran, and a model answering "there is nothing here
-        // yet" in prose rather than `[]` decoded as a parse casualty and threw,
-        // so a brand-new root met an error banner on its first REM. Skip the
-        // call when the window cannot clear the floor and complete honestly
-        // with zero proposals. A window that CAN clear it is untouched.
-        let distinctDreamDays = Set(entries.map(\.date)).count
-        let thinMaterial = distinctDreamDays < REMConstants._REM_MIN_EVIDENCE_DATES
-        if !entries.isEmpty, !thinMaterial {
+        if !entries.isEmpty {
             rawProposals = try await helper.consolidate(
                 entries: entries,
                 personaDocs: personaDocs,
+                identities: identities,
                 system: bypassSystem,
                 model: pickedModel,
                 surface: "rem",
@@ -374,16 +388,15 @@ public actor REMConsolidator {
             }
         }
 
-        // (4) Evidence floor (_REM_MIN_EVIDENCE_DATES) — now counted in
-        // INDEPENDENT LIVED DATES *or* dream dates. Lived dates are the real
-        // measure of recurrence; the dream-date floor is retained so entries
+        // (4) Evidence floor — distinct supporting experiences or dream dates.
+        // The dream-date floor is retained so entries
         // written before provenance existed still reach the inbox instead of
         // vanishing for a fortnight. What changed is that clearing the floor on
         // dream dates alone no longer LOOKS like recurrence: `support` says
         // whether it recurred, was dwelt on, or is simply not knowable.
         var passEvidence: [REMProposal] = []
         for p in rawProposals {
-            let floor = max(p.independentLivedDateCount, p.dreamDateCount)
+            let floor = max(p.supportingExperienceCount(identities: identities) ?? 0, p.dreamDateCount)
             if floor >= REMConstants._REM_MIN_EVIDENCE_DATES {
                 passEvidence.append(p)
             }
@@ -402,7 +415,7 @@ public actor REMConsolidator {
         // evidence. They are now ordered by INDEPENDENTLY SUPPORTED RECURRENCE
         // (distinct lived dates, descending), with emission order as the
         // tiebreak so the ordering stays total and deterministic.
-        let kept: [REMProposal] = Self.rankedByRecurrence(passTomb)
+        let kept = Self.rankedByRecurrence(passTomb, identities: identities)
 
         // A timed-out scheduler body is cancel()ed and abandoned; the LLM
         // distillation above honors cancellation, but a body that already got
@@ -423,9 +436,11 @@ public actor REMConsolidator {
 
         // (7b) Stage ONE approval record per newly-appended pending proposal.
         // Staging stamps each row with the approval id, so a re-run can't
-        // double-stage. Failures are non-fatal; later ticks catch up existing rows.
+        // double-stage. A failed stage stays owed under the same proposal IDs.
         try Task.checkCancellation()
-        await stagePendingUnstagedRows(store)
+        var stagingFailure: (any Error)?
+        do { try await stagePendingUnstagedRows(store, resolver: resolver) }
+        catch { stagingFailure = error }
 
         // (8) GROWTH.md size-cap eviction → KG.
         try Task.checkCancellation()
@@ -436,14 +451,12 @@ public actor REMConsolidator {
 
         // (10) 14-day disk archival.
         try Task.checkCancellation()
-        let archiver = DreamArchiver(dataRoot: dataRoot)
-        let moved = (try? await archiver.archiveOlderThan(
-            daysOld: REMConstants._REM_ARCHIVE_DAYS, now: now
-        )) ?? 0
+        let moved = try await archiveDreams()
+        if let stagingFailure { throw stagingFailure }
 
         let dweltOnKept = kept.filter { $0.support == .dweltOn }.count
         let unavailableKept = kept.filter { $0.support == .provenanceUnavailable }.count
-        let report = REMReport(
+        var report = REMReport(
             proposalsGenerated: kept.count,
             evidenceDatesMin: REMConstants._REM_MIN_EVIDENCE_DATES,
             tombstoneSkips: tombSkips,
@@ -456,13 +469,28 @@ public actor REMConsolidator {
             // How many of the week's survivors are NOT recurrence. A run
             // report that says "5 proposals" while three of them are one
             // Tuesday dreamt three times is a report that lies by omission.
-            skipReason: thinMaterial ? "nothing_to_consolidate" : nil,
             dweltOnKept: dweltOnKept == 0 ? nil : dweltOnKept,
             provenanceUnavailableKept: unavailableKept == 0 ? nil : unavailableKept
         )
+        let keptIds = Set(kept.map(\.id))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let committed = try await store.loadAllStrictly().filter { keptIds.contains($0.id) }
+        report.reflectionMaterial = committed.isEmpty ? [:] : reflectionMaterial
+        for row in committed {
+            let sources = (row.supportingPassages ?? []).flatMap { passage in
+                passage.sourceRefs + entries.filter { $0.date == passage.dreamDate }
+                    .map { "dream_diary/\($0.filename ?? "\($0.date).md")" }
+            }
+            var cause = CognitiveReflectionCause(
+                text: String(decoding: try encoder.encode(row), as: UTF8.self),
+                sources: sources, material: report.reflectionMaterial)
+            cause.sourcePeerIds = sourcePeers
+            report.reflectionMaterial["rem_proposal:\(row.id)"] = cause
+        }
         await persistRunReport(
             outcome: .completed,
-            reason: thinMaterial ? "nothing_to_consolidate" : nil,
+            reason: nil,
             report: report,
             startedAt: runStartedAt
         )
@@ -486,18 +514,22 @@ public actor REMConsolidator {
     /// cut to `_REM_MAX_PROPOSALS`.
     ///
     /// Agent's binding constraint (2026-09-13): a thing dwelt on must NEVER
-    /// sneak in as a pattern, and must NEVER vanish. Ordering by lived dates
+    /// sneak in as a pattern, and must NEVER vanish. Ordering by experiences
     /// puts every genuinely recurring candidate above every dwelt-on one, which
     /// covers the first half. The reserved slot below covers the second: when a
     /// week is full of real recurrence, the dwelt-on candidate still reaches the
     /// inbox — labelled `dwelt_on`, with its passages bound — so she can approve
     /// it deliberately or not at all, rather than never being asked.
-    nonisolated static func rankedByRecurrence(_ proposals: [REMProposal]) -> [REMProposal] {
+    nonisolated static func rankedByRecurrence(_ proposals: [REMProposal], identities: [String: String]) -> [REMProposal] {
         let cap = REMConstants._REM_MAX_PROPOSALS
         guard proposals.count > cap else { return proposals }
+        var counts: [Int: Int] = [:]
+        for (index, proposal) in proposals.enumerated() {
+            counts[index] = proposal.supportingExperienceCount(identities: identities) ?? 0
+        }
         let ordered = proposals.enumerated().sorted { lhs, rhs in
-            let l = lhs.element.independentLivedDateCount
-            let r = rhs.element.independentLivedDateCount
+            let l = counts[lhs.offset]!
+            let r = counts[rhs.offset]!
             if l != r { return l > r }
             return lhs.offset < rhs.offset     // emission order, last
         }.map(\.element)
@@ -620,39 +652,46 @@ public actor REMConsolidator {
 
     // MARK: rem_proposals.jsonl
 
-    /// Stage pending, unstamped rows when a stager is wired. Never throws —
-    /// unstamped rows are retried on the next pass, and a staging failure
-    /// must not fail (or re-run) the surrounding weekly pass.
-    private func stagePendingUnstagedRows(_ store: REMProposalStore) async {
-        guard let stageApproval else { return }
-        // A cancelled pass (job timeout / scheduler stop) must not stamp
-        // approval cards through the app stager — rows stay pending and the
-        // next pass catches them up (review finding 2026-07-01). The guard
-        // also rides inside the per-row closure so a cancel landing mid-batch
-        // stops further card writes.
-        guard !Task.isCancelled else {
-            FileHandle.standardError.write(Data(
-                "REMConsolidator: staging skipped — pass cancelled\n".utf8
-            ))
-            return
+    /// Repair committed REM work without generating another proposal set.
+    public func repairPendingWork() async throws -> Int {
+        guard gate.remEnabled else {
+            throw DreamREMCycleError.cycleDisabled(error: "rem_cycle_disabled", detail: DreamREMGatePolicy.remDisabledDetail)
         }
+        let directory = dataRoot.appendingPathComponent("harness", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let reservation = try DreamRunReservation.acquire(at: directory.appendingPathComponent(".rem_run.lock")) else {
+            throw ToolFailureError("REM is still running; its repair remains owed until the current pass ends.", effects: .none)
+        }
+        defer { reservation.release() }
+        try await stagePendingUnstagedRows(REMProposalStore(dataRoot: dataRoot),
+            resolver: ChatSessionRecollections.ExperienceResolver(dataRoot: dataRoot))
+        return try await archiveDreams()
+    }
+
+    private func archiveDreams() async throws -> Int {
         do {
-            let guardedStager: REMApprovalStager = { row in
-                // nil = not staged; the row stays pending for the next pass.
-                if Task.isCancelled { return nil }
-                return await stageApproval(row)
-            }
-            let staged = try await store.stagePendingApprovals(guardedStager)
-            if staged > 0 {
-                FileHandle.standardError.write(Data(
-                    "REMConsolidator: staged \(staged) REM proposal approvals\n".utf8
-                ))
-            }
+            let moved = try await DreamArchiver(dataRoot: dataRoot).archiveOlderThan(
+                daysOld: REMConstants._REM_ARCHIVE_DAYS, now: clock())
+            await RepairOwed.settle(dataRoot, operation: "rem.archive",
+                evidence: .init(source: "dream_diary/archive", id: NativeTimestampFormat.fractionalZulu(clock()))).value
+            return moved
         } catch {
-            FileHandle.standardError.write(Data(
-                "REMConsolidator: approval staging failed: \(error)\n".utf8
-            ))
+            await RepairOwed.owe(dataRoot, id: "rem-archive-repair:" + UUID().uuidString, kind: .run,
+                operation: "rem.archive", owner: "dream_diary archival",
+                words: "REM archival failed: \(error.localizedDescription)",
+                nextCall: ToolFailureError.call("app", ["action": .string("mind.rem"), "args": .object(["repair": .bool(true)])])).value
+            throw error
         }
+    }
+
+    private func stagePendingUnstagedRows(_ store: REMProposalStore, resolver: ChatSessionRecollections.ExperienceResolver) async throws {
+        try await store.stagePendingApprovals({ [stageApproval] row, experiences in
+            try Task.checkCancellation()
+            guard let stageApproval else {
+                throw ToolFailureError("REM approval staging has no connected owner.", effects: .none)
+            }
+            return try await stageApproval(row, experiences)
+        }, resolver: resolver)
     }
 
     // MARK: rem_pins.json (latest-3-approved index)

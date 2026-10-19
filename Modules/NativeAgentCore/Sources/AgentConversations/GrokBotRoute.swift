@@ -25,6 +25,9 @@ public struct GrokPendingRequest: Codable, Sendable {
     /// or why it could not.
     public var handOver: String?
     public var settledAt: Date?
+    /// The door the asking turn spoke from, kept when the question was sent:
+    /// the answer goes back there, whatever the contact is doing since.
+    public var route: AgentBridgeCompletionRoute?
 }
 
 public struct GrokRequestStore: Sendable {
@@ -35,14 +38,15 @@ public struct GrokRequestStore: Sendable {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return root.appendingPathComponent(id + ".json")
     }
-    public func create(id: String, peer: String, conversation: String, quiet: Bool = false, now: Date = Date()) throws -> GrokPendingRequest {
+    public func create(id: String, peer: String, conversation: String, route: AgentBridgeCompletionRoute, quiet: Bool = false,
+                       now: Date = Date()) throws -> GrokPendingRequest {
         guard NativeAgentChatSessionID.normalizedPathComponent(conversation) == conversation else { throw GrokLinkCredential.Failure.invalid }
         let file = try url(id)
         try pruneSettled(now: now)
         return try CredentialFileLock.withLock(file) {
             guard !FileManager.default.fileExists(atPath: file.path) else { throw GrokLinkCredential.Failure.invalid }
             let request = GrokPendingRequest(messageID: id, peerID: peer, conversationID: conversation,
-                expiresAt: now.addingTimeInterval(600), state: "sending", quiet: quiet ? true : nil)
+                expiresAt: now.addingTimeInterval(600), state: "sending", quiet: quiet ? true : nil, route: route)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(request), to: file)
             return request
         }
@@ -219,13 +223,13 @@ public enum GrokBotRoute {
         if let handOver = pending.handOver { fields["hand_over"] = .string(handOver) }
         return AgentConversationView.expiringReply(.object(fields))
     }
-    public static func send(peer: AgentPeerContact, text: String, conversation: String, messageID: String,
-                            dataRoot: URL, credential: GrokLinkCredential, quiet: Bool = false,
+    public static func send(peer: AgentPeerContact, text: String, conversation: String, route: AgentBridgeCompletionRoute,
+                            messageID: String, dataRoot: URL, credential: GrokLinkCredential, quiet: Bool = false,
                             post: @Sendable (URLRequest) async throws -> Int = postOnce) async throws -> JSONValue {
         guard peer.grokSetup == "set up", let address = credential.webhookURL,
               let key = credential.webhookKey, let url = URL(string: address) else { throw GrokLinkCredential.Failure.unavailable }
         let store = GrokRequestStore(dataRoot: dataRoot)
-        _ = try store.create(id: messageID, peer: peer.id, conversation: conversation, quiet: quiet)
+        _ = try store.create(id: messageID, peer: peer.id, conversation: conversation, route: route, quiet: quiet)
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")

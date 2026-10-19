@@ -12,6 +12,7 @@ public final class MacPhoneRequestChannel {
         let deadline: Task<Void, Never>
     }
     private var pending: [String: Pending] = [:]
+    var hasPendingRequest: Bool { !pending.isEmpty }
 
     init(bridge: iCloudBridge) { self.bridge = bridge }
 
@@ -37,6 +38,7 @@ public final class MacPhoneRequestChannel {
                     )))
                 }
                 pending[request.id] = Pending(continuation: continuation, deadline: deadline)
+                bridge.scheduleNextDeviceDrainFallback()
                 Task { [weak self] in
                     guard self?.pending[request.id] != nil, request.expiresAt > Date() else { return }
                     do {
@@ -58,6 +60,7 @@ public final class MacPhoneRequestChannel {
 
     private func finish(_ id: String, result: Result<BridgeMessage, Error>) {
         guard let value = pending.removeValue(forKey: id) else { return }
+        bridge?.scheduleNextDeviceDrainFallback()
         value.deadline.cancel()
         value.continuation.resume(with: result)
     }

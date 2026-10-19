@@ -123,9 +123,6 @@ struct PersonalityRailPage: View {
 
 struct TrustRailPage: View {
     @AppStorage(ShellRailTab.storageKey(.trust)) private var tab = TrustTab.access.rawValue
-    /// Mac control's unsaved edits live here, above the tabs, so switching
-    /// tabs (which rebuilds each tab's view) keeps them.
-    @State private var macControlDraft: TrustMacControlPolicy?
 
     static let tabs = [
         ShellTab(key: TrustTab.access.rawValue, title: "Access"),
@@ -146,8 +143,8 @@ struct TrustRailPage: View {
         ) { key in
             switch key {
             case "mac", TrustTab.macAndBrowser.rawValue:
-                MacIntegrationView(showsMacControl: true, macControlDraft: $macControlDraft)
-            default: TrustCenterView(tab: TrustTab(rawValue: key) ?? .access, macControlDraft: $macControlDraft)
+                MacIntegrationView(showsMacControl: true)
+            default: TrustCenterView(tab: TrustTab(rawValue: key) ?? .access)
             }
         }
         .keepsShownTab(.trust, Self.tabs, $tab)

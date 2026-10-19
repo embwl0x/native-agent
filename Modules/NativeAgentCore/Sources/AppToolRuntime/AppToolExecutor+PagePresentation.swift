@@ -1,3 +1,4 @@
+import ChatOrchestration
 import Dispatcher
 import Foundation
 import PersistenceCore
@@ -17,7 +18,7 @@ extension AppToolExecutor {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             try rendered.data.write(to: file, options: .atomic)
         } catch {
-            return AppToolExecutor.failure("write_failed", "The picture could not be saved: \(error.localizedDescription)")
+            return AppToolExecutor.failure("write_failed", "The picture could not be saved: \(error.localizedDescription)", extra: ["effects": .string("unknown")])
         }
         do {
             // The current file stays protected until delivery. Inline delivery
@@ -26,7 +27,7 @@ extension AppToolExecutor {
             try prunePageShots(in: folder, preserving: file)
         } catch {
             return AppToolExecutor.failure("retention_failed", "The picture was saved, but diagnostic retention could not finish: \(error.localizedDescription)",
-                                           extra: ["path": .string(file.path)])
+                                           extra: ["path": .string(file.path), "effects": .string("occurred")])
         }
         // A text-only call (the Claude bridge) has no turn to show pixels in:
         // the path comes back instead.
@@ -42,7 +43,7 @@ extension AppToolExecutor {
             rendered.data, name: "\(page.id).png",
             width: rendered.width, height: rendered.height
         ) else {
-            return AppToolExecutor.failure("image_delivery_failed", "The picture could not be handed to the model.")
+            return AppToolExecutor.failure("image_delivery_failed", "The picture could not be handed to the model.", extra: ["effects": .string("occurred")])
         }
         delivery["page"] = .string(page.id)
         delivery["title"] = .string(page.title)
@@ -91,8 +92,8 @@ extension AppToolExecutor {
             return AppToolExecutor.pageReadResult(page: "agent_view", fields: ["status": .string("ok"), "title": .string("Agent view"), "tabs": tabs])
         }
         guard rooms.contains(room) else {
-            return .object(["status": .string("not_found"), "reason": .string("unknown_room"), "detail": .string("The Agent view has no tab called that."),
-                            "requested": .string(room), "tabs": tabs])
+            return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found"), "reason": .string("unknown_room"), "detail": .string("The Agent view has no tab called that."),
+                            "requested": .string(room), "tabs": tabs]))
         }
         let named = pageInputText(input["session_id"])
         let scope = named.isEmpty ? activeSessionID : named

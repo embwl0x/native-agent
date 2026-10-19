@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import Desk
 import DoctorChecks
 import NativeAgentShared
@@ -11,7 +12,9 @@ extension DoctorFacade {
                                     safeDetail: (String) -> String) async -> (checks: [CheckResult], repaired: Bool) {
         let desk = await deskCheck(approvals: approvals, root: root, repair: repairDesk, stuckReason: stuckReason, safeDetail: safeDetail)
         let activity = await activityCheck(root: root, safeDetail: safeDetail)
-        return ([desk.row, activity], desk.repaired)
+        let rows = [desk.row, activity]
+        await DoctorStatusProjection.recordReadings(rows, dataRoot: root)
+        return (rows, desk.repaired)
     }
 
     private static func deskCheck(approvals: ApprovalsFacade, root: URL, repair: Bool, stuckReason: (DeskItem, [DeskItem]) -> String, safeDetail: (String) -> String) async -> (row: CheckResult, repaired: Bool) {
@@ -31,9 +34,12 @@ extension DoctorFacade {
             let pendingApprovals: Int
             do {
                 pendingApprovals = try await approvals.list()
-                    .filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }.count
+                    .filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }.count
             } catch {
-                return (CheckResult(id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
+                return (CheckResult(source: "workflows/approvals/requests.json",
+                                    nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("workflows/approvals/requests.json"), dataRoot: root,
+                                        shape: "A JSON array of saved approval requests with their original identities, payloads and decisions. Preserve all authority and decision fields exactly; never approve, deny or invent a request."),
+                                    id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
                                     detail: "Approvals could not be read: \(safeDetail(error.localizedDescription)).",
                                     harm: "Pending decisions cannot be read or safely settled.",
                                     human_action: "Open Approvals and refresh its pending list; inspect the approval store before changing any saved request."), repaired)
@@ -41,7 +47,7 @@ extension DoctorFacade {
             let id = "status.desk_attention"
             let title = "Desk work and decisions"
             guard pendingApprovals > 0 || !waiting.isEmpty || !blocked.isEmpty || !contradictions.isEmpty else {
-                return (CheckResult(id: id, title: title, status: "ok",
+                return (CheckResult(source: "desk/desk_ops_base.json and desk/desk_ops.jsonl", id: id, title: title, status: "ok",
                                     detail: "No blocked Desk work, owner decision, or terminal-parent contradiction."), repaired)
             }
             var parts: [String] = []
@@ -54,13 +60,23 @@ extension DoctorFacade {
             if pendingApprovals > 0 { actions.append("Open Approvals and decide the \(pendingApprovals) pending request(s).") }
             if !blocked.isEmpty { actions.append("Open Desk and resolve \(labels(blocked)) using each recorded blocked reason or waiting party; if neither is recorded, clarify the block in Desk.") }
             if !contradictions.isEmpty { actions.append("Open Desk and inspect terminal parents \(labels(contradictions)) if Repair Safe Issues cannot reconcile them.") }
-            let severity = contradictions.isEmpty && blocked.isEmpty ? "ok" : "warn"
-            return (CheckResult(id: id, title: title, status: severity, detail: parts.joined(separator: " "),
+            let severity = contradictions.isEmpty ? "ok" : "warn"
+            return (CheckResult(source: "desk/desk_ops_base.json and desk/desk_ops.jsonl", id: id, title: title, status: severity, detail: parts.joined(separator: " "),
                                 harm: severity == "warn" ? "The named Desk work cannot move forward or is marked finished while work remains." : nil,
                                 repair: contradictions.isEmpty ? nil : "Run Repair Safe Issues to reconcile terminal Desk parents with open descendants.",
                                 human_action: actions.joined(separator: " "), repair_available: !contradictions.isEmpty), repaired)
         } catch {
-            return (CheckResult(id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
+            let file: URL?
+            switch error {
+            case DeskError.compactionBaseCorrupt(let path), DeskError.compactionBaseUnreadable(let path): file = URL(fileURLWithPath: path)
+            default:
+                let path = (error as NSError).userInfo[NSFilePathErrorKey] as? String
+                file = path.flatMap { $0 == store.opsPath.path || $0 == store.basePath.path ? URL(fileURLWithPath: $0) : nil }
+            }
+            return (CheckResult(source: file?.path ?? "desk/desk_ops_base.json and desk/desk_ops.jsonl",
+                                nextCall: file.map { ToolFailureError.fileRepairCall($0, dataRoot: root,
+                                    shape: "The Desk compaction base holds the saved items and lastCompactedOpId; its JSONL tail holds DeskOp events. Preserve identities, parent links, continuations and recorded outcomes.") },
+                                id: "status.desk_attention", title: "Desk work and decisions", status: "fail",
                                 detail: "Desk's canonical state could not be read: \(safeDetail(error.localizedDescription)).",
                                 harm: "Saved work cannot be read or safely advanced.",
                                 human_action: "Open Desk and inspect its unavailable-state detail; restore its canonical feed from a verified backup if the owner reports corruption."), false)
@@ -101,63 +117,37 @@ extension DoctorFacade {
             let formatter = ISO8601DateFormatter()
             let fractionalFormatter = ISO8601DateFormatter()
             fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            // Only a later success for the same identified subject resolves
-            // an adverse receipt. Subjectless receipts remain independent.
-            var succeededSubjects = Set<String>()
-            var adverse: [ActivityEvent] = []
-            for record in readout.records.suffix(40).reversed() {
-                let severity = record.event.status.lowercased()
-                if ["ok", "success", "succeeded"].contains(severity) {
-                    if let subject = record.subject { succeededSubjects.insert(subject) }
-                } else if (["fail", "failed", "error"].contains(severity) || record.needsReconciliation),
-                          record.subject.map({ !succeededSubjects.contains($0) }) ?? true {
-                    adverse.append(record.event)
-                }
-            }
-            let current = adverse.filter { event in
-                guard let date = fractionalFormatter.date(from: event.createdAt)
-                    ?? formatter.date(from: event.createdAt) else { return false }
+            // A later receipt or an age cutoff cannot reconcile an unknown effect.
+            let reconciliation = readout.records.filter(\.needsReconciliation)
+            let current = readout.records.filter { record in
+                guard !record.needsReconciliation,
+                      ["fail", "failed", "error"].contains(record.event.status.lowercased()),
+                      let date = fractionalFormatter.date(from: record.event.createdAt)
+                        ?? formatter.date(from: record.event.createdAt) else { return false }
                 return date >= cutoff && date <= Date().addingTimeInterval(60)
             }
             let malformed = readout.malformedRowCount
             let partial = malformed > 0
                 ? "Activity log \(readout.records.isEmpty ? "unreadable" : "partially readable"): \(malformed) malformed row(s) in its bounded tail. "
                 : ""
-            let inspectLog = "Inspect activity/events.jsonl without replacing its bytes."
-            guard !current.isEmpty else {
-                if malformed > 0 {
-                    return CheckResult(id: id, title: title, status: readout.records.isEmpty ? "fail" : "warn",
-                                       detail: partial + (readout.records.isEmpty ? "" : "No current actionable failure or reconciliation receipt was found in its bounded tail."),
-                                       harm: "Parts of the activity history cannot be reviewed.",
-                                       human_action: "Open Status and refresh Recent activity once; if rows remain malformed, inspect activity/events.jsonl without replacing its bytes.")
-                }
-                return CheckResult(id: id, title: title, status: "ok",
-                                   detail: "The activity log is readable; no current actionable failure or reconciliation receipt was found in its bounded tail.")
-            }
-            let owners = Set(current.map { owner(for: $0.kind) }).sorted()
-            let latestTitles = current.sorted { $0.createdAt > $1.createdAt }.prefix(3)
-                .map { safeDetail($0.title) }.joined(separator: "; ")
-            return CheckResult(id: id, title: title, status: "warn",
-                               detail: partial + "\(current.count) current adverse activity receipt(s), owner(s): \(owners.joined(separator: ", ")). Latest: \(latestTitles).",
-                               harm: "The recorded work may still be incomplete or need reconciliation.",
-                               human_action: "Open Activity and inspect the latest \(owners.joined(separator: ", ")) receipt; use its current owner state before taking action. Do not rerun the recorded action." + (malformed > 0 ? " " + inspectLog : ""))
+            let latestTitles = (reconciliation + current).sorted { $0.event.createdAt > $1.event.createdAt }.prefix(3)
+                .map { safeDetail($0.event.title) }.joined(separator: "; ")
+            return CheckResult(source: "activity/events.jsonl",
+                               nextCall: malformed > 0 ? ToolFailureError.fileRepairCall(root.appendingPathComponent("activity/events.jsonl"), dataRoot: root,
+                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence.") : nil,
+                               id: id, title: title, status: malformed > 0 ? "fail" : reconciliation.isEmpty && current.isEmpty ? "ok" : "unmeasured",
+                               detail: partial + "\(reconciliation.count) outcome(s) need reconciliation; \(current.count) failure receipt(s) in the last 15 minutes of the retained activity tail."
+                                   + (latestTitles.isEmpty ? "" : " Latest: \(latestTitles)."),
+                               harm: malformed > 0 ? "Parts of the activity history cannot be reviewed." : nil)
         } catch {
-            return CheckResult(id: id, title: title, status: "fail",
+            return CheckResult(source: "activity/events.jsonl",
+                               nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("activity/events.jsonl"), dataRoot: root,
+                                   shape: "Each JSONL line must hold an activity event with its original identity, timestamp, status and outcome payload. Preserve unknown outcomes and reconciliation evidence."),
+                               id: id, title: title, status: "fail",
                                detail: "The activity log could not be read: \(safeDetail(error.localizedDescription)).",
                                harm: "Recent work and its outcomes cannot be reviewed.",
                                human_action: "Open Status and refresh Recent activity once; if the log is still unavailable, inspect activity/events.jsonl without replacing its bytes.")
         }
     }
 
-    private static func owner(for kind: String) -> String {
-        let kind = kind.lowercased()
-        if kind.contains("provider") || kind.contains("oauth") { return "Providers" }
-        if kind.contains("desk") || kind.contains("workshop") { return "Desk" }
-        if kind.contains("approval") { return "Approvals" }
-        if kind.contains("dream") { return "Dreams" }
-        if kind.contains("memory") { return "Memory" }
-        if kind.contains("loop") || kind.contains("scheduler") { return "Background work" }
-        if kind.contains("tool") { return "Tools" }
-        return "Activity"
-    }
 }

@@ -108,9 +108,11 @@ enum MacAXAttributeRead {
         }
     }
 
-    /// Own title/description, else — for a field or popup Cocoa names with a
-    /// separate label ("Save As:", "Where:") — that label's text: its
-    /// AXTitleUIElement, else the previous sibling static text ending in ":".
+    /// Own title/description, else — for a field or popup named by a separate
+    /// label ("Save As:", Qt's "File Name") — that label's text: its
+    /// AXTitleUIElement, else the static text a person reads just before it,
+    /// beside or above it (`copyCaption`). Its value stays its value, and its
+    /// placeholder still answers as a second name.
     /// The ONE identity rule for perception and the act-side drift check.
     /// Display cleanup is opt-in; it must never remove a redaction caption.
     static func copyLabel(
@@ -182,14 +184,25 @@ enum MacAXAttributeRead {
             )
         }
         guard MacPerceptionCompiler.captionedRoles.contains(role) else { return nil }
-        guard let parent = copyElement(element, kAXParentAttribute).map(prepare) else { return nil }
+        // The label a person reads: among the field's own siblings, the nearest
+        // static text before it with nothing else between, on its row to the
+        // left or directly above (`isLabel`), one line tall. Anything else and
+        // the field has no label; its placeholder still names it.
+        guard let field = copyFrame(element),
+              let parent = copyElement(element, kAXParentAttribute).map(prepare) else { return nil }
         let siblings = copyElementArray(parent, kAXChildrenAttribute)
-        guard let index = siblings.firstIndex(where: { CFEqual($0, element) }), index > 0 else { return nil }
-        let previous = prepare(siblings[index - 1])
-        guard copyString(previous, kAXRoleAttribute) == "AXStaticText",
-              let raw = copyString(previous, kAXValueAttribute) ?? copyString(previous, kAXTitleAttribute),
-              raw.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(":") else { return nil }
-        return MacPerceptionCompiler.captionText(raw)
+        guard let index = siblings.firstIndex(where: { CFEqual($0, element) }) else { return nil }
+        for sibling in siblings[..<index].reversed() {
+            let sibling = prepare(sibling)
+            guard copyString(sibling, kAXRoleAttribute) == "AXStaticText" else { return nil }
+            guard let text = MacPerceptionCompiler.captionText(
+                copyString(sibling, kAXValueAttribute) ?? copyString(sibling, kAXTitleAttribute)
+            ) else { continue }
+            guard let frame = copyFrame(sibling), frame.h <= 2 * field.h,
+                  MacScreenViewTextRedaction.isLabel(frame, forValueAt: field) else { return nil }
+            return text
+        }
+        return nil
     }
 
     static func copyActions(_ element: AXUIElement) -> [String] {

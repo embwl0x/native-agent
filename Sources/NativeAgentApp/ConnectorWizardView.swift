@@ -79,7 +79,6 @@ final class ConnectorWizardState {
     /// The one error line: what happened and what to do. Never a service's
     /// own text, which goes to the log only.
     var errorMessage: String?
-    var oauthClientId: String = ""
     var oauthClientSecret: String = ""
     // Tracks the running sign-in or save so a sheet dismissed mid-flow, or a
     // step left with Back, cannot mutate the wizard afterward.
@@ -116,21 +115,44 @@ struct ConnectorWizardView: View {
 
     @Environment(AppModel.self) private var appModel
     @State private var state = ConnectorWizardState()
+    // Tokens and OAuth secrets deliberately stay view-local and die with the wizard.
+    @State private var savedOAuthClientId = ""
+    @State private var slackPolicy = SlackSocketModeConfig.loadIngressPolicy()
     @State private var githubToken: String = ""
     @State private var githubCode: GitHubOAuthDeviceFlow.DeviceCode?
     @State private var githubLogin: String?
     @State private var didCopyGitHubCode = false
     @State private var slackToken: String = ""
     @State private var slackAppToken: String = ""
-    @State private var slackAllowedChannels: String = ""
-    @State private var slackAllowedUsers: String = ""
-    @State private var slackRequireMention = true
     @State private var slackSettingsOpenOutcome: SlackSettingsPortal.OpenOutcome?
     @State private var notionToken: String = ""
     @State private var isSaving = false
     @State private var isConnecting = false
     @State private var didCopyRedirect = false
     @State private var didSaveOAuthApp = false
+
+    private var oauthClientId: String {
+        get { appModel.editDraft("connector:\(connectorID):oauthClientId", seed: savedOAuthClientId) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "connector:\(connectorID):oauthClientId") }
+    }
+    private var slackAllowedChannels: String {
+        get { appModel.editDraft("connector:\(connectorID):slackAllowedChannels", seed: slackPolicy.allowedChannelIds.sorted().joined(separator: ", ")) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "connector:\(connectorID):slackAllowedChannels") }
+    }
+    private var slackAllowedUsers: String {
+        get { appModel.editDraft("connector:\(connectorID):slackAllowedUsers", seed: slackPolicy.allowedUserIds.sorted().joined(separator: ", ")) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "connector:\(connectorID):slackAllowedUsers") }
+    }
+    private var slackRequireMention: Bool {
+        get { appModel.editDraft("connector:\(connectorID):slackRequireMention", seed: slackPolicy.requireMention) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "connector:\(connectorID):slackRequireMention") }
+    }
+
+    private func clearDraft() {
+        for field in ["oauthClientId", "slackAllowedChannels", "slackAllowedUsers", "slackRequireMention"] {
+            appModel.clearEditDraft("connector:\(connectorID):" + field)
+        }
+    }
 
     private var route: ConnectorWizardSetupRoute { ConnectorWizardSetupRoute.resolve(provider: provider) }
     private var connectorID: String { InlineInteractionRegistry.canonicalConnectorID(provider) }
@@ -176,9 +198,6 @@ struct ConnectorWizardView: View {
         .animation(NativeAgentMotion.standard, value: state.step)
         .animation(NativeAgentMotion.standard, value: state.errorMessage)
         .task {
-            if connectorID == "slack" {
-                loadSlackIngressPolicy()
-            }
             await loadRegistrationStatus()
         }
         .onDisappear {
@@ -269,7 +288,7 @@ struct ConnectorWizardView: View {
         case .appCredentials:
             return PrimaryAction(
                 title: isSaving ? "Saving…" : "Save and continue",
-                enabled: !isSaving && !trimmed(state.oauthClientId).isEmpty
+                enabled: !isSaving && !trimmed(oauthClientId).isEmpty
             ) { saveAppCredentials() }
         case .signIn where isGitHub:
             if let code = githubCode {
@@ -319,7 +338,10 @@ struct ConnectorWizardView: View {
                 }
                 Spacer(minLength: 0)
                 if state.step != .success {
-                    Button(state.step == .error ? "Close" : "Cancel") { onDismiss() }
+                    Button(state.step == .error ? "Close" : "Cancel") {
+                        if state.step != .error { clearDraft() }
+                        onDismiss()
+                    }
                         .keyboardShortcut(.cancelAction)
                 }
                 if let primary {
@@ -484,7 +506,7 @@ struct ConnectorWizardView: View {
                     Text("Make an app in \(displayName)'s developer portal, then paste its details here.")
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                TextField(googleConnectorId != nil ? "Client ID" : "OAuth client ID", text: $state.oauthClientId)
+                TextField(googleConnectorId != nil ? "Client ID" : "OAuth client ID", text: appModel.editBinding("connector:\(connectorID):oauthClientId", seed: savedOAuthClientId))
                     .textFieldStyle(.roundedBorder)
                 SecureField("Client secret, if you were given one", text: $state.oauthClientSecret)
                     .textFieldStyle(.roundedBorder)
@@ -588,10 +610,10 @@ struct ConnectorWizardView: View {
 
     private var slackTokensView: some View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-            card("Bot token") {
-                SecureField("xoxb-…", text: $slackToken)
+            card("Bot or user token") {
+                SecureField("xoxb-… or xoxp-…", text: $slackToken)
                     .textFieldStyle(.roundedBorder)
-                note("From your Slack app's OAuth & Permissions page. Leave it empty if it's already saved. It stays on this Mac, and I check it with Slack before saving.")
+                note("From your Slack app's OAuth & Permissions page. Search needs a User OAuth Token (xoxp-…) with search:read in User Token Scopes. Leave it empty if it's already saved. It stays on this Mac, and I check it with Slack before saving.")
             }
             card("App token, to chat with me in Slack") {
                 SecureField("xapp-…", text: $slackAppToken)
@@ -629,11 +651,11 @@ struct ConnectorWizardView: View {
 
     private var slackAccessView: some View {
         card("Who can message me") {
-            TextField("Channel IDs, like C0123", text: $slackAllowedChannels)
+            TextField("Channel IDs, like C0123", text: appModel.editBinding("connector:\(connectorID):slackAllowedChannels", seed: slackPolicy.allowedChannelIds.sorted().joined(separator: ", ")))
                 .textFieldStyle(.roundedBorder)
-            TextField("User IDs, like U0123", text: $slackAllowedUsers)
+            TextField("User IDs, like U0123", text: appModel.editBinding("connector:\(connectorID):slackAllowedUsers", seed: slackPolicy.allowedUserIds.sorted().joined(separator: ", ")))
                 .textFieldStyle(.roundedBorder)
-            Toggle("In channels and groups, only answer when @mentioned", isOn: $slackRequireMention)
+            Toggle("In channels and groups, only answer when @mentioned", isOn: appModel.editBinding("connector:\(connectorID):slackRequireMention", seed: slackPolicy.requireMention))
             note("Add at least one channel or user. With both empty, I stay out of Slack chats. Direct messages never need an @mention.")
         }
     }
@@ -735,7 +757,7 @@ struct ConnectorWizardView: View {
             state.step = .error
         case .nativeOAuth(let connectorId):
             if let credentials = NativeOAuthFlow.connectorOAuthAppCredentials(connectorId: connectorId) {
-                state.oauthClientId = credentials.clientId
+                savedOAuthClientId = credentials.clientId
                 state.oauthClientSecret = credentials.clientSecret ?? ""
             }
             do {
@@ -813,7 +835,7 @@ struct ConnectorWizardView: View {
 
     private func saveAppCredentials() {
         if googleConnectorId != nil,
-           let issue = NativeOAuthFlow.googleClientIDIssue(state.oauthClientId) {
+           let issue = NativeOAuthFlow.googleClientIDIssue(oauthClientId) {
             state.errorMessage = issue
             return
         }
@@ -824,13 +846,16 @@ struct ConnectorWizardView: View {
         guard case .nativeOAuth(let connectorId) = route else { return }
         isSaving = true
         defer { isSaving = false }
+        let submittedID = oauthClientId
         let result = await NativeOAuthFlow.saveConnectorOAuthApp(
             connectorId: connectorId,
-            clientId: state.oauthClientId,
+            clientId: submittedID,
             clientSecret: state.oauthClientSecret
         )
         guard !Task.isCancelled else { return }
         if result.ok {
+            savedOAuthClientId = submittedID
+            if oauthClientId == submittedID { appModel.clearEditDraft("connector:\(connectorID):oauthClientId") }
             didSaveOAuthApp = true
             state.step = .signIn
         } else {
@@ -862,15 +887,21 @@ struct ConnectorWizardView: View {
         isSaving = true
         defer { isSaving = false }
 
+        let submittedChannels = slackAllowedChannels
+        let submittedUsers = slackAllowedUsers
+        let submittedMention = slackRequireMention
         let result = await NativeOAuthFlow.saveSlackToken(
             slackToken,
             appToken: slackAppToken,
-            allowedChannelIds: SlackSocketModeConfig.parseIDs(slackAllowedChannels),
-            allowedUserIds: SlackSocketModeConfig.parseIDs(slackAllowedUsers),
-            requireMention: slackRequireMention
+            allowedChannelIds: SlackSocketModeConfig.parseIDs(submittedChannels),
+            allowedUserIds: SlackSocketModeConfig.parseIDs(submittedUsers),
+            requireMention: submittedMention
         )
         guard !Task.isCancelled else { return }
         if result.ok {
+            slackPolicy = SlackSocketModeConfig.loadIngressPolicy()
+            if slackAllowedChannels == submittedChannels, slackAllowedUsers == submittedUsers,
+               slackRequireMention == submittedMention { clearDraft() }
             slackToken = ""
             slackAppToken = ""
             state.step = .success
@@ -882,14 +913,6 @@ struct ConnectorWizardView: View {
                 fallback: "Couldn't save the Slack settings. Go Back to check the tokens, then try again.")
         }
     }
-
-    private func loadSlackIngressPolicy() {
-        let policy = SlackSocketModeConfig.loadIngressPolicy()
-        slackAllowedChannels = policy.allowedChannelIds.sorted().joined(separator: ", ")
-        slackAllowedUsers = policy.allowedUserIds.sorted().joined(separator: ", ")
-        slackRequireMention = policy.requireMention
-    }
-
 
     private func saveGitHubToken() async {
         isSaving = true

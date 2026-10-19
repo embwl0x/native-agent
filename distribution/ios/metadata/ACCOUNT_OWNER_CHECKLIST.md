@@ -3,6 +3,25 @@
 These steps require the NativeAgent Apple Developer/App Store Connect account
 and cannot be completed or truthfully verified from source alone.
 
+## 0.6.7 build 20 — 2026-10-19
+
+- [x] iOS bumped to `0.6.7 (20)` with rewritten What's New
+  (`metadata/en-US/release_notes.txt`), to ship beside the next Mac DMG. The
+  Mac side of the same change stops a second Mac on the Apple Account from
+  taking the phone at launch; the store phone needs that Mac release.
+- [x] `script/ios_release.sh --archive --export` passed from clean commit
+  `787b68c76`: preflight all PASS (fresh production CloudKit schema, App Store
+  profile, Apple Distribution identity, production APNS/CloudKit, privacy
+  manifest, icon), signed archive validated, IPA exported locally and
+  re-validated. Nothing was uploaded. No CloudKit schema change.
+- [ ] Upload the IPA (or the archive through Xcode Organizer) to App Store
+  Connect, after the go for the Mac DMG.
+- [ ] After processing: attach build 20 to TestFlight (User Internal), install
+  on the phone, pair with the current Mac, check chat, Stop, notifications and
+  approval cards.
+- [ ] Create the `0.6.7` App Store version, select build 20, paste What's New,
+  submit for review.
+
 ## 0.5.0 build 15 — 2026-09-25
 
 - [x] Claude's redesign and notification/approval fixes landed on private

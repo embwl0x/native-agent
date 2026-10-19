@@ -1,24 +1,13 @@
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import Transcripts
 
-/// Async, fire-and-forget upgrade of the mechanical chat compaction summary.
-///
-/// The autocompactor runs at turn start under a file lock and instantly writes
-/// ONE mechanical `compaction_summary` row (role: prefix lines). That is pure
-/// information loss — no decisions, no why, no relational/tone arc — yet the
-/// assistant later reads it AS ITS OWN RECOLLECTION. This distiller reads the
-/// pre-compaction backup, asks the LLM to re-write the replaced turns as a
-/// durable first-person recollection, and swaps it into the summary row in
-/// place.
-///
-/// Fail-safe by construction: any read/LLM/lock failure leaves the mechanical
-/// summary standing. The distiller constructs its own router + persistence bound
-/// to `dataRoot` (the same self-contained pattern the autocompactor uses), so it
-/// touches neither the client init, the factories, nor the TurnEngine. Pin
-/// lookup and the LLM call are injectable closures for testability.
+/// Recollection from the preserved source, with a repair owed on failure.
+/// A turn waits on a pending one a foreground compaction wrote; the aging lane
+/// distills ahead of its replacement and never leaves one pending.
 public struct ChatCompactionDistiller: Sendable {
     let dataRoot: URL
     let persistence: SwiftNativePersistenceCore
@@ -31,8 +20,6 @@ public struct ChatCompactionDistiller: Sendable {
     public static let distillSurface = "compaction"
     /// User 2026-09-23: every model (was 12K; 40K on verified 1M routes only).
     static let maxSummaryChars = 40_000
-
-    static let timeoutSeconds = 120.0
 
     /// System prompt for the distillation call. The output is stored as the
     /// summary row's content and is later read by the model AS ITS OWN
@@ -183,7 +170,7 @@ public struct ChatCompactionDistiller: Sendable {
         self.now = now
     }
 
-    public func distill(
+    @discardableResult public func distill(
         sessionId: String,
         summaryRowId: String,
         backupPath: String,
@@ -191,22 +178,66 @@ public struct ChatCompactionDistiller: Sendable {
         turnModel: String,
         surface: String,
         runId: String?
-    ) async {
+    ) async -> Bool {
         let key = dataRoot.standardizedFileURL.path + "/" + sessionId + "/" + summaryRowId
-        guard await PendingDistillations.shared.claim(key) else { return }
+        return await PendingDistillations.shared.run(key) {
+            await completeDistillation(sessionId: sessionId, summaryRowId: summaryRowId, backupPath: backupPath,
+                messagesReplaced: messagesReplaced, turnModel: turnModel, surface: surface, runId: runId)
+        }
+    }
+
+    private func completeDistillation(sessionId: String, summaryRowId: String, backupPath: String,
+                                     messagesReplaced: Int, turnModel: String, surface: String, runId: String?) async -> Bool {
         await performDistillation(
             sessionId: sessionId, summaryRowId: summaryRowId, backupPath: backupPath,
             messagesReplaced: messagesReplaced, turnModel: turnModel,
             surface: surface, runId: runId
         )
-        await PendingDistillations.shared.release(key)
+        guard !Task.isCancelled else { return false }
+        let operation = "chat.compact:" + sessionId + ":" + summaryRowId
+        do {
+            let rows = try await persistence.readJSONL(messagesPath(sessionId: sessionId))
+            let ready = rows.contains {
+                guard case .object(let row) = $0, row["id"] == .string(summaryRowId),
+                      case .object(let metadata)? = row["metadata"] else { return false }
+                return metadata["distill"] == .string("llm")
+            }
+            if ready {
+                RepairOwed.settle(dataRoot, operation: operation,
+                    evidence: .init(source: "chat/messages/\(sessionId).jsonl", id: summaryRowId))
+                return true
+            }
+        } catch { nativeLog("Recollection readiness could not be read: %@", error.localizedDescription) }
+        RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: operation,
+            owner: "chat/messages/\(sessionId).jsonl#\(summaryRowId); providers.memory_and_mind_model",
+            words: "Recollection is unavailable. The original turns remain in \(backupPath); no substitute recollection is accepted.",
+            nextCall: ToolFailureError.call("app", ["action": .string("chat.compact"),
+                "args": .object(["session_id": .string(sessionId)])]))
+        return false
     }
 
     private actor PendingDistillations {
         static let shared = PendingDistillations()
-        var active: Set<String> = []
-        func claim(_ key: String) -> Bool { active.insert(key).inserted }
-        func release(_ key: String) { active.remove(key) }
+        var active: [String: (task: Task<Bool, Never>, done: ScopedWaiter)] = [:]
+        func run(_ key: String, work: @escaping @Sendable () async -> Bool) async -> Bool {
+            guard !Task.isCancelled else { return false }
+            if let flight = active[key] {
+                await flight.done.park()
+                return Task.isCancelled ? false : await flight.task.value
+            }
+            let done = ScopedWaiter()
+            let task = Task {
+                let result = await work()
+                active[key] = nil
+                done.resume()
+                return result
+            }
+            active[key] = (task, done)
+            return await withTaskCancellationHandler {
+                await done.park()
+                return Task.isCancelled ? false : await task.value
+            } onCancel: { task.cancel() }
+        }
     }
 
     private func performDistillation(
@@ -263,7 +294,8 @@ public struct ChatCompactionDistiller: Sendable {
         guard let recollection = await prepareRecollection(
             rows: replaced, sessionId: sessionId, turnModel: turnModel,
             surface: surface, runId: runId,
-            summaryRowId: summaryRowId
+            stillWanted: { try await destinationExists(sessionId: sessionId, summaryRowId: summaryRowId) },
+            goneStatus: "row_missing"
         ) else {
             return
         }
@@ -271,7 +303,6 @@ public struct ChatCompactionDistiller: Sendable {
         let distilled = recollection.text
         let promptCharsPerPass = recollection.promptCharsPerPass
         let promptChars = promptCharsPerPass.reduce(0, +)
-        let rowsOmitted = recollection.rowsOmitted
         let thirdPerson = recollection.thirdPerson
 
         // 6. Swap the distilled text into the summary row in place, under lock.
@@ -302,20 +333,17 @@ public struct ChatCompactionDistiller: Sendable {
                           kind == "compaction_summary",
                           meta["distill"] == .string("pending")
                     else { continue }
-                    // The mechanical header carried the "cards kept below"
-                    // clause; the distilled text replaces that header, so the
-                    // clause is re-stated from the metadata the compactor
-                    // wrote. Without it the recollection reads as if the
-                    // preserved cards were folded away too.
+                    // The "cards kept below" clause, from the count the
+                    // compactor wrote (see `recollectionContent`).
                     var preservedCards = 0
                     if case .int(let value)? =
                         meta[InlineInteractionCompactionRetention.preservedMetadataKey] {
                         preservedCards = Int(value)
                     }
-                    let clause = InlineInteractionCompactionRetention
-                        .summaryClause(preservedCount: preservedCards)
                     let sourceNote = meta["receipt_source_note"].flatMap { if case .string(let note) = $0 { return note }; return nil } ?? ""
-                    obj["content"] = .string(sourceNote + "\n" + (clause.isEmpty ? distilled : distilled + "\n[" + clause.trimmingCharacters(in: .whitespaces) + "]"))
+                    obj["content"] = .string(Self.recollectionContent(
+                        distilled, sourceNote: sourceNote, preservedCards: preservedCards
+                    ))
                     var newMeta = meta
                     newMeta["distill"] = .string("llm")
                     newMeta["distill_model"] = .string(model)
@@ -340,7 +368,7 @@ public struct ChatCompactionDistiller: Sendable {
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: model,
                 charsIn: promptChars, charsOut: distilled.count, runId: runId, status: "failed",
-                promptCharsPerPass: promptCharsPerPass, rowsOmitted: rowsOmitted, failure: error
+                promptCharsPerPass: promptCharsPerPass, failure: error
             )
             return
         }
@@ -363,25 +391,86 @@ public struct ChatCompactionDistiller: Sendable {
             charsOut: status == "ok" ? distilled.count : 0,
             runId: runId, status: status,
             thirdPerson: status == "ok" ? thirdPerson : false,
-            promptCharsPerPass: promptCharsPerPass, rowsOmitted: rowsOmitted
+            promptCharsPerPass: promptCharsPerPass
         )
+    }
+
+    /// The stored text of a finished recollection. The mechanical header
+    /// carried the "cards kept below" clause; the distilled text replaces that
+    /// header, so the clause is re-stated from the count the compactor wrote.
+    /// Without it the recollection reads as if the preserved cards were folded
+    /// away too.
+    package static func recollectionContent(_ distilled: String, sourceNote: String, preservedCards: Int) -> String {
+        let clause = InlineInteractionCompactionRetention.summaryClause(preservedCount: preservedCards)
+        return sourceNote + "\n" + (clause.isEmpty
+            ? distilled
+            : distilled + "\n[" + clause.trimmingCharacters(in: .whitespaces) + "]")
+    }
+
+    /// The aging lane's recollection, written BEFORE anything is replaced
+    /// (User, 2026-10-19: a background pass never makes a turn wait). The live
+    /// transcript is untouched while the model works, so no pending row exists
+    /// for a turn to wait on. `stillCurrent` is asked before each pass;
+    /// `commit` takes the transcript lock only for the durable replacement and
+    /// returns false when the source moved on meanwhile. Nothing is owed on
+    /// failure: the raw turns are still in place, and the next append past the
+    /// boundary schedules a fresh pass.
+    package func distillAhead(
+        sessionId: String,
+        rows: [JSONValue],
+        turnModel: String,
+        surface: String,
+        runId: String?,
+        stillCurrent: @escaping @Sendable () async throws -> Bool,
+        commit: @escaping @Sendable (_ text: String, _ model: String) async throws -> Bool
+    ) async -> Bool {
+        guard let recollection = await prepareRecollection(
+            rows: rows, sessionId: sessionId, turnModel: turnModel,
+            surface: surface, runId: runId,
+            stillWanted: stillCurrent, goneStatus: "source_changed"
+        ) else { return false }
+        let promptChars = recollection.promptCharsPerPass.reduce(0, +)
+        let committed: Bool
+        do {
+            try Task.checkCancellation()
+            committed = try await commit(recollection.text, recollection.model)
+        } catch {
+            await emitDistillTrace(
+                sessionId: sessionId, surface: surface, model: recollection.model,
+                charsIn: promptChars, charsOut: recollection.text.count, runId: runId, status: "failed",
+                promptCharsPerPass: recollection.promptCharsPerPass, failure: error
+            )
+            return false
+        }
+        await emitDistillTrace(
+            sessionId: sessionId, surface: surface, model: recollection.model,
+            charsIn: promptChars,
+            charsOut: committed ? recollection.text.count : 0,
+            runId: runId, status: committed ? "ok" : "source_changed",
+            thirdPerson: committed ? recollection.thirdPerson : false,
+            promptCharsPerPass: recollection.promptCharsPerPass
+        )
+        return committed
     }
 
     private struct PreparedRecollection: Sendable {
         let text: String
         let model: String
         let promptCharsPerPass: [Int]
-        let rowsOmitted: Int
         let thirdPerson: Bool
     }
 
+    /// `stillWanted` false before a pass ends the work with `goneStatus`: the
+    /// recollection's destination (or source) is gone and a completion now
+    /// would buy nothing.
     private func prepareRecollection(
         rows: [JSONValue],
         sessionId: String,
         turnModel: String,
         surface: String,
         runId: String?,
-        summaryRowId: String
+        stillWanted: @Sendable () async throws -> Bool,
+        goneStatus: String
     ) async -> PreparedRecollection? {
         let summaryCap = Self.maxSummaryChars
         // 2. Resolve the model through the Providers GROUP that owns
@@ -391,7 +480,7 @@ public struct ChatCompactionDistiller: Sendable {
         //    group's connected route cannot serve, which is how a legacy
         //    compaction pin kept executing after upgrade while the Providers
         //    page showed Memory and mind following Chat. Nothing resolved means
-        //    nothing is set up; the mechanical summary stands.
+        //    nothing is set up; recollection remains owed.
         //    The budget below is a function of THAT model's window, so it has
         //    to be known before the prompt is planned.
         guard let resolved = await summaryModelResolver(Self.distillSurface),
@@ -412,12 +501,10 @@ public struct ChatCompactionDistiller: Sendable {
             summaryCap: summaryCap
         )
 
-        // 4. One LLM call per chunk, oldest-first, each inside a bounded
-        //    timeout. Every pass but the last produces an INTERIM note that
+        // 4. One LLM call per chunk, oldest-first. Every pass but the last produces an INTERIM note that
         //    the next pass carries as its pinned memory, so a transcript wider
         //    than one prompt is chained rather than omitted; the last pass's
-        //    output is the recollection. Any throw/timeout is fail-safe: the
-        //    mechanical summary stays.
+        //    output is the recollection. Failure leaves the source intact and owes repair.
         var carried = plan.pinned
         var promptCharsPerPass: [Int] = []
         var raw = ""
@@ -426,12 +513,12 @@ public struct ChatCompactionDistiller: Sendable {
             let output: String
             do {
                 try Task.checkCancellation()
-                guard try await destinationExists(sessionId: sessionId, summaryRowId: summaryRowId) else {
+                guard try await stillWanted() else {
                     await emitDistillTrace(
                         sessionId: sessionId, surface: surface, model: model,
                         charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
-                        runId: runId, status: "row_missing",
-                        promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted
+                        runId: runId, status: goneStatus,
+                        promptCharsPerPass: promptCharsPerPass
                     )
                     return nil
                 }
@@ -442,7 +529,7 @@ public struct ChatCompactionDistiller: Sendable {
                     sessionId: sessionId, surface: surface, model: model,
                     charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
                     runId: runId, status: "failed",
-                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted, failure: error
+                    promptCharsPerPass: promptCharsPerPass, failure: error
                 )
                 return nil
             }
@@ -452,7 +539,7 @@ public struct ChatCompactionDistiller: Sendable {
                     sessionId: sessionId, surface: surface, model: model,
                     charsIn: promptCharsPerPass.reduce(0, +), charsOut: 0,
                     runId: runId, status: "failed",
-                    promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted, failure: DistillError.empty
+                    promptCharsPerPass: promptCharsPerPass, failure: DistillError.empty
                 )
                 return nil
             }
@@ -474,7 +561,7 @@ public struct ChatCompactionDistiller: Sendable {
             await emitDistillTrace(
                 sessionId: sessionId, surface: surface, model: model,
                 charsIn: promptChars, charsOut: 0, runId: runId, status: "failed",
-                promptCharsPerPass: promptCharsPerPass, rowsOmitted: plan.omitted, failure: DistillError.empty
+                promptCharsPerPass: promptCharsPerPass, failure: DistillError.empty
             )
             return nil
         }
@@ -489,7 +576,7 @@ public struct ChatCompactionDistiller: Sendable {
 
         return PreparedRecollection(
             text: distilled, model: model, promptCharsPerPass: promptCharsPerPass,
-            rowsOmitted: plan.omitted, thirdPerson: thirdPerson
+            thirdPerson: thirdPerson
         )
     }
 
@@ -518,41 +605,19 @@ public struct ChatCompactionDistiller: Sendable {
         case empty
     }
 
-    /// One distillation call inside the bounded timeout. Extracted so every
-    /// chained pass shares the same deadline the single pass always had.
+    /// Provider transport and cancellation own the lifetime. A full-window
+    /// reasoning pass cannot share a fixed short interactive-call deadline.
     private func callLLM(model: String, prompt: String) async throws -> String {
-        let complete = llmComplete
-        return try await TurnDeadline.withThrowingDeadline(
-            seconds: Self.timeoutSeconds,
-            { try await complete(model, prompt) }
-        )
+        try await llmComplete(model, prompt)
     }
 
-    /// 2026-07-21 audit fix: bound the distill prompt. Compaction fires at
-    /// ≥200k estimated tokens, so an uncapped prompt routinely approached
-    /// the distill model's context window, the call 400'd, and the
-    /// mechanical summary stood — the feature silently never upgraded the
-    /// BIGGEST sessions it exists for. Recency-biased char budget (~24k
-    /// tokens at the repo's 4-chars-per-token convention): newest turns are
-    /// kept first, older turns omit honestly, and a single oversized row is
-    /// truncated rather than prompting with nothing.
-    ///
-    /// 2026-09-05: the fixed 96k cap is now the FLOOR, not the budget. It was
-    /// written for a 128k-window distiller; on a 200k/1M model it left ~90% of
-    /// the window unused and forced omissions that cost the session its
-    /// earlier arc. The budget scales with the window of the model actually
-    /// used, and — see `buildPlan` — nothing is omitted in the normal case
-    /// anyway: what does not fit is CHAINED, not dropped.
+    /// Scale each pass to its model's window; chain the source oldest-first.
     private static let minPromptChars = 96_000
     /// Past this, more prompt buys latency and cost, not recall.
     private static let maximumPromptChars = 600_000
     /// Share of the window one distillation pass may claim. The rest covers the
     /// system prompt, the model's reasoning, and the note it writes back.
     private static let promptWindowFraction = 0.45
-    /// Chained passes are bounded: past this the plan degrades to the old
-    /// recency-biased single pass rather than spending an unbounded number of
-    /// 120-second calls on one background distillation.
-    static let maximumDistillPasses = 6
 
     /// Characters one pass may spend, as a function of the distill model's
     /// verified window (`ProviderRouting.verifiedContextLength`, reached via
@@ -570,12 +635,10 @@ public struct ChatCompactionDistiller: Sendable {
 
     /// What the passes will be: the pinned prior recollection (never dropped)
     /// plus the raw turns split into consecutive oldest-first chunks that each
-    /// fit one prompt. `omitted` is 0 unless the pass bound forced the legacy
-    /// recency-biased fallback.
+    /// fit one prompt.
     struct PromptPlan: Sendable, Equatable {
         var pinned: String?
         var chunks: [String]
-        var omitted: Int
     }
 
     static let turnsHeader = "Here are the earlier turns to distill into your recollection:\n\n"
@@ -601,14 +664,7 @@ public struct ChatCompactionDistiller: Sendable {
         return out
     }
 
-    /// 2026-09-05 defect: the replaced range OPENS with the prior recollection
-    /// row, the rendering was newest-first, and the over-budget rows were
-    /// dropped OLDEST-first — so the moment a compaction replaced more than
-    /// the budget, the first thing thrown away was the only carrier of
-    /// everything before it and the session's earlier arc vanished for good.
-    /// The recollection row(s) are now pinned at the head and can only be
-    /// truncated to their own `maxSummaryChars`; the raw turns are chunked
-    /// oldest-first and chained, so nothing is dropped at all.
+    /// Carry the prior recollection into each consecutive pass.
     static func buildPlan(
         from rows: [JSONValue], budget: Int, summaryCap: Int = maxSummaryChars
     ) -> PromptPlan {
@@ -629,12 +685,7 @@ public struct ChatCompactionDistiller: Sendable {
                 toolSummaryCap: ChatCompactionRowRendering.distillerToolResultSummaryMaximumCharacters
             ) else { continue }
             if pinning, ChatCompactionRowRendering.isRecollection(obj) {
-                // User, 2026-09-06: TAIL, not head. A legacy over-cap summary
-                // row (the mechanical fallback used to emit ~24 000 chars) was
-                // pinned by its first 12 000, which is its OLDEST half — the
-                // newly summarised history was cut off at the very moment it
-                // entered the prompt. Keep the newest, as the mechanical
-                // fallback and the in-turn fold both now do.
+                // Legacy over-cap rows retain their newest recollection.
                 pinnedLines.append(String(
                     ChatSessionRecollections.droppingAddressTraits(body).suffix(summaryCap)
                 ))
@@ -670,39 +721,7 @@ public struct ChatCompactionDistiller: Sendable {
         if !current.isEmpty { chunks.append(current.joined(separator: "\n")) }
         if chunks.isEmpty { chunks = [""] }
 
-        guard chunks.count > maximumDistillPasses else {
-            return PromptPlan(pinned: pinned, chunks: chunks, omitted: 0)
-        }
-
-        // Degrade, never fail: past the pass bound this is the pre-2026-09-05
-        // behaviour — recency-biased, oldest raw turns omitted honestly — but
-        // with the pinned recollection still at the head, so the earlier arc
-        // survives even here.
-        var kept: [String] = []
-        var remaining = chunkBudget
-        var omitted = 0
-        for (index, line) in bodyLines.reversed().enumerated() {
-            if line.count <= remaining {
-                kept.append(line)
-                remaining -= line.count + 1
-                continue
-            }
-            if index == 0 {
-                // gpt-5.5 review 2026-07-21: the NEWEST row must never be
-                // displaced by older rows — recency is the contract.
-                // Truncate it into the remaining budget rather than dropping.
-                kept.append(String(line.prefix(max(0, remaining))))
-                remaining = 0
-                continue
-            }
-            omitted += 1
-        }
-        var body = ""
-        if omitted > 0 {
-            body += "[\(omitted) older turn(s) omitted to fit the distillation window]\n"
-        }
-        body += kept.reversed().joined(separator: "\n")
-        return PromptPlan(pinned: pinned, chunks: [body], omitted: omitted)
+        return PromptPlan(pinned: pinned, chunks: chunks)
     }
 
     /// 2026-09-06: advance the session's transcript version after the in-place
@@ -756,7 +775,6 @@ public struct ChatCompactionDistiller: Sendable {
         status: String,
         thirdPerson: Bool = false,
         promptCharsPerPass: [Int] = [],
-        rowsOmitted: Int = 0,
         failure: (any Error)? = nil
     ) async {
         let tracesPath = dataRoot
@@ -786,15 +804,13 @@ public struct ChatCompactionDistiller: Sendable {
         if thirdPerson {
             payload["distill.thirdPerson"] = .bool(true)
         }
-        // What the chaining actually did: how many calls, how big each prompt
-        // was, and how many rows never made it in (0 unless the pass bound
-        // forced the recency-biased fallback).
+        // Every source row participates in the chained passes.
         if !promptCharsPerPass.isEmpty {
             payload["distill.passes"] = .int(Int64(promptCharsPerPass.count))
             payload["distill.promptCharsPerPass"] = .array(
                 promptCharsPerPass.map { .int(Int64($0)) }
             )
-            payload["distill.rowsOmitted"] = .int(Int64(rowsOmitted))
+            payload["distill.rowsOmitted"] = .int(0)
         }
         let row: JSONValue = .object([
             "id": .string(UUID().uuidString.lowercased()),
@@ -823,10 +839,8 @@ public extension Notification.Name {
     /// Fired by AppModel.sendChat after a turn lands so any ContextFillBar
     /// instance can re-poll the session context.
     static let chatTurnCompleted = Notification.Name("chatTurnCompleted")
-    /// Posted after a transcript was rewritten in place OUTSIDE a turn — today
-    /// the compaction distiller's summary swap — and its session's transcript
-    /// version bumped. `object` is the chat session id. The Mac's sync engine
-    /// listens and publishes the transcript snapshot; nothing else depends on it.
+    /// Posted after transcript appends and rewrites, with its version bumped.
+    /// `object` is the session id; transcript and world projections invalidate.
     static let nativeAgentChatTranscriptDidChange = Notification.Name(
         "NativeAgent.chatTranscriptDidChange"
     )

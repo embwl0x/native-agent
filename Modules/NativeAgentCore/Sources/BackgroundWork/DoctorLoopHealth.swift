@@ -450,7 +450,7 @@ public enum DoctorLoopHealth {
         // fleet at launch, so an empty status list means the scheduler has not
         // come up (or has gone away) rather than that everything is fine.
         guard !observations.isEmpty else {
-            return CheckResult(
+            return CheckResult(source: "Background loop registrations",
                 id: doctorCheckID,
                 title: "Background Loops",
                 status: "unmeasured",
@@ -498,26 +498,12 @@ public enum DoctorLoopHealth {
         if let worst = verdicts.first, worst.level.isFault {
             detail += " Worst: \(worst.loopId) — \(worst.detail)"
         }
-        let status: String
-        if !failing.isEmpty {
-            status = "fail"
-        } else if dormantVerdicts.isEmpty && degraded.isEmpty {
-            status = "ok"
-        } else {
-            status = "warn"
-        }
-        let iCloudDriveOff = observations.first { $0.name == verdicts.first?.loopId }?
-            .lastResult?.localizedCaseInsensitiveContains("unavailable: iCloud Drive") == true
-        return CheckResult(
+        // Individual loop rows own repairs; this count creates no second debt.
+        return CheckResult(source: "Background loop registrations",
             id: doctorCheckID,
             title: "Background Loops",
-            status: status,
-            detail: detail,
-            harm: status == "ok" ? nil : "The named background work is failing or is not being done on schedule.",
-            human_action: status == "ok" ? nil : (iCloudDriveOff
-                ? iCloudDriveStep
-                : "Open Doctor → background loops for the named loop's current failure."),
-            ask: status != "ok" && iCloudDriveOff ? .permission : nil
+            status: failing.isEmpty && dormantVerdicts.isEmpty && degraded.isEmpty ? "ok" : "unmeasured",
+            detail: detail
         )
     }
 

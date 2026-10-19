@@ -346,12 +346,10 @@ extension CognitiveSubstrate {
                 && stringValue(object["summary"]) != nil
                 && dateValue(object["occurredAt"]) != nil
         case "schema_proposal":
-            guard let status = stringValue(object["status"]) else { return false }
             return uuidValue(object["id"]) != nil
                 && stringValue(object["title"]) != nil
                 && stringValue(object["body"]) != nil
                 && stringValue(object["target"]) != nil
-                && CognitiveSchemaProposalStatus(rawValue: status) != nil
                 && dateValue(object["createdAt"]) != nil
         case "standing_view":
             guard let status = stringValue(object["status"]) else { return false }
@@ -473,8 +471,6 @@ extension CognitiveSubstrate {
                   let title = stringValue(object["title"]),
                   let body = stringValue(object["body"]),
                   let target = stringValue(object["target"]),
-                  let statusRaw = stringValue(object["status"]),
-                  let status = CognitiveSchemaProposalStatus(rawValue: statusRaw),
                   let createdAt = dateValue(object["createdAt"]) else {
                 continue
             }
@@ -483,7 +479,6 @@ extension CognitiveSubstrate {
                 title: title,
                 body: body,
                 target: target,
-                status: status,
                 confidence: doubleValue(object["confidence"]) ?? 0,
                 createdAt: createdAt,
                 evidenceNodeIds: uuidArrayValue(object["evidenceNodeIds"]),

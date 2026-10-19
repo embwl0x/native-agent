@@ -553,7 +553,7 @@ create_archive() {
   # Opt-in only: lets Xcode register App IDs/profiles for new targets on the team.
   local provisioning=()
   [[ "${NATIVEAGENT_IOS_ALLOW_PROVISIONING:-0}" == "1" ]] && provisioning=(-allowProvisioningUpdates)
-  xcodebuild archive "${provisioning[@]}" \
+  xcodebuild archive ${provisioning[@]+"${provisioning[@]}"} \
     -onlyUsePackageVersionsFromResolvedFile -skipPackageUpdates \
     -project "$PROJECT" \
     -scheme "$SCHEME" \
@@ -591,7 +591,7 @@ export_archive() {
   printf '[EXPORT] %s\n' "$EXPORT_PATH"
   local provisioning=()
   [[ "${NATIVEAGENT_IOS_ALLOW_PROVISIONING:-0}" == "1" ]] && provisioning=(-allowProvisioningUpdates)
-  xcodebuild -exportArchive "${provisioning[@]}" \
+  xcodebuild -exportArchive ${provisioning[@]+"${provisioning[@]}"} \
     -archivePath "$ARCHIVE_PATH" \
     -exportPath "$EXPORT_PATH" \
     -exportOptionsPlist "$options" || {

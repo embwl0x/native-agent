@@ -20,10 +20,14 @@ import ProviderRouting
 // now names which lane ran (`lane: aging` vs `lane: backstop`).
 //
 // What does NOT change: the aging pass runs the SAME `ChatSessionAutocompactor`
-// body under the same file lock, with the same verified pre-compaction backup,
-// the same transcript validator, and the same durable replacement. What DOES
-// change is where a failure goes — a background pass may never take a turn down
-// with it, so failure is loud in the receipt and on stderr instead.
+// selection and replacement, with the same verified pre-compaction backup, the
+// same transcript validator, and the same durable write. What DOES change is
+// where a failure goes — a background pass may never take a turn down with it,
+// so failure is loud in the receipt and on stderr instead — and when the model
+// works: aging distills BEFORE it replaces, with the transcript unlocked, so
+// no turn ever waits on a background recollection (2026-10-19: a 114 s aging
+// distill held User's next message, because the pass wrote its row pending
+// first and the turn waited for it).
 
 /// Verdict from the host's background-cognition gate.
 public enum BackgroundConsolidationGateDecision: Sendable, Equatable {
@@ -240,64 +244,102 @@ public struct ChatSessionAgingConsolidation: Sendable {
         }
 
         let compactor = ChatSessionAutocompactor(dataRoot: dataRoot, config: config, now: now)
-        let outcome: ChatSessionCompactionOutcome
+        let start: ChatSessionAutocompactor.AgingStart
         do {
-            outcome = try await compactor.compactIfNeeded(
+            start = try await compactor.startAging(
                 sessionId: sessionId,
                 model: model,
-                surface: surface,
-                runId: runId,
                 providerID: providerID,
                 trigger: agingTrigger,
-                force: false,
-                thresholdTokensOverride: boundaryTokens,
-                keepTailFixed: true
+                thresholdTokens: boundaryTokens
             )
         } catch {
             // FAIL LOUD, off the critical path. The autocompactor refuses to
-            // replace conversation content without a verified backup and refuses
-            // to compact a corrupt transcript. Recovery may already have settled
-            // an orphaned pending marker without changing its summary text.
-            let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-            await emitAgingTrace(
-                sessionId: sessionId,
-                surface: surface,
-                model: model,
-                runId: runId,
-                status: "error",
-                detail: detail,
-                boundaryTokens: boundaryTokens,
-                dataRoot: dataRoot,
-                now: now
-            )
-            FileHandle.standardError.write(
-                Data("ChatSessionAging: consolidation failed for \(sessionId): \(detail)\n".utf8)
+            // compact a corrupt transcript, and recovery may already have
+            // settled an orphaned pending marker without changing its text.
+            await reportAgingError(
+                error, sessionId: sessionId, surface: surface, model: model, runId: runId,
+                boundaryTokens: boundaryTokens, dataRoot: dataRoot, now: now
             )
             return
         }
-        if outcome.compacted {
-            await ChatCompactionDistiller.publishTranscriptChange(
-                sessionId: sessionId, dataRoot: dataRoot, persistence: compactor.persistence
+        let distiller = makeAgingDistiller(dataRoot: dataRoot, llm: llm, now: now)
+        switch start {
+        case .nothing:
+            return
+        case .pending(let outcome):
+            // A foreground compaction left this recollection owed; the turn
+            // that needs it next would distill it anyway, so do it between
+            // turns.
+            guard let summaryRowId = outcome.summaryRowId,
+                  let backupPath = outcome.backupPath
+            else { return }
+            await distiller.distill(
+                sessionId: sessionId,
+                summaryRowId: summaryRowId,
+                backupPath: backupPath,
+                messagesReplaced: outcome.messagesReplaced,
+                turnModel: model,
+                surface: surface,
+                runId: runId
             )
+        case .fold(let fold):
+            // Distill FIRST, from the prefix as read, with the transcript
+            // unlocked and unchanged: a turn arriving meanwhile reads its
+            // history as it is and waits on nothing. Only the finished
+            // recollection takes the lock, for a replacement that first
+            // checks the prefix is still exactly what was distilled.
+            let committed = await distiller.distillAhead(
+                sessionId: sessionId,
+                rows: fold.source,
+                turnModel: model,
+                surface: surface,
+                runId: runId,
+                stillCurrent: { try await compactor.agingFoldIsCurrent(fold) },
+                commit: { text, distillModel in
+                    try await compactor.commitAging(
+                        fold,
+                        recollection: text,
+                        distillModel: distillModel,
+                        model: model,
+                        surface: surface,
+                        runId: runId,
+                        trigger: Self.agingTrigger
+                    ).compacted
+                }
+            )
+            if committed {
+                await ChatCompactionDistiller.publishTranscriptChange(
+                    sessionId: sessionId, dataRoot: dataRoot, persistence: compactor.persistence
+                )
+            }
         }
-        guard config.distillEnabled,
-              let summaryRowId = outcome.summaryRowId,
-              let backupPath = outcome.backupPath
-        else { return }
+    }
 
-        // Distillation happens INSIDE this background pass rather than as a
-        // second fire-and-forget hop off a turn: the recollection row is
-        // finished before the pass reports done, which is what lets a test
-        // await the effect and what keeps the mechanical text from being what
-        // history renders in the meantime.
-        await makeAgingDistiller(dataRoot: dataRoot, llm: llm, now: now).distill(
+    private static func reportAgingError(
+        _ error: Error,
+        sessionId: String,
+        surface: String,
+        model: String,
+        runId: String?,
+        boundaryTokens: Int,
+        dataRoot: URL,
+        now: @escaping @Sendable () -> Date
+    ) async {
+        let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        await emitAgingTrace(
             sessionId: sessionId,
-            summaryRowId: summaryRowId,
-            backupPath: backupPath,
-            messagesReplaced: outcome.messagesReplaced,
-            turnModel: model,
             surface: surface,
-            runId: runId
+            model: model,
+            runId: runId,
+            status: "error",
+            detail: detail,
+            boundaryTokens: boundaryTokens,
+            dataRoot: dataRoot,
+            now: now
+        )
+        FileHandle.standardError.write(
+            Data("ChatSessionAging: consolidation failed for \(sessionId): \(detail)\n".utf8)
         )
     }
 

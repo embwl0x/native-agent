@@ -21,6 +21,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Studio
+import Transcripts
 
 extension CognitiveSubstrate {
     static let maximumOpinions = 8
@@ -48,21 +49,33 @@ extension CognitiveSubstrate {
     }
 
     static func reflectionOccurrenceKey(_ receipt: CognitiveReflectionReceipt) -> String {
-        occurrenceKey(day: receipt.createdAt, source: reflectionSourceKey(receipt.request))
+        let source = receipt.judgment.map { judgment in
+            Set(judgment.sources + judgment.sources.flatMap {
+                guard let cause = receipt.request.material[$0] else { return [String]() }
+                return cause.sourceRefs + cause.sourceNodeIds.map(\.uuidString)
+            })
+                .sorted().joined(separator: ",")
+        }
+            ?? reflectionSourceKey(receipt.request)
+        return occurrenceKey(day: receipt.createdAt, source: source)
     }
 
     /// Independent of every known occurrence: another day AND no shared source.
-    static func isIndependentOccurrence(_ key: String, of known: [String]) -> Bool {
+    func isIndependentOccurrence(_ key: String, of known: [String]) async throws -> Bool {
         func split(_ key: String) -> (String, Set<String>) {
-            let bare = key.hasPrefix(taintedOccurrencePrefix) ? String(key.dropFirst(taintedOccurrencePrefix.count)) : key
+            let bare = key.hasPrefix(Self.taintedOccurrencePrefix) ? String(key.dropFirst(Self.taintedOccurrencePrefix.count)) : key
             let parts = bare.split(separator: "|", maxSplits: 1).map(String.init)
             let sources = Set((parts.count > 1 ? parts[1] : "").split(separator: ",").map(String.init))
             return (parts.first ?? "", sources)
         }
         let (day, sources) = split(key)
+        let identities = try await ChatSessionRecollections.experienceIdentities(
+            for: Array(sources) + known.flatMap { split($0).1 },
+            dataRoot: store?.databaseURL.deletingLastPathComponent().deletingLastPathComponent())
+        let canonical = Set(sources.compactMap { identities[$0] })
         return !known.contains { other in
             let (otherDay, otherSources) = split(other)
-            return otherDay == day || !otherSources.isDisjoint(with: sources)
+            return otherDay == day || !Set(otherSources.compactMap { identities[$0] }).isDisjoint(with: canonical)
         }
     }
 
@@ -125,8 +138,6 @@ extension CognitiveSubstrate {
         return out
     }
 
-    static let opinionProtocolPrefixes = ["because:", "unless:", "revise:"]
-
     // MARK: - D1 paraphrase (local embedder)
 
     /// bge-large cosine between two `view:` lines that say the same thing in
@@ -184,7 +195,7 @@ extension CognitiveSubstrate {
         return lowered
     }
 
-    static func peerIdentity(metadata: [String: JSONValue]) -> String? {
+    public static func peerIdentity(metadata: [String: JSONValue]) -> String? {
         var session: String?
         if case .string(let value)? = metadata["sessionId"] { session = value }
         if case .object(let origin)? = metadata["origin"], case .string(let authored)? = origin["authored"],

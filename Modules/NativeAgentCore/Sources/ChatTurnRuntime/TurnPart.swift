@@ -1,6 +1,7 @@
 import AuthoredCapabilities
 import AgentWorkspace
 import CryptoKit
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -41,7 +42,7 @@ struct TurnPart {
     private var state: JSONValue = .null
     /// The current model round: its ordinal, call ids and payload digests; an
     /// app effect runs each call once.
-    private var round: (ordinal: Int, ids: [String], digests: [String], used: Set<Int>)?
+    private var round: (ordinal: Int, ids: [String], digests: [String], used: Set<Int>, repair: Bool)?
     private var rounds = 0
     private var seen: [String: Int] = [:]
     private var file: AbilityStore.File
@@ -63,13 +64,44 @@ struct TurnPart {
         let current = Self.read(store, .current)
         if let chosen = current.file ?? Self.read(store, .previous).file {
             file = chosen
+            var metadata = chosen.metadata
+            metadata["version"] = seed.metadata["version"]
+            // Upgrade only the unchanged shipped version, never an authored part.
+            if !current.unreadable, chosen.metadata["version"] == .int(1), metadata == seed.metadata,
+               chosen.bodyDigest == "f9eecf7ec5040bb1ec7bf56f5fdf27b10b21d6c01304dd88ef015f9cb9e2ff40" {
+                file = await Self.install(seed, over: chosen, store: store, dataRoot: dataRoot)
+            }
         } else {
             file = seed
-            if !current.unreadable {
-                let seed = seed
-                do { try await Self.asStem { try store.write(seed) } }
-                catch { nativeLog("Her turn part: the seed was not installed: %@", error.localizedDescription) }
+            if !current.unreadable { file = await Self.install(seed, over: nil, store: store, dataRoot: dataRoot) }
+        }
+    }
+
+    /// Installing the shipped part is the stem's bookkeeping, never a
+    /// precondition of the turn: a store that refuses the write leaves the turn
+    /// running the shipped part, and the abilities directory owes repair until
+    /// a later turn's install works. What someone else wrote meanwhile is adopted.
+    private static func install(_ seed: AbilityStore.File, over expected: AbilityStore.File?,
+                                store: AbilityStore, dataRoot: URL) async -> AbilityStore.File {
+        do {
+            let installed = try await asStem {
+                try AbilityStore.withLock {
+                    if let latest = try store.read(id: id), latest != expected { return latest }
+                    try store.write(seed)
+                    return seed
+                }
             }
+            RepairOwed.settle(dataRoot, operation: "turn.part.install", evidence: .init(source: "abilities", id: seed.bodyDigest))
+            return installed
+        } catch {
+            let owner = store.root.path + " (turn.js)"
+            let words = "The shipped turn part was not written to \(owner): \(error.localizedDescription). Turns run the shipped part meanwhile; repair is owed until a turn installs it."
+            RepairOwed.owe(dataRoot, id: "turn-part-install:" + UUID().uuidString, kind: .run,
+                operation: "turn.part.install", owner: owner, words: words,
+                nextCall: ToolFailureError.call("app", ["action": .string("codex.message"), "args": .object([
+                    "conversation_mode": .string("new"),
+                    "text": .string("Make \(store.root.path) accept the shipped turn part (turn.js). The write failed: \(error.localizedDescription). Preserve every ability file and its .prev version; never remove or rewrite an authored part. Repair is proved only when a turn installs the shipped part, not by a restart.")])]))
+            return seed
         }
     }
 
@@ -79,7 +111,9 @@ struct TurnPart {
         let first = log.count
         log += events.map { .object(["event": $0]) }
         do { for index in first..<log.count { try await step(index) } }
-        catch let fault as Fault { _ = try await heal(fault) }
+        catch let fault as Fault {
+            _ = try await heal(fault)
+        }
     }
 
     /// A relaunched turn rebuilds from its log. True when the part must hear
@@ -165,7 +199,7 @@ struct TurnPart {
                 streamed += text
             } else if case .object(let event)? = entry["event"] {
                 switch event["type"] {
-                case .string("model"), .string("observation"):
+                case .string("model"), .string("observation"), .string("provider_failure"):
                     open = open.filter { !$0.hasPrefix("model.call:") }
                 case .string("result"):
                     if let round, case .int(let at)? = event["index"], round.ids.indices.contains(Int(at)) {
@@ -181,10 +215,12 @@ struct TurnPart {
 
     private mutating func rebuild() async throws -> Bool {
         do { return try await reconstruct() }
-        catch let fault as Fault { return try await heal(fault) }
+        catch let fault as Fault {
+            return try await heal(fault)
+        }
     }
 
-    private static func callIdentity(_ round: (ordinal: Int, ids: [String], digests: [String], used: Set<Int>), _ at: Int) -> String {
+    private static func callIdentity(_ round: (ordinal: Int, ids: [String], digests: [String], used: Set<Int>, repair: Bool), _ at: Int) -> String {
         round.ids[at].isEmpty ? "app:\(round.ordinal):\(at)" : "app:" + round.ids[at]
     }
 
@@ -200,10 +236,10 @@ struct TurnPart {
         }
         var calls: [JSONValue] = []
         if case .array(let given)? = event["calls"] { calls = given }
-        if event["type"] == .string("model") {
+        if event["type"] == .string("model") || event["type"] == .string("provider_failure") {
             rounds += 1
             round = (rounds, calls.map { if case .object(let call) = $0, case .string(let id)? = call["id"] { id } else { "" } },
-                     calls.map(Self.digest), [])
+                     calls.map(Self.digest), [], event["type"] == .string("provider_failure"))
         } else if event["type"] != .string("result") { round = nil }
         var effects: [(effect: [String: JSONValue], identity: String, digest: String, step: Int)] = []
         var opened: (system: SystemPromptSegments, tools: [String]?)?
@@ -221,6 +257,19 @@ struct TurnPart {
             }
             switch name {
             case "app":
+                if event["type"] == .string("provider_failure"), var current = round,
+                   case .object(var call)? = effect["call"], call["tool"] == .string("app"),
+                   case .object? = call["input"] {
+                    let position = current.ids.count
+                    let id = "repair:\(current.ordinal):\(position)"
+                    call["id"] = .string(id)
+                    current.ids.append(id); current.digests.append(Self.digest(.object(call))); current.used.insert(position)
+                    round = current
+                    effect = ["effect": .string("app"), "index": .int(Int64(position)), "call": .object(call)]
+                    identity = Self.callIdentity(current, position)
+                    digest = current.digests[position]
+                    break
+                }
                 // A call of this model round, by id (index when id-less), each once.
                 guard var current = round, case .object(let call)? = effect["call"] else {
                     throw Fault(code: "malformed", why: "Its app effect names no call of the current model round.")
@@ -236,8 +285,9 @@ struct TurnPart {
                 identity = Self.callIdentity(current, position)
                 digest = current.digests[position]
             case "reply.end":
-                guard event["type"] == .string("model"), calls.isEmpty else {
-                    throw Fault(code: "malformed", why: "Its reply.end did not follow a model reply without calls.")
+                let repairResult = event["type"] == .string("result") && round?.repair == true
+                guard (event["type"] == .string("model") && calls.isEmpty) || event["type"] == .string("provider_failure") || repairResult else {
+                    throw Fault(code: "malformed", why: "Its reply.end did not follow a model reply without calls or an owned provider failure.")
                 }
             case "model.call" where system == nil && opened == nil:
                 guard case .object(let named)? = effect["system"], case .string(let stable)? = named["stable"],
@@ -384,7 +434,7 @@ struct TurnPart {
     /// Writes the stem makes under its own law. A peer-steered turn may not
     /// change her parts (CapabilityLifecycle.requireWrite reads the turn's
     /// provenance); the seed and the swap-back are not the turn's doing.
-    private static func asStem(_ write: @escaping @Sendable () throws -> Void) async throws {
+    private static func asStem<T: Sendable>(_ write: @escaping @Sendable () throws -> T) async throws -> T {
         try await Task.detached { try write() }.value
     }
 

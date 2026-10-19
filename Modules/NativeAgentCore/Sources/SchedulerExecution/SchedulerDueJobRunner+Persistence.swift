@@ -1,6 +1,7 @@
 import Privacy
 import BackgroundWork
 import Foundation
+import Experiences
 import AttentionRouting
 import NativeAgentCore
 import NotificationInbox
@@ -13,25 +14,21 @@ import Synchronization
 
 extension SchedulerDueJobRunner {
     func update(job: DueJob, result: JobResult, at runDate: Date) async throws {
-        // FIX 2 (A4.4): a park (retry cap reached) must leave a user-visible
-        // receipt. The park decision is made under the jobs lock; the receipt
-        // is emitted afterward so the two file locks never nest.
-        let parkedAttempts = try await schedulerJobs.settleOccurrence(
+        if job.kind == "dream" {
+            let output = Self.object(result.output)
+            if (result.status == "error" || output["skipReason"] == .string("already_running")), output["remedy"] == nil {
+                await RepairOwed.owe(root, id: "scheduled-dream-repair:" + UUID().uuidString, kind: .run,
+                    evidence: [.init(source: "scheduler/jobs.json", id: job.occurrenceKey)],
+                    operation: "dream", owner: "scheduler/jobs.json > " + job.id,
+                    words: "Scheduled dream remains owed: " + result.detail,
+                    nextCall: ToolFailureError.call("app", ["action": .string("mind.dream")])).value
+            }
+        }
+        try await schedulerJobs.settleOccurrence(
             jobId: job.id, occurrenceKey: job.occurrenceKey, status: result.status,
             detail: result.detail, output: result.output, at: runDate,
             runDateKey: NativeAgentDreamCycleSchedule.runDateKey(runDate)
         )
-
-        if let attempts = parkedAttempts {
-            let agentName = NativeAgentNotificationDefaults.agentDisplayName(dataRoot: root)
-            try? await appendNotificationInbox(
-                title: "\(job.name) paused after repeated failures",
-                message: "\(job.name) failed \(attempts) time\(attempts == 1 ? "" : "s") today and was paused to stop a retry storm. \(agentName) will try again at its next scheduled time.",
-                source: "scheduler",
-                severity: "important",
-                jobId: job.id
-            )
-        }
     }
 
     func appendActivity(

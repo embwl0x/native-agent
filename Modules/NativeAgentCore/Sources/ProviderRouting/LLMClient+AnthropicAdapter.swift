@@ -709,6 +709,7 @@ public final class AnthropicAdapter: LLMAdapter {
                         try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
                         switch effectiveEvent {
                         case "message_stop":
+                            continuation.yield(runaway.finish())
                             // Documented terminal event. Finish clean and return —
                             // don't trust any bytes after this.
                             let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
@@ -754,8 +755,8 @@ public final class AnthropicAdapter: LLMAdapter {
                                 }
                                 yieldedAnyText = true
                                 let stop = runaway.feed(text)
-                                let kept = runaway.keptPart(of: text)
-                                if !kept.isEmpty { continuation.yield(kept) }
+                                let kept = runaway.takeCommittedText()
+                                continuation.yield(kept)
                                 if stop {
                                     // Ended by us, not by message_stop: record the call anyway, so
                                     // the turn's cost stays visible (usage has message_start's input

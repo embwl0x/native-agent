@@ -108,17 +108,21 @@ struct ScrollWheelCatcher: NSViewRepresentable {
     /// was disarming chat follow. The monitor stays installed (its state, and
     /// the follow state it feeds, survive the trip); it just stops reporting.
     var isActive: Bool = true
+    /// A left press inside the view, as its distance from the view's top.
+    var onPress: ((CGFloat) -> Void)? = nil
     var onScroll: (CGFloat) -> Void
 
     func makeNSView(context: Context) -> ScrollWheelNSView {
         let view = ScrollWheelNSView()
         view.onScroll = onScroll
+        view.onPress = onPress
         view.isActive = isActive
         return view
     }
 
     func updateNSView(_ nsView: ScrollWheelNSView, context: Context) {
         nsView.onScroll = onScroll
+        nsView.onPress = onPress
         nsView.isActive = isActive
     }
 
@@ -129,6 +133,7 @@ struct ScrollWheelCatcher: NSViewRepresentable {
 
 final class ScrollWheelNSView: NSView {
     var onScroll: ((CGFloat) -> Void)?
+    var onPress: ((CGFloat) -> Void)?
     var isActive: Bool = true
     nonisolated(unsafe) private var monitor: Any?
 
@@ -148,12 +153,13 @@ final class ScrollWheelNSView: NSView {
             return
         }
         guard monitor == nil else { return }
-        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .leftMouseDown]) { [weak self] event in
             guard let self, self.isActive else { return event }
             let point = self.convert(event.locationInWindow, from: nil)
-            if event.window === self.window,
-               self.bounds.contains(point),
-               (abs(event.scrollingDeltaY) > 0.5 || abs(event.scrollingDeltaX) > 0.5) {
+            guard event.window === self.window, self.bounds.contains(point) else { return event }
+            if event.type == .leftMouseDown {
+                self.onPress?(self.isFlipped ? point.y : self.bounds.height - point.y)
+            } else if abs(event.scrollingDeltaY) > 0.5 || abs(event.scrollingDeltaX) > 0.5 {
                 self.onScroll?(event.scrollingDeltaY)
             }
             return event

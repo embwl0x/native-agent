@@ -48,7 +48,7 @@ extension SwiftToolDispatcher {
         path: String?,
         error: Error
     ) -> JSONValue? {
-        guard case AutonomyGateError.toolDenied(let reason) = error,
+        guard case AutonomyGateError.toolDenied(let reason, _) = error,
               reason.contains("outside trusted workspace roots")
         else { return nil }
         let named = (path?.isEmpty == false) ? path! : "that file"

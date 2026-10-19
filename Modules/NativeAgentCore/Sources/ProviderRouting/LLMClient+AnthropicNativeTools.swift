@@ -594,8 +594,8 @@ extension AnthropicAdapter {
     ///
     ///   * FIRST-PARTY (api.anthropic.com, api-key): a REAL SSE parse —
     ///     `content_block_start` → `input_json_delta` accumulation →
-    ///     `content_block_stop` → one `.toolCall`, with text deltas streaming
-    ///     as they arrive. This matters because the api-key Claude path is a
+    ///     `content_block_stop` → one `.toolCall` once input is confirmed,
+    ///     with text deltas streaming as they arrive. The api-key Claude path is a
     ///     CHAT surface: before this lane existed it rode the grown-prompt SSE
     ///     and streamed token by token, and moving it to a blocking call would
     ///     have traded marker-parsing for a frozen bubble. Same shape the
@@ -714,7 +714,7 @@ extension AnthropicAdapter {
     ///     from that block's `input_json_delta` fragments. PARALLEL tool use is
     ///     the default on this family, so several blocks may arrive in one
     ///     message: each opens at its own `content_block_start` and closes at
-    ///     its own `content_block_stop`, and every one of them is yielded.
+    ///     its own `content_block_stop`; empty input waits for a normal terminal.
     ///   * `.keepAlive` for thinking and tool-argument deltas — real model
     ///     output that carries no reply text. ProviderStreamGuard's idle clock
     ///     only advances on a yield, so without these a long thinking phase or
@@ -786,16 +786,13 @@ extension AnthropicAdapter {
         var openToolId: String?
         var openToolName: String?
         var openToolJSON = ""
-        /// Completed tool_use blocks, held until `message_stop` so they can be
-        /// validated against the assembled JSON and the response's stop_reason
-        /// (User, 2026-09-06).
-        var pendingToolCalls: [(id: String, name: String, json: String)] = []
+        var pendingToolCalls: [LLMStreamToolCall] = []
         // Thinking-replay state. `openThinkingType` is the presence flag for
         // an in-flight thinking / redacted_thinking block; its text and
         // signature arrive as separate delta streams and are only valid
         // together, so both accumulate into the same block. Completed blocks
         // land in `thinkingBlocks` in wire order, and every tool_use id the
-        // stream yields is banked against them at message_stop.
+        // stream commits is banked against them when its input is confirmed.
         var openThinkingType: String?
         var openThinkingText = ""
         var openThinkingSignature = ""
@@ -803,20 +800,22 @@ extension AnthropicAdapter {
         var thinkingBlocks: [AnthropicThinkingBlock] = []
         var runaway = RunawayOutputDetector()
 
-        func releasePendingToolCalls() async throws {
-            let content = try pendingToolCalls.map { call -> [String: Any] in
-                let json = call.json.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let input = try? JSONSerialization.jsonObject(with: Data((json.isEmpty ? "{}" : json).utf8))
-                    as? [String: Any] else { throw LLMError.failure(.malformedResponse) }
-                return ["type": "tool_use", "id": call.id, "name": call.name, "input": input]
-            }
-            let calls = try Self.nativeToolCalls(content)
-            if !calls.isEmpty {
+        func commitToolCalls(terminal: Bool) async throws {
+            while let call = pendingToolCalls.first {
+                if call.inputJSON.isEmpty && !terminal { break }
+                pendingToolCalls.removeFirst()
+                if call.inputJSON.isEmpty,
+                   !["end_turn", "tool_use", "stop_sequence", "pause_turn"].contains(lastStopReason ?? "") { continue }
+                let json = call.inputJSON.isEmpty ? Data("{}".utf8) : call.inputJSON
+                guard let input = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
+                else { throw LLMError.failure(.malformedResponse) }
+                let calls = try Self.nativeToolCalls([
+                    ["type": "tool_use", "id": call.id, "name": call.name, "input": input]
+                ])
                 await thinkingLedger.record(thinkingBlocks, toolUseIDs: calls.map(\.id))
                 yieldedSemanticOutput = true
+                for call in calls { continuation.yield(.toolCall(call)) }
             }
-            for call in calls { continuation.yield(.toolCall(call)) }
-            pendingToolCalls = []
         }
 
         do {
@@ -840,8 +839,6 @@ extension AnthropicAdapter {
                 try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
                 switch effectiveEvent {
                 case "message_stop":
-                    // Truncated batches never dispatch; validate the whole
-                    // batch before yielding any completed call.
                     let cutByTokenLimit = (lastStopReason == "max_tokens")
                     let durationMs = Int(
                         (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
@@ -856,14 +853,13 @@ extension AnthropicAdapter {
                         status: cutByTokenLimit ? "incomplete" : "ok",
                         stopReason: lastStopReason
                     )
+                    try await commitToolCalls(terminal: true)
                     if cutByTokenLimit {
-                        pendingToolCalls = []
                         RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
                         continuation.yield(.toolBoundary(.outputLimit))
                         continuation.finish()
                         return
                     }
-                    try await releasePendingToolCalls()
                     if !yieldedSemanticOutput {
                         throw FirstPartyExecutionControls.anthropicEmptyStreamError(
                             providerID: providerId,
@@ -914,7 +910,7 @@ extension AnthropicAdapter {
                         }
                         yieldedSemanticOutput = true
                         let boundary = runaway.feed(text)
-                        let kept = runaway.keptPart(of: text)
+                        let kept = runaway.takeCommittedText()
                         if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
                         if boundary {
                             await telemetry.record(
@@ -928,7 +924,7 @@ extension AnthropicAdapter {
                                 status: "ok",
                                 stopReason: "client_tool_boundary"
                             )
-                            try await releasePendingToolCalls()
+                            try await commitToolCalls(terminal: true)
                             if let reason = runaway.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                             continuation.finish()
                             return
@@ -973,24 +969,17 @@ extension AnthropicAdapter {
                         continue
                     }
                     guard let name = openToolName else { continue }
-                    // User, 2026-09-06: the assembled argument bytes used to be
-                    // yielded RIGHT HERE, unvalidated — so a block cut mid-JSON
-                    // was dispatched with truncated arguments, and one cut
-                    // before any argument text was dispatched as `{}`, i.e. the
-                    // model's call with every argument invented. The block's
-                    // `stop_reason` has not arrived yet at this point, so the
-                    // calls are buffered and released at `message_stop`, where
-                    // both the parse and the max_tokens verdict are known.
-                    // Mirrors the OpenAI OAuth-direct `response.incomplete` rule.
+                    // Empty input needs a normal terminal's confirmation. Hold
+                    // later blocks behind it to preserve wire order.
                     if ttftMs == nil {
                         ttftMs = Int(
                             (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     }
-                    pendingToolCalls.append((
-                        id: openToolId ?? "",
-                        name: name,
-                        json: openToolJSON
+                    let json = openToolJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+                    pendingToolCalls.append(LLMStreamToolCall(
+                        id: openToolId ?? "", name: name, inputJSON: Data(json.utf8)
                     ))
+                    try await commitToolCalls(terminal: false)
                     openToolId = nil
                     openToolName = nil
                     openToolJSON = ""
@@ -999,16 +988,18 @@ extension AnthropicAdapter {
                     continue
                 }
             }
-        } catch let err as LLMError {
-            throw err
-        } catch is CancellationError {
-            throw CancellationError()
+            // EOF without message_stop is a truncation, not a clean end.
+            throw LLMError.streamTruncated(
+                message: "\(providerId): native tools stream ended without message_stop"
+            )
         } catch {
+            try Task.checkCancellation()
+            if !(error is any ProviderFailureWrapping), ProviderFailure.classify(error) == .network {
+                pendingToolCalls.removeAll { $0.inputJSON.isEmpty }
+                try await commitToolCalls(terminal: true)
+            }
+            if let err = error as? LLMError { throw err }
             throw mapTransportError(error, fallback: .underlying(message: "stream: \(error)"))
         }
-        // EOF without message_stop is a truncation, not a clean end.
-        throw LLMError.streamTruncated(
-            message: "\(providerId): native tools stream ended without message_stop"
-        )
     }
 }

@@ -3,6 +3,7 @@ import ChatTurnContracts
 import Darwin
 import CryptoKit
 import ChatOrchestration
+import AgentWorkspace
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -119,7 +120,10 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             response(400, ["error": "missing_text"])
             return
         }
-        let isCodexCompletion = ["codex", "claude", "omp"].contains(defaultSender) && json["completion"] is [String: Any]
+        let isCodexCompletion = json["completion"] is [String: Any]
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        let owner = AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + principal.id)
+        let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner
         let requestedSessionId = json["sessionId"] as? String
         // Real artifacts over the bridge (2026-09-02): a studio consult needs
         // the image, not a description of it. `image_paths` are local files
@@ -151,7 +155,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         let sessionId = Self.bridgeMessageSessionID(
             requested: requestedSessionId,
             active: isCodexCompletion ? nil
-                : sender == defaultSender ? ContactThread.session(owner: defaultSender)
+                : sender == defaultSender ? ContactThread.session(owner: threadOwner)
                 : port.activeSessionID(dataRoot: PersistenceCore.defaultDataRoot())
         )
         if !isCodexCompletion, sessionId == nil {
@@ -179,7 +183,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             return
         }
         let githubCommandCompletion: (messageIds: [String], status: String, threadId: String?, turnId: String?, errorMessage: String?, noWorkObserved: Bool?)? = {
-            guard defaultSender == "codex", let completion = json["completion"] as? [String: Any] else { return nil }
+            guard let completion = json["completion"] as? [String: Any] else { return nil }
             let messageIds = (completion["messageIds"] as? [Any])?.compactMap { $0 as? String } ?? []
             guard !messageIds.isEmpty else { return nil }
             return (
@@ -200,8 +204,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 sessionId: sessionId
             )
         }()
-        let claudeReplyID = sender == "claude" ? Self.claudeReplyID(json) : nil
-        let dataRoot = PersistenceCore.defaultDataRoot()
+        let claudeReplyID = Self.claudeReplyID(json, owner: owner)
         let baseRequest: TurnRequest = {
             var request = principal.turnRequest(context: nil, plain: rawText, attachments: attachments, originID: claudeReplyID)
             request.sessionID = sessionId
@@ -386,8 +389,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
                 }
                 if let claudeReplyID {
-                    Self.recordClaudeReply(to: claudeReplyID, text: rawText, sessionId: resp.sessionId ?? sessionId)
-                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? sessionId)
+                    Self.recordClaudeReply(to: claudeReplyID, text: rawText, sessionId: resp.sessionId ?? sessionId, owner: owner)
+                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? sessionId, owner: owner)
                 }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -785,6 +788,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         runTurn: Bool = true
     ) {
         let enqueueLatch = ClaudeBridgeRuntime.WorkLatch()
+        let owner = AgentContactIdentity(dataRoot: PersistenceCore.defaultDataRoot()).canonical("peer:" + principal.id)
         let sessionId = request.sessionID
         let text = request.message
         // 2026-09-06: the enqueued row is the ONLY durable user message on
@@ -877,8 +881,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 try await CodexCompletionLifecycle.shared.cacheResponse(resp, deliveryId: "bridge-http." + requestID, requestDigest: requestID)
                 await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? enqueued.sessionId)
                 if let claudeReplyID {
-                    Self.recordClaudeReply(to: claudeReplyID, text: claudeReplyText, sessionId: resp.sessionId ?? enqueued.sessionId)
-                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? enqueued.sessionId)
+                    Self.recordClaudeReply(to: claudeReplyID, text: claudeReplyText, sessionId: resp.sessionId ?? enqueued.sessionId, owner: owner)
+                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? enqueued.sessionId, owner: owner)
                 }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
                 let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1100,41 +1104,39 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         }
     }
 
-    /// 2026-09-22: a live Claude answers Agent in a bridge chat, never in the
-    /// wake job, so her delegations all read unanswered. A `reply_to` naming a
-    /// real inbox message is recorded beside that inbox for the projection.
-    static func validClaudeReplyID(_ messageID: String) -> String? {
-        let dir = messageReplyURL().deletingLastPathComponent()
+    /// An answer names an exact send owed to this who, through any of its doors.
+    static func validClaudeReplyID(_ messageID: String, owner: String) -> String? {
+        let root = PersistenceCore.defaultDataRoot()
+        let identity = AgentContactIdentity(dataRoot: root)
         guard !messageID.isEmpty, messageID.utf8.count <= 128,
-              !DelegationStatusProjector.requestTexts(inbox: dir.appendingPathComponent("claude-inbox.jsonl"),
-                                                      ids: [messageID], field: "messageId").isEmpty else { return nil }
+              let records = try? AgentConversationStore(dataRoot: root).records(),
+              records.contains(where: { identity.canonical($0.agent) == owner && $0.readInput?["message_id"] == .string(messageID) }) else { return nil }
         return messageID
     }
 
-    /// The send Claude's message answers, only when she says which: an exact
-    /// inbox messageId (`reply_to` / `in_reply_to`), or the conversation it
-    /// continues (`conversation_id`, her claude:<topic> handle) resolved to the
-    /// send waiting there. A message naming neither answers nothing; it is
-    /// Claude starting a chat of her own.
-    static func claudeReplyID(_ json: [String: Any]) -> String? {
+    /// A message naming neither a send nor a conversation answers nothing.
+    static func claudeReplyID(_ json: [String: Any], owner: String) -> String? {
         if let named = (json["reply_to"] ?? json["in_reply_to"]) as? String, !named.isEmpty {
-            return validClaudeReplyID(named)
+            return validClaudeReplyID(named, owner: owner)
         }
         guard let conversation = json["conversation_id"] as? String, !conversation.isEmpty, conversation.utf8.count <= 512
         else { return nil }
         return (try? AgentConversationStore(dataRoot: PersistenceCore.defaultDataRoot())
-            .waitingMessage(agent: "claude", conversationID: conversation)).flatMap(validClaudeReplyID)
+            .waitingMessage(agent: owner, conversationID: conversation)).flatMap { validClaudeReplyID($0, owner: owner) }
     }
 
     /// After the reply is durably in the chat: the receipt the delegation
     /// projection joins, and the answered send's conversation record settles.
-    static func recordClaudeReply(to messageID: String, text: String, sessionId: String?) {
-        _ = try? AgentConversationStore(dataRoot: PersistenceCore.defaultDataRoot())
-            .settleReply(agent: "claude", messageID: messageID, text: text, landedIn: sessionId)
+    static func recordClaudeReply(to messageID: String, text: String, sessionId: String?, owner: String) {
+        let dataRoot = PersistenceCore.defaultDataRoot()
+        _ = try? AgentConversationStore(dataRoot: dataRoot)
+            .settleReply(agent: owner, messageID: messageID, text: text, landedIn: sessionId)
+        guard AgentContactIdentity(dataRoot: dataRoot).aliases["claude"] == owner else { return }
         let dir = messageReplyURL().deletingLastPathComponent()
+        // The answer as every job retains it, so an exact read returns it, not a preview.
         let row: [String: Any] = [
             "messageId": messageID, "sessionId": sessionId ?? NSNull(),
-            "replyTextHead": text.count > 400 ? String(text.prefix(399)) + "…" : text,
+            "replyText": String(text.prefix(6000)), "replyTruncated": text.count > 6000,
             "createdAt": ISO8601DateFormatter().string(from: Date()),
         ]
         guard var line = try? JSONSerialization.data(withJSONObject: row) else { return }
@@ -1152,18 +1154,17 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         _ = try? enforceJSONLLineCap(at: file, maxLines: 500, trimWhenBytesExceed: 1_048_576)
     }
 
-    /// User 10-01: Claude's answer to a message Agent sent her from a chat
-    /// wakes Agent in Claude's own conversation; Agent's answer to it then
-    /// goes back to the chat that asked, as a contact's reply turn's does.
-    /// Lane turns carry no requested-result marker, so no push is asked for.
-    func answerAskingChat(replyTo messageID: String, response: ChatOrchestration.ChatResponse, turnSession: String?) async {
+    /// The answer goes back to the chat that asked, from this who's own conversation.
+    func answerAskingChat(replyTo messageID: String, response: ChatOrchestration.ChatResponse, turnSession: String?, owner: String) async {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        guard let turnSession, turnSession == ContactThread.session(owner: "claude"),
+        let identity = AgentContactIdentity(dataRoot: dataRoot)
+        let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner
+        guard let turnSession, turnSession == ContactThread.session(owner: threadOwner),
               !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(response.attachments ?? []).isEmpty,
               let row = try? AgentConversationStore(dataRoot: dataRoot).records().first(where: {
-                  $0.agent == "claude" && $0.readInput?["message_id"] == .string(messageID)
+                  identity.canonical($0.agent) == owner && $0.readInput?["message_id"] == .string(messageID)
               }), row.scopeSessionID != turnSession else { return }
-        let deliveryId = "claude-reply:" + messageID
+        let deliveryId = owner + "-reply:" + messageID
         let route = AgentBridgeCompletionRoute(asking: row, turnSessionId: turnSession)
         let digest = SHA256.hash(data: Data(response.output.utf8)).map { String(format: "%02x", $0) }.joined()
         let lifecycle = CodexCompletionLifecycle.shared

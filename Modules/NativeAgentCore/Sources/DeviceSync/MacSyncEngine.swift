@@ -70,6 +70,7 @@ public final class MacSyncEngine: ObservableObject {
     var snapshotWriteInFlight = false
     var snapshotWriteQueued = false
     var snapshotWriteQueuedNeedsHeavy = false
+    var snapshotWriteQueuedNeedsRepublish = false
     var snapshotWriteQueuedNeedsMemories = false
     var snapshotWriteQueuedNeedsChatTranscripts = false
     var snapshotWriteQueuedNeedsStandardPass = false

@@ -42,9 +42,7 @@ public struct CognitiveMoodReading: Sendable, Equatable {
 }
 
 extension CognitiveSubstrate {
-    /// Shared clause/token parser for positive conversational evidence. It uses
-    /// the same Unicode punctuation boundaries, apostrophe preservation, and
-    /// two-token negation window as `dispositionTone`.
+    /// Clause/token parser for the conversational evidence path.
     static func containsUnnegatedPhrase(_ text: String, phrases: [String]) -> Bool {
         let negators: Set<String> = [
             "not", "never", "no", "nothing", "isn't", "isnt", "wasn't", "wasnt",
@@ -217,87 +215,8 @@ extension CognitiveSubstrate {
         return disposition.valence * pow(0.5, elapsed / (capturedDynamics ?? dynamics).dispositionHalfLife)
     }
 
-    /// The SIGNED felt tone of a considered outcome — the ONE lexicon shared by every
-    /// disposition writer (a reflection's text, a dream's mood line). Positive: it reads
-    /// settled/warm/clear. Negative: strained/uneasy/heavy. Both present → they offset;
-    /// nothing felt → 0 and the disposition is untouched. Extracted from
-    /// `reflectionDispositionTone` (2026-07-09, U2) so a dream that "feels heavy" and a
-    /// reflection that "feels heavy" can never disagree about the sign.
-    ///
-    /// Matching is WORD-BOUNDARY tokens with a 2-token negation window (GPT-5.6
-    /// audit, 2026-07-09): substring matching read "unsettled" as settled,
-    /// "unclear" as clear, and "not calm" as calm — a strained day scored as a
-    /// positive one. A negated positive ("not settled") counts NEGATIVE; a
-    /// negated negative ("not worried") counts as nothing rather than flipping
-    /// to reassurance. Sentence punctuation bounds the negation window so
-    /// "No. Everything feels settled." stays positive.
-    func dispositionTone(from text: String) -> Double {
-        let negators: Set<String> = [
-            "not", "never", "no", "nothing", "isn't", "isnt", "wasn't", "wasnt",
-            "aren't", "arent", "don't", "dont", "doesn't", "doesnt",
-            "hardly", "barely", "less", "ill",
-        ]
-        let positiveSingles: Set<String> = [
-            "settled", "grounded", "steady", "calm", "warm", "warmth", "clear",
-            "clear-headed",
-        ]
-        let negativeSingles: Set<String> = [
-            "strained", "uneasy", "heavy", "worried", "worry", "worries", "worrying",
-            "off-balance", "tense", "contradiction", "contradictions",
-            "misread", "misreading", "wrong", "anomaly", "anomalies",
-            "unsettled", "unclear", "frayed",
-        ]
-        let positivePairs: [(String, String)] = [("at", "ease"), ("good", "footing"), ("quiet", "pass")]
-        let negativePairs: [(String, String)] = [("off", "balance")]
-
-        // Curly apostrophes are what LLM prose actually emits — "don't feel
-        // calm" must keep its negator intact (gpt-5.5 review HIGH, 2026-07-10).
-        let normalized = text.lowercased()
-            .replacingOccurrences(of: "\u{2019}", with: "'")
-            .replacingOccurrences(of: "\u{2018}", with: "'")
-
-        var positiveHit = false
-        var negativeHit = false
-        // Clause-by-clause: ANY punctuation (Unicode-aware — em/en dashes
-        // included, reflection prose is full of them) resets the negation
-        // window, except the apostrophes and hyphens that live inside tokens.
-        for clause in normalized.split(whereSeparator: {
-            $0.isNewline || ($0.isPunctuation && $0 != "-" && $0 != "'")
-        }) {
-            // Apostrophes survive so "isn't" stays one negator token; hyphens
-            // survive so "off-balance" stays one lexicon token.
-            let tokens = clause.split(whereSeparator: { !$0.isLetter && $0 != "-" && $0 != "'" })
-                .map(String.init)
-            func negated(before index: Int) -> Bool {
-                tokens[max(0, index - 2)..<index].contains { negators.contains($0) }
-            }
-            for (i, token) in tokens.enumerated() {
-                if positiveSingles.contains(token) {
-                    if negated(before: i) { negativeHit = true } else { positiveHit = true }
-                }
-                if negativeSingles.contains(token), !negated(before: i) {
-                    negativeHit = true
-                }
-                if i + 1 < tokens.count {
-                    let next = tokens[i + 1]
-                    if positivePairs.contains(where: { $0.0 == token && $0.1 == next }) {
-                        if negated(before: i) { negativeHit = true } else { positiveHit = true }
-                    }
-                    if negativePairs.contains(where: { $0.0 == token && $0.1 == next }),
-                       !negated(before: i) {
-                        negativeHit = true
-                    }
-                }
-            }
-        }
-        var tone = 0.0
-        if positiveHit { tone += 1 }
-        if negativeHit { tone -= 1 }
-        return tone
-    }
-
     /// Fold a considered outcome's felt tone into the slow layer. `tone` is signed −1…+1
-    /// (from `dispositionTone`, or a caller-derived sign); zero-tone outcomes leave it
+    /// (her explicit judgment, or a typed outcome); zero-tone outcomes leave it
     /// untouched. Decays the stored value to `now` first so nudges compose over real time,
     /// then clamps to the undertone cap. Persisted like affect (stable-id artifact) so
     /// what she's concluded SURVIVES a restart — safe now that the artifact table
@@ -495,35 +414,15 @@ extension CognitiveSubstrate {
         return nil
     }
 
-    /// Dream-mood writer (U2a, 2026-07-09). The nightly dream's own `mood` line — the
-    /// felt tone of what she dreamt, written by her, about her day — nudges the slow
-    /// layer through the SAME lexicon, cap, and decay as a reflection. One dream per
-    /// calendar day, so this is at most one nudge/day.
-    ///
-    /// The dream's mood is a short phrase ("quiet, warm, a little tired"), not prose,
-    /// so a mixed line offsets to 0 and leaves her undertone alone — exactly as a
-    /// mixed reflection does. The app layer passes the raw line; the lexicon lives
-    /// here so the dream surface never gets its own private idea of what "heavy" means.
-    /// `dreamId` (additive, 2026-09-02) identifies the COMMITTED dream this mood
-    /// line came from, so the residue below can be idempotent per dream rather
-    /// than per call. Callers that do not have one degrade to the local calendar
-    /// day — the same granularity the dream lane's own once-per-day integration
-    /// claim already uses, so an omitted id is not a weaker claim in practice.
-    /// Returns whether the night is DURABLY integrated. 2026-09-06: the runner
-    /// stamps a once-per-day claim before calling this and releases it on
-    /// false, so a write that never reached disk leaves the night retryable
-    /// rather than permanently spent. A blank mood line is nothing to
-    /// integrate, not a failure.
+    /// Persist her dream's explicit judgment through the existing night claims,
+    /// disposition decay and residue owner. Prose is never classified here.
     @discardableResult
     public func integrateDreamDisposition(
-        moodLine: String,
+        tone: Double,
         at now: Date,
         dreamId: String? = nil
     ) async -> Bool {
         await waitForMaintenanceTransition()
-        let trimmed = moodLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
-        let tone = dispositionTone(from: trimmed)
         // IDEMPOTENT PER NIGHT (2026-09-06). This sink is two writes, and a
         // partial one used to be unrepeatable: a residue failure returned false,
         // the runner released the day's claim, and the retry ran the disposition
@@ -566,9 +465,7 @@ extension CognitiveSubstrate {
     // entry that tells me what settled."
     //
     // A residue is a mood WITHOUT ITS STORY. So this mints exactly one felt node
-    // carrying the dream's own mood line as a FEELING — sign from the same
-    // `dispositionTone` lexicon every disposition writer shares, so the night
-    // and the undertone can never disagree — with:
+    // carrying her dream's explicit affect judgment, with:
     //   • NO summary text. The node is payload-free; the diary is the record of
     //     what she dreamt, and a second copy in the continuity field would be
     //     the document she is complaining about, not the residue.
@@ -1020,8 +917,7 @@ extension CognitiveSubstrate {
 /// The night's leftover mood (item 7, 2026-09-02). A feeling, a timestamp, and
 /// a small budget of turns — no text, because a residue has no story.
 public struct CognitiveDreamResidue: Sendable, Equatable {
-    /// −1…1, the dream's own mood line read through the shared disposition
-    /// lexicon and scaled down. It colors; it never leads.
+    /// −1…1, her explicit dream affect scaled down. It colors; it never leads.
     public var valence: Double
     public var mintedAt: Date
     /// Accepted turns still owed the lean. Counts down to zero and then the

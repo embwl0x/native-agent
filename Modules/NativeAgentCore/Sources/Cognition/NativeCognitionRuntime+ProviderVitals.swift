@@ -21,23 +21,30 @@ import ProviderRouting
 extension NativeCognitionRuntime {
     /// Bootstrap-owned restore. Snapshot age and row validity are enforced by
     /// the sensor; a missing or stale file is a normal cold start. First
-    /// outputs come from the trace, read once here.
+    /// outputs come from the retained traces, which grow with her history, so
+    /// they are read behind her: launch and her first turn never wait on them
+    /// (two weeks of retained traces, 77 MB, held the bootstrap every turn
+    /// awaits). A stream that starts before the read lands runs unmeasured,
+    /// as on a fresh install.
     func restoreProviderVitalsSnapshot() async {
         do {
             _ = try await providerVitalsSensor.restoreSnapshot(dataRoot: dataRoot, now: now())
         } catch {
             nativeLog("Provider vitals snapshot unavailable: %@", error.localizedDescription)
         }
-        do {
-            try await providerVitalsSensor.readFirstOutputs(dataRoot: dataRoot)
-        } catch {
-            nativeLog("Provider first outputs unreadable from retained traces (first-output deadlines learn from this run's calls only): %@",
-                      error.localizedDescription)
+        let sensor = providerVitalsSensor, root = dataRoot, cutoff = now()
+        Task.detached(priority: .utility) {
+            do {
+                try await sensor.readFirstOutputs(dataRoot: root, before: cutoff)
+            } catch {
+                nativeLog("Provider first outputs unreadable from retained traces (first-output deadlines learn from this run's calls only): %@",
+                          error.localizedDescription)
+            }
         }
     }
 
     /// The stream guard's read port: the sensor is a `let`, so no hop onto
-    /// this actor. The router's lifecycle start has already awaited bootstrap.
+    /// this actor. Unmeasured until the launch read of first outputs lands.
     public nonisolated func firstOutputDeadline(provider: String, model: String,
                                                 streamKind: String?) async -> FirstOutputDeadline {
         await providerVitalsSensor.firstOutputDeadline(provider: provider, model: model, streamKind: streamKind)

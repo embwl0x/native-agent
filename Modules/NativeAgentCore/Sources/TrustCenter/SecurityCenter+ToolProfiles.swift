@@ -9,13 +9,17 @@ public enum AuthoredToolEffects {
     @TaskLocal public static var admissionOnly = false
     @TaskLocal public static var call: (tool: String, perform: @Sendable () async throws -> JSONValue)?
 
+    /// A watching part's hands on the window it watches (MacScreenWatch): act's effects.
+    public static let handOperations: Set<String> = ["hand.click", "hand.double_click", "hand.right_click", "hand.move",
+                                                     "hand.drag", "hand.key", "hand.hold", "hand.down", "hand.up"]
     public static let primitiveCapabilities: [String: Set<String>] = [
         "network.receive": ["safe_read", "network_read"],
         "network.connect": ["network_write"], "network.listen": ["network_write"],
         "network.accept": ["network_write"], "network.close": ["network_write"],
         "network.send": ["network_write", "external_send"],
         "apps.call": ["applescript", "system_control"],
-    ]
+        "screen.watch": ["safe_read"], "screen.next": ["safe_read"], "frame.read": ["safe_read"],
+    ].merging(handOperations.map { ($0, ["mac_control", "ax_injection"]) }) { $1 }
 
     public static func appReadOnly(_ args: [String: JSONValue]) -> Bool {
         args["script"] == nil && (args["dictionary"] == .bool(true) || args["event_class"] == .string("core")

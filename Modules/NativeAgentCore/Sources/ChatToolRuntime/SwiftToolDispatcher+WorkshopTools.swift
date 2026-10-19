@@ -316,6 +316,8 @@ extension SwiftToolDispatcher {
                 dataRoot: dataRoot,
                 runner: workshopRunner()
             ).submit(spec: spec, existing: (deskHandle?.isEmpty == false) ? deskHandle : nil)
+        } catch let error as ToolFailureError {
+            throw error
         } catch {
             // Honest pass-through of the runner's typed refusal/failure. The
             // Compatibility error code (forbidden / missions_busy) rides along when

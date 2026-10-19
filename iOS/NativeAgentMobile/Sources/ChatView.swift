@@ -859,6 +859,7 @@ struct ChatView: View {
                 // receives the words.
                 guard let origin = dictationSessionKey,
                       origin == store.queueSessionKey(store.selectedSessionID) else { return }
+                if let attachment = voiceInput.lastAttachment { pendingFiles.append(attachment) }
                 if draft.text.isEmpty {
                     draft.text = newValue
                 } else {

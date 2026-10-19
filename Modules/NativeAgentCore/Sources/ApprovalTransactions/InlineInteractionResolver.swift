@@ -1,4 +1,5 @@
 import AuthoredCapabilities
+import Experiences
 import Foundation
 import ChatOrchestration
 import MacIntegration
@@ -283,7 +284,7 @@ public enum InlineInteractionResolver {
             return .object(["status": .string("failed"), "reason": .string("invalid_args"), "effects": .string("none"),
                 "detail": .string("This card holds the turn and replays the call once answered, and the call's arguments would not be saved whole: they carry a secret or run past 4,000 characters. Nothing was asked; call again with no secret in the arguments and under that length.")])
         }
-        guard let raised = await raise(card, sessionID: sessionID, resumable: blocked,
+        guard let raised = await raise(card, sessionID: sessionID, resumable: InlineInteractionNeed.blocksTurn(interaction),
             toolName: blocked ? tool : nil, toolArgumentsJSON: blocked ? arguments : nil,
             toolCallId: blocked ? UUID().uuidString : nil,
             origin: TurnEnvelope.current(surface: ChatToolSessionContext.envelope?.surface ?? "chat"), dataRoot: dataRoot) else {
@@ -313,7 +314,7 @@ public enum InlineInteractionResolver {
                 ?? .object(["status": .string("failed"), "reason": .string("continuation_refused"),
                     "detail": .string("The blocked call could not resume; check its card before continuing.")])
         }
-        if blocked { await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot) }
+        await invalidateContinuation(id: raised.id, sessionID: sessionID, dataRoot: dataRoot)
         guard case .object(var receipt) = receiptEnvelope(current) else { return receiptEnvelope(current) }
         if case .declined = current.state { receipt["reason"] = .string("declined"); receipt["effects"] = .string("none") }
         if let choice = current.state.outcome?.selection { receipt["answer"] = .string(choice) }
@@ -561,6 +562,14 @@ public enum InlineInteractionResolver {
             try await persist(
                 settled, sessionID: sessionID, ifRevision: current.revision, dataRoot: dataRoot
             )
+            if [.permission, .capability].contains(settled.kind) {
+                for target in settled.allTargets {
+                    guard let capability = SystemPermissionPreflight.cardSettingsCapability(target) else { continue }
+                    let id = SystemAppleScriptAdapter.automationTarget(target).map { "applescript:" + $0 } ?? capability.rawValue
+                    RepairOwed.settle(dataRoot, operation: "permissions.request:" + id + (capability == .calendars && settled.mode == .write ? ":write" : ""),
+                                     evidence: .init(source: "interaction", id: settled.id))
+                }
+            }
             await resumeOnce(settled, sessionID: sessionID, dataRoot: dataRoot)
             return settled
         }
@@ -750,7 +759,7 @@ public enum InlineInteractionResolver {
             if interaction.target == "chrome" {
                 let status = await platform.chromeConnectionStatus()
                 guard status.enabled, status.connected else {
-                    return .failure("Chrome\u{2019}s extension isn\u{2019}t connected yet: on chrome://extensions, "
+                    return .failure("Chrome isn't connected yet. "
                         + platform.chromeSteps)
                 }
                 return .success(.init(selection: "chrome", summary: "Chrome connected"))
@@ -1071,7 +1080,8 @@ public enum InlineInteractionResolver {
                     verifiedUserId: $0.verifiedUserId,
                     commandSignatureVerified: true,
                     deliveryRoute: $0.deliveryRoute,
-                    declaredRemote: $0.declaredRemote
+                    declaredRemote: $0.declaredRemote,
+                    answerExperienceID: $0.answerExperienceID
                 )
             }
         }

@@ -25,7 +25,9 @@ extension MacFourVerbs {
         seconds: Double?,
         holding: String?,
         button: String?,
-        attention: BurstAttention?
+        attention: BurstAttention?,
+        /// A read already taken for this act; nil reads afresh.
+        carried: Sighting? = nil
     ) async -> MacFourVerbsReply {
         if verb == .hold, Self.keySpec(target) != nil, holding != nil {
             return MacFourVerbsReply(
@@ -42,7 +44,8 @@ extension MacFourVerbs {
                 return MacFourVerbsReply(ok: false, text: "Which key or chord should I use?")
             }
             let before: Sighting?
-            switch await sight(part: nil) {
+            let sighted: Sighted = if let carried { .seen(carried) } else { await sight(part: nil) }
+            switch sighted {
             case .blind(let reply):
                 // The front app with every window closed still takes keys
                 // (cmd+n is how a window comes back).
@@ -65,7 +68,8 @@ extension MacFourVerbs {
         }
 
         var before: Sighting
-        switch await sight(part: nil) {
+        let sighted: Sighted = if let carried { .seen(carried) } else { await sight(part: nil) }
+        switch sighted {
         case .blind(let reply): return reply
         case .seen(let seen): before = seen
         }
@@ -204,16 +208,19 @@ extension MacFourVerbs {
     }
 
     /// The one physical tail, once both ends are screen points, for a named
-    /// act and a place on an image alike: a drag's line clear of password
-    /// fields, both ends and the line clear of anything covering the window,
-    /// then the hand, with what it did said in words.
+    /// act, a place on an image and a watch's frame alike: a drag's line clear
+    /// of password fields, both ends and the line clear of anything covering
+    /// the window, then the hand, with what it did said in words. A watch
+    /// passes the secret fields where they are now and `confirm: false`: its
+    /// stream is the observation, so no confirming look follows the hand.
     func performPointer(
         _ gesture: String, at start: MacPointerPosition, to end: MacPointerPosition?,
         saying source: String, destination: String?, before: Sighting, excluding excluded: [MacAXFrame] = [],
         seconds: Double?, holding: String?, button: String?, attention: BurstAttention?,
-        physicalOnly: Bool = false, pointerTarget: String? = nil, receipt: [String: JSONValue] = [:]
+        physicalOnly: Bool = false, pointerTarget: String? = nil, receipt: [String: JSONValue] = [:],
+        secrets: [MacAXFrame]? = nil, confirm: Bool = true, pressed: ActTarget? = nil
     ) async -> MacFourVerbsReply {
-        if let end, !MacRegionAim.pathIsClear(from: start, to: end, excluding: before.targets.filter(\.secret).compactMap(\.frame)) {
+        if let end, !MacRegionAim.pathIsClear(from: start, to: end, excluding: secrets ?? before.targets.filter(\.secret).compactMap(\.frame)) {
             return MacFourVerbsReply(
                 ok: false,
                 text: MacCrossAppDrag.pathCrossesSecureWords(destinationApp: before.appName ?? "this window"),
@@ -221,7 +228,7 @@ extension MacFourVerbs {
             )
         }
         guard MacRegionAim.pathIsClear(from: start, to: end ?? start, excluding: excluded + before.obstructions) else {
-            return Self.obstructedPointReply(screen: before.render)
+            return Self.obstructedPointReply(screen: confirm ? before.render : "")
         }
         var body: [String: JSONValue] = [
             "gesture": .string(gesture),
@@ -251,10 +258,12 @@ extension MacFourVerbs {
             body: body,
             description: description,
             attention: attention,
-            before: before,
+            before: confirm ? before : nil,
             allowGenericScreenChangeVerification: !physicalOnly,
             afterPart: physicalOnly ? "visual surface" : nil,
-            pointerTarget: pointerTarget
+            pointerTarget: pointerTarget,
+            pressed: pressed,
+            confirm: confirm
         )
         var detail = reply.detail.merging(receipt) { _, new in new }
         if let button { detail["button"] = .string(button) }

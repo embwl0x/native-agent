@@ -9,32 +9,47 @@ struct BotsEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
     let definition: BotDefinition?
     let save: (BotDefinition) async throws -> Void
-    @State private var name = ""
-    @State private var brief = ""
-    @State private var provider = ""
-    @State private var model = ""
-    @State private var modelPinned = false
+    private struct Draft: Codable, Equatable {
+        var name = ""
+        var brief = ""
+        var provider = ""
+        var model = ""
+        var modelPinned = false
+        var think = ""
+        var fast: Bool?
+        var when = "Manual only"
+        var hours = ""
+        /// The clock time for Daily, Weekdays and Weekly; only its hour and minute count.
+        var time = Calendar.current.startOfDay(for: Date(timeIntervalSinceReferenceDate: 0)).addingTimeInterval(9 * 3600)
+        /// Cron day-of-week, 0 is Sunday.
+        var weekday = 1
+        /// The When section as it opened; saved untouched, the bot keeps its exact timing.
+        var loadedTiming: [String]?
+        var cron = ""
+        var zone = ""
+        var tokens = ""
+        var seconds = ""
+        var daily = ""
+        var eventSource = BotEventSource.github
+        var eventFilter = ""
+        var eventKeyword = ""
+        var tell = false
+        var condition = ""
+        var clockText: String {
+            let clock = Calendar.current.dateComponents([.hour, .minute], from: time)
+            return String(format: "%02d:%02d", clock.hour ?? 9, clock.minute ?? 0)
+        }
+        var timingKey: [String] { [when, hours, cron, zone, String(weekday), clockText] }
+    }
+
+    private var draftSubject: String { "bot/\(definition?.id.uuidString ?? "new")" }
+    @State private var seed: Draft?
+    private var draft: Draft {
+        get { appModel.editDraft(draftSubject, seed: seed ?? Draft()) }
+        nonmutating set { appModel.setEditDraft(newValue, for: draftSubject, baseline: seed ?? Draft()) }
+    }
+    private var draftBinding: Binding<Draft> { Binding(get: { draft }, set: { draft = $0 }) }
     @State private var followingModel: String?
-    @State private var think = ""
-    @State private var fast: Bool?
-    @State private var when = "Manual only"
-    @State private var hours = ""
-    /// The clock time for Daily, Weekdays and Weekly; only its hour and minute count.
-    @State private var time = Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? Date()
-    /// Cron day-of-week, 0 is Sunday.
-    @State private var weekday = 1
-    /// The When section as it opened; saved untouched, the bot keeps its exact timing.
-    @State private var loadedTiming: [String]?
-    @State private var cron = ""
-    @State private var zone = ""
-    @State private var tokens = ""
-    @State private var seconds = ""
-    @State private var daily = ""
-    @State private var eventSource = BotEventSource.github
-    @State private var eventFilter = ""
-    @State private var eventKeyword = ""
-    @State private var tell = false
-    @State private var condition = ""
     @State private var providers: [ProviderThenModelPicker.Provider] = []
     @State private var error: String?
     @State private var saving = false
@@ -45,7 +60,7 @@ struct BotsEditorSheet: View {
     }
 
     private var selectedModel: ProviderThenModelPicker.Model? {
-        providers.first { $0.id == provider }?.models.first { $0.id == model }
+        providers.first { $0.id == draft.provider }?.models.first { $0.id == draft.model }
     }
 
     var body: some View {
@@ -60,23 +75,31 @@ struct BotsEditorSheet: View {
             if let error { Text(error).font(.subheadline).foregroundStyle(.red) }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }.disabled(saving)
+                Button("Cancel") { appModel.clearEditDraft(draftSubject); dismiss() }.disabled(saving)
                 Button(definition == nil ? "Create" : "Save") {
                     saving = true
+                    let subject = draftSubject
+                    let submitted = draft
+                    let submission = Result { try makeDefinition() }
                     Task {
                         defer { saving = false }
-                        do { try await save(makeDefinition()); dismiss() }
+                        do {
+                            let saved = try submission.get()
+                            try await save(saved)
+                            appModel.acceptEditDraft(subject, submitted: submitted, saved: initialDraft(saved))
+                            dismiss()
+                        }
                         catch { self.error = BotsShelfView.problem(error, action: "save that helper") }
                     }
                 }.keyboardShortcut(.defaultAction)
-                    .disabled(saving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(saving || draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draft.brief.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24).frame(width: 570)
         .houseSheet()
         .interactiveDismissDisabled(saving)
+        .onAppear { if seed == nil { seed = initialDraft(definition) } }
         .task {
-            populate()
             switch await appModel.engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause) {
             case .loaded(let snapshot):
                 providers = snapshot.providers.map { account in
@@ -94,85 +117,85 @@ struct BotsEditorSheet: View {
 
     private var fields: some View {
                 VStack(alignment: .leading, spacing: 14) {
-                    field("Name", text: $name)
-                    editor("What to do", text: $brief, height: 110)
+                    field("Name", text: draftBinding.name)
+                    editor("What to do", text: draftBinding.brief, height: 110)
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Model").font(.subheadline)
-                        Picker("Model selection", selection: $modelPinned) {
+                        Picker("Model selection", selection: draftBinding.modelPinned) {
                             Text("Follow Providers").tag(false)
                             Text("Pin a model").tag(true)
                         }
-                        if modelPinned == false {
+                        if draft.modelPinned == false {
                             Text("follows Providers (\(followingModel ?? "unavailable"))").font(.caption).foregroundStyle(.secondary)
                         } else {
                         ModelChoiceRow {
                             // A Picker, not a Menu: a pop-up button hands its
                             // options to accessibility, so a driver can set the
                             // account without a menu being popped first.
-                            Picker("Provider", selection: Binding(get: { provider }, set: {
-                                provider = $0; model = ""; think = ""; fast = nil
+                            Picker("Provider", selection: Binding(get: { draft.provider }, set: {
+                                draft.provider = $0; draft.model = ""; draft.think = ""; draft.fast = nil
                             })) {
                                 Text("Choose an account").tag("")
-                                if !provider.isEmpty, providers.first(where: { $0.id == provider }) == nil {
-                                    Text(provider + " · unavailable").tag(provider)
+                                if !draft.provider.isEmpty, providers.first(where: { $0.id == draft.provider }) == nil {
+                                    Text(draft.provider + " · unavailable").tag(draft.provider)
                                 }
                                 ForEach(providers.filter(\.ready)) { Text($0.name).tag($0.id) }
                             }.accessibilityLabel("Provider")
                         } model: {
-                            Picker("Model", selection: Binding(get: { model }, set: {
-                                model = $0; think = ""; fast = nil
+                            Picker("Model", selection: Binding(get: { draft.model }, set: {
+                                draft.model = $0; draft.think = ""; draft.fast = nil
                             })) {
                                 Text("Choose").tag("")
-                                if !model.isEmpty, selectedModel == nil {
-                                    Text(model + " · unavailable").tag(model)
+                                if !draft.model.isEmpty, selectedModel == nil {
+                                    Text(draft.model + " · unavailable").tag(draft.model)
                                 }
-                                ForEach(providers.first { $0.id == provider }?.models ?? []) { Text($0.name).tag($0.id) }
-                            }.disabled(provider.isEmpty).accessibilityLabel("Model")
+                                ForEach(providers.first { $0.id == draft.provider }?.models ?? []) { Text($0.name).tag($0.id) }
+                            }.disabled(draft.provider.isEmpty).accessibilityLabel("Model")
                         } think: {
-                            Picker("Think", selection: $think) {
+                            Picker("Think", selection: draftBinding.think) {
                                 Text("Choose").tag("")
                                 ForEach(selectedModel?.supportedEfforts ?? [], id: \.self) { Text($0.capitalized).tag($0) }
                             }.disabled(selectedModel == nil).accessibilityLabel("Think")
                         } fast: {
                             if selectedModel?.supportsFast == true {
-                                Toggle("Fast", isOn: Binding(get: { fast ?? false }, set: { fast = $0 }))
+                                Toggle("Fast", isOn: Binding(get: { draft.fast ?? false }, set: { draft.fast = $0 }))
                                     .toggleStyle(.switch)
                                     .hazeTinted()
                             }
                         }
-                        if !provider.isEmpty, let caption = ProviderToolCapability.caption(providerID: provider) {
+                        if !draft.provider.isEmpty, let caption = ProviderToolCapability.caption(providerID: draft.provider) {
                             Text(caption).font(.caption).foregroundStyle(NativeAgentShell.secondary)
                         }
                         }
                         Divider().padding(.vertical, 4)
-                            Picker("When", selection: $when) {
+                            Picker("When", selection: draftBinding.when) {
                                 ForEach(["Manual only", "Daily", "Weekdays", "Weekly", "Every N hours", "On an event"], id: \.self) { Text($0).tag($0) }
                                 // A cron saved elsewhere still opens and saves as it was.
-                                if when == "Custom" { Text("Custom (cron)").tag("Custom") }
+                                if draft.when == "Custom" { Text("Custom (cron)").tag("Custom") }
                             }
-                        if ["Daily", "Weekdays", "Weekly"].contains(when) {
+                        if ["Daily", "Weekdays", "Weekly"].contains(draft.when) {
                             HStack(spacing: 12) {
-                                if when == "Weekly" {
-                                    Picker("On", selection: $weekday) {
+                                if draft.when == "Weekly" {
+                                    Picker("On", selection: draftBinding.weekday) {
                                         ForEach(0..<7, id: \.self) { Text(Calendar.current.weekdaySymbols[$0]).tag($0) }
                                     }.fixedSize()
                                 }
-                                DatePicker("At", selection: $time, displayedComponents: .hourAndMinute).fixedSize()
+                                DatePicker("At", selection: draftBinding.time, displayedComponents: .hourAndMinute).fixedSize()
                             }
                         }
-                        if when == "Every N hours" { field("Hours between runs", text: $hours) }
-                        if when == "Custom" {
-                            field("Schedule (cron)", text: $cron)
-                            field("Time zone", text: $zone)
+                        if draft.when == "Every N hours" { field("Hours between runs", text: draftBinding.hours) }
+                        if draft.when == "Custom" {
+                            field("Schedule (cron)", text: draftBinding.cron)
+                            field("Time zone", text: draftBinding.zone)
                         }
-                        if when == "On an event" {
-                            Picker("Event", selection: $eventSource) {
+                        if draft.when == "On an event" {
+                            Picker("Event", selection: draftBinding.eventSource) {
                                 Text("GitHub issue or pull request").tag(BotEventSource.github)
                                 Text("Slack message").tag(BotEventSource.slack)
                             }
-                            field(eventSource == .github ? "Repository (owner/repo)" : "Channel ID", text: $eventFilter)
-                            field("Keyword (optional)", text: $eventKeyword)
-                            Text(eventSource == .github
+                            field(draft.eventSource == .github ? "Repository (owner/repo)" : "Channel ID", text: draftBinding.eventFilter)
+                            field("Keyword (optional)", text: draftBinding.eventKeyword)
+                            Text(draft.eventSource == .github
                                 ? "A new issue or pull request on that repository wakes the bot. GitHub events arrive with the connector's refresh."
                                 : "A message in that channel wakes the bot. Slack delivers a channel ID, so paste the ID rather than the name: in Slack, open the channel, choose View channel details, and copy the ID at the bottom. Events arrive on the channels the Slack connector already receives.")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -183,14 +206,14 @@ struct BotsEditorSheet: View {
                     DisclosureGroup("Optional controls") {
                         VStack(alignment: .leading, spacing: 12) {
                             HStack {
-                                field("Output tokens per run", text: $tokens)
-                                field("Seconds per run", text: $seconds)
-                                field("Daily token reservation", text: $daily)
+                                field("Output tokens per run", text: draftBinding.tokens)
+                                field("Seconds per run", text: draftBinding.seconds)
+                                field("Daily token reservation", text: draftBinding.daily)
                             }
                             Text("Choose execution limits before saving. Output limits do not include hidden reasoning or guarantee billed usage.")
                                 .font(.caption).foregroundStyle(.secondary)
-                            Toggle("Tell me if", isOn: $tell)
-                            if tell { field("Condition", text: $condition) }
+                            Toggle("Tell me if", isOn: draftBinding.tell)
+                            if draft.tell { field("Condition", text: draftBinding.condition) }
                         }.padding(.top, 8)
                     }
                 }
@@ -209,58 +232,60 @@ struct BotsEditorSheet: View {
                 .accessibilityLabel(label)
         }
     }
-    private func populate() {
-        guard let bot = definition else { return }
+    private func initialDraft(_ definition: BotDefinition?) -> Draft {
+        var draft = Draft()
+        guard let bot = definition else { return draft }
         // One place describes the job. A definition written when "Desired
         // output" was its own field still reads: its output instructions are
         // shown after the brief and are stored back as one brief on save.
-        name = bot.name
-        brief = [bot.brief, bot.outputFormat ?? ""]
+        draft.name = bot.name
+        draft.brief = [bot.brief, bot.outputFormat ?? ""]
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n\n")
-        provider = bot.provider ?? ""; model = bot.model ?? ""; think = bot.reasoningEffort ?? ""; fast = bot.fast
-        modelPinned = bot.modelPinned ?? false
-        tokens = String(bot.budget.tokens); seconds = String(bot.budget.seconds); daily = bot.dailyTokenCeiling.map(String.init) ?? ""
-        tell = bot.notificationCondition != nil; condition = bot.notificationCondition ?? ""
+        draft.provider = bot.provider ?? ""; draft.model = bot.model ?? ""; draft.think = bot.reasoningEffort ?? ""; draft.fast = bot.fast
+        draft.modelPinned = bot.modelPinned ?? false
+        draft.tokens = String(bot.budget.tokens); draft.seconds = String(bot.budget.seconds); draft.daily = bot.dailyTokenCeiling.map(String.init) ?? ""
+        draft.tell = bot.notificationCondition != nil; draft.condition = bot.notificationCondition ?? ""
         if let trigger = bot.eventTrigger {
-            eventSource = trigger.source; eventFilter = trigger.filter; eventKeyword = trigger.keyword ?? ""
+            draft.eventSource = trigger.source; draft.eventFilter = trigger.filter; draft.eventKeyword = trigger.keyword ?? ""
         }
         switch bot.cadence {
-        case .manual: when = bot.eventTrigger == nil ? "Manual only" : "On an event"
+        case .manual: draft.when = bot.eventTrigger == nil ? "Manual only" : "On an event"
         case .interval(let value):
             // A rolling day or week from before clock times opens as one, at
             // its next run's time and day (09:00 when it has none).
-            when = value == 86400 ? "Daily" : value == 604800 ? "Weekly" : "Every N hours"
-            hours = String(value / 3600)
-            if when != "Every N hours",
+            draft.when = value == 86400 ? "Daily" : value == 604800 ? "Weekly" : "Every N hours"
+            draft.hours = String(value / 3600)
+            if draft.when != "Every N hours",
                let next = try? BotRunnerScheduler.scheduledDates(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())[bot.id] {
-                time = next; weekday = Calendar.current.component(.weekday, from: next) - 1
+                draft.time = next; draft.weekday = Calendar.current.component(.weekday, from: next) - 1
             }
         case .cron(let expression, let timeZone):
-            when = "Custom"; cron = expression; zone = timeZone ?? ""
+            draft.when = "Custom"; draft.cron = expression; draft.zone = timeZone ?? ""
             let parts = expression.split(separator: " ").map(String.init)
             if parts.count == 5, parts[2] == "*", parts[3] == "*",
                let minute = Int(parts[0]), let hour = Int(parts[1]), (0...59).contains(minute), (0...23).contains(hour),
-               let clock = Calendar.current.date(bySettingHour: hour, minute: minute, second: 0, of: Date()) {
-                if parts[4] == "*" { when = "Daily" } else if parts[4] == "1-5" { when = "Weekdays" }
-                else if let day = Int(parts[4]), (0...6).contains(day) { when = "Weekly"; weekday = day }
-                if when != "Custom" { time = clock }
+               let clock = Calendar.current.date(bySettingHour: hour, minute: minute, second: 0, of: draft.time) {
+                if parts[4] == "*" { draft.when = "Daily" } else if parts[4] == "1-5" { draft.when = "Weekdays" }
+                else if let day = Int(parts[4]), (0...6).contains(day) { draft.when = "Weekly"; draft.weekday = day }
+                if draft.when != "Custom" { draft.time = clock }
             }
         }
-        loadedTiming = timingKey
+        draft.loadedTiming = draft.timingKey
+        return draft
     }
-    private var clockText: String {
-        let clock = Calendar.current.dateComponents([.hour, .minute], from: time)
-        return String(format: "%02d:%02d", clock.hour ?? 9, clock.minute ?? 0)
-    }
-    private var timingKey: [String] { [when, hours, cron, zone, String(weekday), clockText] }
     private func makeDefinition() throws -> BotDefinition {
-        try BotDefinitionStore.editorDefinition(definition, name: name, brief: brief,
-            provider: provider, model: model, think: think, modelPinned: modelPinned,
-            providerReady: providers.first(where: { $0.id == provider })?.ready == true,
+        let current = try definition.map {
+            try BotDefinitionStore(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()).get($0.id)
+        }
+        let draft = try appModel.mergingEditDraft(draftSubject, edited: draft, into: initialDraft(current))
+        let selectedModel = providers.first { $0.id == draft.provider }?.models.first { $0.id == draft.model }
+        return try BotDefinitionStore.editorDefinition(current, name: draft.name, brief: draft.brief,
+            provider: draft.provider, model: draft.model, think: draft.think, modelPinned: draft.modelPinned,
+            providerReady: providers.first(where: { $0.id == draft.provider })?.ready == true,
             supportedEfforts: selectedModel?.supportedEfforts, supportsFast: selectedModel?.supportsFast == true,
-            fast: fast, tokens: tokens, seconds: seconds, daily: daily, when: when, hours: hours,
-            cron: cron, zone: zone, weekday: weekday, clockText: clockText, timingUnchanged: timingKey == loadedTiming,
-            eventSource: eventSource, eventFilter: eventFilter, eventKeyword: eventKeyword, tell: tell, condition: condition)
+            fast: draft.fast, tokens: draft.tokens, seconds: draft.seconds, daily: draft.daily, when: draft.when, hours: draft.hours,
+            cron: draft.cron, zone: draft.zone, weekday: draft.weekday, clockText: draft.clockText, timingUnchanged: draft.timingKey == draft.loadedTiming,
+            eventSource: draft.eventSource, eventFilter: draft.eventFilter, eventKeyword: draft.eventKeyword, tell: draft.tell, condition: draft.condition)
     }
 }

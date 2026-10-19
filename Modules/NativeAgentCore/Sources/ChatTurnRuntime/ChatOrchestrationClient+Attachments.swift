@@ -91,7 +91,8 @@ extension SwiftNativeChatOrchestrationClient {
         message: String,
         attachments: [MultimodalAttachment],
         dataRoot: URL,
-        queryUserMessage: String? = nil
+        queryUserMessage: String? = nil,
+        runId: String? = nil
     ) throws -> TurnAttachmentInput {
         let queryMessage = queryUserMessage ?? message
         if attachments.contains(where: {
@@ -104,6 +105,13 @@ extension SwiftNativeChatOrchestrationClient {
             return TurnAttachmentInput(imageBlocks: [], userMessage: message, queryUserMessage: queryMessage)
         }
         var notes: [String] = []
+        for (index, attachment) in attachments.enumerated() {
+            guard let utterance = attachment.utterance else { continue }
+            let reference = attachment.path ?? runId.map {
+                attachmentURL(dataRoot: dataRoot, runId: $0, index: index).path
+            } ?? attachment.id
+            notes.append(try utterance.evidence(audioReference: reference))
+        }
 
         // "Allow vision API calls". Off → the images never become blocks, and
         // the model is told so in the same shape LLMClient+Real uses when a

@@ -34,18 +34,10 @@ final class InboxStore: ObservableObject {
     private var knownIDs: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "NativeAgentMobile.inboxKnownIDs") ?? [])
     // Whether we are currently on the Inbox tab (caller sets this)
     var isVisible: Bool = false
-    private let notificationScheduler: ((InboxLocalNotificationPlan, Int) -> Void)?
+    private let notificationScheduler: ((InboxLocalNotificationPlan) -> Void)?
 
-    init(notificationScheduler: ((InboxLocalNotificationPlan, Int) -> Void)? = nil) {
+    init(notificationScheduler: ((InboxLocalNotificationPlan) -> Void)? = nil) {
         self.notificationScheduler = notificationScheduler
-    }
-
-    var activeCount: Int {
-        items.filter { $0.isUnread }.count
-    }
-
-    var tabBadge: String? {
-        activeCount > 0 ? "\(activeCount)" : nil
     }
 
     // MARK: - Fetch
@@ -180,7 +172,7 @@ final class InboxStore: ObservableObject {
         } else {
             items = fetched
         }
-        scheduleLocalNotifications(notificationPlan, badgeCount: activeCount)
+        scheduleLocalNotifications(notificationPlan)
     }
 
     func shouldIgnoreTransientEmptySnapshot(fetched: [InboxItemRecord], snapshotLoaded: Bool) -> Bool {
@@ -198,10 +190,10 @@ final class InboxStore: ObservableObject {
         }
     }
 
-    private func scheduleLocalNotifications(_ plan: InboxLocalNotificationPlan, badgeCount: Int) {
+    private func scheduleLocalNotifications(_ plan: InboxLocalNotificationPlan) {
         if let notificationScheduler {
             guard plan != .none else { return }
-            notificationScheduler(plan, badgeCount)
+            notificationScheduler(plan)
             return
         }
         switch plan {
@@ -209,14 +201,14 @@ final class InboxStore: ObservableObject {
             return
         case .items(let items):
             for item in items {
-                Self.fireLocalNotification(for: item, badgeCount: badgeCount)
+                Self.fireLocalNotification(for: item)
             }
         case .summary(let newUnreadCount):
-            Self.fireBatchNotification(newUnreadCount: newUnreadCount, badgeCount: badgeCount)
+            Self.fireBatchNotification(newUnreadCount: newUnreadCount)
         }
     }
 
-    private static func fireLocalNotification(for item: InboxItemRecord, badgeCount: Int) {
+    private static func fireLocalNotification(for item: InboxItemRecord) {
         var userInfo = [
             "itemId": item.id,
             "source": item.source,
@@ -234,7 +226,6 @@ final class InboxStore: ObservableObject {
             content.title = item.title
             content.body = item.summary
             content.sound = .default
-            content.badge = NSNumber(value: badgeCount)
             content.userInfo = userInfo
             do {
                 let added = try await NativeAgentNotificationEventGate.add(
@@ -250,13 +241,12 @@ final class InboxStore: ObservableObject {
         }
     }
 
-    private static func fireBatchNotification(newUnreadCount: Int, badgeCount: Int) {
+    private static func fireBatchNotification(newUnreadCount: Int) {
         Task.detached {
             let content = UNMutableNotificationContent()
             content.title = "NativeAgent Inbox"
             content.body = "\(newUnreadCount) new Inbox items are ready to review."
             content.sound = .default
-            content.badge = NSNumber(value: badgeCount)
             content.userInfo = ["screen": "activity", "source": "inbox_batch"]
             do {
                 let request = UNNotificationRequest(
@@ -316,9 +306,9 @@ struct InboxView: View {
 
     private var headerLine: String {
         switch active.count {
-        case 0: return "Nothing new from me."
-        case 1: return "One new thing from me."
-        default: return "\(AliveWords.spelled(active.count)) new things from me."
+        case 0: return "No unread notes from me."
+        case 1: return "One unread note from me."
+        default: return "\(AliveWords.spelled(active.count)) unread notes from me."
         }
     }
 
@@ -436,7 +426,7 @@ struct InboxView: View {
                             Text(groupFilter.title)
                                 .font(.body.weight(.medium))
                                 .foregroundStyle(AlivePalette.text)
-                            Text("\(active.count) new, \(read.count) earlier")
+                            Text("\(active.count) unread, \(read.count) earlier")
                                 .font(.footnote)
                                 .foregroundStyle(AlivePalette.secondary)
                         }

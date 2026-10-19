@@ -41,6 +41,21 @@ extension SwiftNativeTrustCenter {
     /// Reads the authoritative saved policy without conflating a missing file
     /// with damaged authority state. Missing is the only bootstrap-empty case.
     public nonisolated static func loadRawPolicyChecked(at path: URL) throws -> [String: JSONValue] {
+        guard let data = try policyBytesChecked(at: path) else { return [:] }
+        let decoded: JSONValue
+        do {
+            decoded = try JSONDecoder().decode(JSONValue.self, from: data)
+        } catch {
+            throw TrustCenterError.underlying("saved trust policy is malformed")
+        }
+        guard case .object(let object) = decoded else {
+            throw TrustCenterError.underlying("saved trust policy must be a JSON object")
+        }
+        try validateAuthorityPolicyShape(object)
+        return object
+    }
+
+    nonisolated static func policyBytesChecked(at path: URL) throws -> Data? {
         // 2026-09-06: inspect the entry without following its final symlink.
         // A dangling link is saved but unreadable authority, never bootstrap.
         var metadata = stat()
@@ -48,7 +63,7 @@ extension SwiftNativeTrustCenter {
             guard errno == ENOENT else {
                 throw TrustCenterError.underlying("saved trust policy cannot be inspected")
             }
-            return [:]
+            return nil
         }
         let data: Data
         do {
@@ -69,17 +84,7 @@ extension SwiftNativeTrustCenter {
         } catch {
             throw TrustCenterError.underlying("saved trust policy is unreadable")
         }
-        let decoded: JSONValue
-        do {
-            decoded = try JSONDecoder().decode(JSONValue.self, from: data)
-        } catch {
-            throw TrustCenterError.underlying("saved trust policy is malformed")
-        }
-        guard case .object(let object) = decoded else {
-            throw TrustCenterError.underlying("saved trust policy must be a JSON object")
-        }
-        try validateAuthorityPolicyShape(object)
-        return object
+        return data
     }
 
     /// A saved scalar must never replace one of the policy dictionaries that
@@ -216,36 +221,37 @@ extension SwiftNativeTrustCenter {
         return snapshot.policy
     }
 
-    /// SecurityCenter authorization read. Keep this as a value snapshot rather
-    /// than a cache: every effect-time check still rereads canonical authority,
-    /// but all fields used by that one check come from one validated generation.
-    public func loadAuthorizationSnapshotChecked() async throws
-        -> TrustPolicyAuthorizationSnapshot
-    {
+    /// The saved generation checked by both authorization and person-only recovery.
+    nonisolated static func loadSavedPolicyChecked(at path: URL, defaults: [String: JSONValue]) throws -> [String: JSONValue] {
         // Fold the future spelling BEFORE type validation, not just before the
         // normalize merge — otherwise a `workshopPolicy` block skips the
         // nested type checks the legacy spelling gets (defaults only carry the
         // wire key), making future-key reads more permissive than old-key
         // reads (review 2026-08-06 blocking #3).
-        let sourcePresent = FileManager.default.fileExists(atPath: trustPolicyURL.path)
         let saved = WorkshopPolicyBlockVocabulary.foldToWireKey(
-            try Self.loadRawPolicyChecked(at: trustPolicyURL))
-        let defaults = defaultTrustPolicy()
+            try Self.loadRawPolicyChecked(at: path))
         try Self.validateKnownAuthorityPolicyTypes(saved, against: defaults)
         // Every saved autonomy entry is a level Trust knows, checked on its own:
         // the code no longer lists per-tool defaults to type-check it against.
-        let overrides: [String: JSONValue]
         switch saved["toolAutonomy"] {
-        case nil: overrides = [:]
+        case nil: break
         case .object(let value)?:
             for (tool, level) in value {
                 guard case .string(let name) = level, Self.unifiedPolicyAutonomyLevels.contains(name) else {
                     throw TrustCenterError.underlying("saved trust policy field toolAutonomy.\(tool) is not an autonomy level")
                 }
             }
-            overrides = value
         default: throw TrustCenterError.underlying("saved trust policy field toolAutonomy has the wrong JSON type")
         }
+        return saved
+    }
+
+    /// Every effect-time check reads one freshly validated authority generation.
+    public func loadAuthorizationSnapshotChecked() async throws -> TrustPolicyAuthorizationSnapshot {
+        let sourcePresent = FileManager.default.fileExists(atPath: trustPolicyURL.path)
+        let defaults = defaultTrustPolicy()
+        let saved = try Self.loadSavedPolicyChecked(at: trustPolicyURL, defaults: defaults)
+        let overrides: [String: JSONValue] = if case .object(let value)? = saved["toolAutonomy"] { value } else { [:] }
         return TrustPolicyAuthorizationSnapshot(
             // An empty policy file (setup writes `{}` before the person has
             // chosen anything) is a fresh install too.

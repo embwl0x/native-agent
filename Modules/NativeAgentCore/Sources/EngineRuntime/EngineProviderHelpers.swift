@@ -543,7 +543,7 @@ extension ProvidersFacade {
         if verb == "refresh_models" {
             let refreshed = await refresh()
             if let detail = refreshed.failure {
-                return AppToolExecutor.failure("refresh_failed", "The model lists did not refresh: \(detail)." + retry)
+                return AppToolExecutor.failure("refresh_failed", "The model lists did not refresh: \(detail)." + retry, extra: ["effects": .string("unknown")])
             }
             await reload()
             return .object([
@@ -571,7 +571,7 @@ extension ProvidersFacade {
         case "test":
             let result: NativeAgentShared.ProviderTestResult
             do { result = try await test(id) } catch {
-                return AppToolExecutor.failure("test_failed", "The test of \(name) could not run: \(error.localizedDescription)." + retry)
+                return AppToolExecutor.failure("test_failed", "The test of \(name) could not run: \(error.localizedDescription)." + retry, extra: ["effects": .string("unknown")])
             }
             let works = result.tested && result.status == "ok"
             let problem = NativeAppSecretRedactor.redactText(result.error ?? result.detail ?? result.status)
@@ -617,7 +617,7 @@ extension ProvidersFacade {
             do {
                 try await configure(id, mode.selectedMode, model)
             } catch {
-                return AppToolExecutor.failure("save_failed", "\(name)'s fallback model was not saved: \(error.localizedDescription)." + retry)
+                return AppToolExecutor.failure("save_failed", "\(name)'s fallback model was not saved: \(error.localizedDescription)." + retry, extra: ["effects": .string("unknown")])
             }
             await reload()
             return .object([
@@ -632,7 +632,7 @@ extension ProvidersFacade {
             guard outcome.ok else {
                 return AppToolExecutor.failure("disconnect_failed",
                     "\(outcome.detail) app {page:\"providers\"} shows where \(name) stands.",
-                    extra: ["provider": .string(id)])
+                    extra: ["provider": .string(id), "effects": .string("unknown")])
             }
             HarnessDecidedRow.post(requester: "Full Mac", tool: "provider.disconnect \(id)",
                                    sessionID: AppToolExecutor.inputString(input["__session_id"]),

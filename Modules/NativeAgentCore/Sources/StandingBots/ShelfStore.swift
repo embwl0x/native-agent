@@ -1,5 +1,7 @@
 import Foundation
 import PersistenceCore
+import Experiences
+import NativeAgentCore
 
 public struct ShelfStore: Sendable {
     public static let maximumPageSize = 100
@@ -33,6 +35,7 @@ public struct ShelfStore: Sendable {
         let book = Book(sequence: last + 1, entry: entry)
         try disk.write(book, at: pendingPath)
         try apply(book, index: &index)
+        recordExperience(entry)
     }
 
     /// The approval this entry stopped on has been decided. The shelf is
@@ -59,6 +62,7 @@ public struct ShelfStore: Sendable {
             _ = try loadIndex()
             guard let book = try disk.read(Book.self, at: indexedPath(id)) else { throw StandingBotsError.notFound(id) }
             try validate(book.entry)
+            recordExperience(book.entry)
             return book.entry
         }
     }
@@ -187,8 +191,24 @@ public struct ShelfStore: Sendable {
             for book in try books() {
                 grouped[book.entry.botId, default: []].append(book.entry)
             }
+            for entries in grouped.values {
+                if let latest = entries.filter({ $0.runtimeStatus == .completed }).max(by: { $0.runAt < $1.runAt }) {
+                    recordExperience(latest)
+                }
+            }
             return grouped
         }
+    }
+
+    private func recordExperience(_ entry: ShelfEntry) {
+        guard entry.runtimeStatus == .completed else { return }
+        let result = Experience(id: entry.id.uuidString, kind: .run,
+            evidence: [.init(source: "bots/shelf-entries", id: entry.id.uuidString)],
+            outcome: .init(domain: "bot", status: entry.runtimeStatus.rawValue),
+            face: .init(words: TurnSecretRedactor.redactText(entry.actualReply),
+                artifacts: (entry.artifacts ?? []).map { .init(source: $0.path, id: $0.name) }),
+            addressedTo: ["bot:" + entry.botId.uuidString])
+        ExperienceStore.record(dataRoot, result.id) { try await $0.begin(result) }
     }
 
     /// The verdict and result identity are committed together; the existing

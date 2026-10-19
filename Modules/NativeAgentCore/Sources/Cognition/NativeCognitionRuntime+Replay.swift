@@ -33,7 +33,6 @@ extension NativeCognitionRuntime {
                     target: row.targetDoc,
                     text: row.proposalText,
                     evidenceDates: row.evidenceDates,
-                    status: row.status,
                     confidence: row.confidence,
                     createdAt: row.createdAt
                 )

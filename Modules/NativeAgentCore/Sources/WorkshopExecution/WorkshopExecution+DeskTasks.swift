@@ -102,6 +102,11 @@ public struct WorkshopDirectedTaskSubmitter: Sendable {
                 item.handle,
                 text: "Workshop submission refused: \(String(error.localizedDescription.prefix(600)))"
             )
+            if let failure = error as? ToolFailureError {
+                throw ToolFailureError(failure.message + " Desk item \(item.handle) was retained.",
+                    argumentPath: failure.argumentPath, accepted: failure.accepted, effects: .occurred,
+                    owner: failure.owner, nextCall: failure.nextCall, tap: failure.tap, personDecides: failure.personDecides)
+            }
             throw error
         }
     }

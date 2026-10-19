@@ -7,6 +7,7 @@ import Privacy
 import PersonaEngine
 import Senses
 import TrustCenter
+import ToolRegistry
 
 /// The app door supplies its registry and gate chain to the shared executor.
 /// Receipt classification, journal/replay, quotas and the VM have one owner.
@@ -136,6 +137,12 @@ enum AppScriptRunner {
         var admit: @Sendable (String, [String: JSONValue]) async -> JSONValue? = { _, _ in
             AppToolExecutor.failure("door_unavailable", "Authored execution requires the originating Trust gate.")
         }
+        func dependencyRevision(_ dependencies: [String]) throws -> [String] {
+            let paths = Set(["tools/.manifest_signing_key"]).union(dependencies.flatMap { resolved($0)?.dependencyFiles ?? [] })
+            return try [String(AppActionBinding.registeredToolCount),
+                AppActions.senses().map { $0.id + ":" + $0.page }.sorted().joined(separator: ",")]
+                + paths.sorted().map { try AbilityStore.fileRevision(dataRoot.appendingPathComponent($0)) }
+        }
         var actionIDs: [String] { (AppActions.all + AppActions.mcp(dataRoot: dataRoot) + AppActions.authored(dataRoot: dataRoot) + AppActions.senses()).map(\.id) }
         var floorReasons: Set<String> { AppToolExecutor.doorFloorReasons }
         var scriptKey: String { AppToolExecutor.doorScriptKey }
@@ -178,6 +185,18 @@ enum AppScriptRunner {
         func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? {
             SessionHistoryPromptRenderer.receiptField(key, in: receipt)
         }
+        /// One shape: a door receipt's object result comes up to the top, and
+        /// what the door writes for the model (guide, remedy, next_call,
+        /// provenance) is not the program's.
+        func answer(_ receipt: JSONValue) -> JSONValue {
+            guard case .object(var fields) = receipt else { return receipt }
+            if fields["action"] != nil, case .object(let result)? = fields["result"] {
+                fields.removeValue(forKey: "result")
+                fields.merge(result) { _, own in own }
+            }
+            for key in ["guide", "remedy", "next_call", "sense_provenance"] { fields.removeValue(forKey: key) }
+            return .object(fields)
+        }
         func perform(_ input: [String: JSONValue]) async -> JSONValue {
             guard !SkillRunContext.handsBack else { return await call(input) }
             let requester = SkillRunContext.partID.map { "\(PersonaCompiler.agentDisplayName(dataRoot: dataRoot))'s \($0)" }
@@ -206,8 +225,10 @@ enum AppScriptRunner {
         func dependencyMatches(_ id: String, _ saved: JSONValue?) -> Bool {
             guard let saved, let current = dependencyShape(id) else { return false }
             if saved == current || saved == pin(current).map(JSONValue.string) { return true }
-            // Older authored tools stored the full shape, so their contract is recoverable.
-            return AppActions.legacyDependencyContract(saved) == current
+            // A full shape (older authored tools stored theirs inside discovery) still
+            // matches while the current contract accepts every call it did. A digest
+            // alone can only match exactly.
+            return AppActions.acceptsEveryCall(current, of: AppActions.legacyDependencyContract(saved) ?? saved)
         }
         func admitTool(_ id: String, input: [String: JSONValue]) async -> JSONValue? { await admit(id, input) }
         func performReach(_ operation: String, arguments: JSONValue) async throws -> JSONValue {

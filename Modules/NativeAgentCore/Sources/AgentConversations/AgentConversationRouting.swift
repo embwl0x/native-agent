@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import StandingBots
 
 /// Argument translation only. Callers must dispatch through the original tool's
 /// admission and execution owners; this type grants no authority or tool access.
@@ -21,7 +22,26 @@ public enum AgentConversationRouting {
         public var errorDescription: String? { message }
     }
 
-    public static func route(tool: String, input: [String: JSONValue]) throws -> Route? {
+    public static func namingSavedContact(_ tool: String, _ input: [String: JSONValue], dataRoot: URL?) throws -> [String: JSONValue] {
+        guard ["agent_message", "agent_read", "agent_cancel"].contains(tool), let dataRoot,
+              case .string(let raw)? = input["agent"], !raw.contains(":") else { return input }
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An unreadable address book resolves no name; the literal handle still reaches its own door.
+        guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return input }
+        var matches = Set(peers.filter {
+            $0.id == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
+                || ($0.handles ?? []).contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+        }.map { peer in peer.handles?.first { $0.caseInsensitiveCompare(name) == .orderedSame } ?? "peer:" + peer.id })
+        matches.formUnion(try BotDefinitionStore(dataRoot: dataRoot).list().filter {
+            $0.id.uuidString.lowercased() == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
+        }.map { "bot:" + $0.id.uuidString })
+        guard matches.count <= 1 else { throw InvalidRequest(message: "More than one contact is named \(name). Choose its exact contact from agent_contacts.") }
+        var input = input
+        if let exact = matches.first { input["agent"] = .string(exact) }
+        return input
+    }
+
+    public static func route(tool: String, input: [String: JSONValue], dataRoot: URL? = nil) throws -> Route? {
         guard tool == "agent_message" || tool == "agent_read" else { return nil }
         if let details = input["details"], details != .null {
             guard tool == "agent_read", case .bool = details else { throw invalid("details is a boolean for agent_read only.") }
@@ -33,10 +53,12 @@ public enum AgentConversationRouting {
             ? ["agent", "text", "conversation_id", "message_id", "options", "expects_reply", "session_id", "__session_id"]
             : ["agent", "conversation_id", "message_id", "limit", "offset", "session_id", "__session_id"]
         let raw = try string(input["agent"], field: "agent", maximum: 180)
-        let agent = raw == "claude" ? "claude" : raw
+        let agent = raw
+        let door = dataRoot.flatMap { AgentConversationDelivery.door(for: agent, dataRoot: $0) }
+        if door != nil, AgentRecipeStore.dryRun { return nil }
         if agent.hasPrefix("peer:") {
             guard UUID(uuidString: String(agent.dropFirst(5))) != nil else { throw invalid("peer reference must contain a UUID.") }
-            return nil // External adapters retain their own validation and owner.
+            if !sending || door == nil { return nil } // The selected recipe retains its own owner.
         }
         try keys(input, allowed: allowed)
         let botID: UUID?
@@ -44,7 +66,7 @@ public enum AgentConversationRouting {
             guard let id = UUID(uuidString: String(agent.dropFirst(4))) else { throw invalid("bot reference must contain a UUID.") }
             botID = id
         } else {
-            guard ["codex", "claude", "omp"].contains(agent) else { throw invalid("No contact is named '\(raw)'. Use a name exactly as agent_contacts shows it, or codex, claude or omp.") }
+            guard door != nil else { throw invalid("No contact is named '\(raw)'. Use a name exactly as agent_contacts shows it.") }
             botID = nil
         }
         let canonical = botID.map { "bot:" + $0.uuidString } ?? agent
@@ -71,15 +93,16 @@ public enum AgentConversationRouting {
                 args["question"] = .string(text)
                 return Route(tool: "bot_ask", input: args, agent: canonical)
             }
-            try validate(options: options, agent: agent, continuing: conversation != nil)
+            guard let door else { throw invalid("No saved inbox door for this contact.") }
+            try validate(options: options, allowed: door.options, continuing: conversation != nil)
             args.merge(options) { _, new in new }
             args["text"] = .string(text)
             args["conversation_mode"] = .string(conversation == nil ? "new" : "resume")
             if let conversation { args["conversation_id"] = .string(conversation) }
             if let message { args["message_id"] = .string(message) }
-            // Claude's inbox row records it; the other lanes do not read it.
-            if agent == "claude", let expects = input["expects_reply"], case .bool = expects { args["expects_reply"] = expects }
-            return Route(tool: agent + "_message", input: args, agent: canonical)
+            args["agent"] = .string(door.handle)
+            if door.liveReader, let expects = input["expects_reply"], case .bool = expects { args["expects_reply"] = expects }
+            return Route(tool: door.tool, input: args, agent: canonical)
         }
         if let botID {
             guard input["offset"] == nil else { throw invalid("Bot shelf pagination uses an opaque cursor; offset is unsupported.") }
@@ -154,17 +177,12 @@ public enum AgentConversationRouting {
         return .object(["tool": .string("agent_read"), "input": .object(input)])
     }
 
-    public static func supportedOptions(agent: String) -> Set<String>? {
-        guard ["codex", "claude", "omp"].contains(agent) else { return nil }
-        var allowed: Set<String> = ["working_directory", "topic"]
-        if agent == "omp" { allowed.insert("timeout_seconds") }
-        if agent == "codex" { allowed.formUnion(["model", "reasoning_effort", "fast", "pair_reviewer"]) }
-        if agent == "claude" { allowed.insert("pair_reviewer") }
-        return allowed
+    public static func supportedOptions(agent: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Set<String>? {
+        AgentConversationDelivery.door(for: agent, dataRoot: dataRoot)?.options
     }
 
-    private static func validate(options: [String: JSONValue], agent: String, continuing: Bool) throws {
-        try keys(options, allowed: supportedOptions(agent: agent) ?? [])
+    package static func validate(options: [String: JSONValue], allowed: Set<String>, continuing: Bool) throws {
+        try keys(options, allowed: allowed)
         if continuing, options["working_directory"] != nil || options["topic"] != nil {
             throw invalid("A continuation reuses its existing workspace and topic; omit those options.")
         }

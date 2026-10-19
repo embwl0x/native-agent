@@ -42,7 +42,22 @@ public enum AgentConversationView {
         catch CocoaError.fileReadNoSuchFile {
             return .object(["status": .string("absent"), "detail": .string("Claude has no worklog.")])
         } catch {
-            return .object(["status": .string("unavailable"), "detail": .string("Claude's worklog could not be read. Check its file permissions.")])
+            let attributes = try? FileManager.default.attributesOfItem(atPath: claudeWorklogURL.path)
+            let canRepairMode = (error as? CocoaError)?.code == .fileReadNoPermission
+                && attributes?[.type] as? FileAttributeType == .typeRegular
+                && (attributes?[.ownerAccountID] as? NSNumber)?.uint32Value == getuid()
+                && (attributes?[.posixPermissions] as? NSNumber).map { $0.intValue & 0o400 == 0 } == true
+            let command = "chmod u+r -- '" + claudeWorklogURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            let remedy: JSONValue = canRepairMode
+                ? Repair.remedy(owner: claudeWorklogURL.path + ": owner read permission", nextCall: .object([
+                    "tool": .string("app"), "input": .object(["action": .string("shell.run"), "args": .object(["cmd": .string(command)])])]), tap: nil)
+                : .object(["kind": .string("inspect"),
+                    "instruction": .string("Inspect the path with next_call to identify the failed read's cause. If macOS denies access, the person must grant it in System Settings > Privacy & Security > Full Disk Access > NativeAgent switch. Inspection alone changes nothing."),
+                    "next_call": .object(["tool": .string("app"),
+                        "input": .object(["action": .string("files.info"), "args": .object(["path": .string(claudeWorklogURL.path)])])])])
+            return .object(["status": .string("unavailable"), "effects": .string("none"),
+                "detail": .string("Worklog open/seek/read failed at \(claudeWorklogURL.path): \(error.localizedDescription)"),
+                "remedy": remedy])
         }
         let entries = rows.compactMap { row -> (Date, JSONValue)? in
             guard let ts = row["ts"] as? String, let at = NativeTimestampFormat.parseISO8601(ts),

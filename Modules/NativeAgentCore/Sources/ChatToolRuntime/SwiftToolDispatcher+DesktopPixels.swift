@@ -206,7 +206,7 @@ extension SwiftToolDispatcher {
         let maskedShot = MacScreenShot(bounds: shot.bounds,
             pixelWidth: masked.width, pixelHeight: masked.height, cgImage: masked)
         guard !Task.isCancelled else { return failed("Desktop capture cancelled.") }
-        guard let png = renderer.renderPNG(shot: maskedShot, placements: [], downscale: 1) else {
+        guard let png = renderer.renderPNG(shot: maskedShot, placements: [], secretFrames: [], downscale: 1) else {
             return failed("Desktop image encoding failed.")
         }
         let delivered = LocalToolImage.deliverPNG(png, name: "primary-desktop.png", width: masked.width, height: masked.height)

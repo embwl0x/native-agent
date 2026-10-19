@@ -24,10 +24,11 @@ public actor AgentContactHealth {
             evidence.retainReplyEvidence()
             return evidence
         }
-        let identity = AgentContactIdentity(dataRoot: dataRoot)
         let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
-        let bridge = claudePresence(dataRoot: dataRoot)
-        for key in Set(["claude"] + peers.filter { identity.canonical("peer:" + $0.id) == "claude" }.map { "peer:" + $0.id }) {
+        for peer in peers {
+            let key = "peer:" + peer.id
+            guard let door = AgentConversationDelivery.door(for: key, dataRoot: dataRoot), door.liveReader else { continue }
+            let bridge = claudePresence(inbox: door.inbox)
             if health[key] == nil { health[key] = AgentLocalHealth(status: "unchecked", detail: "", checkedAt: .distantPast, authenticated: false) }
             health[key]?.present(bridge)
         }
@@ -39,17 +40,18 @@ public actor AgentContactHealth {
         return health
     }
 
-    private nonisolated static func claudePresence(dataRoot: URL) -> AgentLocalHealth {
-        let path = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
-            .appendingPathComponent("claude-bridge/claude-live")
+    private nonisolated static func claudePresence(inbox: URL) -> AgentLocalHealth {
+        let path = inbox.deletingLastPathComponent().appendingPathComponent("claude-live")
         let at = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
         let recent = at.map { Date().timeIntervalSince($0) < 600 } == true
-        return bridgePresence(recent)
+        var presence = bridgePresence(recent)
+        presence.checkedAt = at ?? .distantPast
+        return presence
     }
 
     private nonisolated static func bridgePresence(_ recent: Bool) -> AgentLocalHealth {
         AgentLocalHealth(status: recent ? "recent_activity" : "waiting",
-            detail: recent ? "Claude's bridge was active within the last 10 minutes." : "No recent activity from Claude's bridge.",
+            detail: recent ? "The inbox bridge was active within the last 10 minutes." : "No recent activity from the inbox bridge.",
             checkedAt: Date(), authenticated: false)
     }
 
@@ -76,7 +78,14 @@ public actor AgentContactHealth {
     /// controls found without typing or coming forward (desktop chat), its
     /// executable and args checked without launching (command line). Findings
     /// are written to its recipe; a pass closes the bridge items it exercised.
-    package static func repair(_ agent: String, dataRoot: URL, perform: AgentConversationSession.Dispatch) async throws -> JSONValue {
+    package static func repair(_ agent: String, dataRoot: URL, workspace: String? = nil, perform: AgentConversationSession.Dispatch) async throws -> JSONValue {
+        let store = AgentPeerStore(dataRoot: dataRoot)
+        let peer = try store.list().first { "peer:" + $0.id == agent }
+        if let row = peer.flatMap({ AgentPeerStore.hostRowID($0.endpoint) }).flatMap(AgentHostDirectory.row(named:)) ?? AgentHostDirectory.row(named: agent),
+           row.acp == nil, row.settingsSupported || row.format == .shellEnvironment {
+            let setup = AgentHostConnection.verifySetup(name: row.id, store: store, dataRoot: dataRoot, workspace: workspace ?? peer?.hostWorkspace)
+            if !passed(setup) || peer == nil || row.commandLine == nil { return setup }
+        }
         let found = try await perform("agent_message", ["agent": .string(agent), "text": .string(AgentHostDirectory.probeToken), "dry_run": .bool(true)])
         if passed(found), case .object(let fields) = found, let peer = text(fields["agent"]) {
             // A pass closes only what it exercised: an ACP handshake's protocol
@@ -191,17 +200,14 @@ public actor AgentContactHealth {
         }
         guard let peers = try? AgentPeerStore(dataRoot: dataRoot).list(),
               let records = try? AgentConversationStore(dataRoot: dataRoot).recordsUnlocked() else { return }
-        var previous = AgentLocalHealth.read(dataRoot)
-        let identity = AgentContactIdentity(dataRoot: dataRoot)
-        let claude = peers.filter { identity.canonical("peer:" + $0.id) == "claude" }
+        guard var previous = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
         let iso = ISO8601DateFormatter()
-        let bridge = Probe.bridge(live: Self.claudePresence(dataRoot: dataRoot).status == "recent_activity")
-        var probes: [(String, Probe)] = peers.map { ("peer:" + $0.id, claude.contains($0) ? bridge : probe($0)) }
-        if !claude.isEmpty || records.contains(where: { $0.agent == "claude" }) { probes.append(("claude", bridge)) }
-        for (lane, binary) in [("codex", "codex"), ("omp", "omp")] {
-            if AgentHostCommandLines.resolveExecutable(binary) != nil || records.contains(where: { $0.agent == lane }) {
-                probes.append((lane, .command(binary, AgentHostCommandLines.resolveExecutable(binary))))
+        let probes: [(String, Probe)] = peers.map { peer in
+            let key = "peer:" + peer.id
+            if let door = AgentConversationDelivery.door(for: key, dataRoot: dataRoot), door.liveReader {
+                return (key, .bridge(live: Self.claudePresence(inbox: door.inbox).status == "recent_activity"))
             }
+            return (key, probe(peer))
         }
         var observations: [Probe: AgentLocalHealth] = [:]
         var changed = false
@@ -345,7 +351,8 @@ public actor AgentContactHealth {
         guard changed else { return }
         let active = Set(probes.map(\.0))
         previous = previous.filter { active.contains($0.key) }
-        for (agent, saved) in AgentLocalHealth.read(dataRoot) where saved.repairFor == previous[agent]?.repairFor {
+        guard let savedHealth = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
+        for (agent, saved) in savedHealth where saved.repairFor == previous[agent]?.repairFor {
             previous[agent]?.repairDetail = saved.repairDetail
         }
         do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(previous), to: AgentLocalHealth.url(dataRoot)) }
@@ -384,7 +391,7 @@ public actor AgentContactHealth {
                 ? String(error.localizedDescription.split(separator: "\n").first ?? "Routine verification failed.") + " Open Grok Bot's Routines and import the NativeAgent reply routine on Connect."
                 : "Restore \(name)'s reply endpoint or sign-in, then verify in Connect."
         }
-        var health = AgentLocalHealth.read(dataRoot)
+        guard var health = try? AgentLocalHealth.checkedRead(dataRoot) else { return }
         guard health[agent]?.repairFor == operation, health[agent]?.brokenSince != nil || health[agent]?.status == "no_reply_by_deadline" else { return }
         health[agent]?.repairDetail = detail
         for key in health.keys { health[key]?.retainReplyEvidence() }

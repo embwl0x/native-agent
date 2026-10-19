@@ -1,3 +1,4 @@
+import ApprovalTransactions
 import ChatOrchestration
 import Dispatcher
 import Foundation
@@ -134,7 +135,10 @@ extension AppToolExecutor {
     }
 
     /// What a gate refused with, before anything was touched.
-    struct GateRefusal: Error { let answer: JSONValue }
+    struct GateRefusal: Error {
+        let answer: JSONValue
+        init(answer: JSONValue) { self.answer = ChatToolOutcome.refusedBeforeRunning(answer) }
+    }
 
     /// A card's id, bare or as its inbox note's (`interaction:<id>`).
     private static func cardID(_ input: [String: JSONValue]) -> String {
@@ -364,10 +368,7 @@ extension AppToolExecutor {
                     extra: continuationExtra(id)
                 )
             } catch {
-                return Self.interactionFailure(
-                    "not_settled", error.localizedDescription,
-                    extra: ["interaction_id": .string(id)]
-                )
+                return Self.cardTransitionFailure("not_settled", error, id: id)
             }
         }
 
@@ -380,10 +381,7 @@ extension AppToolExecutor {
                 expectedRevision: current.revision, dataRoot: dataRoot
             )
         } catch {
-            return Self.interactionFailure(
-                "not_begun", error.localizedDescription,
-                extra: ["interaction_id": .string(id)]
-            )
+            return Self.cardTransitionFailure("not_begun", error, id: id)
         }
 
         // `begin` is transcript I/O, and the Full Mac check above ran before
@@ -561,7 +559,7 @@ extension AppToolExecutor {
                 "Signing in to \(interaction.target) happens in a browser, with the person there."
             )
         case .macPermissionGrant:
-            if interaction.allTargets.contains(where: InlineInteractionRegistry.isMacControlCategory) {
+            if interaction.allTargets.contains(where: { InlineInteractionRegistry.isMacControlCategory($0) || SystemPermissionPreflight.cardSettingsCapability($0) != nil }) {
                 return .needsGlass("Allowing Mac control is the owner's choice. Use the permission card on the Mac.")
             }
             return .permissionGrant
@@ -740,10 +738,10 @@ extension AppToolExecutor {
     @MainActor
     func composerRead(sessionId: String) async -> JSONValue {
         guard let appModel = quietHost() else {
-            return Self.interactionFailure(
+            return ChatToolOutcome.refusedBeforeRunning(Self.interactionFailure(
                 "app_window_unavailable",
                 "The app's own composer is not available in this process."
-            )
+            ))
         }
         var body = await appModel.composerState(sessionId: sessionId)
         if body["status"] == nil { body["status"] = .string("ok") }
@@ -879,6 +877,7 @@ extension AppToolExecutor {
                     "target": .string("composer"),
                     "verb": .string(verb),
                     "element": .string(outcome.element),
+                    "effects": .string(refusal.effects.rawValue),
                 ]
             )
         }
@@ -924,6 +923,12 @@ extension AppToolExecutor {
     }
 
     // MARK: - Answers
+
+    /// Only begin/decline's typed rejections precede their transcript write.
+    private static func cardTransitionFailure(_ reason: String, _ error: Error, id: String) -> JSONValue {
+        let result = interactionFailure(reason, error.localizedDescription, extra: ["interaction_id": .string(id)])
+        return error is InlineInteractionResolver.ResolveError ? ChatToolOutcome.refusedBeforeRunning(result) : result
+    }
 
     private static func interactionFailure(
         _ reason: String, _ detail: String, extra: [String: JSONValue] = [:]

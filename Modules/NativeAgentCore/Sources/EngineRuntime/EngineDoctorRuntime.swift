@@ -13,13 +13,16 @@ import ProviderRouting
 import MacControl
 import Research
 import AgentConversations
+import AgentWorkspace
 import Synchronization
+import Experiences
 
 /// Platform observations and callbacks; Doctor owns interpretation and repair admission.
 public protocol EngineDoctorPlatformPort: Sendable {
     var doctorEngine: NativeAgentEngine { get }
     var doctorManager: BackgroundLoops.BackgroundLoopsManager { get }
     func doctorRestartLoop(id: String) async -> LoopRestartOutcome
+    func doctorRepairPhoneSync() async -> DoctorRepairAttempt?
     func doctorStartBridge(name: String) async
     func doctorInspectorRepair(for check: CheckResult) async -> DoctorExecutableRepair?
     func doctorBridgeSnapshots() async -> [DoctorBridgeSnapshot]
@@ -43,17 +46,21 @@ public struct EngineDoctorRuntime<Port: EngineDoctorPlatformPort>: DoctorActionP
     /// Every Doctor run ends here — the automatic one, Run, Repair — so each
     /// adverse row takes its owner's route and healed rows resolve.
     public func runDoctor(repair: Bool = false, repairScope: DoctorRepairScope = .automatic,
-                   checks: (any DoctorChecksProtocol)? = nil) async throws -> DoctorReport {
-        let result = try await doctorActions.runDoctor(repair: repair, repairScope: repairScope, checks: checks ?? makeDoctorChecks(root: dataRoot))
-        let asksFiled = await MaintenanceBackgroundWork(port: EngineBackgroundWorkPort())
-            .fileDoctorAsk(dataRoot: dataRoot, rows: result.checks)
-        let routed = await MaintenanceBackgroundWork.routeDoctorRows(result.checks, dataRoot: dataRoot)
-        Self.acknowledgeDoctorTransitions(result.checks, asksFiled: asksFiled, routed: routed)
+                   checks: (any DoctorChecksProtocol)? = nil, checkID: String? = nil) async throws -> DoctorReport {
+        let result = try await doctorActions.runDoctor(repair: repair, repairScope: repairScope, checks: checks ?? makeDoctorChecks(root: dataRoot), checkID: checkID)
+        await DoctorStatusProjection.recordReadings(result.checks, dataRoot: dataRoot)
+        let rows = await DoctorStatusProjection.repairProjection(result.checks, dataRoot: dataRoot)
+        if !rows.contains(where: { $0.id == "doctor.repair_store" }) {
+            _ = await MaintenanceBackgroundWork(port: EngineBackgroundWorkPort())
+                .fileDoctorAsk(dataRoot: dataRoot, rows: rows)
+        }
         return DoctorReport(status: result.status, repaired: result.repaired, checks: result.checks)
     }
 
     public func liveDoctorCoverageChecks() async -> [CheckResult] {
-        await doctorActions.liveDoctorCoverageChecks()
+        let rows = await doctorActions.liveDoctorCoverageChecks()
+        await DoctorStatusProjection.recordReadings(rows, dataRoot: dataRoot)
+        return rows
     }
 
     public static func safeDetail(_ value: String) -> String {
@@ -91,13 +98,12 @@ extension EngineDoctorRuntime {
            saved["reason"] as? String == "public_release_blank_slate_first_run",
            let backup = saved["backupPath"] as? String, !backup.isEmpty,
            FileManager.default.fileExists(atPath: backup) {
-            return CheckResult(
-                id: "install.data_root", title: "Data root", status: "warn",
-                detail: "An earlier launch moved saved data. Recorded backup location: \(backup)",
-                harm: "The earlier saved configuration and files are outside the current data root."
+            return CheckResult(source: marker.path,
+                id: "install.data_root", title: "Data root", status: "ok",
+                detail: "An earlier launch moved saved data. Recorded backup location: \(backup)"
             )
         }
-        return CheckResult(id: "install.data_root", title: "Data root", status: "ok",
+        return CheckResult(source: marker.path,id: "install.data_root", title: "Data root", status: "ok",
                            detail: "No existing backup from an earlier data-root move was found.")
     }
 
@@ -174,6 +180,11 @@ extension EngineDoctorRuntime {
         guard requestedRoot.resolvingSymlinksInPath().standardizedFileURL
             == PersistenceCore.defaultDataRoot().resolvingSymlinksInPath().standardizedFileURL else { return nil }
         switch check.id {
+        case "icloud_bridge_state":
+            guard check.owner != .builder else { return nil }
+            return DoctorExecutableRepair(checkID: check.id) {
+                await port.doctorRepairPhoneSync() ?? .unverified("Phone sync has no mounted transport; repair remains owed.")
+            }
         case "live.memory":
             guard !check.detail.hasPrefix("quick_check on ") else { return nil }
             return DoctorExecutableRepair(checkID: check.id) {
@@ -340,20 +351,32 @@ extension EngineDoctorRuntime {
     public func doctorAgentConnectionsCheck() async -> CheckResult {
         let root = dataRoot
         await AgentContactHealth.shared.refresh(dataRoot: root)
+        var source = "agents/peers.json"
         do {
             let peers = try AgentPeerStore(dataRoot: root).list()
+            source = "agents/conversations.json"
             _ = try AgentConversationStore(dataRoot: root).recordsUnlocked()
-            let problems: [String] = AgentContactHealth.read(dataRoot: root).sorted { $0.key < $1.key }.compactMap { agent, health in
+            source = "agents/local-health.json"
+            _ = try AgentLocalHealth.checkedRead(root)
+            var problems: [String] = AgentContactHealth.read(dataRoot: root).sorted { $0.key < $1.key }.compactMap { agent, health in
                 guard health.isBroken else { return nil }
                 return health.problem.map { (peers.first { "peer:" + $0.id == agent }?.name ?? agent) + ": " + $0 }
             }
-            return CheckResult(id: "live.agent_connections", title: "Agent connections", status: problems.isEmpty ? "ok" : "warn",
-                detail: problems.isEmpty ? "No broken reply path is recorded; setup alone does not prove a reply." : problems.joined(separator: "\n"),
-                harm: problems.isEmpty ? nil : "She cannot reliably exchange replies with the affected helpers.",
-                repair: nil, human_action: problems.isEmpty ? nil : problems.joined(separator: "\n"))
+            // A message waiting for its recipient's session is owed, not damage; only
+            // an agent connection that owes repair is a problem here.
+            source = "experiences/experiences.sqlite"
+            for owed in try await ExperienceStore.at(root).projection() where owed.owes["repair"]?.phase.isSettled == false
+                && owed.claims.contains(where: { $0.claim.hasPrefix("operation: peer.") || $0.claim.hasPrefix("operation: agent.") }) {
+                problems.append(owed.face?.words ?? "An agent connection still owes repair.")
+            }
+            return CheckResult(source: "agents/peers.json and agents/local-health.json",id: "live.agent_connections", title: "Agent connections", status: problems.isEmpty ? "ok" : "unmeasured",
+                detail: problems.isEmpty ? "No broken reply path is recorded; setup alone does not prove a reply." : problems.joined(separator: "\n"))
         } catch {
-            return CheckResult(id: "live.agent_connections", title: "Agent connections", status: "warn",
-                detail: "Agent connection evidence is unavailable. Restore the saved contacts and conversations, then run Doctor.",
+            return CheckResult(source: source,
+                nextCall: source == "experiences/experiences.sqlite" ? nil : ToolFailureError.fileRepairCall(root.appendingPathComponent(source), dataRoot: root,
+                    shape: "Retain the saved peer contacts, conversations or local-health observations in this file, with their original identities and recorded states. Preserve credentials, admission and elevation choices exactly; never grant authority or invent a reply."),
+                id: "live.agent_connections", title: "Agent connections", status: "warn",
+                detail: "Agent connection evidence is unavailable: \(Self.safeDetail(error.localizedDescription))",
                 harm: "Her saved helper contacts and conversations cannot be read.", repair: nil)
         }
     }
@@ -385,11 +408,8 @@ extension EngineDoctorRuntime {
                 + (pulse.note.isEmpty ? "" : " (\(pulse.note))")
                 + (pulse.cadence.map { ", every \(DoctorLoopHealth.describeAge($0))" } ?? "") + (overdue ? " — overdue" : ""), pulse.organ)
         }.sorted { ($0.0 ? 0 : 1, $0.1) < ($1.0 ? 0 : 1, $1.1) }
-        let overdue = rows.filter(\.0).map(\.2)
-        return CheckResult(id: "live.pulses", title: "Organ pulses", status: overdue.isEmpty ? "ok" : "warn",
-                           detail: rows.isEmpty ? "No organ has pulsed yet." : rows.map(\.1).joined(separator: "\n"),
-                           harm: overdue.isEmpty ? nil : "The overdue background work is not being confirmed as done.",
-                           human_action: overdue.isEmpty ? nil : "Overdue: \(overdue.joined(separator: ", ")).")
+        return CheckResult(source: "Organ pulse registrations",id: "live.pulses", title: "Organ pulses", status: rows.isEmpty || rows.contains(where: \.0) ? "unmeasured" : "ok",
+                           detail: rows.isEmpty ? "No organ has pulsed yet." : rows.map(\.1).joined(separator: "\n"))
     }
 
     public func doctorInspectorCheck() async -> CheckResult {
@@ -416,82 +436,19 @@ extension EngineDoctorRuntime {
             safeDetail: Self.safeDetail,
             runCoreChecks: { try await makeDoctorChecks(root: dataRoot).runAll() }
         )
-        await repairOnAdverseTransition(card)
-        return card
+        let rows = await DoctorStatusProjection.repairProjection(card.subsystems.map { subsystem in
+            liveChecks.first { $0.id == subsystem.id }
+                ?? CheckResult(id: subsystem.id, title: subsystem.label, status: subsystem.status, detail: subsystem.detail)
+        }, dataRoot: dataRoot)
+        // A cached core row keeps the lever it was measured with.
+        let measured = Dictionary(card.subsystems.map { ($0.id, $0.fixAction) }, uniquingKeysWith: { first, _ in first })
+        return HealthCard(overall: DoctorStatusProjection.doctorRollup(rows.map(\.status)), subsystems: rows.map {
+            HealthCardSubsystem(id: $0.id, label: $0.title, status: $0.status, detail: $0.repairFace,
+                                fixAction: $0.repairCall ?? $0.repairTap ?? measured[$0.id] ?? nil)
+        }, createdAt: card.createdAt)
     }
 
-    /// A row that read ok last poll and adverse now is recorded, and wakes
-    /// Doctor's repair pass.
-    private func repairOnAdverseTransition(_ card: HealthCard) async {
-        healthCardStatuses.withLock { state in
-            for row in card.subsystems
-            where state.statuses[row.id] == "ok" && DoctorSafeRepairPolicy.isAdverse(row.status) {
-                state.pending.insert(row.id)
-            }
-            state.statuses = Dictionary(card.subsystems.map { ($0.id, $0.status) }, uniquingKeysWith: { first, _ in first })
-        }
-        await wakeDoctorForPendingTransitions()
-    }
-
-    /// Fresh Doctor measurements settle healed rows and routed ones: a
-    /// successfully surfaced sign-in/permission ask, a wake for her, a harness
-    /// item. A row left to its repair keeps the wake.
-    public static func acknowledgeDoctorTransitions(_ checks: [CheckResult], asksFiled: Bool, routed: Set<String>) {
-        healthCardStatuses.withLock { state in
-            for check in checks where !DoctorSafeRepairPolicy.isAdverse(check.status) || routed.contains(check.id)
-                || (asksFiled && DoctorSafeRepairPolicy.isUserAsk(check)) {
-                state.pending.remove(check.id)
-            }
-        }
-    }
-
-    /// One single-flight attempt per ten-minute window while repair is pending.
-    /// Manager readiness also wakes retained work without consuming it.
-    /// True when this call woke Doctor.
-    @discardableResult
-    public func wakeDoctorForPendingTransitions() async -> Bool {
-        let now = Date()
-        let manager = port.doctorManager
-        let ready = await manager.isRunning(loopId: "doctor_auto_run")
-        let decision: (wake: Bool, deferFor: TimeInterval?) = healthCardStatuses.withLock { state in
-            guard !state.pending.isEmpty, !state.inFlight else { return (false, nil) }
-            let wait = state.lastAttempt.addingTimeInterval(600).timeIntervalSince(now)
-            if ready, wait <= 0 {
-                state.inFlight = true
-                state.lastAttempt = now
-                return (true, nil)
-            }
-            guard !state.deferred else { return (false, nil) }
-            state.deferred = true
-            return (false, ready ? wait : max(600, wait))
-        }
-        if decision.wake {
-            let port = self
-            Task {
-                _ = await manager.runTickOnce(loopId: "doctor_auto_run")
-                healthCardStatuses.withLock { $0.inFlight = false }
-                await port.wakeDoctorForPendingTransitions()
-            }
-        }
-        if let deferFor = decision.deferFor {
-            let port = self
-            Task {
-                do { try await Task.sleep(for: .seconds(deferFor)) }
-                catch { healthCardStatuses.withLock { $0.deferred = false }; return }
-                healthCardStatuses.withLock { $0.deferred = false }
-                let woke = await port.wakeDoctorForPendingTransitions()
-                OrganPulse.record("doctor_wake_deferred", woke ? .worked : .nothing,
-                                  note: woke ? "Doctor woke for rows still adverse" : "")
-            }
-        }
-        return decision.wake
-    }
 }
-
-/// Last health-card reading per row, rows that turned adverse since Doctor's
-/// last transition run, and whether a run is scheduled for the window's end.
-private let healthCardStatuses = Mutex<(statuses: [String: String], pending: Set<String>, lastAttempt: Date, deferred: Bool, inFlight: Bool)>(
-    ([:], [], .distantPast, false, false))
 
 extension EngineDoctorRuntime {
     public static func reusableSupportReport(

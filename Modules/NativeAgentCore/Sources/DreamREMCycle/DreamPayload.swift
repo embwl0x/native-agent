@@ -4,15 +4,19 @@ struct DreamPayload: Decodable {
     let title: String
     let summary: String
     let mood: String
+    let affect: Double?
     let emergingThemes: [String]
     let surprisingMoments: [String]
+    let claims: [DreamEntryProvenance]
 
     private enum CodingKeys: String, CodingKey {
         case title
         case summary
         case mood
+        case affect
         case emergingThemes = "emerging_themes"
         case surprisingMoments = "surprising_moments"
+        case claims
     }
 
     init(from decoder: Decoder) throws {
@@ -20,8 +24,14 @@ struct DreamPayload: Decodable {
         title = try container.decode(String.self, forKey: .title)
         summary = try container.decode(String.self, forKey: .summary)
         mood = try container.decode(String.self, forKey: .mood)
+        affect = try container.decode(Double?.self, forKey: .affect)
+        if let affect, !affect.isFinite || !(-1...1).contains(affect) {
+            throw DecodingError.dataCorruptedError(forKey: .affect, in: container,
+                debugDescription: "affect must be null or a number from -1 to 1")
+        }
         emergingThemes = try container.decode([String].self, forKey: .emergingThemes)
         surprisingMoments = try container.decode([String].self, forKey: .surprisingMoments)
+        claims = try container.decode([DreamEntryProvenance].self, forKey: .claims)
 
         guard !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DecodingError.dataCorruptedError(

@@ -249,13 +249,13 @@ struct CapabilitiesView: View {
     @Environment(AppModel.self) private var appModel
     /// Which of the page's tabs this is (CapabilitiesRailPage).
     private let mode: CapabilityWorkspaceMode
-    @State private var routeText = "Research a topic, save it as a reusable tool if it comes up again, and ask me before anything risky."
-    @State private var researchObjective = "Find current best practices for lightweight autonomous agent capability systems."
+    private var routeText: String { appModel.editDraft("capability-route/new", seed: "Research a topic, save it as a reusable tool if it comes up again, and ask me before anything risky.") }
+    private var researchObjective: String { appModel.editDraft("capability-research/new", seed: "Find current best practices for lightweight autonomous agent capability systems.") }
     @State private var researchLabRunsState: CapabilitiesResearchLabPresentation.RunList = .loading
     @State private var researchLabMessage: CapabilitiesResearchLabPresentation.Message?
     @State private var isRunningResearchLab = false
-    @State private var catalogSourceName = "Local NativeAgent Catalog"
-    @State private var catalogSourceURL = ""
+    private var catalogSourceName: String { appModel.editDraft("capability-catalog/new/name", seed: "Local NativeAgent Catalog") }
+    private var catalogSourceURL: String { appModel.editDraft("capability-catalog/new/url", seed: "") }
     @State private var catalogSourceOutcome: AppModel.CapabilityCatalogSourceSaveOutcome?
     /// Per-action result from the checked SecurityCenter authority owner.
     /// Missing stays conservative: the Run button remains disabled until a
@@ -351,7 +351,7 @@ struct CapabilitiesView: View {
             mcpCount: appModel.mcpServers.count,
             nextGenReadyCount: nextGenReadyCount,
             nextGenTotalCount: nextGenTotalCount,
-            approvalCount: appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }.count,
+            approvalCount: WorkOverviewRead.waitingApprovals(appModel.engine.approvals.records).count,
             refresh: appModel.panelRefreshStatus[.capabilities]
         )
         // Alive glass (2026-09-23): the five tiles fold into one quiet line of
@@ -675,11 +675,11 @@ struct CapabilitiesView: View {
                 }
 
                 HStack(spacing: 8) {
-                    TextField("Source name", text: $catalogSourceName)
+                    TextField("Source name", text: appModel.editBinding("capability-catalog/new/name", seed: "Local NativeAgent Catalog"))
                         .textFieldStyle(.roundedBorder)
                         .font(ShellType.label)
                         .accessibilityIdentifier("capabilities.catalogSource.name")
-                    TextField("Source URL or path", text: $catalogSourceURL)
+                    TextField("Source URL or path", text: appModel.editBinding("capability-catalog/new/url", seed: ""))
                         .textFieldStyle(.roundedBorder)
                         .font(ShellType.label)
                         .accessibilityIdentifier("capabilities.catalogSource.url")
@@ -745,12 +745,14 @@ struct CapabilitiesView: View {
 
     private func addCatalogSource() {
         catalogSourceOutcome = nil
+        let name = catalogSourceName
+        let url = catalogSourceURL
         Task {
-            let outcome = await appModel.addCatalogSource(name: catalogSourceName, url: catalogSourceURL)
+            let outcome = await appModel.addCatalogSource(name: name, url: url)
             catalogSourceOutcome = outcome
-            if outcome.didSave {
-                catalogSourceName = ""
-                catalogSourceURL = ""
+            if outcome.didSave, catalogSourceName == name, catalogSourceURL == url {
+                appModel.clearEditDraft("capability-catalog/new/name")
+                appModel.clearEditDraft("capability-catalog/new/url")
             }
         }
     }
@@ -780,12 +782,16 @@ struct CapabilitiesView: View {
 
                 AdvancedSection(title: "Plan a task") {
                     VStack(alignment: .leading, spacing: 10) {
-                        TextField("Describe a task", text: $routeText, axis: .vertical)
+                        TextField("Describe a task", text: appModel.editBinding("capability-route/new", seed: "Research a topic, save it as a reusable tool if it comes up again, and ask me before anything risky."), axis: .vertical)
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                             .lineLimit(2...4)
                         Button("Make a plan") {
-                            Task { await appModel.routeIntent(routeText) }
+                            let submitted = routeText
+                            Task {
+                                await appModel.routeIntent(submitted)
+                                if case .plan = appModel.routePresentation, routeText == submitted { appModel.clearEditDraft("capability-route/new") }
+                            }
                         }
                         .disabled(appModel.routePresentation.isPlanning)
                     }
@@ -897,12 +903,13 @@ struct CapabilitiesView: View {
     private var researchLab: some View {
         AdvancedSection(title: "Research lab") {
             VStack(alignment: .leading, spacing: 10) {
-                TextField("Research objective", text: $researchObjective, axis: .vertical)
+                TextField("Research objective", text: appModel.editBinding("capability-research/new", seed: "Find current best practices for lightweight autonomous agent capability systems."), axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .font(ShellType.label)
                     .lineLimit(2...4)
                 Button("Run the research lab") {
-                    Task { await runResearchLab() }
+                    let submitted = researchObjective
+                    Task { await runResearchLab(objective: submitted) }
                 }
                 .disabled(isRunningResearchLab)
             }
@@ -936,12 +943,13 @@ struct CapabilitiesView: View {
     }
 
     @MainActor
-    private func runResearchLab() async {
+    private func runResearchLab(objective: String) async {
         isRunningResearchLab = true
         defer { isRunningResearchLab = false }
-        let outcome = await appModel.runResearchLab(objective: researchObjective)
+        let outcome = await appModel.runResearchLab(objective: objective)
         researchLabMessage = CapabilitiesResearchLabPresentation.message(for: outcome)
         if case .recorded(let run) = outcome {
+            if researchObjective == objective { appModel.clearEditDraft("capability-research/new") }
             researchLabRunsState = CapabilitiesResearchLabPresentation.list(
                 rows: [run] + appModel.engine.desk.researchRuns.filter { $0.id != run.id }
             )

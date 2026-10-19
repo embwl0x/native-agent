@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import CryptoKit
 import MacControl
 import PersistenceCore
@@ -58,11 +59,11 @@ actor BuilderWorktreeAllocator {
         requestedDirectory: String?,
         defaultDirectory: String?,
         configRoot: URL
-    ) async -> AllocationResult {
+    ) async throws -> AllocationResult {
         let baseDirectory = requestedDirectory ?? defaultDirectory
 
         if isFollowUp, let conversationId,
-           let existing = await existingAssignment(
+           let existing = try await existingAssignment(
                agent: agent,
                identity: conversationId,
                configRoot: configRoot
@@ -93,7 +94,7 @@ actor BuilderWorktreeAllocator {
         guard let baseDirectory else { return .unchanged(nil) }
 
         let identity = conversationId ?? "message:\(messageId)"
-        if let existing = await existingAssignment(
+        if let existing = try await existingAssignment(
             agent: agent,
             identity: identity,
             configRoot: configRoot
@@ -260,36 +261,62 @@ actor BuilderWorktreeAllocator {
         agent: Agent,
         identity: String,
         configRoot: URL
-    ) async -> Assignment? {
+    ) async throws -> Assignment? {
         let pointer = pointerURL(agent: agent, identity: identity, configRoot: configRoot)
-        guard let raw = try? String(contentsOf: pointer, encoding: .utf8) else { return nil }
+        let raw: String
+        do {
+            raw = try String(contentsOf: pointer, encoding: .utf8)
+        } catch CocoaError.fileReadNoSuchFile where !pathEntryExists(pointer, fileManager: .default) {
+            return nil
+        } catch {
+            throw pointerFailure(pointer, field: "contents", detail: error.localizedDescription)
+        }
         let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard lines.count >= 2 else { return nil }
+        guard lines.count >= 2 else {
+            throw pointerFailure(pointer, field: "lines 1–2", detail: "Expected a working directory followed by its 16-character token.")
+        }
         let workingDirectory = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
         let token = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !workingDirectory.isEmpty,
-              token.count == 16,
+        guard workingDirectory.hasPrefix("/") else {
+            throw pointerFailure(pointer, field: "line 1 (working directory)", detail: "Expected an absolute directory path.")
+        }
+        guard token.count == 16,
               token.unicodeScalars.allSatisfy({ scalar in
                   (48...57).contains(scalar.value) || (97...102).contains(scalar.value)
-              }) else { return nil }
+              }) else {
+            throw pointerFailure(pointer, field: "line 2 (token)", detail: "Expected 16 lowercase hexadecimal characters.")
+        }
         let directory = URL(fileURLWithPath: workingDirectory)
             .standardizedFileURL
             .resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
-              isDirectory.boolValue else { return nil }
+              isDirectory.boolValue else {
+            throw pointerFailure(pointer, field: "line 1 (working directory)", detail: "The assigned directory does not exist: \(directory.path)")
+        }
         let root = await git(["rev-parse", "--show-toplevel"], cwd: directory)
         let branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd: directory)
-        guard root.status == 0,
-              branch.status == 0,
-              branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard root.status == 0, branch.status == 0 else {
+            throw pointerFailure(pointer, field: "line 1 (working directory)",
+                                 detail: "Git could not verify \(directory.path): \(boundedDetail(root)) \(boundedDetail(branch))")
+        }
+        guard branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
                 == "nativeagent/\(agent.rawValue)-\(token)",
               URL(fileURLWithPath: root.stdout.trimmingCharacters(
                 in: .whitespacesAndNewlines
               )).lastPathComponent.hasSuffix("-wt-\(agent.rawValue)-\(token)") else {
-            return nil
+            throw pointerFailure(pointer, field: "lines 1–2 (assignment)",
+                                 detail: "Expected branch nativeagent/\(agent.rawValue)-\(token) in a checkout ending -wt-\(agent.rawValue)-\(token); found branch \(branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) at \(root.stdout.trimmingCharacters(in: .whitespacesAndNewlines)).")
         }
         return Assignment(workingDirectory: directory.path, token: token)
+    }
+
+    private func pointerFailure(_ pointer: URL, field: String, detail: String) -> ToolFailureError {
+        ToolFailureError("Builder assignment is unreadable or invalid; no builder was started. \(detail) Repair the preserved assignment or its Git checkout, then send the original message again.",
+                         effects: .none, owner: "\(pointer.path) > \(field)",
+                         nextCall: ToolFailureError.call("app", ["action": .string("codex.invoke"), "args": .object([
+                            "cwd": .string(pointer.deletingLastPathComponent().path), "context": .string("\(pointer.path) > \(field): \(detail)"),
+                            "text": .string("Repair only this builder assignment from retained Git and pointer evidence. Preserve the original pointer bytes in a new hidden sibling backup before editing. Do not guess a repository, branch or token; do not reset, discard work, switch branches or assign another checkout. If the intended assignment cannot be established, preserve it and name the missing evidence. Report the repaired pointer and verified checkout; do not send the original builder message. A builder response does not prove continuity; the original dispatch must verify it again.")])]))
     }
 
     private func writePointer(

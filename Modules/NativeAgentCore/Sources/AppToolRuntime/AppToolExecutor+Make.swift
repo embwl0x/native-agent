@@ -1,3 +1,4 @@
+import ChatOrchestration
 import Foundation
 import PersistenceCore
 import Studio
@@ -42,7 +43,30 @@ extension AppToolExecutor {
         } catch let refusal as MakeStudio.Refusal {
             return Self.failure(refusal.reason, refusal.message)
         } catch {
-            return Self.failure("make_show_failed", error.localizedDescription + " Nothing was added.")
+            return Self.failure("make_show_failed", error.localizedDescription + " Nothing was added.", extra: ["effects": .string("unknown")])
+        }
+    }
+
+    /// reply.attach: an image she sends with this reply, behind the same fence as
+    /// make.add, chosen into the turn's own reply.
+    @MainActor
+    func runReplyAttach(input: [String: JSONValue]) async -> JSONValue {
+        let path = Self.inputString(input["path"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the image to send with this reply.") }
+        guard let choices = ReplyChoices.current else {
+            return Self.failure("no_reply", "Only a turn answering a conversation has a reply to attach to. Nothing was attached.")
+        }
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let fullMac = await Self.freshQuietPosture(dataRoot: root)?.name == Self.fullMacModeName
+        switch await Self.fencedAttachment(path, fullMac: fullMac, dataRoot: root) {
+        case .failure(let refusal): return Self.failure(refusal.reason, refusal.detail)
+        case .success(let file):
+            guard ChatGeneratedImageArtifacts.attachment(file) != nil else {
+                return Self.failure("not_an_image", "\(file.lastPathComponent) is not an image a reply carries: jpg, png, gif, webp, bmp or heic. Nothing was attached.")
+            }
+            choices.choose(file.path)
+            return .object(["status": .string("ok"), "effects": .string("none"), "attached": .string(file.path),
+                            "detail": .string("Attached; it goes with this reply.")])
         }
     }
 }

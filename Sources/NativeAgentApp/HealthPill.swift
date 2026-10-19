@@ -25,20 +25,8 @@ enum HealthPillDoctorJump {
     }
 }
 
-/// D3 (2026-08-28): what the pill SAYS when you open it.
-///
-/// The pill used to jump straight to Diagnostics — a developer-gated surface
-/// whose sidebar row a normal user cannot even see (`SidebarItem.developerItems`
-/// contains `.diagnostics`), so the one always-visible health control led into a
-/// room the user was not admitted to. It now explains itself in place.
-///
-/// Copy bar: nothing in the user-visible strings may name a developer concept.
-/// No "Doctor", no "diagnostics", no "checks", no "repair", no "report" — a
-/// person reading this has never heard those words in this app.
+/// The pill renders each owner's repair face without requiring another surface.
 enum HealthPillPopoverPresentation: Equatable {
-    /// The one action offered. Details stay out unless the user has already
-    /// turned developer surfaces on — otherwise the button lands them somewhere
-    /// with no way back.
     enum Action: Equatable {
         case check          // run it now
         case checking       // a run is already in flight
@@ -90,6 +78,7 @@ public struct HealthPill: View {
     @Environment(AppModel.self) var appModel
     @AppStorage("showDeveloperSurfaces") private var showDeveloperSurfaces = false
     @State private var showPopover = false
+    @State private var repairNotice: String?
 
     public init() {}
 
@@ -118,7 +107,7 @@ public struct HealthPill: View {
         .help("How the app is doing")
         .accessibilityLabel("How the app is doing: \(label)")
         .accessibilityIdentifier("health-pill.open-doctor")
-        .accessibilityHint("Shows what the app has found, and lets you check again")
+        .accessibilityHint("Shows what needs repair and how to fix it")
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             popoverContent(summary: summary, statusColor: statusColor)
         }
@@ -131,6 +120,9 @@ public struct HealthPill: View {
     ) -> some View {
         let isChecking = appModel.engine.doctor.isRunning
         let action = HealthPillPopoverPresentation.action(isChecking: isChecking)
+        let issues = (appModel.engine.doctor.report?.checks ?? []).filter {
+            ["warn", "warning", "fail", "failed", "error"].contains($0.status.lowercased())
+        }
 
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 7) {
@@ -149,7 +141,43 @@ public struct HealthPill: View {
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
 
+            if !issues.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(issues) { check in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(check.title).font(.callout.bold())
+                                Text(check.repairFace).font(.callout)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 300)
+            } else if appModel.engine.doctor.report == nil, let card = appModel.engine.doctor.healthCard {
+                ScrollView {
+                    Text(card.subsystems.filter { ["warn", "fail", "error"].contains($0.status) }
+                        .map { $0.label + ": " + $0.detail }.joined(separator: "\n\n"))
+                        .font(.callout).textSelection(.enabled)
+                }
+                .frame(maxHeight: 300)
+            }
+            if let repairNotice {
+                Text(repairNotice).font(.callout).foregroundStyle(.secondary)
+            }
+
             HStack(spacing: 8) {
+                if issues.contains(where: { $0.repair_available == true }) {
+                    Button("Repair safe issues") {
+                        Task {
+                            let outcome = await appModel.runDoctor(repair: true, repairScope: .button)
+                            repairNotice = DoctorRunButtonPresentation.notice(for: outcome, repair: true).detail
+                        }
+                    }
+                    .disabled(isChecking)
+                    .accessibilityIdentifier("health-pill.repair-now")
+                }
                 Button(HealthPillPopoverPresentation.actionTitle(action)) {
                     Task { _ = await appModel.runDoctor(repair: false) }
                 }
@@ -169,7 +197,7 @@ public struct HealthPill: View {
             }
         }
         .padding(14)
-        .frame(width: 290, alignment: .leading)
+        .frame(width: 380, alignment: .leading)
     }
 
     private func label(for summary: SystemHealthSummary) -> String {

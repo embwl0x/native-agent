@@ -109,18 +109,13 @@ public struct OrganismSleepPressureComponents: Sendable, Equatable {
 
 public enum OrganismSleepLane: String, Codable, Sendable, Equatable, CaseIterable {
     case quietLocalRepair = "quiet_local_repair"
-    case identityDreamProposal = "identity_dream_proposal"
-    case generatedFrozenRecalibration = "generated_frozen_recalibration"
 }
 
 public enum OrganismSleepLaneDisposition: String, Codable, Sendable, Equatable {
     case inactive
     case waitingForQuiet = "waiting_for_quiet"
     case ready
-    case refractory
     case resourceInhibited = "resource_inhibited"
-    case privacyGateRequired = "privacy_gate_required"
-    case providerBudgetGateRequired = "provider_budget_gate_required"
 }
 
 public struct OrganismSleepLaneOpportunity: Sendable, Equatable {
@@ -146,45 +141,6 @@ public struct OrganismSleepLaneOpportunity: Sendable, Equatable {
         self.nextEligibleAt = nextEligibleAt
         self.controlAuthority = controlAuthority
     }
-}
-
-/// Refractory bookkeeping only. This is not residual evidence and does not
-/// raise pressure. It is persisted solely so restarts cannot replay the same
-/// evidence generation or evade the Dream/provider budget.
-public struct OrganismSleepControlState: Codable, Sendable, Equatable {
-    public var lastProviderDreamAt: Date?
-    public var lastGeneratedRecalibrationAt: Date?
-    public var lastGeneratedEvidenceGeneration: String?
-
-    public init(
-        lastProviderDreamAt: Date? = nil,
-        lastGeneratedRecalibrationAt: Date? = nil,
-        lastGeneratedEvidenceGeneration: String? = nil
-    ) {
-        self.lastProviderDreamAt = lastProviderDreamAt
-        self.lastGeneratedRecalibrationAt = lastGeneratedRecalibrationAt
-        self.lastGeneratedEvidenceGeneration = lastGeneratedEvidenceGeneration.map { String($0.prefix(80)) }
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case lastProviderDreamAt
-        case lastGeneratedRecalibrationAt, lastGeneratedEvidenceGeneration
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            lastProviderDreamAt: try container.decodeIfPresent(Date.self, forKey: .lastProviderDreamAt),
-            lastGeneratedRecalibrationAt: try container.decodeIfPresent(
-                Date.self, forKey: .lastGeneratedRecalibrationAt
-            ),
-            lastGeneratedEvidenceGeneration: try container.decodeIfPresent(
-                String.self, forKey: .lastGeneratedEvidenceGeneration
-            )
-        )
-    }
-
-    public static let empty = Self()
 }
 
 /// A local, payload-free read of why quiet repair/consolidation is warranted.

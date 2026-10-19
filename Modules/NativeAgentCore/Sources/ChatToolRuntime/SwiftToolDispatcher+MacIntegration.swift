@@ -116,21 +116,16 @@ extension SwiftToolDispatcher {
         request.source = source; request.destination = target
         request.transportType = transport == "walking" ? .walking : .automobile
         try Task.checkCancellation()
-        // Server, throttling and "Directions Not Available" (seen to clear on an identical second request) get one retry; the first cause is reported.
-        func calculate() async throws -> MKDirections.Response { try await MKDirections(request: request).calculate() }
         let response: MKDirections.Response
-        do { response = try await calculate() } catch is CancellationError { throw CancellationError() } catch {
-            let first = "MapKit returned no route: \(error.localizedDescription)"
-            guard let code = (error as? MKError)?.code, [.serverFailure, .loadingThrottled, .directionsNotFound].contains(code) else {
-                throw AutonomyGateError.toolDenied(reason: first)
-            }
-            try await Task.sleep(nanoseconds: 1_500_000_000)
-            do { response = try await calculate() } catch {
-                throw AutonomyGateError.toolDenied(reason: first + " (one retry also failed)")
-            }
+        do { response = try await MKDirections(request: request).calculate() }
+        catch is CancellationError { throw CancellationError() }
+        catch {
+            throw ToolFailureError("MapKit returned no route: \(error.localizedDescription)", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("maps.route"), "args": .object(input)]))
         }
         guard let route = response.routes.first else {
-            throw AutonomyGateError.toolDenied(reason: "MapKit returned no route for these locations and transport.")
+            throw ToolFailureError("MapKit returned no route for these locations and transport.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("maps.route"), "args": .object(input)]))
         }
         let steps = route.steps.enumerated().filter { !$0.element.instructions.isEmpty }
             .sorted { $0.element.distance > $1.element.distance }.prefix(5).sorted { $0.offset < $1.offset }
@@ -202,8 +197,8 @@ extension SwiftToolDispatcher {
     package static func switchRefusal(integration: String, mode: MacIntegrationPermissionMode,
                                       store: MacIntegrationPermissionStore) async throws -> JSONValue? {
         guard let refusal = try await store.readinessChecked().refusal(integration: integration, mode: mode) else { return nil }
-        return .object(["status": .string("denied"), "reason": .string("operator_permission_off"),
-            "integration": .string(integration), "mode": .string(mode.rawValue), "message": .string(refusal)])
+        return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("denied"), "reason": .string("operator_permission_off"),
+            "integration": .string(integration), "mode": .string(mode.rawValue), "message": .string(refusal)]))
     }
 
     func dispatchMacIntegrationTool(
@@ -250,22 +245,30 @@ extension SwiftToolDispatcher {
             ) {
                 return InlineInteractionNeed.envelope(need)
             }
-            return .object([
+            return ChatToolOutcome.refusedBeforeRunning(.object([
                 "status": .string("denied"),
                 "reason": .string("integration_permission_denied"),
                 "integration": .string(integration),
                 "mode": .string(mode.rawValue),
                 "fix": .string(fixHint),
-            ])
+            ]))
         }
         guard let bridge = macIntegrationBridge else {
-            return .object([
+            return ChatToolOutcome.refusedBeforeRunning(.object([
                 "status": .string("failed"),
                 "reason": .string("bridge_not_wired"),
                 "integration": .string(integration),
-                "fix": .string("App-side MacIntegrationToolBridge not injected; restart the app."),
-            ])
+                "message": .string("Mac integration is unavailable in this caller. Call app from the installed app's chat tool chain; supplying a session id cannot attach it."),
+                "remedy": .object(["kind": .string("correct_arguments"),
+                    "instruction": .string("Call app from the installed app's chat tool chain."), "next_call": .null]),
+            ]))
         }
-        return try await run(bridge, input)
+        let result = try await run(bridge, input)
+        if integration == MacIntegrationID.messages, case .object(var fields) = result,
+           fields["reason"] == .string("database_unavailable") || fields["history_reason"] == .string("database_unavailable") {
+            fields["remedy"] = SystemPermissionPreflight.remedy("full_disk_access")
+            return .object(fields)
+        }
+        return result
     }
 }

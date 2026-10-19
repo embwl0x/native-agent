@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import os
 import PersistenceCore
 import Transcripts
@@ -38,6 +39,8 @@ public struct AgentConversationRecord: Codable, Sendable {
     /// Follow-ups written while a reply was still in flight, oldest first.
     /// Each goes by itself, in order, once the reply ahead of it settles.
     public var queued: [AgentConversationQueued]?
+    /// Exact terminal transitions, committed with the conversation that removed them.
+    public var settledObligations: [String: [String: Experience.Obligation]]?
     /// A stop asked for on the in-flight reply (`agent_cancel`).
     public var stop: AgentConversationStop?
     /// The queued message taken to be sent next: the thread is its alone

@@ -1,3 +1,7 @@
+import Experiences
+import AgentWorkspace
+import Agents
+import TurnTrace
 import AuthoredCapabilities
 import AttentionRouting
 import ChatOrchestration
@@ -79,12 +83,77 @@ extension AppToolExecutor {
     static func doorRefusal(_ reason: String, _ detail: String, remedy kind: String, _ instruction: String,
                             next: [String: JSONValue]? = nil, extra: [String: JSONValue] = [:]) -> JSONValue {
         var extra = extra
-        extra["effects"] = .string("none")
         extra["remedy"] = .object([
             "kind": .string(kind), "instruction": .string(instruction),
             "next_call": next.map { .object(["tool": .string("app"), "input": .object($0)]) } ?? .null,
         ])
         return failure(reason, detail, extra: extra)
+    }
+
+    /// An owned no at the door (User 10-18): what decided it, and her door call
+    /// that changes it, or the person's exact control where the law gives it to him.
+    static func doorRefusal(_ reason: String, _ detail: String, owner: String, next: [String: JSONValue]? = nil,
+                            tap: String? = nil, extra: [String: JSONValue] = [:]) -> JSONValue {
+        var extra = extra
+        extra["remedy"] = Repair.remedy(owner: owner,
+            nextCall: next.map { .object(["tool": .string("app"), "input": .object($0)]) }, tap: tap)
+        return failure(reason, detail, extra: extra)
+    }
+
+    /// Let go of a repair she owes, saying why: the only settlement besides
+    /// the operation working again.
+    @MainActor
+    func runRepairLetGo(input: [String: JSONValue]) async -> JSONValue {
+        let id = (Self.inputString(input["id"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let reason = (Self.inputString(input["reason"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty, !reason.isEmpty else {
+            return Self.doorRefusal("invalid_args", "Pass id (from an OWED line on your home) and reason. Nothing was let go.",
+                remedy: "correct_arguments", "Call repair.let_go with id and reason.")
+        }
+        let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let store = ExperienceStore.at(root)
+        do {
+            await store.drained()
+            let owed = try await store.experience(id)
+            // A reply she owes a who is let go by its owner, so its delivery and
+            // the experience agree; the Desk line asking for it then settles.
+            if let owed, owed.owes["deliver"]?.phase.isSettled == false,
+               owed.evidence.contains(where: { $0.source == "codex-completion-lifecycle" }) {
+                try await CodexCompletionLifecycle.letGoReplies(deliveryIDs: [id], outcome: reason, dataRoot: root,
+                    configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root))
+                return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
+            }
+            if let owed, owed.owes["decide"]?.phase.isSettled == false {
+                return Self.doorRefusal("person_decides", "\(id) waits on the person's decision; it is theirs to answer, not yours to let go. Nothing was let go.",
+                    remedy: "none", "Wait on it with desk.wait, or ask the person.")
+            }
+            guard let owed, owed.owes["repair"]?.phase.isSettled == false else {
+                return Self.doorRefusal("not_owed", "Nothing open that you owe has id \(id). Nothing was let go.",
+                    remedy: "inspect", "Read the OWED lines on your home for the ids still owed.", next: ["page": .string("home")])
+            }
+            try await store.append([.claim(.init(claim: "let go: " + reason, evidence: [])),
+                                    .letGo(key: "repair", reason: .abandoned)], to: id)
+            return .object(["status": .string("ok"), "id": .string(id), "let_go": .string(reason), "effects": .string("occurred")])
+        } catch {
+            return Self.doorRefusal("unreadable", "The experience store could not be read or written: \(error.localizedDescription) Nothing was let go.",
+                owner: "experiences/experiences.sqlite", next: ["action": .string("doctor.run")])
+        }
+    }
+
+    @MainActor func runBackgroundRepair(tool: String, input: [String: JSONValue]) async -> JSONValue {
+        let root = quietHost()?.dataRootOverride ?? securityCenter.dataRoot
+        do {
+            let detail: String
+            switch tool {
+            case "turn_reconcile":
+                try await AbandonedTurnReconciliationHook.reconcile(dataRoot: root,
+                    sessionId: Self.doorText(input["session_id"]), turnId: Self.doorText(input["turn_id"]))
+                detail = "The saved turn was reconciled."
+            default:
+                detail = try ResidentWake.shared.accept(dataRoot: root, id: Self.inputString(input["id"]))
+            }
+            return .object(["status": .string("ok"), "detail": .string(detail)])
+        } catch { return ChatToolOutcome.failure(error: error) }
     }
 
     /// A read-only action named as a page or item just runs: there is
@@ -326,7 +395,7 @@ extension AppToolExecutor {
                 args[name] = value
                 corrections.append("Use args.\(name), not args.\(key).")
             }
-            if target.id == "agent.message", let supported = AgentConversationRouting.supportedOptions(agent: Self.doorText(args["agent"]).lowercased()),
+            if target.id == "agent.message", let supported = AgentConversationRouting.supportedOptions(agent: Self.doorText(args["agent"]).lowercased(), dataRoot: root),
                case .object(let options)? = properties["options"],
                case .object(let fields)? = options["properties"] {
                 var supplied = if case .object(let given)? = args["options"] { given } else { [String: JSONValue]() }
@@ -726,8 +795,10 @@ extension AppToolExecutor {
             shape.append(line)
             pages.append(.string(line))
         }
+        let home = await doorHome([:], input: input)
+        guard ChatToolOutcome.outputLooksSuccessful(home) else { return home }
         return .object([
-            "home": await doorHome([:], input: input),
+            "home": home,
             "status": .string("ok"),
             "pages": .array(pages),
             "pages_version": .string(SHA256.hash(data: Data(shape.joined(separator: "\n").utf8))
@@ -752,11 +823,12 @@ extension AppToolExecutor {
     private func doorHome(_ call: [String: JSONValue], input: [String: JSONValue]) async -> JSONValue {
         guard let perform = AppDoorReentry.perform else {
             return Self.doorRefusal("door_unavailable",
-                "Home reads only through a chat's tool chain. Nothing was read.", remedy: "none", "Use app from a chat turn.")
+                "Home reads only through a chat's tool chain. Nothing was read.",
+                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         let call = ChatToolSessionInjection.apply(toolName: "workspace", input: call,
                                                   sessionId: Self.inputString(input["__session_id"]))
-        do { return Self.foldedResult(try await perform("workspace", call), about: nil) }
+        do { return Self.foldedResult(try await perform("workspace", call), guide: nil) }
         catch { return ChatToolOutcome.failure(error: error, tool: "app") }
     }
 
@@ -894,113 +966,121 @@ extension AppToolExecutor {
     /// settings, items), not the accessibility tree.
     @MainActor
     private func doorRead(page: QuietToolPage, item: String) async throws -> JSONValue {
-        if ["tools", "skills"].contains(page.id), item.lowercased() == "census" {
-            if let blocked = await doorSavedBlock("app_page_read") { return blocked }
-            return try await Self.doorAbilityCensus(root: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
-        }
-        if page.id == "tools", !item.isEmpty {
-            if let blocked = await doorSavedBlock("app_page_read") { return blocked }
-            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let tools = try await SwiftNativeToolRegistry(root: root).listTools(filter: .all)
-            guard let id = InstalledSkillInventory.match(item, in: tools.map { $0.toJSON() })?.id,
-                  let tool = tools.first(where: { $0.id == id }) else {
-                return .object(["status": .string("not_found")])
+        do {
+            // An action's guide, before any page reads its items as its own names.
+            if item.hasPrefix("guide:"),
+               let action = await Self.doorPageActions(page.id, hasSettings: false).first(where: { "guide:" + $0.id == item }),
+               let guide = AppActions.about(action) {
+                return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item),
+                                "guide": .object([action.id: .string(guide)])])
             }
-            if let field = tool.authoredFieldProblem {
-                throw ToolRegistryError.registryUnreadable(reason: "tool \(tool.id) has no valid \(field)")
+            if ["tools", "skills"].contains(page.id), item.lowercased() == "census" {
+                if let blocked = await doorSavedBlock("app_page_read") { return blocked }
+                return try await Self.doorAbilityCensus(root: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             }
-            guard case .object(var detail) = ToolRegistryActions.read(tool) else { throw ToolRegistryError.registryUnreadable(reason: "Tool detail is not an object.") }
-            detail["converted_versions"] = try await SwiftNativeToolExecution(root: root).convertedVersions(for: tool)
-            return .object(["status": .string("ok"), "page": .string(page.id), "item": .object(detail)])
-        }
-        if page.id == "skills" {
-            if let blocked = await doorSavedBlock(item.isEmpty ? "list_skills" : "read_skill") { return blocked }
-            if !item.isEmpty {
-                let result = try await doorDo("skill.read", input: ["args": .object(["name": .string(item)])],
-                                              surface: "app", inProcess: true)
+            if page.id == "tools", !item.isEmpty {
+                if let blocked = await doorSavedBlock("app_page_read") { return blocked }
+                let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                let tools = try await SwiftNativeToolRegistry(root: root).listTools(filter: .all)
+                guard let id = InstalledSkillInventory.match(item, in: tools.map { $0.toJSON() })?.id,
+                      let tool = tools.first(where: { $0.id == id }) else {
+                    return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found")]))
+                }
+                if let field = tool.authoredFieldProblem {
+                    throw ToolRegistryError.registryUnreadable(reason: "tool \(tool.id) has no valid \(field)")
+                }
+                guard case .object(var detail) = ToolRegistryActions.read(tool) else { throw ToolRegistryError.registryUnreadable(reason: "Tool detail is not an object.") }
+                detail["converted_versions"] = try await SwiftNativeToolExecution(root: root).convertedVersions(for: tool)
+                return .object(["status": .string("ok"), "page": .string(page.id), "item": .object(detail)])
+            }
+            if page.id == "skills" {
+                if let blocked = await doorSavedBlock(item.isEmpty ? "list_skills" : "read_skill") { return blocked }
+                if !item.isEmpty {
+                    let result = try await doorDo("skill.read", input: ["args": .object(["name": .string(item)])],
+                                                  surface: "app", inProcess: true)
+                    guard ChatToolOutcome.outputLooksSuccessful(result) else { return result }
+                    return .object(["status": .string("ok"), "page": .string(page.id), "item": result])
+                }
+                let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+                let items: [JSONValue]
+                do { items = try InstalledSkillInventory.entries(dataRoot: root).map(\.summary) }
+                catch { return Self.failure("skills_unreadable", "The skill inventory didn't read: \(error.localizedDescription)") }
+                var read: [String: JSONValue] = ["status": .string("ok"), "page": .string(page.id),
+                    "title": .string(page.title), "items": .array(items)]
+                if await doorSavedBlock("skill_manage") == nil {
+                    do {
+                        read["stopped_run_ids"] = .array(try SkillRunStore.waitingIDs(root: root).map(JSONValue.string))
+                        read["resume_note"] = .string("stopped_run_ids are saved targets for skill.resume; an empty list means none. Resume rechecks the seal, skill and replayed reads.")
+                    } catch { return ChatToolOutcome.failure(error: error, tool: "list_skills", effects: ToolFailureError.Effects.none) }
+                }
+                return .object(read)
+            }
+            if page.id == "inbox" {
+                if let blocked = await doorSavedBlock("inbox") { return blocked }
+                guard let host = quietHost() else { return Self.unattachedFailure() }
+                if item.isEmpty || item.lowercased() == "all" {
+                    let result = await host.inbox(verb: "list", input: item.isEmpty ? [:]
+                        : ["filter": .string("all"), "limit": .int(200)])
+                    guard case .object(let list) = result, list["status"] == .string("ok") else { return result }
+                    let notes: [JSONValue] = if case .array(let notes)? = list["notes"] { notes } else { [] }
+                    return .object(["status": .string("ok"), "page": .string("inbox"), "title": .string(page.title),
+                                    "about": .string(page.summary), "count": list["count"] ?? .null,
+                                    "shown": list["shown"] ?? .null, "needs_you_count": list["needs_you_count"] ?? .null,
+                                    "items": .array(notes.map { note in
+                                        guard case .object(let row) = note else { return note }
+                                        let title = String(Self.doorText(row["title"]).split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(120))
+                                        return .string("\(Self.doorText(row["id"])) | kind=\(Self.doorText(row["source"])) | \(title) | unread=\(row["status"] == .string("unread")) | needs-you=\(row["needs_you"] == .bool(true))")
+                                    })])
+                }
+                let result = await host.inbox(verb: "read", input: ["id": .string(item)])
+                guard ChatToolOutcome.outputLooksSuccessful(result) else { return result }
+                guard case .object(let read) = result, case .array(let notes)? = read["notes"],
+                      let note = notes.first else { return result }
+                return .object(["status": .string("ok"), "page": .string("inbox"), "item": Self.doorButtons(note)])
+            }
+            if let tool = ["diagnostics": "doctor_status", "telegram": "telegram_status"][page.id],
+               Self.doorItemReads[page.id]?[item.lowercased()] != nil {
+                if let blocked = await doorSavedBlock(tool) { return blocked }
+                let result = try await healthRead(item.lowercased())
                 guard ChatToolOutcome.outputLooksSuccessful(result) else { return result }
                 return .object(["status": .string("ok"), "page": .string(page.id), "item": result])
             }
-            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-            let items: [JSONValue]
-            do { items = try InstalledSkillInventory.entries(dataRoot: root).map(\.summary) }
-            catch { return Self.failure("skills_unreadable", "The skill inventory didn't read: \(error.localizedDescription)") }
-            var read: [String: JSONValue] = ["status": .string("ok"), "page": .string(page.id),
-                "title": .string(page.title), "items": .array(items)]
-            if await doorSavedBlock("skill_manage") == nil {
-                do {
-                    read["stopped_run_ids"] = .array(try SkillRunStore.waitingIDs(root: root).map(JSONValue.string))
-                    read["resume_note"] = .string("stopped_run_ids are saved targets for skill.resume; an empty list means none. Resume rechecks the seal, skill and replayed reads.")
-                } catch { read["resume_note"] = .string("Stopped runs unavailable: \(error.localizedDescription)") }
+            if ["context", "agent_view"].contains(page.id) {
+                if let blocked = await doorSavedBlock("app_page_read") { return blocked }
+                return await runAppPageRead(input: ["page": .string(page.id), (page.id == "agent_view" ? "room" : "session_id"): .string(item)])
             }
-            return .object(read)
-        }
-        if item.hasPrefix("guide:"),
-           let action = await Self.doorPageActions(page.id, hasSettings: false).first(where: { "guide:" + $0.id == item && AppActions.guided.contains($0.id) }),
-           let guide = AppActions.about(action) {
-            return .object(["status": .string("ok"), "page": .string(page.id), "item": .string(item),
-                            "guide": .object([action.id: .string(guide)])])
-        }
-        if page.id == "inbox" {
-            if let blocked = await doorSavedBlock("inbox") { return blocked }
-            guard let host = quietHost() else { return Self.unattachedFailure() }
-            if item.isEmpty || item.lowercased() == "all" {
-                let result = await host.inbox(verb: "list", input: item.isEmpty ? [:]
-                    : ["filter": .string("all"), "limit": .int(200)])
-                guard case .object(let list) = result, list["status"] == .string("ok") else { return result }
-                let notes: [JSONValue] = if case .array(let notes)? = list["notes"] { notes } else { [] }
-                return .object(["status": .string("ok"), "page": .string("inbox"), "title": .string(page.title),
-                                "about": .string(page.summary), "count": list["count"] ?? .null,
-                                "shown": list["shown"] ?? .null, "needs_you_count": list["needs_you_count"] ?? .null,
-                                "items": .array(notes.map { note in
-                                    guard case .object(let row) = note else { return note }
-                                    let title = String(Self.doorText(row["title"]).split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(120))
-                                    return .string("\(Self.doorText(row["id"])) | kind=\(Self.doorText(row["source"])) | \(title) | unread=\(row["status"] == .string("unread")) | needs-you=\(row["needs_you"] == .bool(true))")
-                                })])
+            switch (page.id, item.isEmpty) {
+            case ("chat", false):
+                // The composer's own read.
+                if let blocked = await doorSavedBlock("interaction_act") { return blocked }
+                let result = await composerRead(sessionId: item)
+                guard case .object(let state) = result, state["status"] == .string("ok") else { return result }
+                return .object(["status": .string("ok"), "page": .string("chat"), "item": result])
+            case (_, false):
+                return ChatToolOutcome.refusedBeforeRunning(.object(["status": .string("not_found")]))
+            default:
+                if let blocked = await doorSavedBlock("app_page_read") { return blocked }
+                let result = await runAppPageRead(input: ["page": .string(page.id)])
+                guard case .object(var read) = result, read["status"] == .string("ok"), let host = quietHost() else { return result }
+                // Chat also lists the sidebar's conversations, the first page of
+                // chat.list. Outside the version: her own turn moves them.
+                if page.id == "chat", await doorSavedBlock("chat_conversations") == nil,
+                   case .object(let list) = await host.runChatSession(verb: "list", input: [:], reachesUser: false) {
+                    guard ChatToolOutcome.outputLooksSuccessful(.object(list)) else { return .object(list) }
+                    read["conversations"] = list["conversations"]
+                    read["conversations_next_offset"] = list["next_offset"]
+                }
+                // Providers also lists each account's id, fallback model and
+                // models, as provider.test and provider.set_fallback_model take them.
+                if page.id == "providers", await doorSavedBlock("provider") == nil,
+                   case .object(let list) = await host.provider(verb: "list", input: [:]) {
+                    guard ChatToolOutcome.outputLooksSuccessful(.object(list)) else { return .object(list) }
+                    read["accounts"] = list["accounts"]
+                }
+                return .object(read)
             }
-            let result = await host.inbox(verb: "read", input: ["id": .string(item)])
-            guard case .object(let read) = result, case .array(let notes)? = read["notes"],
-                  let note = notes.first else { return result }
-            return .object(["status": .string("ok"), "page": .string("inbox"), "item": Self.doorButtons(note)])
-        }
-        if let tool = ["diagnostics": "doctor_status", "telegram": "telegram_status"][page.id],
-           Self.doorItemReads[page.id]?[item.lowercased()] != nil {
-            if let blocked = await doorSavedBlock(tool) { return blocked }
-            let result = try await healthRead(item.lowercased())
-            guard ChatToolOutcome.outputLooksSuccessful(result) else { return result }
-            return .object(["status": .string("ok"), "page": .string(page.id), "item": result])
-        }
-        if ["context", "agent_view"].contains(page.id) {
-            if let blocked = await doorSavedBlock("app_page_read") { return blocked }
-            return await runAppPageRead(input: ["page": .string(page.id), (page.id == "agent_view" ? "room" : "session_id"): .string(item)])
-        }
-        switch (page.id, item.isEmpty) {
-        case ("chat", false):
-            // The composer's own read.
-            if let blocked = await doorSavedBlock("interaction_act") { return blocked }
-            let result = await composerRead(sessionId: item)
-            guard case .object(let state) = result, state["status"] == .string("ok") else { return result }
-            return .object(["status": .string("ok"), "page": .string("chat"), "item": result])
-        case (_, false):
-            return .object(["status": .string("not_found")])
-        default:
-            if let blocked = await doorSavedBlock("app_page_read") { return blocked }
-            let result = await runAppPageRead(input: ["page": .string(page.id)])
-            guard case .object(var read) = result, read["status"] == .string("ok"), let host = quietHost() else { return result }
-            // Chat also lists the sidebar's conversations, the first page of
-            // chat.list. Outside the version: her own turn moves them.
-            if page.id == "chat", await doorSavedBlock("chat_conversations") == nil,
-               case .object(let list) = await host.runChatSession(verb: "list", input: [:], reachesUser: false) {
-                read["conversations"] = list["conversations"]
-                read["conversations_next_offset"] = list["next_offset"]
-            }
-            // Providers also lists each account's id, fallback model and
-            // models, as provider.test and provider.set_fallback_model take them.
-            if page.id == "providers", await doorSavedBlock("provider") == nil,
-               case .object(let list) = await host.provider(verb: "list", input: [:]) {
-                read["accounts"] = list["accounts"]
-            }
-            return .object(read)
+        } catch {
+            return ChatToolOutcome.failure(error: error, tool: "app", effects: ToolFailureError.Effects.none)
         }
     }
 
@@ -1042,6 +1122,7 @@ extension AppToolExecutor {
         let (ranked, degraded) = try await AppActions.ranked(query, pages: doorPageIndex, dataRoot: root)
         let matches = ranked.prefix(5)
         let actions = matches.filter { !$0.isItemRead }
+        let named = AppActions.named(query)
         let items: [JSONValue] = matches.filter(\.isItemRead).map {
             .object($0.input.merging(["description": .string($0.label)]) { _, value in value })
         }
@@ -1062,29 +1143,38 @@ extension AppToolExecutor {
             "status": .string(matches.isEmpty && pages.isEmpty && disabled.isEmpty && reads.isEmpty ? "not_found" : "ok"),
             "find": .string(query),
             "matched_actions": .int(Int64(AppActions.matchedActions(ranked).count)), "shown_actions": .int(Int64(actions.count)),
+            // One line each; an action the words name by its id answers in full.
             "actions": .array(actions.map { action in
                 let permissionBlocker = ToolPreloadHeuristics.macIntegrationGates[action.tool].flatMap {
                     permissions?.refusal(integration: $0.integration, mode: $0.mode)
                 }
                 let blocker = permissionBlocker ?? unready[action.tool]
-                var discovered = AppActions.discovery(action, blocker: blocker, dataRoot: root)
-                if action.id == "mac.look", AppActions.hits(["screenshot", "capture"], asked) > 0,
-                   case .object(var fields) = discovered {
-                    fields["example"] = .object(["action": .string("mac.look"), "args": .object(["pixels": .bool(true)])])
-                    discovered = .object(fields)
-                }
-                if action.id == "schedule.create", AppActions.timerIntent(query), case .object(var fields) = discovered {
-                    fields["example"] = .object(["action": .string("schedule.create"), "args": .object([
-                        "kind": .string("notify"), "payload": .object(["message": .string("Timer finished.")]),
-                        "in_minutes": .int(10)])])
-                    discovered = .object(fields)
-                }
-                return discovered
+                guard named.contains(action.id) else { return .string(action.line + (blocker.map { " Unavailable: " + $0 } ?? "")) }
+                return AppActions.discovery(action, blocker: blocker, dataRoot: root)
             }),
             "pages": .array(pages.map { .string("\($0.0.id): \($0.0.title). \($0.0.summary)") }),
             "read_next": .array(items + reads),
-            "note": .string("find discovers actions, including on home. Search saved work and conversations explicitly with work.context {query}, or chat.search {query}. Reversible actions run directly; irreversible examples include preview:true to report checks without running. Example values in <angle brackets> must be replaced with your values."),
+            "note": .string("find discovers actions, including on home, one line each as id(args) label. Name an action's id in find for its args_schema and example. Search saved work and conversations explicitly with work.context {query}, or chat.search {query}. Reversible actions run directly; irreversible examples include preview:true to report checks without running. Example values in <angle brackets> must be replaced with your values."),
+            // A find is a read; finding nothing is its answer.
+            "effects": .string("none"),
         ]
+        if found["status"] == .string("not_found") {
+            found["reason"] = .string("no_match")
+            found["message"] = .string("Nothing matches \"\(query)\": no action, page or item.")
+        }
+        // The best match's call shape, unless it is already shown in full.
+        if let first = actions.first, !named.contains(first.id),
+           case .object(let fields) = AppActions.discovery(first, dataRoot: root), var example = fields["example"] {
+            if first.id == "mac.look", AppActions.hits(["screenshot", "capture"], asked) > 0 {
+                example = .object(["action": .string("mac.look"), "args": .object(["pixels": .bool(true)])])
+            }
+            if first.id == "schedule.create", AppActions.timerIntent(query) {
+                example = .object(["action": .string("schedule.create"), "args": .object([
+                    "kind": .string("notify"), "payload": .object(["message": .string("Timer finished.")]),
+                    "in_minutes": .int(10)])])
+            }
+            found["example"] = example
+        }
         if !disabled.isEmpty { found["disabled"] = .array(Array(disabled)) }
         if let degraded { found["ranking_degraded"] = .string("Ranked by words only: " + degraded) }
         let words = AppActions.words(query)
@@ -1143,7 +1233,7 @@ extension AppToolExecutor {
         guard let perform = AppDoorReentry.perform else {
             return Self.doorRefusal("door_unavailable",
                 "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
-                remedy: "none", "Use app from a chat turn.")
+                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         let session = input["__session_id"]
         let preview = input["preview"] == .bool(true)
@@ -1169,7 +1259,7 @@ extension AppToolExecutor {
         guard let perform = AppDoorReentry.perform else {
             return Self.doorRefusal("door_unavailable",
                 "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
-                remedy: "none", "Use app from a chat turn.")
+                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         guard (1...AppScriptRunner.actionLimit).contains(entries.count) else {
             return Self.doorRefusal("invalid_actions",
@@ -1293,7 +1383,8 @@ extension AppToolExecutor {
             return Self.failure("undo_unavailable", "That receipt has no undo action. Nothing was written.")
         }
         guard let perform = AppDoorReentry.perform else {
-            return Self.failure("door_unavailable", "Use app from a chat turn. Nothing was written.")
+            return Self.doorRefusal("door_unavailable", "Use app from a chat turn. Nothing was written.",
+                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         // Re-enter the original action's gates; only its owner applies the receipt.
         return try await perform("app", ["action": .string(action), "args": .object(args),
@@ -1311,8 +1402,18 @@ extension AppToolExecutor {
         guard let action = await AppActions.resolvedAction(id, dataRoot: root) else {
             if let toolID = ToolNameAliases.authoredTool(id),
                let tool = try await SwiftNativeToolRegistry(root: root).getTool(id: toolID), tool.status == "disabled" {
+                // Off by the person (or by a record too old to say who) is his
+                // decision: name his control and owe nothing. Off by her is hers to restore.
+                let offBy: String? = if case .object(let record) = tool.toJSON(),
+                    case .string(let who)? = record["disabledBy"] { who } else { nil }
+                if CapabilityLifecycle.requiresOwnerToEnable(isOff: true, disabledBy: offBy) {
+                    return Self.failure("tool_disabled", "\(tool.name) was switched off by the person; nothing ran.",
+                        extra: ["remedy": Repair.why(owner: "tool \(tool.id): switched off by the person",
+                                                     tap: "Tools page > \(tool.name) > turn on"),
+                                "requested": .string(id), "tool_id": .string(tool.id)])
+                }
                 return Self.doorRefusal("tool_disabled", "\(tool.name) is switched off; nothing ran. tool.restore turns it back on under Trust.",
-                    remedy: "restore", "Call tool.restore to turn this tool back on under Trust.",
+                    owner: "tool \(tool.id).status",
                     next: ["action": .string("tool.restore"), "args": .object(["tool_id": .string(tool.id)])],
                     extra: ["requested": .string(id), "tool_id": .string(tool.id)])
             }
@@ -1339,8 +1440,10 @@ extension AppToolExecutor {
             "action": .string(action.id), "page": .string(action.page), "label": .string(action.label),
             "owner": .string(action.isHis && !fullMac ? "his" : "hers"), "execution": .string("not_run"),
         ]
-        // A folded tool's whole description rides what refuses or previews it.
-        if !action.partAction, let about = AppActions.about(action) { receipt["about"] = .string(about) }
+        // What refuses or previews a folded tool points to its guide, never carries it.
+        if !action.partAction, action.page != "*", AppActions.about(action) != nil {
+            receipt["guide"] = .object(["page": .string(action.page), "item": .string("guide:" + action.id)])
+        }
         func badArgs(_ reason: String, _ detail: String, _ path: String) -> JSONValue {
             var extra = receipt
             extra["argument_path"] = .string(path)
@@ -1407,6 +1510,9 @@ extension AppToolExecutor {
         // runner and the floor check classify on.
         if let reason = Self.inputString(args["reason"]) { receipt["reason_given"] = .string(String(reason.prefix(280))) }
         var call = action.binding.arguments(args)
+        // A program calling gets a reader's structured form, where it has one.
+        if input[Self.doorScriptKey] == .bool(true), call["structured"] == nil,
+           action.argSpecs.flatMap(\.names).contains("structured") { call["structured"] = .bool(true) }
         if action.id == "mac.look", args["__sense_screen_frame"] != nil {
             let cursor = args.filter { ["app", "__sense_screen_frame", "__sense_text_offset"].contains($0.key) }
             call["__sense_address"] = .string(try JSONValue.object(cursor).serialize(pretty: false))
@@ -1460,7 +1566,7 @@ extension AppToolExecutor {
         guard AppDoorReentry.perform != nil || inProcess else {
             return Self.doorRefusal("door_unavailable",
                 "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing was read or done.",
-                remedy: "none", "Use app from a chat turn.")
+                remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
         }
         if input["preview"] == .bool(true) {
             receipt["status"] = .string("preview")
@@ -1481,7 +1587,7 @@ extension AppToolExecutor {
             refusal = await doorSavedBlock(action.tool)
             if refusal == nil { refusal = await foldedRefusal(action, input: call, surface: surface) }
             if let refused = refusal {
-                refusal = Self.foldedResult(ChatToolOutcome.normalizedFailure(refused, tool: action.tool), about: nil, tool: action.tool)
+                refusal = Self.foldedResult(ChatToolOutcome.normalizedFailure(refused, tool: action.tool), guide: nil, tool: action.tool)
             }
             guard case .object(let refused)? = refusal, refused["status"] != .string("would") else {
                 receipt["would_card"] = .bool(await doorWouldCard(action, call: call, input: input, surface: surface))
@@ -1517,7 +1623,7 @@ extension AppToolExecutor {
         // A folded tool answers as its direct call did: its own result, its
         // own gates (User's saved level on it among them) and its own card.
         if action.isFold && !action.partAction || action.id == "chat.list" {
-            let result = Self.foldedResult(try await runFolded(action, input: call, surface: surface), about: receipt["about"],
+            let result = Self.foldedResult(try await runFolded(action, input: call, surface: surface), guide: receipt["guide"],
                                           browser: action.tool.hasPrefix("browser."), tool: action.tool)
             let folded = Self.actionResult(result, action: action, args: args, root: root)
             // A versioned write says the version it left, as the app's own buttons do.
@@ -1561,6 +1667,8 @@ extension AppToolExecutor {
         if watch { snapshot?.notes = notesAfter }
         let knocksAfter = watch ? AttentionRouter.deliveredKnocks(dataRoot: root) : [:]
 
+        result = ChatToolOutcome.normalizedFailure(result, tool: action.tool)
+
         // The receipt's status is the code's own: its status, else whether
         // its result reads as a success, never the door's own ok.
         receipt["status"] = .string(ChatToolOutcome.outputLooksSuccessful(result) ? "ok" : "failed")
@@ -1588,6 +1696,7 @@ extension AppToolExecutor {
         if case .object(let fields) = result,
            !ChatToolOutcome.outputLooksSuccessful(result) || ChatToolOutcome.isWaitingOnPerson(result) {
             let reason = Self.doorText(fields["reason"])
+            receipt["message"] = fields["message"]
             let waiting = Self.doorText(fields["not_run_status"])
             // The refusal's own code on the receipt itself (owners_screen, not
             // tool_failed); a sentence stays where it is.
@@ -1603,9 +1712,7 @@ extension AppToolExecutor {
                 ])
             } else {
                 receipt["effects"] = fields["effects"] ?? .string(read ? "none" : "unknown")
-                // A read that failed changed nothing, so reading the page again is a round
-                // spent, and no inner remedy may say it may have taken effect.
-                receipt["remedy"] = (read ? nil : fields["remedy"]) ?? .object([
+                receipt["remedy"] = fields["remedy"] ?? .object([
                     "kind": .string("inspect"),
                     "instruction": .string(read
                         ? "Nothing changed. Do what the reason names, or tell the person why."
@@ -1704,6 +1811,11 @@ extension AppToolExecutor {
               fields["effects"] == nil || fields["effects"] == .string("unknown") || fields["effects"] == .string("none") else { return .object(fields) }
         fields["effects"] = .string("none")
         fields["outcome"] = .string("unmet")
+        if case .object(let remedy)? = fields["remedy"], remedy["kind"] == .string("inspect"),
+           let instruction = inputString(remedy["instruction"]),
+           instruction.hasPrefix("It may have taken effect:") || instruction.hasPrefix("The call took effect.") {
+            fields["remedy"] = nil
+        }
         if fields["remedy"] == nil { fields["remedy"] = .object([
             "kind": .string("inspect"),
             "instruction": .string("Nothing changed. Do what the reason names, or tell the person why."),
@@ -1715,9 +1827,9 @@ extension AppToolExecutor {
     /// A folded tool's result as she reads it through the door: a call it
     /// points to by a folded name is that tool's app call, its sentences name
     /// folded tools by action id, its next page's args are the door's names,
-    /// and a failure that was not User's or a card carries the tool's whole
-    /// description. Data fields are left as they are.
-    static func foldedResult(_ result: JSONValue, about: JSONValue?, browser: Bool = false, tool: String = "") -> JSONValue {
+    /// and a failure that was not User's or a card points to the tool's guide.
+    /// Data fields are left as they are.
+    static func foldedResult(_ result: JSONValue, guide: JSONValue?, browser: Bool = false, tool: String = "") -> JSONValue {
         // A browser page's own text names its next steps by tool (scroll for
         // the rest, snapshot to read again): through the door they are app calls.
         if browser, case .string(let page) = result { return .string(browserSteps(page)) }
@@ -1732,9 +1844,9 @@ extension AppToolExecutor {
                 fields[key] = .string(ToolNameAliases.foldedProse(text))
             }
         }
-        if let about, !ChatToolOutcome.outputLooksSuccessful(result), !ChatToolOutcome.isWaitingOnPerson(result),
+        if let guide, !ChatToolOutcome.outputLooksSuccessful(result), !ChatToolOutcome.isWaitingOnPerson(result),
            !doorFloorReasons.contains(doorText(fields["reason"])) {
-            fields["about"] = about
+            fields["guide"] = guide
         }
         return .object(fields)
     }

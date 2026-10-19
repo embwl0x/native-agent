@@ -18,10 +18,13 @@ public enum LocalToolImage {
     // the thing, through this same sink: a bounded thumbnail rides back on the
     // SAME tool result, the full-size file path stays in the JSON.
 
-    /// Images ONE tool result may deliver. Eight: a folder read_file with
-    /// `match` (2026-09-24), a generate call with n=4, a before/after pair —
-    /// the same eight `boundConversation` keeps.
-    public static let maximumImagesPerResult = 8
+    /// The images one round may deliver, across all its calls: eight, and
+    /// 32 MiB. Pixels the model has not answered are never released, so this
+    /// is what bounds a request; `boundConversation` releases to half of it.
+    public static let roundImages = 8
+    public static let roundBytes = 32 * 1024 * 1024
+    /// Said by every reader the round's budget turns away.
+    public static let roundFull = "This round's images are full (\(roundImages) images or 32 MiB); read it next."
     /// Long edge of a produced-image thumbnail. Half the verified reader's
     /// 2048: a produced image is shown so the model can CHECK it (did it come
     /// out, is it the right shape, is the text right), and 1024 JPEG is a
@@ -89,7 +92,7 @@ public enum LocalToolImage {
                 mediaType: "image/jpeg", base64: thumbnail.data.base64EncodedString(),
                 name: label, byteSize: thumbnail.data.count
             )) else {
-                return skipped("Not shown inline: this tool result already carries \(maximumImagesPerResult) image(s), the per-result cap.")
+                return skipped("Not shown inline: \(roundFull) The file is at the path above.")
             }
             return ProducedImage(
                 shown: true,
@@ -128,19 +131,29 @@ public enum LocalToolImage {
     }
 
     /// Bound the entire active conversation, not just one tool iteration.
-    /// Keep the newest eight images for before/after comparisons. Replace old
+    /// Up to eight images stay for before/after comparisons. Replace old
     /// pixels with an explicit reread notice; paired tool receipts stay intact.
+    /// A release rewrites the provider-cached turn from the oldest image it
+    /// touches, so it happens once at the cap, down to half: never one image
+    /// per round. Images the model has not answered yet are never released.
     public static func boundConversation(_ messages: inout [LLMMessage],
-                                         maxImages: Int = 8, maxBytes: Int = 32 * 1024 * 1024) {
-        var count = 0, bytes = 0
-        for index in messages.indices.reversed() {
+                                         maxImages: Int = roundImages, maxBytes: Int = roundBytes) {
+        func size(_ block: LLMContentBlock) -> Int? {
+            guard case .image(_, let base64, _, let byteSize) = block else { return nil }
+            return max(byteSize, base64.utf8.count * 3 / 4)
+        }
+        let all = messages.flatMap(\.content).compactMap(size)
+        guard all.count > maxImages || all.reduce(0, +) > maxBytes else { return }
+        let answered = messages.lastIndex { $0.role == .assistant } ?? -1
+        let unseen = messages[(answered + 1)...].flatMap(\.content).compactMap(size)
+        var count = unseen.count, bytes = unseen.reduce(0, +)
+        for index in messages.indices.reversed() where index <= answered {
             let message = messages[index]
             var content = message.content
             var changed = false
             for blockIndex in content.indices.reversed() {
-                guard case .image(_, let base64, let name, let byteSize) = content[blockIndex] else { continue }
-                let size = max(byteSize, base64.utf8.count * 3 / 4)
-                if count < maxImages, size <= maxBytes - bytes {
+                guard case .image(_, _, let name, _) = content[blockIndex], let size = size(content[blockIndex]) else { continue }
+                if count < maxImages / 2, size <= maxBytes / 2 - bytes {
                     count += 1; bytes += size
                 } else {
                     content[blockIndex] = .text("[Earlier image \(name ?? "attachment") released from visual context to bound this turn. Its pixels are no longer visible; reread the original file if needed.]")
@@ -165,25 +178,48 @@ public enum LocalToolImage {
         return messages
     }
 
+    /// One round's image budget, shared by every call's sink in that round.
+    public final class Round: @unchecked Sendable {
+        private let lock = NSLock()
+        private var images = 0, bytes = 0
+        public init() {}
+        /// Room for another image; one too large for what is left is refused by `take`.
+        public var hasRoom: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return images < roundImages && bytes < roundBytes
+        }
+        fileprivate func take(_ size: Int) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            guard images < roundImages, bytes + size <= roundBytes else { return false }
+            images += 1; bytes += size
+            return true
+        }
+        fileprivate func giveBack(_ count: Int, _ size: Int) {
+            lock.lock(); defer { lock.unlock() }
+            images -= count; bytes -= size
+        }
+    }
+
     public final class Sink: @unchecked Sendable {
         private let lock = NSLock()
-        // 2026-09-13: was a single slot, because read_file was the only
-        // producer and one call reads one file. A generate call returns n
-        // images, so the slot became a bounded list — `maximumImagesPerResult`
-        // is the whole of the widening, and one image is still one image.
+        public let round: Round
         private var images: [LLMContentBlock] = []
+        private var taken = 0
         private var closed = false
-        public init() {}
+        public init(round: Round = Round()) { self.round = round }
         fileprivate func accept(_ block: LLMContentBlock) -> Bool {
+            guard case .image(_, _, _, let size) = block else { return false }
             lock.lock(); defer { lock.unlock() }
-            guard !closed, images.count < maximumImagesPerResult else { return false }
-            images.append(block)
+            guard !closed, round.take(size) else { return false }
+            images.append(block); taken += size
             return true
         }
         public func finish(success: Bool) -> [LLMContentBlock] {
             lock.lock(); defer { lock.unlock() }
             closed = true
             defer { images = [] }
+            // A failed call shows nothing, so its images go back to the round.
+            if !success { round.giveBack(images.count, taken) }
             return success ? images : []
         }
     }
@@ -210,7 +246,7 @@ public enum LocalToolImage {
             mediaType: mediaType, base64: data.base64EncodedString(),
             name: name, byteSize: data.count
         )) else {
-            return failure("Image delivery was cancelled or this tool call already supplied an image.")
+            return failure(Task.isCancelled ? "Image delivery was cancelled." : roundFull)
         }
         return .object([
             "status": .string("ok"), "image_pixels": .bool(true),

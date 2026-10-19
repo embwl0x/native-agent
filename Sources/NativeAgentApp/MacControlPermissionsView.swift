@@ -341,7 +341,10 @@ enum MacControlSetupStatusBadges {
 
 struct MacControlPermissionsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var policy = TrustMacControlPolicy()
+    private var policy: TrustMacControlPolicy {
+        get { appModel.editDraft("mac-control/policy", seed: savedPolicy) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "mac-control/policy", baseline: savedPolicy) }
+    }
     @State private var savedPolicy = TrustMacControlPolicy()
     @State private var policyReadState: MacControlSetupStatusBadges.PolicyReadState = .loading
     @State private var isSaving = false
@@ -362,18 +365,8 @@ struct MacControlPermissionsView: View {
     @State private var appleDataProbeStatus: String?
     @State private var assistantWatchRefreshToken = 0
     private let loadsOnAppear: Bool
-    /// Unsaved edits held by the page above (the Trust tabs), so a tab switch
-    /// that rebuilds this view keeps them. Nil where nothing above holds one.
-    private let draft: Binding<TrustMacControlPolicy?>?
-
-    init(loadsOnAppear: Bool = true, draft: Binding<TrustMacControlPolicy?>? = nil) {
+    init(loadsOnAppear: Bool = true) {
         self.loadsOnAppear = loadsOnAppear
-        self.draft = draft
-    }
-
-    /// Hand the unsaved edits up, or clear them once nothing is unsaved.
-    private func syncDraft() {
-        draft?.wrappedValue = hasUnsavedChanges ? policy : nil
     }
 
     private var hasUnsavedChanges: Bool {
@@ -423,14 +416,9 @@ struct MacControlPermissionsView: View {
         .task {
             guard loadsOnAppear else { return }
             await loadPolicy()
-            // Back on this tab: the edits made before the switch return.
-            if policyReadState == .available, let held = draft?.wrappedValue { policy = held }
         }
-        .onChange(of: policy) { syncDraft() }
-        .onChange(of: savedPolicy) { syncDraft() }
         .onChange(of: appModel.engine.trust.policy) { _, newPolicy in
             if let mp = newPolicy?.macControlPolicy {
-                if !isSaving && !hasUnsavedChanges { policy = mp }
                 savedPolicy = mp
                 policyReadState = .available
             } else {
@@ -799,12 +787,13 @@ struct MacControlPermissionsView: View {
             isSaving = false
             applyingPreset = nil
         }
+        let submitted = policy
         do {
             let result = try await appModel
                 .saveMacIntegrationPreset(preset.rawValue, currentPolicy: appModel.engine.trust.policy)
             appModel.applySavedTrustPolicy(result, status: "Applied \(preset.title).")
             if let mp = result.macControlPolicy {
-                policy = mp
+                appModel.acceptEditDraft("mac-control/policy", submitted: submitted, saved: mp)
                 savedPolicy = mp
                 policyReadState = .available
                 testNotifStatus = "Applied \(preset.title)."
@@ -881,7 +870,6 @@ struct MacControlPermissionsView: View {
     private func loadPolicy() async {
         // Use cache if available
         if let mp = appModel.engine.trust.policy?.macControlPolicy {
-            policy = mp
             savedPolicy = mp
             policyReadState = .available
             return
@@ -891,7 +879,6 @@ struct MacControlPermissionsView: View {
             let tp = try await appModel.engine.trust.load()
             await MainActor.run { appModel.engine.trust.policy = tp }
             if let mp = tp.macControlPolicy {
-                policy = mp
                 savedPolicy = mp
                 policyReadState = .available
             } else {
@@ -908,13 +895,17 @@ struct MacControlPermissionsView: View {
     private func save() async {
         isSaving = true
         saveError = nil
+        let submitted = policy
         do {
+            // Nothing saved yet is the default policy the edit started from.
+            let current = try await appModel.engine.trust.load().macControlPolicy ?? TrustMacControlPolicy()
+            let merged = try appModel.mergingEditDraft("mac-control/policy", edited: submitted, into: current)
             let result = try await appModel
-                .saveMacControlPolicy(policy)
+                .saveMacControlPolicy(merged)
             await MainActor.run {
                 appModel.applySavedTrustPolicy(result, status: "Mac Control policy saved")
                 if let mp = result.macControlPolicy {
-                    policy = mp
+                    appModel.acceptEditDraft("mac-control/policy", submitted: submitted, saved: mp)
                     savedPolicy = mp
                     policyReadState = .available
                 } else {
@@ -1145,18 +1136,22 @@ private enum MacControlWorkbenchMode: String, CaseIterable, Identifiable {
 }
 
 struct MacControlWorkbenchView: View {
+    private struct Draft: Equatable {
+        var shellCommand = "pwd"
+        var shellCWD = NSHomeDirectory()
+        var filePath = NSHomeDirectory()
+        var fileContent = ""
+        var fileAppend = false
+        var notificationTitle = "NativeAgent"
+        var notificationMessage = "Mac Control workbench test"
+    }
     @Environment(AppModel.self) private var appModel
     var policy: TrustMacControlPolicy
     var policySaved: Bool = true
 
     @State private var mode: MacControlWorkbenchMode = .shell
-    @State private var shellCommand = "pwd"
-    @State private var shellCWD = NSHomeDirectory()
-    @State private var filePath = NSHomeDirectory()
-    @State private var fileContent = ""
-    @State private var fileAppend = false
-    @State private var notificationTitle = "NativeAgent"
-    @State private var notificationMessage = "Mac Control workbench test"
+    private var draftSubject: String { "mac-control/workbench/\(mode.rawValue)" }
+    private var input: Binding<Draft> { appModel.editBinding(draftSubject, seed: Draft()) }
     @State private var isRunning = false
     @State private var resultTitle = "Idle"
     @State private var resultBody = "Try an action to see its results, any errors, and whether it needs your approval."
@@ -1193,17 +1188,17 @@ struct MacControlWorkbenchView: View {
                     let availability = MacControlWorkbenchAction.shell.availability(
                         policy: policy,
                         policySaved: policySaved,
-                        hasRequiredInput: !shellCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        hasRequiredInput: !input.wrappedValue.shellCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     )
-                    TextField("Working directory", text: $shellCWD)
+                    TextField("Working directory", text: input.shellCWD)
                         .textFieldStyle(.roundedBorder)
-                    TextField("Command", text: $shellCommand, axis: .vertical)
+                    TextField("Command", text: input.shellCommand, axis: .vertical)
                         .lineLimit(2...5)
                         .textFieldStyle(.roundedBorder)
                     workbenchButton(.shell, availability: availability) {
                         await run(path: MacControlWorkbenchAction.shell.path, body: [
-                            "command": shellCommand,
-                            "cwd": shellCWD,
+                            "command": input.wrappedValue.shellCommand,
+                            "cwd": input.wrappedValue.shellCWD,
                             "timeout": 60,
                             "trigger": "user"
                         ])
@@ -1213,19 +1208,19 @@ struct MacControlWorkbenchView: View {
                     let readAvailability = MacControlWorkbenchAction.fileRead.availability(
                         policy: policy,
                         policySaved: policySaved,
-                        hasRequiredInput: !filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        hasRequiredInput: !input.wrappedValue.filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     )
                     let writeAvailability = MacControlWorkbenchAction.fileWrite.availability(
                         policy: policy,
                         policySaved: policySaved,
-                        hasRequiredInput: !filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !fileContent.isEmpty
+                        hasRequiredInput: !input.wrappedValue.filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !input.wrappedValue.fileContent.isEmpty
                     )
-                    TextField("Path", text: $filePath)
+                    TextField("Path", text: input.filePath)
                         .textFieldStyle(.roundedBorder)
-                    TextField("Write content", text: $fileContent, axis: .vertical)
+                    TextField("Write content", text: input.fileContent, axis: .vertical)
                         .lineLimit(2...6)
                         .textFieldStyle(.roundedBorder)
-                    Toggle("Append instead of replace", isOn: $fileAppend)
+                    Toggle("Append instead of replace", isOn: input.fileAppend)
                         .toggleStyle(.switch)
                         .hazeTinted()
                         .controlSize(.small)
@@ -1233,16 +1228,16 @@ struct MacControlWorkbenchView: View {
                     HStack {
                         workbenchButton(.fileRead, availability: readAvailability) {
                             await run(path: MacControlWorkbenchAction.fileRead.path, body: [
-                                "path": filePath,
+                                "path": input.wrappedValue.filePath,
                                 "max_bytes": 200_000,
                                 "trigger": "user"
                             ])
                         }
                         workbenchButton(.fileWrite, availability: writeAvailability) {
                             await run(path: MacControlWorkbenchAction.fileWrite.path, body: [
-                                "path": filePath,
-                                "content": fileContent,
-                                "append": fileAppend,
+                                "path": input.wrappedValue.filePath,
+                                "content": input.wrappedValue.fileContent,
+                                "append": input.wrappedValue.fileAppend,
                                 "trigger": "user"
                             ])
                         }
@@ -1255,16 +1250,16 @@ struct MacControlWorkbenchView: View {
                     let availability = MacControlWorkbenchAction.notify.availability(
                         policy: policy,
                         policySaved: policySaved,
-                        hasRequiredInput: !notificationMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        hasRequiredInput: !input.wrappedValue.notificationMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     )
-                    TextField("Notification title", text: $notificationTitle)
+                    TextField("Notification title", text: input.notificationTitle)
                         .textFieldStyle(.roundedBorder)
-                    TextField("Notification message", text: $notificationMessage)
+                    TextField("Notification message", text: input.notificationMessage)
                         .textFieldStyle(.roundedBorder)
                     workbenchButton(.notify, availability: availability) {
                         await run(path: MacControlWorkbenchAction.notify.path, body: [
-                            "title": notificationTitle,
-                            "message": notificationMessage,
+                            "title": input.wrappedValue.notificationTitle,
+                            "message": input.wrappedValue.notificationMessage,
                             "trigger": "user"
                         ])
                     }
@@ -1327,6 +1322,8 @@ struct MacControlWorkbenchView: View {
     }
 
     private func run(path: String, body: [String: Any]) async {
+        let subject = draftSubject
+        let submitted = input.wrappedValue
         isRunning = true
         resultTitle = "Running"
         resultBody = path
@@ -1348,6 +1345,10 @@ struct MacControlWorkbenchView: View {
                 resultTitle = "Failed"
                 resultBody = pretty(json) ?? String(data: data, encoding: .utf8) ?? "Command failed."
             } else if (200..<300).contains(statusCode) {
+                if path != MacControlWorkbenchAction.fileRead.path,
+                   appModel.editDraft(subject, seed: Draft()) == submitted {
+                    appModel.clearEditDraft(subject)
+                }
                 resultTitle = "Done"
                 resultBody = pretty(json) ?? String(data: data, encoding: .utf8) ?? "Done."
             } else {

@@ -19,10 +19,8 @@ public struct ConversationSurfaceProfile: Sendable, Equatable, Hashable {
 
     public var isRemote: Bool { Self.remoteSurfaceIDs.contains(id) }
 
-    /// The inbound agent-to-agent bridge lane (`/agent/mcp`, `/a2a`,
-    /// `/agent/message`). A REMOTE PEER IS NEVER THE PERSON: this surface is
-    /// its own id precisely so a peer turn can never be mistaken for the
-    /// operator's own "chat". Claude's own bridge lane keeps `claude-bridge`.
+    /// Saved bridge spellings remain readable as peer surfaces. A transport
+    /// label alone never admits the caller as the local operator.
     public static let agentBridgeID = "agent-bridge"
     public var isAgentBridge: Bool { id == Self.agentBridgeID }
     public var isIOSRemote: Bool { Self.iosRemoteSurfaceIDs.contains(id) }
@@ -41,5 +39,10 @@ public struct ConversationSurfaceProfile: Sendable, Equatable, Hashable {
         "i-pad": "ipad",
         "agentbridge": agentBridgeID,
         "agent bridge": agentBridgeID,
+        "claude-bridge": agentBridgeID,
+        "codex-bridge": agentBridgeID,
+        "omp-bridge": agentBridgeID,
+        "claude-bridge": agentBridgeID,
+        "bridge": agentBridgeID,
     ]
 }

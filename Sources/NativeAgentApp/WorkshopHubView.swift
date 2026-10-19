@@ -51,13 +51,16 @@ enum NewDeskTaskPresentation {
 // B2.3: the single unique control salvaged from the retired Command Center —
 // Title + Objective → AppModel.createWorkshopTask. The implementation keeps
 // its compatibility name, but the user-facing task belongs to the Desk. We
-// dismiss only when the runner did not report a creation failure.
-// when the status does not indicate failure, never eating the user's text.
+// dismiss only when creation succeeded, never eating the user's text on failure.
 struct NewWorkshopTaskSheet: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
-    @State private var title = ""
-    @State private var objective = ""
+    private struct Draft: Equatable {
+        var title = ""
+        var objective = ""
+    }
+    private let draftSubject = "desk-task/new"
+    private var draft: Binding<Draft> { appModel.editBinding(draftSubject, seed: Draft()) }
     @State private var submitting = false
     @State private var errorMessage: String?
 
@@ -67,8 +70,8 @@ struct NewWorkshopTaskSheet: View {
                 .font(NativeAgentFont.title)
 
             Form {
-                TextField("Title", text: $title)
-                TextField("Objective", text: $objective, axis: .vertical)
+                TextField("Title", text: draft.title)
+                TextField("Objective", text: draft.objective, axis: .vertical)
                     .lineLimit(2...5)
             }
             .formStyle(.grouped)
@@ -82,7 +85,7 @@ struct NewWorkshopTaskSheet: View {
 
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { appModel.clearEditDraft(draftSubject); dismiss() }
                     .keyboardShortcut(.cancelAction)
                     .disabled(submitting)
                 Button("Create Task", systemImage: "plus.circle") {
@@ -91,7 +94,7 @@ struct NewWorkshopTaskSheet: View {
                 .buttonStyle(.borderedProminent)
                 .hazeTinted(.button)
                 .keyboardShortcut(.defaultAction)
-                .disabled(submitting || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(submitting || draft.wrappedValue.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(NativeAgentSpacing.xl)
@@ -100,19 +103,21 @@ struct NewWorkshopTaskSheet: View {
     }
 
     private func submit() {
-        let nextTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let nextObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        let submitted = draft.wrappedValue
+        let nextTitle = submitted.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextObjective = submitted.objective.trimmingCharacters(in: .whitespacesAndNewlines)
         errorMessage = nil
         submitting = true
         Task {
-            await appModel.createWorkshopTask(
+            let succeeded = await appModel.createWorkshopTask(
                 title: nextTitle,
                 objective: nextObjective.isEmpty ? nextTitle : nextObjective
             )
             submitting = false
-            if let inlineError = NewDeskTaskPresentation.inlineError(from: appModel.statusText) {
-                errorMessage = inlineError
+            if !succeeded {
+                errorMessage = NewDeskTaskPresentation.inlineError(from: appModel.statusText)
             } else {
+                if appModel.editDraft(draftSubject, seed: submitted) == submitted { appModel.clearEditDraft(draftSubject) }
                 NotificationCenter.default.post(name: .deskTaskCreated, object: nil)
                 dismiss()
             }

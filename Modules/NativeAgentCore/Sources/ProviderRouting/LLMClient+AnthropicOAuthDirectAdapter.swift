@@ -553,6 +553,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                 try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
                 switch effectiveEvent {
                 case "message_stop":
+                    continuation.yield(runaway.finish())
                     let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                     await telemetry.record(
                         requestBody: req.httpBody,
@@ -609,8 +610,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     }
                     yieldedAnyText = true
                     let stop = runaway.feed(text)
-                    let kept = runaway.keptPart(of: text)
-                    if !kept.isEmpty { continuation.yield(kept) }
+                    let kept = runaway.takeCommittedText()
+                    continuation.yield(kept)
                     if stop {
                         // Ended by us, not by message_stop: record the call anyway, so
                         // the turn's cost stays visible (usage has message_start's input
@@ -778,6 +779,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                     try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
                     switch effectiveEvent {
                     case "message_stop":
+                        let tail = runaway.finish()
+                        if !tail.isEmpty { continuation.yield(.textDelta(tail)) }
                         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
                         await telemetry.record(
                             requestBody: req.httpBody,
@@ -806,6 +809,7 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             )
                         }
                         Self.logStopWithoutToolCall(lastStopReason, runaway.text)
+                        if let reason = runaway.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                         continuation.finish()
                         return
                     case "content_block_start":
@@ -827,8 +831,8 @@ public final class AnthropicOAuthDirectAdapter: LLMAdapter {
                             }
                             yieldedSemanticOutput = true
                             let stop = runaway.feed(text)
-                            let kept = runaway.keptPart(of: text)
-                            if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
+                            let kept = runaway.takeCommittedText()
+                            continuation.yield(kept.isEmpty ? .keepAlive : .textDelta(kept))
                             if stop {
                                 // Ended by us, not by message_stop: record the call anyway, so
                                 // the turn's cost stays visible (usage has message_start's input

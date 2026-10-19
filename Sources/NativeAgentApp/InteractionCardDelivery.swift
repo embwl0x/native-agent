@@ -102,8 +102,8 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
     var fullMacGrantIsActive: Bool { appModel.engine.trust.policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) ?? false }
     func enableChromeControl() async { await appModel.saveChromeControlEnabled(true) }
     func setUpChromeControl() async -> String? {
-        let setup = await ChromeExtensionFolder.setUp()
-        return setup.folder == nil || !setup.extensionsPageOpened ? setup.message : nil
+        do { _ = try await ChromeExtensionFolder.setUp(); return nil }
+        catch { return ChromeExtensionFolder.setupMessage(error) }
     }
 
     func saveConnectorCredentials(connector: String, values: [String: String], dataRoot: URL) async -> (error: String?, note: String?) {

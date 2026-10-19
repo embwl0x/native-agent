@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+import CognitiveSubstrate
 
 extension DreamCycleRunner {
     private static let convCharBudget: Int = 80_000
@@ -28,16 +29,17 @@ extension DreamCycleRunner {
         since mark: Date,
         feltRank: [String: Int] = [:]
     ) throws -> (
-        messages: [(sessionId: String, role: String, content: String)],
+        messages: [(sessionId: String, role: String, content: String, source: String?)],
         newest: Date?,
-        sources: [DreamSourceRef]
+        sources: [DreamSourceRef],
+        material: [String: CognitiveReflectionCause]
     ) {
         let messagesDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
         let names: [String]
         do { names = try fm.contentsOfDirectory(atPath: messagesDir.path) }
-        catch CocoaError.fileReadNoSuchFile { return ([], nil, []) }
-        struct Row { let at: Date; let sid: String; let mid: String?; let role: String; let content: String }
+        catch CocoaError.fileReadNoSuchFile { return ([], nil, [], [:]) }
+        struct Row { let at: Date; let sid: String; let mid: String?; let runID: String?; let role: String; let content: String; let peers: [String]? }
         var all: [Row] = []
         for name in names where name.hasSuffix(".jsonl") {
             let url = messagesDir.appendingPathComponent(name)
@@ -94,8 +96,10 @@ extension DreamCycleRunner {
                         at: coveredThrough,
                         sid: sid,
                         mid: recollection.rowId,
+                        runID: nil,
                         role: Self.recollectionRole,
-                        content: recollection.text
+                        content: recollection.text,
+                        peers: DreamEntryProvenance.transcriptCause(obj, session: sid)?.sourcePeerIds
                     ))
                     continue
                 }
@@ -105,8 +109,8 @@ extension DreamCycleRunner {
                 if case .string(let r)? = obj["role"] { role = r }
                 if case .string(let c)? = obj["content"] { content = c }
                 // The row's own id — the join key back to the substrate's felt
-                // origins (`metadata["messageId"]` / `subject.id`). Read only;
-                // it never reaches the prompt.
+                // origins (`metadata["messageId"]` / `subject.id`) and to the
+                // claim's source lineage.
                 if case .string(let mid)? = obj["id"] { messageId = mid }
                 if content.isEmpty { continue }
                 // Only her + the user's turns shape identity (tool/system rows dropped).
@@ -118,7 +122,9 @@ extension DreamCycleRunner {
                     return mtime
                 }()
                 if at <= mark { continue }   // already dreamed — skip
-                all.append(Row(at: at, sid: sid, mid: messageId, role: role, content: content))
+                let runID: String? = if case .string(let id)? = obj["runId"], !id.isEmpty { id } else { nil }
+                all.append(Row(at: at, sid: sid, mid: messageId, runID: runID, role: role, content: content,
+                    peers: DreamEntryProvenance.transcriptCause(obj, session: sid)?.sourcePeerIds))
             }
         }
         all.sort { $0.at < $1.at }
@@ -266,22 +272,20 @@ extension DreamCycleRunner {
         // Restore chronological order — the dream reads a day, not a ranking.
         pickedEntries.sort { $0.index < $1.index }
         let picked = pickedEntries.map(\.row)
-        // PROVENANCE (item 4). The rows that actually fed this dream, each with
-        // the date it HAPPENED. The dream used to keep only `picked.count`'s
-        // session count; a count cannot distinguish one night dreamt three
-        // times from three nights each dreamt once, and REM was reading the
-        // difference off the dream dates — the one place it is not written.
-        // Read-only: none of this reaches the prompt.
-        let sources: [DreamSourceRef] = picked.compactMap { row in
-            guard let mid = row.mid?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !mid.isEmpty else { return nil }
-            return DreamSourceRef(
-                kind: row.role == Self.recollectionRole ? "recollection" : "message",
-                id: mid,
-                sessionID: row.sid,
-                livedDate: DreamEntryProvenance.dateStem(for: row.at)
-            )
+        // Rows remain citable without a run; only known runs establish exchange grouping.
+        var sourcesByIndex: [Int: DreamSourceRef] = [:]
+        var material: [String: CognitiveReflectionCause] = [:]
+        for (index, row) in pickedEntries {
+            let recollection = row.role == Self.recollectionRole
+            guard let mid = row.mid, !mid.isEmpty else { continue }
+            let source = DreamSourceRef(
+                kind: recollection ? "recollection" : row.runID == nil ? "message" : "exchange",
+                id: row.runID ?? mid, sessionID: row.sid,
+                livedDate: DreamEntryProvenance.dateStem(for: row.at), messageID: row.runID == nil ? nil : mid)
+            sourcesByIndex[index] = source
+            material[source.reference] = CognitiveReflectionCause(text: "\(row.role):\n\(row.content)", sourcePeerIds: row.peers)
         }
+        let sources = pickedEntries.compactMap { sourcesByIndex[$0.index] }
         // MARK ARITHMETIC IS UNCHANGED. The old walk always included the newest
         // row in the window, so its `picked.last?.at` WAS `all.last?.at`; the
         // mark advanced past everything older that the budget dropped. Sampling
@@ -289,9 +293,10 @@ extension DreamCycleRunner {
         // explicitly here. Same value as before, same intentional drop: omitted
         // older material is not re-dreamed on the next pass.
         return (
-            picked.map { ($0.sid, $0.role, $0.content) },
+            pickedEntries.map { ($0.row.sid, $0.row.role, $0.row.content, sourcesByIndex[$0.index]?.reference) },
             picked.isEmpty ? nil : all.last?.at,
-            sources
+            sources,
+            material
         )
     }
 

@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
+import Experiences
 
 // MARK: - Agent Desk chat lane (desk_*)
 //
@@ -550,6 +551,7 @@ extension SwiftToolDispatcher {
     // MARK: - desk_set_status
 
     func impl_desk_set_status(input: [String: JSONValue]) async throws -> JSONValue {
+        if input["wait"] == .bool(true) { return try await impl_desk_wait(input: input) }
         let handle = try await resolveDeskHandle(input)
         let statusText = try requireString(input, "status").trimmingCharacters(in: .whitespacesAndNewlines)
         var statusRaw = statusText.lowercased()
@@ -619,6 +621,39 @@ extension SwiftToolDispatcher {
             laneOf: laneOf
         )
         return await deskConfirm(store, handle: handle, prefix: "status set")
+    }
+
+    func impl_desk_wait(input: [String: JSONValue]) async throws -> JSONValue {
+        let handle = try await resolveDeskHandle(input)
+        let values: [JSONValue]
+        if case .array(let list)? = input["on"] { values = list }
+        else { values = input["on"].map { [$0] } ?? [] }
+        let ids = values.compactMap { value -> String? in
+            guard case .string(let id) = value, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return id.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let correction = "desk.wait on takes any id you can owe or be owed: a Desk handle/number from desk.read, a card id (or its interaction:<id>), a message id from agent.message, a reply's delivery id from agent.jobs or a Desk line, or a repair debt id from home. Use one id or a list."
+        guard !ids.isEmpty, ids.count == values.count else { throw ToolFailureError(correction, argumentPath: "$.on", effects: .none) }
+        let store = deskStore(), state = try await store.liveState()
+        // An id an owner just handed out may still be on its way into the store.
+        let experiences = ExperienceStore.at(dataRoot)
+        await experiences.drained()
+        var blockers: [String] = [], settled: [String] = []
+        for id in ids {
+            if let item = try Self.deskMatches(id, in: state).first { blockers.append(item.handle); continue }
+            // A card answers to its bare id too (its experience is `interaction:<id>`).
+            var found = try await experiences.experience(id)
+            if found == nil { found = try await experiences.experience("interaction:" + id) }
+            guard let experience = found else {
+                throw ToolFailureError("Unknown condition \(id). " + correction, argumentPath: "$.on", effects: .none)
+            }
+            if experience.isOpen { blockers.append("exp:" + experience.id) } else { settled.append(id) }
+        }
+        let why = try deskMetadataString(input, "why")
+        _ = try await store.setBlockedOn(handle, blockers: blockers, waiting: true, note: why)
+        if blockers.isEmpty { return await deskConfirm(store, handle: handle, prefix: "already settled: nothing to wait for; go on now") }
+        return await deskConfirm(store, handle: handle, prefix: "waiting on " + blockers.map { $0.hasPrefix("exp:") ? String($0.dropFirst(4)) : $0 }.joined(separator: ", ")
+            + (settled.isEmpty ? "" : "; already settled: " + settled.joined(separator: ", ")))
     }
 
     // MARK: - desk_update_item

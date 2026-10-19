@@ -53,8 +53,9 @@ public final class PeerDataTaint: @unchecked Sendable {
     /// turn it is (`peerBridge`, which latches nothing of its own), and the
     /// peers the person elevated.
     public static func carried(peerBridge: Bool, peerID: String?) -> (sources: [String], elevated: [String]) {
-        var sources = current?.checkpointSources ?? []
-        if sources.isEmpty, peerBridge { sources = [peerID.map { "peer:" + $0 } ?? "another agent"] }
+        var sources = Array(Set((current?.checkpointSources ?? []) + abilitySources)).sorted()
+        if peerBridge, let peerID, !peerID.isEmpty { sources = Array(Set(sources + ["peer:" + peerID])).sorted() }
+        if sources.isEmpty, peerBridge { sources = ["another agent"] }
         return (sources, current?.elevatedSources ?? [])
     }
 
@@ -142,10 +143,26 @@ public final class PeerDataTaint: @unchecked Sendable {
     }
 
     public static var abilityWriteCheck: @Sendable () -> String? {
+        let check = abilityWriteFailure
+        return { check()?.message }
+    }
+
+    public static var sourceName: @Sendable (String) -> String? {
+        get { hookLock.withLock { nameHook } }
+        set { hookLock.withLock { nameHook = newValue } }
+    }
+    nonisolated(unsafe) private static var nameHook: @Sendable (String) -> String? = { _ in nil }
+
+    public static var abilityWriteFailure: @Sendable () -> ToolFailureError? {
         let peers = abilitySources
         return {
             let untrusted = peers.filter { !ownerTrusts($0) }.sorted()
-            return untrusted.isEmpty ? nil : CapabilityLifecycle.peerRefusal(untrusted.joined(separator: ", "))
+            guard !untrusted.isEmpty else { return nil }
+            let names = untrusted.map { sourceName($0) }
+            let tap = names.allSatisfy { $0 != nil }
+                ? names.compactMap { $0 }.map { "Trust > Connected agents > " + $0 }.joined(separator: "; ") : nil
+            let who = zip(untrusted, names).map { source, name in name.map { "\($0) [\(source)]" } ?? source }.joined(separator: ", ")
+            return CapabilityLifecycle.peerRefusal(who, tap: tap)
         }
     }
 
@@ -165,7 +182,7 @@ public final class PeerDataTaint: @unchecked Sendable {
         set { hookLock.withLock { agentHook = newValue } }
     }
     nonisolated(unsafe) private static var agentHook: @Sendable (String) -> Bool = {
-        $0.lowercased().hasPrefix("peer:") || $0.lowercased() == "another agent" // an unidentified bridge peer stays untrusted
+        $0.lowercased().hasPrefix("peer:") || ["another agent", "a remote peer", unrecorded].contains($0.lowercased())
     }
 
     /// A peer the person elevated retains its identity without taint.

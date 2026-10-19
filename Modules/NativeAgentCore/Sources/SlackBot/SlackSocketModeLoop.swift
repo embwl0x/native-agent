@@ -1090,13 +1090,16 @@ public struct SlackSocketModeLoop: LoopRunner {
         }
         if let phase = record.settledAssistantRuns?[response.runId] {
             guard ["delivered", "sent_unconfirmed", "failed_before_answer"].contains(phase) else { throw SlackInboundJournalError.malformed }
-            try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: response.runId)
-            return phase == "delivered" ? "completed" : phase
+            let verdict = phase == "delivered" ? "completed" : phase
+            try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot, sessionId: session,
+                                                                               runId: response.runId, verdict: verdict)
+            return verdict
         }
         if record.assistantRunId == response.runId, record.phase.isTerminal {
-            try settleCheckpoint(record)
-            return record.phase == .failedBeforeAnswer ? "failed_before_answer"
+            let verdict = record.phase == .failedBeforeAnswer ? "failed_before_answer"
                 : record.phase == .sentUnconfirmed ? "sent_unconfirmed" : "completed"
+            try await settleCheckpoint(record, verdict: verdict)
+            return verdict
         }
         if record.assistantRunId != response.runId {
             guard record.phase.isTerminal else { return "owed" }
@@ -1110,7 +1113,7 @@ public struct SlackSocketModeLoop: LoopRunner {
             let migrated = priorVerdict == "completed"
                 ? try await deliveryJournal.markDelivered(eventId: eventId)
                 : try await deliveryJournal.settleUnconfirmed(eventId: eventId)
-            try settleCheckpoint(migrated)
+            try await settleCheckpoint(migrated, verdict: priorVerdict)
             return priorVerdict
         }
         guard await processDurableInbound(inbound) else { return "owed" }
@@ -1127,9 +1130,10 @@ public struct SlackSocketModeLoop: LoopRunner {
             ? "Generated image" : response.output, uploads: uploads)
     }
 
-    private func settleCheckpoint(_ record: SlackInboundDeliveryRecord) throws {
+    private func settleCheckpoint(_ record: SlackInboundDeliveryRecord, verdict: String) async throws {
         if let session = record.assistantSessionId, let run = record.assistantRunId {
-            try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)
+            try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot, sessionId: session,
+                                                                               runId: run, verdict: verdict)
         }
     }
 
@@ -1443,7 +1447,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 record = try await deliveryJournal.confirmReplyPart(eventId: inbound.eventId, isText: false)
             }
             _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
-            try settleCheckpoint(record)
+            try await settleCheckpoint(record, verdict: "completed")
             await recordReceipt(kind: "reply", inbound: inbound, reply: prepared.text)
             await writeState([
                 "lastDeliveryOutcome": .string("delivered"),
@@ -1543,7 +1547,7 @@ public struct SlackSocketModeLoop: LoopRunner {
                 return await settleUnconfirmedReply(record, detail: "Text reply accepted; image completion is unconfirmed")
             }
             _ = try await deliveryJournal.markDelivered(eventId: inbound.eventId)
-            try settleCheckpoint(record)
+            try await settleCheckpoint(record, verdict: "completed")
             await recordReceipt(kind: "reply_reconciled", inbound: inbound, reply: prepared.text)
             await writeState([
                 "lastDeliveryOutcome": .string("delivered"),
@@ -1560,7 +1564,7 @@ public struct SlackSocketModeLoop: LoopRunner {
         do {
             _ = try await deliveryJournal.markOutcomeUnknown(eventId: record.inbound.eventId, detail: detail)
             _ = try await deliveryJournal.settleUnconfirmed(eventId: record.inbound.eventId)
-            try settleCheckpoint(record)
+            try await settleCheckpoint(record, verdict: "sent_unconfirmed")
             await recordError(context: "reply_sent_unconfirmed", error: SlackSocketModeError.api(detail), inbound: record.inbound.inbound)
             return true
         } catch {

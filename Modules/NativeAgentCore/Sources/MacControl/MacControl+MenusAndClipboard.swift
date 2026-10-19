@@ -111,8 +111,18 @@ extension SwiftNativeMacControl {
         // A background app's menus report stale enabled states (File › Save
         // "disabled" on an edited document), so they are not claimed.
         let statesKnown = accessibilitySource.frontmostApp()?.processIdentifier == app.processIdentifier
+        // `words` (the door's find): only the items whose path holds every
+        // word, rendered at the find depth, instead of the whole bar.
+        let words = body.stringValue("words").map { $0.lowercased().split { !$0.isLetter && !$0.isNumber } }
+        let listed = words.map { words in
+            MacMenuBar.Reading(items: reading.items.filter { item in
+                let path = item.titlePath.joined(separator: " ").lowercased()
+                return words.allSatisfy(path.contains)
+            }, truncated: reading.truncated, unavailable: reading.unavailable)
+        } ?? reading
         var output: [String: JSONValue] = [:]
-        if case .object(let menuJSON) = MacMenuBar.json(reading, statesKnown: statesKnown) {
+        if case .object(let menuJSON) = MacMenuBar.json(listed, statesKnown: statesKnown,
+                                                         depth: words == nil ? MacMenuBar.maxPathDepth : MacMenuBar.findPathDepth) {
             output = menuJSON
         }
         output["trusted"] = .bool(true)
@@ -140,7 +150,7 @@ extension SwiftNativeMacControl {
             output["found"] = .array(hits.prefix(3).map { item in
                 var row: [String: JSONValue] = [
                     "path": MacScreenViewTextRedaction.redactedLegendString(
-                        item.display, valueChars: MacMenuBar.maxTitleChars * MacMenuBar.findPathDepth
+                        item.display, valueChars: MacMenuBar.pathChars(MacMenuBar.findPathDepth)
                     ),
                 ]
                 if statesKnown { row["enabled"] = .bool(item.enabled) }
@@ -383,7 +393,7 @@ extension SwiftNativeMacControl {
                 "app": app.toJSON(),
                 "path": MacScreenViewTextRedaction.redactedLegendString(
                     item.display,
-                    valueChars: MacMenuBar.maxTitleChars * MacMenuBar.findPathDepth
+                    valueChars: MacMenuBar.pathChars(MacMenuBar.findPathDepth)
                 ),
                 "opens_submenu": .bool(item.hasSubmenu),
                 // The press ran the app's handler. Whether the INTENDED

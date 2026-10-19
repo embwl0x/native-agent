@@ -124,7 +124,9 @@ extension MacFourVerbs {
         before: Sighting?,
         allowGenericScreenChangeVerification: Bool = true,
         afterPart: String? = nil,
-        pointerTarget: String? = nil
+        pointerTarget: String? = nil,
+        /// A pointer press: judged by `MacActClosedLoop.pressEvidence`.
+        pressed: ActTarget? = nil
     ) async -> MacFourVerbsReply {
         switch await sight(part: afterPart) {
         case .blind(let reply):
@@ -172,8 +174,12 @@ extension MacFourVerbs {
                       let frame = target.observedFrame else { return nil }
                 return pointer.isInside(frame) && !target.excludedFrames.contains { pointer.isInside($0) }
             }()
+            let press = Self.pressVerdict(pressed, before: before, after: after)
             let observation: String
-            if pointerOnTarget == true { observation = " The system pointer is inside the target's freshly observed bounds." }
+            if press?.own == true, press?.consequence == false, let pressed {
+                observation = " Only \(Self.name(pressed)) itself changed; nothing it should open or switch did."
+            }
+            else if pointerOnTarget == true { observation = " The system pointer is inside the target's freshly observed bounds." }
             else if pointerOnTarget == false { observation = " The system pointer is outside the target's freshly observed bounds." }
             else if visibleValueChanged { observation = " A value the fresh screen says changed after it." }
             else if structuralChanged == true { observation = " The fresh screen changed after it." }
@@ -212,6 +218,11 @@ extension MacFourVerbs {
                     detail["verification_evidence"] = .string("fresh_system_pointer_in_observed_target")
                     detail["verification_scope"] = .string("pointer_position_only")
                 }
+            } else if let press {
+                detail["verification"] = .string(press.consequence
+                    ? MotorVerificationState.satisfied.rawValue : MotorVerificationState.unverified.rawValue)
+                detail.removeValue(forKey: "verification_evidence")
+                if press.consequence { detail["verification_evidence"] = .string("press_consequence") }
             } else if visibleValueChanged {
                 detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
                 detail["verification_evidence"] = .string("fresh_visible_value_change")
@@ -237,6 +248,22 @@ extension MacFourVerbs {
                 detail: detail
             )
         }
+    }
+
+    /// A pointer press judged by the one judge, `MacActClosedLoop.pressEvidence`,
+    /// over the look before and the look after, each with its own bounds: a
+    /// capped or cut read makes turnover no evidence.
+    static func pressVerdict(_ pressed: ActTarget?, before: Sighting?, after: Sighting) -> (own: Bool, consequence: Bool)? {
+        guard let pressed, let beforePercept = before?.percept, let afterPercept = after.percept else { return nil }
+        func caps(_ percept: MacLookPercept) -> MacLookCompileCaps {
+            MacLookCompileCaps(truncated: percept.truncated || percept.affordancesOmitted > 0)
+        }
+        let frame = MacLookFrame.from(percept: beforePercept, frameId: before?.frameId ?? "", capturedAt: Date(),
+                                      windowTitle: beforePercept.windowTitle, caps: caps(beforePercept))
+        guard let entry = frame.entries[pressed.handle] else { return nil }
+        let diff = MacActClosedLoop.diff(before: frame, after: afterPercept,
+                                         afterWindowTitle: afterPercept.windowTitle, afterCaps: caps(afterPercept))
+        return MacActClosedLoop.pressEvidence(diff, before: frame, pressed: entry, clicked: true)
     }
 
     // MARK: - One sighting
@@ -301,6 +328,9 @@ extension MacFourVerbs {
         /// Other apps' windows over this one, in screen points: a hand landing
         /// on one would reach that app, so no physical act ends or passes there.
         var obstructions: [MacAXFrame] = []
+        /// The look this sighting was read from, so a pointer press is judged
+        /// by the same evidence as an accessibility one.
+        var percept: MacLookPercept? = nil
     }
 
     /// A resolvable thing on the screen. `label` is the DISPLAY text — what the
@@ -427,6 +457,7 @@ extension MacFourVerbs {
         }
         guard result.ok, let frameId = Self.string(output["frame_id"]) else {
             let why = Self.string(output["message"])
+                ?? Self.string(output["note"])
                 ?? Self.lookRefusalWords(result.error ?? Self.string(output["status"]) ?? "unknown")
             return .blind(MacFourVerbsReply(
                 ok: false,
@@ -434,10 +465,11 @@ extension MacFourVerbs {
                 // The refusal's own words, unwrapped. A caller with a different
                 // lead sentence (the cross-app drag: "I can't drop into Mail")
                 // must not have to strip this one's off the front.
-                detail: [
+                detail: Self.operationDetail(result).merging([
                     "error": .string(result.error ?? "look_failed"),
                     "message": .string(why),
-                ].merging(output["frontmost_app"].map { ["frontmost_app": $0] } ?? [:]) { current, _ in current }
+                ]) { _, new in new }.merging(output["frontmost_app"].map { ["frontmost_app": $0] } ?? [:]) { current, _ in current }
+                    .merging(output["requested_app"].map { ["requested_app": $0] } ?? [:]) { current, _ in current }
             ))
         }
 
@@ -543,6 +575,9 @@ extension MacFourVerbs {
         var nativeAXSupplement: MacFourVerbsSupplement?
         let supplement = await MacSightCaptureBinding.$current.withValue(captureBinding) {
             await supplementalSource?.observe(app: app)
+        }
+        if let detail = supplement?.diagnostics, detail["remedy"] != nil {
+            return .blind(MacFourVerbsReply(ok: false, text: Self.string(detail["message"]) ?? "The requested screen capture failed.", detail: detail))
         }
         if let supplement, await captureBinding.isCurrent(),
            Self.sameApp(percept: percept, supplement: supplement) {
@@ -870,6 +905,7 @@ extension MacFourVerbs {
                 "affordances_omitted": output["affordances_omitted"] ?? .int(0),
             ]),
             detail: [
+                "frame_id": .string(frameId),
                 "partial": .bool(cutLine != nil),
                 "truncation_reasons": .array(percept.truncationReasons.map(JSONValue.string)),
                 "bytes": .int(Int64(renderedText.utf8.count)),
@@ -910,7 +946,8 @@ extension MacFourVerbs {
                         $0.secret || MacScreenViewBuilder.isSecretField(role: $0.role, subrole: $0.subrole, label: $0.label)
                     } == true
             }(),
-            obstructions: nativeAXSupplement?.obstructions ?? []
+            obstructions: nativeAXSupplement?.obstructions ?? [],
+            percept: percept
         ))
     }
 

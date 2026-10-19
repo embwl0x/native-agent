@@ -16,7 +16,7 @@ extension HerScreen {
     /// A room for this location, or nil where the old view still applies.
     /// `issue` is the owner read's failure, shown rather than hidden.
     static func room(_ location: AgentWorkspaceLocation, dataRoot: URL, scope: String, issue: String? = nil, value: JSONValue? = nil,
-                     observed: ((HerWorld, Date) -> Void)? = nil) async -> String? {
+                     observed: ((HerWorld, Date, Set<String>) -> Void)? = nil) async -> String? {
         if let comms = commsRoom(location, value: value, dataRoot: dataRoot, issue: issue) { return comms }
         if let read = buildRecordRoom(location, value: value, dataRoot: dataRoot, issue: issue) { return read }
         let now = Date(), person = names(dataRoot).person
@@ -43,7 +43,7 @@ extension HerScreen {
         case .area("helpers"):
             return await helpersRoom(dataRoot: dataRoot, person: person, now: now)
         case .people(page: 0):
-            return await peopleRoom(dataRoot: dataRoot, scope: scope, now: now)
+            return await peopleRoom(dataRoot: dataRoot, scope: scope, now: now, observed: observed)
         case .conversations(let page):
             return await conversationsRoom(dataRoot: dataRoot, person: person, scope: scope, now: now, page: page)
         case .area("files"), .area("code"), .area("github"): return await buildRoom(location, dataRoot: dataRoot, now: now)
@@ -138,11 +138,11 @@ extension HerScreen {
     // MARK: Person
 
     private static func personRoom(_ agent: String, label: String?, dataRoot: URL, person: String, scope: String, issue: String?, now: Date,
-                                   observed: ((HerWorld, Date) -> Void)?) async -> String? {
+                                   observed: ((HerWorld, Date, Set<String>) -> Void)?) async -> String? {
         let world = await readWorld(dataRoot, now: now)
         let (records, chats) = (world.records, world.chats)
         // Identity merging is for list rows. A room retains its selected route.
-        let everyone = contacts(dataRoot: dataRoot, identity: world.identity, mergeIdentities: false)
+        let everyone = world.routes
         let contact = everyone.first { $0.id.caseInsensitiveCompare(agent) == .orderedSame }
             ?? Contact(id: agent, name: records.first { $0.agent == agent }?.name ?? agent, builtIn: builtIns.contains(agent), kind: nil)
         let record = try? AgentWorkspacePorts.current.conversations.find(dataRoot: dataRoot, scopeSessionID: scope, agent: agent, label: label)
@@ -151,7 +151,7 @@ extension HerScreen {
         let members = Set(identity.members(contact.id))
         let theirs = chats.filter { members.contains($0.who) }
         let bare = Contact(id: contact.id, name: contact.name, builtIn: contact.builtIn, kind: nil)
-        let health = world.health[record?.agent ?? contact.id] ?? world.health[contact.id]
+        let healthID = world.healthID(for: contact, record: record), health = world.health[healthID]
         let state = state(bare, record: record, chat: theirs.first { $0.id != scope }, answered: world.answered, now: now, health: health).text
         let slug = withNames(dataRoot) { $0.slug(id: contact.id, name: contact.name) }
 
@@ -251,9 +251,9 @@ extension HerScreen {
         }
         if listed.contains(where: { $0.id != scope }) { verbs.append(("chat.N", "open one of those chats")) }
         let kind = contact.builtIn ? "built-in agent" : contact.kind ?? "agent"
-        observed?(world, now)
+        observed?(world, now, [healthID])
         if !previewing, !answers.isEmpty { AgentWorkspacePorts.current.conversations.shown(answers: answers, peer: contact.id, scope: scope, dataRoot: dataRoot) }
-        return screen([contact.name.uppercased(), kind, state] + (label.map { $0 == "Main" ? [] : ["thread " + clip($0, 30)] } ?? []),
+        return freshness(world) + "\n" + screen([contact.name.uppercased(), kind, state] + (label.map { $0 == "Main" ? [] : ["thread " + clip($0, 30)] } ?? []),
             [section("TALK", talk), section("LAST SEND", outcome), section("CHATS", chatLines), issue.map { section("READ", [clip($0, 100)]) } ?? []], verbs: verbs)
     }
 
@@ -287,7 +287,7 @@ extension HerScreen {
             if messages.isEmpty { talk = ["no messages yet"] }
         }
         let header = [clip(chat?.title ?? title, 40), who] + (chat.map { [age(now.timeIntervalSince($0.at))] } ?? [])
-        return screen(header, [section("TALK", talk), issue.map { section("READ", [clip($0, 100)]) } ?? []],
+        return freshness(world) + "\n" + screen(header, [section("TALK", talk), issue.map { section("READ", [clip($0, 100)]) } ?? []],
             verbs: (who == person ? [] : [(who + ".say", "sends them a message now (text)")]) + [("conversations", "every chat, both directions")])
     }
 
@@ -421,7 +421,7 @@ extension HerScreen {
     private static func deskRoom(dataRoot: URL, person: String, now: Date) async -> String? {
         let world = await readWorld(dataRoot, now: now)
         guard let state = world.desk else {
-            return screen(["DESK", "unavailable"], [["Desk could not be read. Item counts are unavailable."]], verbs: [])
+            return freshness(world) + "\n" + screen(["DESK", "unavailable"], [["Desk could not be read. Item counts are unavailable."]], verbs: [])
         }
         let split = world.split
         func rows(_ items: [DeskItem], _ cap: Int) -> [String] {
@@ -429,9 +429,10 @@ extension HerScreen {
                 + (items.count > cap ? ["+\(items.count - cap) more · app {page:\"home\", find:\"<words>\"} finds one"] : [])
         }
         let parked = split.parked.isEmpty ? [] : ["\(split.parked.count) · untouched \(split.quietDays ?? DeskParking.quietDays)d+ · app {page:\"home\", find:\"<words>\"} finds one"]
-        return screen(["DESK", "\(split.active.count) active", "\(split.parked.count) parked"] + state.boardCountSummary.components(separatedBy: "; ")
+        let owed = await owedRows(dataRoot, person: person, now: now)
+        return freshness(world) + "\n" + screen(["DESK", "\(split.active.count) active", "\(split.parked.count) parked"] + state.boardCountSummary.components(separatedBy: "; ")
                 + (split.waiting.isEmpty ? [] : ["\(split.waiting.count) wait on \(person)"]),
-            [section("WAITING", rows(split.waiting, 5)), section("ACTIVE", rows(split.active, 10)), section("PARKED", parked)],
+            [section("OWED", owed.hers), section("WAITING", owed.his + rows(split.waiting, 5)), section("ACTIVE", rows(split.active, 10)), section("PARKED", parked)],
             verbs: [("desk.N", "open an item"), ("desk.N.note", "add a note (text)"), ("desk.N.done", "mark one done"), ("desk.add", "add work (form)")])
     }
 
@@ -469,7 +470,7 @@ extension HerScreen {
         }
         let width = min(20, (rows.map(\.name.count).max() ?? 0) + 2)
         let busy = ordered.filter { running.contains($0.id) }.count, paused = bots.filter(\.paused).count
-        return screen(["HELPERS", "\(bots.count) helper\(bots.count == 1 ? "" : "s")"]
+        return freshness(world) + "\n" + screen(["HELPERS", "\(bots.count) helper\(bots.count == 1 ? "" : "s")"]
                 + (busy > 0 ? ["\(busy) running"] : []) + (paused > 0 ? ["\(paused) paused"] : []),
             [rows.isEmpty ? ["no helpers yet"] : rows.map { pad(clip($0.name, 30), width) + clip($0.text, 90) }],
             verbs: [("<name>", "open its room"), ("<name>.run", "run it once now"), ("<name>.say", "sends a message now (text)"),
@@ -478,11 +479,12 @@ extension HerScreen {
 
     // MARK: People
 
-    private static func peopleRoom(dataRoot: URL, scope: String, now: Date) async -> String {
+    private static func peopleRoom(dataRoot: URL, scope: String, now: Date, observed: ((HerWorld, Date, Set<String>) -> Void)?) async -> String {
         let world = await readWorld(dataRoot, now: now)
-        let (cells, needs, _) = peopleRows(world, dataRoot: dataRoot, now: now, scope: scope, limit: .max)
+        let (cells, needs, _, health) = peopleRows(world, dataRoot: dataRoot, now: now, scope: scope, limit: .max)
         let width = min(20, (cells.map(\.name.count).max() ?? 0) + 2)
-        return screen(["PEOPLE", "\(cells.count) contact\(cells.count == 1 ? "" : "s")"] + (needs.isEmpty ? [] : ["\(needs.count) ask for input"]),
+        observed?(world, now, health)
+        return freshness(world) + "\n" + screen(["PEOPLE", "\(cells.count) contact\(cells.count == 1 ? "" : "s")"] + (needs.isEmpty ? [] : ["\(needs.count) ask for input"]),
             [cells.isEmpty ? ["no one yet · item \"connections\" adds someone"] : cells.map { pad(clip($0.name, 30), width) + clip($0.state, 80) }],
             verbs: [("<name>", "open their conversation"), ("<name>.say", "sends a message now; queues behind a pending reply (text)"), ("conversations", "every chat, both directions")])
     }
@@ -504,7 +506,7 @@ extension HerScreen {
             return agent
         }
         var order: [String] = [], groups: [String: [AgentConversationRecord]] = [:]
-        for record in ((try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? []).sorted(by: { $0.updatedAt > $1.updatedAt }) {
+        for record in world.records.sorted(by: { $0.updatedAt > $1.updatedAt }) {
             let id = who(record)
             if groups[id] == nil { order.append(id) }
             groups[id, default: []].append(record)
@@ -549,7 +551,7 @@ extension HerScreen {
         if order.count > (page + 1) * 12 { verbs.append(("conversations.more", "the next \(min(12, order.count - (page + 1) * 12)) older")) }
         if page > 0 { verbs.append(("conversations.previous", "newer ones")) }
         verbs.append(("people", "everyone I can reach"))
-        return screen(["CONVERSATIONS", "\(order.count)"] + (order.count > 12 ? ["\(page * 12 + 1)–\(page * 12 + shown.count) shown"] : []),
+        return freshness(world) + "\n" + screen(["CONVERSATIONS", "\(order.count)"] + (order.count > 12 ? ["\(page * 12 + 1)–\(page * 12 + shown.count) shown"] : []),
             [rows.isEmpty ? ["none yet"] : rows.map { pad(clip($0.0, 30), width) + $0.1 }], verbs: verbs)
     }
 

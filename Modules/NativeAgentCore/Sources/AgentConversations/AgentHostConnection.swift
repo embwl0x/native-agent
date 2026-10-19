@@ -1,19 +1,19 @@
 import AgentLinkTransport
+import AgentWorkspace
 import GrokLink
 import Foundation
 import CryptoKit
 import NativeAgentCore
 import Security
 import PersistenceCore
+import Experiences
 
-/// THE AGENT DOES THE SETUP ITSELF — narrowly, reversibly, and behind one card.
+/// One reversible setup path for discovery and the person's Connect action.
 ///
 /// Given a NAME, this finds the row, checks the host is really on this Mac,
 /// mints a key for THIS connection, and writes exactly one entry into that
-/// host's own configuration. Nothing here runs before the person has pressed
-/// the button on the card `cardText` composes: `agent_connect` is a confirm-tier
-/// tool, so the approval membrane files the card and the tool body only ever
-/// executes on the approved replay.
+/// host's own configuration. Discovery connects settings-file hosts without
+/// running them or granting authority. Other routes keep their approval cards.
 ///
 /// The key is minted per connection, stored through the existing peer-credential
 /// path, and written ONLY into that host's entry as an environment variable.
@@ -42,25 +42,22 @@ public enum AgentHostConnection {
         case notInstalled(String)
         case linkCommandMissing
         case notInApplications
-        case alreadyConnected(String)
-        case workspaceRequired
+        case workspaceRequired(String)
 
         public var errorDescription: String? {
             switch self {
-            case .workspaceRequired:
-                return "Name an existing workspace folder for this connection. Nothing was changed."
+            case .workspaceRequired(let checked):
+                return "Workspace check failed: \(checked). Supply an existing absolute directory when host.requiresWorkspace is true; omit workspace when false. Nothing was changed."
             case .unknownHost(let name):
-                return "I don't know how to set up \"\(name)\" yet. I know: "
+                return "No supported host matches \"\(name)\" in agents/recipes (host.id, displayName, aliases and route). Read agent.recipe, then correct a matching recipe or create one with a new host.id using agent.recipe_write. Known hosts: "
                     + AgentHostDirectory.knownNames.joined(separator: ", ")
                     + ". Nothing was changed."
             case .notInstalled(let name):
-                return "\(name) does not look installed on this Mac, so there is nothing to write into. Nothing was changed."
+                return "Installation check failed: \(name). Nothing was changed."
             case .linkCommandMissing:
-                return "The nativeagent-link command is not installed beside this app, so an entry would point at a command that does not exist. Nothing was changed."
+                return "Helper check failed: \(Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("nativeagent-link").path ?? "app executable unavailable") must be a regular installed nativeagent-link file. Reinstall the complete app bundle, then agent.verify. Nothing was changed."
             case .notInApplications:
-                return "Move NativeAgent to Applications first. Run from a disk image or quarantined copy, its link path would not last. Nothing was changed."
-            case .alreadyConnected(let name):
-                return "\(name) is already connected. Disconnect it first if you want a new key."
+                return "Helper path \(AgentHostDirectory.linkCommandPath() ?? "missing") is under /Volumes or /AppTranslocation. Move the complete app to Applications so its connector path persists, then agent.verify. Nothing was changed."
             }
         }
     }
@@ -74,7 +71,7 @@ public enum AgentHostConnection {
         /// agent reaches the install that minted its key rather than whichever
         /// one happens to own the machine-wide rendezvous. A path, not a secret.
         public let descriptorPath: String
-        public let existing: AgentPeerContact?
+        public var existing: AgentPeerContact?
         public var workingDirectory: URL = FileManager.default.temporaryDirectory
         public var contactID: String = UUID().uuidString.lowercased()
         public var executable: AgentACPExecutable? = nil
@@ -85,15 +82,19 @@ public enum AgentHostConnection {
     // MARK: - Look it up
 
     public static func propose(name: String, store: AgentPeerStore, dataRoot: URL, workspace: String? = nil, workingDirectory: String? = nil) throws -> Proposal {
-        guard var row = AgentHostDirectory.row(named: name) else { throw Refusal.unknownHost(name) }
+        var named = try store.list().first { $0.id == name || "peer:" + $0.id == name }
+        guard var row = AgentHostDirectory.row(named: named.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? name) else { throw Refusal.unknownHost(name) }
         guard row.settingsSupported || row.format == .shellEnvironment || row.acp != nil || row.route == .grokBot else { throw Refusal.unknownHost(name) }
-        let folder = try workspaceFolder(row: row, workspace: workspace)
+        let folder = try workspaceFolder(row: row, workspace: workspace ?? named?.hostWorkspace)
+        // A contact's key never leaves its own workspace: another folder is that folder's own contact.
+        if folder != named?.hostWorkspace { named = nil }
         if let folder { row.configPath = folder + "/" + row.configPath }
-        guard row.isInstalled else { throw Refusal.notInstalled(row.displayName) }
+        if let failure = row.installation.failure { throw failure }
+        guard row.isInstalled else { throw Refusal.notInstalled(row.installationCheck) }
         guard let command = AgentHostDirectory.linkCommandPath() else { throw Refusal.linkCommandMissing }
         // A translocated or mounted copy's path vanishes; the entry would point nowhere.
         guard !command.contains("/AppTranslocation/"), !command.hasPrefix("/Volumes/") else { throw Refusal.notInApplications }
-        let existing = try store.list().first {
+        let existing = try named ?? store.list().first {
             row.route == .grokBot ? $0.transport == .grokBot : row.acp != nil
                 ? $0.transport == .acp && AgentPeerStore.hostRowID($0.endpoint) == row.id
                 : $0.transport == .mcpHost && settingsPath(contact: $0) == row.expandedConfigPath
@@ -101,11 +102,11 @@ public enum AgentHostConnection {
         let contactID = existing?.id ?? UUID().uuidString.lowercased()
         let directory: URL
         if let workingDirectory {
-            guard row.acp != nil, workingDirectory.hasPrefix("/") else { throw Refusal.unknownHost("ACP requires an absolute project folder") }
+            guard row.acp != nil, workingDirectory.hasPrefix("/") else { throw Refusal.workspaceRequired("host.acp and working_directory=\(workingDirectory); ACP needs an existing absolute project directory") }
             directory = URL(fileURLWithPath: workingDirectory).standardizedFileURL.resolvingSymlinksInPath()
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                throw Refusal.notInstalled("Project folder \(directory.path)")
+                throw Refusal.notInstalled("working_directory=\(directory.path) must exist and be a directory; supply that folder to agent.connect")
             }
         } else if let saved = existing?.acpWorkingDirectory {
             directory = URL(fileURLWithPath: saved)
@@ -114,7 +115,7 @@ public enum AgentHostConnection {
                 .appendingPathComponent("agent-bridge-runs/" + (row.acp != nil ? row.id : contactID))
         }
         let executable = try row.acp.map { line in
-            guard let path = row.resolveExecutable(line.executable) else { throw Refusal.notInstalled(row.displayName) }
+            guard let path = row.resolveExecutable(line.executable) else { throw Refusal.notInstalled(row.installationCheck) }
             return try AgentACPExecutable.capture(path: path)
         }
         return Proposal(row: row, command: command,
@@ -125,16 +126,17 @@ public enum AgentHostConnection {
     }
 
     static func workspaceFolder(row: AgentHostRow, workspace: String?) throws -> String? {
+        let checked = "agents/recipes/\(row.id).json host.requiresWorkspace=\(row.requiresWorkspace), workspace=\(workspace ?? "missing")"
         guard row.requiresWorkspace else {
-            guard workspace == nil else { throw Refusal.workspaceRequired }
+            guard workspace == nil else { throw Refusal.workspaceRequired(checked) }
             return nil
         }
-        guard let workspace else { throw Refusal.workspaceRequired }
+        guard let workspace else { throw Refusal.workspaceRequired(checked) }
         let expanded = AgentHostDirectory.expand(workspace)
         var directory: ObjCBool = false
         guard expanded.hasPrefix("/"), !expanded.contains("\0"),
               FileManager.default.fileExists(atPath: expanded, isDirectory: &directory), directory.boolValue else {
-            throw Refusal.workspaceRequired
+            throw Refusal.workspaceRequired(checked)
         }
         return URL(fileURLWithPath: expanded).resolvingSymlinksInPath().standardizedFileURL.path
     }
@@ -190,7 +192,7 @@ public enum AgentHostConnection {
         return """
         Connect \(row.displayName) to \(appName)?
         I'll add a messaging connection to \(row.displayName)'s settings so we can exchange messages on this Mac. Existing settings will be preserved.
-        Changes: \(AgentHostDirectory.changesLine(row: row, command: proposal.command))\(row.id == "antigravity-cli" ? "\nAntigravity permissions: allow only this connection's agent_message and agent_reply MCP tools. Disconnect removes only allowances added here; existing Ask/Deny rules are never overridden." : "")
+        Changes: \(AgentHostDirectory.changesLine(row: row, command: proposal.command))\(row.messagingPermissionsPath != nil ? "\nMessaging permissions (host.messagingPermissionsPath=\(row.messagingPermissionsPath!)): allow only this connection's agent_message and agent_reply MCP tools. Disconnect removes only allowances added here; existing Ask/Deny rules are never overridden." : "")
         Access: \(AgentHostDirectory.accessSummary)
         Restart: \(row.restartNote)\(Self.probeLine(proposal))
         You can disconnect later. This does not open access from the network.
@@ -216,7 +218,7 @@ public enum AgentHostConnection {
     /// message that asks for nothing to be read, changed or run.
     private static func probeLine(_ proposal: Proposal) -> String {
         let row = proposal.row
-        guard let executable = proposal.executablePath else { return "\nCheck: no executable found; nothing will run." }
+        guard let executable = proposal.executablePath else { return "\nCheck: host.commandLine in agents/recipes/\(row.id).json supplies no executable. agent.verify checks host.configPath=\(row.expandedConfigPath); an inbound message through its connector proves the connection. Nothing will run." }
         if row.commandLine?.automaticMCPProbe == false {
             return "\nExecutable: \(executable)\nCheck: send a message after setup to verify the connection; setup itself does not run this agent."
         }
@@ -232,119 +234,187 @@ public enum AgentHostConnection {
     /// Mint, store, write, save — in that order, and every step undone if a
     /// later one fails. The returned projection never contains the key.
     public static func connect(proposal: Proposal, store: AgentPeerStore) throws
-        -> (contact: AgentPeerContact, outcome: AgentHostConfigWriter.Outcome) {
-        if proposal.row.route == .grokBot {
-            if let existing = proposal.existing {
-                return (existing, .init(path: "", backupPath: nil, replacedExistingEntry: false, removed: false))
+        -> (contact: AgentPeerContact, outcome: AgentHostConfigWriter.Outcome, permissionsChanged: Bool) {
+        // Both doors hold the settings path through mint, splice, receipts and save.
+        try CredentialFileLock.withLock(URL(fileURLWithPath: proposal.row.expandedConfigPath.isEmpty
+            ? backupRecordURL(row: proposal.row, store: store).path : proposal.row.expandedConfigPath)) {
+            var proposal = proposal
+            proposal.existing = try store.list().first {
+                if let existing = proposal.existing { return $0.endpoint == existing.endpoint && $0.id == existing.id }
+                return AgentPeerStore.hostRowID($0.endpoint) == proposal.row.id && $0.hostWorkspace == proposal.workspace
             }
-            var contact = AgentPeerContact(id: proposal.contactID, name: proposal.row.displayName,
-                endpoint: URL(string: "grok://grok-bot")!, transport: .grokBot)
+            if proposal.row.route == .grokBot {
+                if let existing = proposal.existing {
+                    return (existing, .init(path: "", backupPath: nil, replacedExistingEntry: false, removed: false), false)
+                }
+                var contact = AgentPeerContact(id: proposal.contactID, name: proposal.row.displayName,
+                    endpoint: URL(string: "grok://grok-bot")!, transport: .grokBot)
+                contact.credentialKey = AgentPeerContact.credentialKey(for: contact.id)
+                contact.approvedExecutablePath = proposal.command
+                contact.grokSetup = "creating"
+                let secret = try mintKey()
+                try AgentPeerCredentials.write(secret, peerID: contact.id)
+                do {
+                    try GrokLinkCredential(descriptorPath: proposal.descriptorPath, replyToken: secret).write(peer: contact.id, helperPath: proposal.command)
+                    _ = try store.upsert(contact)
+                } catch {
+                    try? GrokLinkCredential.delete(peer: contact.id)
+                    try? AgentPeerCredentials.delete(peerID: contact.id)
+                    throw error
+                }
+                return (contact, .init(path: "", backupPath: nil, replacedExistingEntry: false, removed: false), false)
+            }
+            if proposal.row.acp != nil {
+                guard proposal.executable?.isCurrent == true,
+                      proposal.executablePath == nil || proposal.executablePath == proposal.executable?.path
+                else { throw Refusal.notInstalled("ACP receipt at \(proposal.executable?.path ?? "missing") failed its file identity/digest check against host.acp.executable; connect again to approve the installed program. \(proposal.row.installationCheck)") }
+                if var contact = proposal.existing {
+                    contact.acpExecutable = proposal.executable
+                    contact.approvedExecutablePath = proposal.executable?.path
+                    contact.acpWorkingDirectory = proposal.workingDirectory.path
+                    contact = try store.upsert(contact, resetProof: true)
+                    return (contact, AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false), false)
+                }
+            } else if var contact = proposal.existing {
+                let saved = try AgentPeerCredentials.read(peerID: contact.id)
+                // Retire old proof before a replacement key can authenticate.
+                // The store preserves the contact's identity and elevation; a
+                // contact saved before it had a key gets its own key slot here.
+                if saved == nil || contact.credentialKey == nil {
+                    contact.credentialKey = AgentPeerContact.credentialKey(for: contact.id)
+                    contact = try store.upsert(contact, resetProof: true)
+                }
+                let secret = try saved ?? mintKey()
+                if saved == nil { try AgentPeerCredentials.write(secret, peerID: contact.id) }
+                var permissionsChanged = false
+                do {
+                    permissionsChanged = try ensureMessagingPermissions(contact: contact, store: store)
+                    let outcome = try AgentHostConfigWriter.$repairingPeer.withValue(contact.id) {
+                        try writeEntry(proposal, secret: secret, store: store)
+                    }
+                    if saved != nil, outcome.backupPath != nil { contact = try store.upsert(contact, resetProof: true) }
+                    return (contact, outcome, permissionsChanged)
+                }
+                catch {
+                    if saved == nil { try AgentPeerCredentials.delete(peerID: contact.id) }
+                    if permissionsChanged { try removeMessagingPermissions(contact: contact, store: store) }
+                    throw error
+                }
+            }
+            let row = proposal.row
+            guard row.settingsSupported || row.format == .shellEnvironment || row.acp != nil else { throw Refusal.unknownHost(row.displayName) }
+            guard let endpoint = URL(string: (row.acp == nil ? "mcp://" : "acp://") + row.id) else { throw Refusal.unknownHost(row.id) }
+            var contact = AgentPeerContact(id: proposal.contactID, name: row.displayName, endpoint: endpoint, transport: row.acp == nil ? .mcpHost : .acp)
+            if row.acp != nil {
+                contact.acpWorkingDirectory = proposal.workingDirectory.path
+                contact.acpExecutable = proposal.executable
+                try FileManager.default.createDirectory(at: proposal.workingDirectory, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+            }
+            contact.hostWorkspace = proposal.workspace
+            contact.approvedExecutablePath = proposal.executable?.path ?? proposal.executablePath
+            // A command contact's receipt: the file a Full Mac launch of it may run.
+            if row.acp == nil, row.commandLine != nil, let path = contact.approvedExecutablePath {
+                contact.acpExecutable = try? AgentACPExecutable.capture(path: path)
+            }
             contact.credentialKey = AgentPeerContact.credentialKey(for: contact.id)
-            contact.approvedExecutablePath = proposal.command
-            contact.grokSetup = "creating"
+            try AgentPeerStore.validate(contact)
+
             let secret = try mintKey()
             try AgentPeerCredentials.write(secret, peerID: contact.id)
             do {
-                try GrokLinkCredential(descriptorPath: proposal.descriptorPath, replyToken: secret).write(peer: contact.id, helperPath: proposal.command)
-                _ = try store.upsert(contact)
+                let outcome = try writeEntry(proposal, secret: secret, store: store)
+                do {
+                    let permissionsChanged = try ensureMessagingPermissions(contact: contact, store: store)
+                    _ = try store.upsert(contact)
+                    return (contact, outcome, permissionsChanged)
+                }
+                catch {
+                    if row.acp == nil, row.format != .sessionMCP {
+                        try? removeMessagingPermissions(contact: contact, store: store)
+                        try? removeEntry(row: row, store: store, peerID: contact.id)
+                    }
+                    throw error
+                }
             } catch {
-                try? GrokLinkCredential.delete(peer: contact.id)
                 try? AgentPeerCredentials.delete(peerID: contact.id)
-                throw error
+                if let decided = error as? ToolFailureError, decided.personDecides { throw decided }
+                throw AgentHostConfigWriter.Failure.unreadable("host.configPath=\(row.expandedConfigPath), host.format=\(row.format.rawValue): \(error.localizedDescription). Correct that file or those recipe fields, then agent.verify")
             }
-            return (contact, .init(path: "", backupPath: nil, replacedExistingEntry: false, removed: false))
         }
-        if proposal.row.acp != nil {
-            guard proposal.executable?.isCurrent == true,
-                  proposal.executablePath == nil || proposal.executablePath == proposal.executable?.path
-            else { throw Refusal.notInstalled("The approved executable changed; connect again") }
-            if var contact = proposal.existing {
-                contact.acpExecutable = proposal.executable
-                contact.approvedExecutablePath = proposal.executable?.path
-                contact.acpWorkingDirectory = proposal.workingDirectory.path
-                contact = try store.upsert(contact, resetProof: true)
-                return (contact, AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false))
-            }
-        } else {
-            guard proposal.existing == nil else { throw Refusal.alreadyConnected(proposal.row.displayName) }
-        }
-        let row = proposal.row
-        guard row.settingsSupported || row.format == .shellEnvironment || row.acp != nil else { throw Refusal.unknownHost(row.displayName) }
-        guard let endpoint = URL(string: (row.acp == nil ? "mcp://" : "acp://") + row.id) else { throw Refusal.unknownHost(row.id) }
-        var contact = AgentPeerContact(id: proposal.contactID, name: row.displayName, endpoint: endpoint, transport: row.acp == nil ? .mcpHost : .acp)
-        if row.acp != nil {
-            contact.acpWorkingDirectory = proposal.workingDirectory.path
-            contact.acpExecutable = proposal.executable
-            try FileManager.default.createDirectory(at: proposal.workingDirectory, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-        }
-        contact.hostWorkspace = proposal.workspace
-        contact.approvedExecutablePath = proposal.executable?.path ?? proposal.executablePath
-        // A command contact's receipt: the file a Full Mac launch of it may run.
-        if row.acp == nil, row.commandLine != nil, let path = contact.approvedExecutablePath {
-            contact.acpExecutable = try? AgentACPExecutable.capture(path: path)
-        }
-        contact.credentialKey = AgentPeerContact.credentialKey(for: contact.id)
-        try AgentPeerStore.validate(contact)
+    }
 
-        let secret = try mintKey()
-        try AgentPeerCredentials.write(secret, peerID: contact.id)
-        do {
-            let outcome: AgentHostConfigWriter.Outcome
-            if row.acp != nil {
-                outcome = AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false)
-            } else {
-            switch row.format {
+    private static func writeEntry(_ proposal: Proposal, secret: String, store: AgentPeerStore) throws -> AgentHostConfigWriter.Outcome {
+        let row = proposal.row
+        let peerID = proposal.existing?.id ?? proposal.contactID
+        if row.acp != nil { return .init(path: "", backupPath: nil, replacedExistingEntry: false, removed: false) }
+        switch row.format {
             case .shellEnvironment:
-                outcome = try AgentHostConfigWriter.writeEnvironment(path: row.expandedConfigPath,
-                    descriptorPath: proposal.descriptorPath, peerID: contact.id, secret: secret)
+                return try AgentHostConfigWriter.writeEnvironment(path: row.expandedConfigPath,
+                    descriptorPath: proposal.descriptorPath, peerID: peerID, secret: secret)
             case .sessionMCP:
-                outcome = AgentHostConfigWriter.Outcome(path: "", backupPath: nil, replacedExistingEntry: false, removed: false)
+                return .init(path: "", backupPath: nil, replacedExistingEntry: false, removed: false)
             case .jsonMCPServers, .jsonBareMCPServers, .jsonContextServers, .jsonServers:
-                outcome = try AgentHostConfigWriter.writeJSONEntry(
+                return try AgentHostConfigWriter.writeJSONEntry(
                     path: row.expandedConfigPath,
                     name: AgentHostDirectory.entryName,
                     entryJSON: AgentHostDirectory.jsonEntry(
-                        command: proposal.command, peerID: contact.id, secret: secret,
+                        command: proposal.command, peerID: peerID, secret: secret,
                         descriptorPath: proposal.descriptorPath, format: row.format),
                     backupRecordURL: backupRecordURL(row: row, store: store),
                     containerKey: row.format.containerKey, comments: row.format.comments, trailingCommas: row.format.trailingCommas)
             case .gooseYAML:
-                outcome = try AgentHostConfigWriter.writeGooseEntry(
+                return try AgentHostConfigWriter.writeGooseEntry(
                     path: row.expandedConfigPath, name: AgentHostDirectory.entryName,
-                    entryJSON: AgentHostDirectory.jsonEntry(command: proposal.command, peerID: contact.id,
+                    entryJSON: AgentHostDirectory.jsonEntry(command: proposal.command, peerID: peerID,
                         secret: secret, descriptorPath: proposal.descriptorPath, format: row.format),
                     backupRecordURL: backupRecordURL(row: row, store: store))
             case .codexTOML:
-                outcome = try AgentHostConfigWriter.writeTOMLEntry(
+                return try AgentHostConfigWriter.writeTOMLEntry(
                     path: row.expandedConfigPath,
                     name: AgentHostDirectory.entryName,
                     entryTOML: AgentHostDirectory.codexEntry(
-                        command: proposal.command, peerID: contact.id, secret: secret,
+                        command: proposal.command, peerID: peerID, secret: secret,
                         descriptorPath: proposal.descriptorPath),
                     backupRecordURL: backupRecordURL(row: row, store: store))
-            }
-            }
-            do {
-                _ = try ensureMessagingPermissions(contact: contact, store: store)
-                _ = try store.upsert(contact)
-            }
-            catch {
-                // Undo only our entry using its ownership receipt, which also
-                // restores any entry it replaced. A whole-file backup would
-                // overwrite settings the host saved after our write.
-                if row.acp != nil || row.format == .sessionMCP {
-                    // No settings were changed.
-                } else {
-                    try? removeMessagingPermissions(contact: contact, store: store)
-                    try? removeEntry(row: row, store: store, peerID: contact.id)
+        }
+    }
+
+    /// The same proposal and splice as Connect, stopping before any write or mint.
+    package static func verifySetup(name: String, store: AgentPeerStore, dataRoot: URL, workspace: String? = nil) -> JSONValue {
+        var checked = "agents/recipes/\(name).json host.id/displayName/aliases"
+        do {
+            let proposal = try propose(name: name, store: store, dataRoot: dataRoot, workspace: workspace)
+            checked = "agents/recipes/\(proposal.row.id).json host.configPath=\(proposal.row.expandedConfigPath), host.format=\(proposal.row.format.rawValue)"
+            return try CredentialFileLock.withLock(URL(fileURLWithPath: proposal.row.expandedConfigPath)) {
+                let secret: String
+                if let peer = proposal.existing {
+                    guard let saved = try AgentPeerCredentials.read(peerID: peer.id) else {
+                        return .object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
+                            "detail": .string("This contact's Keychain key is missing. Connect repairs this same contact and rewrites its connector entry; no disconnect is needed."),
+                            "remedy": Repair.remedy(owner: "Keychain peer:" + peer.id, nextCall: .object(["tool": .string("app"),
+                                "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer.id)])])]), tap: nil)])
+                    }
+                    secret = saved
+                } else { secret = "dry-run" }
+                _ = try AgentHostConfigWriter.$checking.withValue(proposal.existing != nil) {
+                    _ = try writeEntry(proposal, secret: secret, store: store)
+                    let peer = proposal.existing ?? AgentPeerContact(id: proposal.contactID, name: proposal.row.displayName,
+                        endpoint: URL(string: "mcp://" + proposal.row.id)!, transport: .mcpHost)
+                    _ = try ensureMessagingPermissions(contact: peer, store: store)
                 }
-                throw error
+                return .object(["status": .string("passed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
+                    "detail": .string("Checked \(proposal.row.installationCheck) host.configPath=\(proposal.row.expandedConfigPath), host.format=\(proposal.row.format.rawValue), helper=\(proposal.command). \(proposal.existing == nil ? "The Connect splice accepts these settings; agent.connect will mint its credential and save its peer." : "The settings match this contact's helper, descriptor, peer ID and credential.") No message crossed; restart: \(proposal.row.restartNote)")])
             }
-            return (contact, outcome)
+        } catch let failure as ToolFailureError where failure.owner != nil {
+            return .object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
+                "detail": .string(failure.localizedDescription),
+                "remedy": failure.personDecides
+                    ? Repair.why(owner: failure.owner!, tap: failure.tap ?? "")
+                    : Repair.remedy(owner: failure.owner!, nextCall: failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: failure.tap)])
         } catch {
-            try? AgentPeerCredentials.delete(peerID: contact.id)
-            throw error
+            return .object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
+                "detail": .string("Checked \(checked): \(error.localizedDescription) Read agent.recipe, correct its host fields with agent.recipe_write or the named file, then agent.verify.")])
         }
     }
 
@@ -383,31 +453,59 @@ public enum AgentHostConnection {
         }
         guard row.settingsSupported || row.format == .shellEnvironment else { throw Refusal.unknownHost(row.displayName) }
         if let path = settingsPath(contact: contact) { row.configPath = path }
-        // Keep the contact and ownership receipt until revocation succeeds,
-        // so a failed removal or key deletion can be retried.
-        try removeMessagingPermissions(contact: contact, store: store)
-        let outcome = try removeEntry(row: row, store: store, peerID: contact.id)
-        try AgentPeerCredentials.delete(peerID: contact.id)
-        _ = try store.remove(contact.id)
-        if row.format != .shellEnvironment {
-            try AgentHostConfigWriter.removeBackups(path: row.expandedConfigPath,
-                recordURL: backupRecordURL(row: row, store: store))
+        // Keep the person's no before revoking anything. Discovery and dismissal
+        // use this same lock, so an in-flight scan cannot erase the decision.
+        let root = store.fileURL.deletingLastPathComponent().deletingLastPathComponent()
+        try CredentialFileLock.withLock(AgentDiscoveryOffer.url(root)) {
+            guard var offers = AgentDiscoveryOffer.read(root) else { throw AgentHostConfigWriter.Failure.unreadable(AgentDiscoveryOffer.url(root).path) }
+            var entry = offers[id] ?? AgentDiscoveryOffer(name: row.displayName)
+            entry.declinedAt = Date()
+            offers[id] = entry
+            try AgentDiscoveryOffer.write(offers, root)
         }
-        return outcome
+        // Revoking our credential never depends on proving ownership of
+        // another application's bytes. Keep the contact for cleanup recovery.
+        return try CredentialFileLock.withLock(URL(fileURLWithPath: row.expandedConfigPath.isEmpty
+            ? backupRecordURL(row: row, store: store).path : row.expandedConfigPath)) {
+            try AgentPeerCredentials.delete(peerID: contact.id)
+            let operation = "peer.cleanup:" + contact.id
+            let outcome: AgentHostConfigWriter.Outcome
+            do {
+                try removeMessagingPermissions(contact: contact, store: store)
+                outcome = try removeEntry(row: row, store: store, peerID: contact.id)
+            } catch {
+                let id = "peer-cleanup:" + UUID().uuidString.lowercased()
+                let detail = "Credential revoked for peer:\(contact.id). Settings cleanup remains owed: \(error.localizedDescription). Restore the original ownership receipt, then disconnect this exact peer again; or let go of cleanup and preserve the unproven settings bytes."
+                RepairOwed.owe(root, id: id, kind: .act, operation: operation,
+                    owner: backupRecordURL(row: row, store: store).path, words: detail,
+                    nextCall: ToolFailureError.call("app", ["action": .string("repair.let_go"),
+                        "args": .object(["id": .string(id), "reason": .string("Credential revoked; preserve unproven settings bytes.")])]))
+                throw ToolFailureError(detail, effects: .occurred)
+            }
+            _ = try store.remove(contact.id)
+            if row.format != .shellEnvironment {
+                try AgentHostConfigWriter.removeBackups(path: row.expandedConfigPath,
+                    recordURL: backupRecordURL(row: row, store: store))
+            }
+            RepairOwed.settle(root, operation: operation, evidence: .init(source: row.expandedConfigPath, id: contact.id))
+            return outcome
+        }
     }
 
-    package static func ensureMessagingPermissions(contact: AgentPeerContact, store: AgentPeerStore) throws -> Bool {
-        guard AgentPeerStore.hostRowID(contact.endpoint) == "antigravity-cli" else { return false }
+    private static func ensureMessagingPermissions(contact: AgentPeerContact, store: AgentPeerStore) throws -> Bool {
+        guard let id = AgentPeerStore.hostRowID(contact.endpoint),
+              let path = AgentHostDirectory.row(named: id)?.messagingPermissionsPath else { return false }
         let outcome = try AgentHostConfigWriter.grantAntigravityMessaging(
-            path: AgentHostDirectory.expand("~/.gemini/antigravity-cli/settings.json"),
+            path: AgentHostDirectory.expand(path),
             server: AgentHostDirectory.entryName, peerID: contact.id, recordURL: permissionRecord(contact, store))
         return outcome.backupPath != nil
     }
 
     private static func removeMessagingPermissions(contact: AgentPeerContact, store: AgentPeerStore) throws {
-        guard AgentPeerStore.hostRowID(contact.endpoint) == "antigravity-cli" else { return }
+        guard let id = AgentPeerStore.hostRowID(contact.endpoint),
+              let path = AgentHostDirectory.row(named: id)?.messagingPermissionsPath else { return }
         try AgentHostConfigWriter.removeAntigravityMessaging(
-            path: AgentHostDirectory.expand("~/.gemini/antigravity-cli/settings.json"),
+            path: AgentHostDirectory.expand(path),
             server: AgentHostDirectory.entryName, peerID: contact.id, recordURL: permissionRecord(contact, store))
     }
 

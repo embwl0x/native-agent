@@ -416,7 +416,7 @@ extension TelegramPollLoop {
                         case .held: break
                         case .delivered:
                             if let session = claim.assistantSessionId, let run = claim.assistantRunId {
-                                try settleReplyCheckpoint(sessionId: session, runId: run)
+                                try await settleReplyCheckpoint(sessionId: session, runId: run, verdict: "completed")
                             }
                             _ = try await updateInbox.transition(updateId: claim.updateId,
                                 from: [.processing, .completed, .outcomeUnknown, .sentUnconfirmed], to: .completed)
@@ -743,17 +743,11 @@ extension TelegramPollLoop {
                     sizeBytes: bytes.count, bytes: bytes, captureFilename: downloaded.captureFilename
                 )]
             }
-            let progress = makeProgressSink(delivery: delivery, card: card)
-            let generatedImages = TelegramGeneratedImageCollector()
-            let capturingProgress: TelegramChatProgressSink = { event in
-                await generatedImages.record(event)
-                await progress(event)
-            }
-            let reply = try await runChatHandler(
+            let (reply, imagePaths) = try await runChatHandler(
                 destination: message.destination,
                 text: retryText,
                 attachments: attachments,
-                progress: capturingProgress,
+                progress: makeProgressSink(delivery: delivery, card: card),
                 replyTo: retryMessage?.replyTo,
                 fromUserId: retryMessage?.fromUserId ?? message.fromUserId,
                 suppressUserAppend: true,
@@ -762,11 +756,11 @@ extension TelegramPollLoop {
             )
             try Task.checkCancellation()
             if !reply.isEmpty {
-                let deliveryOutcome = await delivery.finalize(reply: reply, imagePaths: await generatedImages.snapshot())
+                let deliveryOutcome = await delivery.finalize(reply: reply, imagePaths: imagePaths)
                 switch deliveryOutcome {
                 case .held: break
                 case .delivered:
-                    try settleReplyCheckpoint(sessionId: sessionId, runId: turnId.uuidString)
+                    try await settleReplyCheckpoint(sessionId: sessionId, runId: turnId.uuidString, verdict: "completed")
                     await recordReceipt(kind: "retry_reply", update: update, message: message, text: commandText, reply: reply)
                     await card.transition(.completed(summary: nil))
                 case .failed(let reason):

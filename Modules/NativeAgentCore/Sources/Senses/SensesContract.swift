@@ -250,10 +250,33 @@ public struct SenseFailure: Codable, Sendable, Hashable, Error {
     public var inputExcerpt: String?
     /// The runner attaches the same provenance to failures as to served views.
     public var provenance: SenseProvenance?
+    public var remedy: JSONValue?
 
-    public init(code: String, message: String, inputExcerpt: String? = nil, provenance: SenseProvenance? = nil) {
+    public init(code: String, message: String, inputExcerpt: String? = nil, provenance: SenseProvenance? = nil, remedy: JSONValue? = nil) {
         self.code = code; self.message = message; self.inputExcerpt = inputExcerpt
         self.provenance = provenance
+        self.remedy = remedy
+    }
+
+    public init(_ error: Error, code: String = "failed") {
+        if let failure = error as? SenseFailure { self = failure; return }
+        let failure = error as? ToolFailureError
+        self.init(code: code, message: error.localizedDescription)
+        guard let failure else { return }
+        let call = failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        if let owner = failure.owner {
+            remedy = if failure.personDecides, let tap = failure.tap {
+                Repair.why(owner: owner, tap: tap)
+            } else { Repair.remedy(owner: owner, nextCall: call, tap: failure.tap) }
+        } else if let call {
+            remedy = .object(["kind": .string(failure.argumentPath == nil ? "inspect" : "correct_arguments"),
+                              "instruction": .string(failure.message), "next_call": call])
+        }
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(code); hasher.combine(message)
+        hasher.combine(inputExcerpt); hasher.combine(provenance)
     }
 }
 

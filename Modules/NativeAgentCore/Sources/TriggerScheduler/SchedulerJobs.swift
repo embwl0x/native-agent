@@ -840,10 +840,9 @@ extension SwiftNativeTriggerScheduler {
     public func settleOccurrence(
         jobId: String, occurrenceKey: String, status: String, detail: String,
         output: JSONValue, at runDate: Date, runDateKey: String
-    ) async throws -> Int? {
-        try await persistence.withFileLock(jobsPath) { () async throws -> Int? in
+    ) async throws {
+        try await persistence.withFileLock(jobsPath) {
             var rows = try Self.readJobsChecked(at: jobsPath)
-            var parkedAttempts: Int?
             var found = false
             for idx in rows.indices {
                 guard case .object(var obj) = rows[idx],
@@ -871,38 +870,14 @@ extension SwiftNativeTriggerScheduler {
                     // Keep the run's evidence without consuming the newly saved schedule.
                 } else if oneShot {
                     obj["enabled"] = .bool(false)
-                    obj["completedAt"] = .string(Self.isoTimestamp(runDate))
-                    Self.clearRetryState(&obj)
-                } else if let retryFloor = Self.retryEpoch(from: output, runDate: runDate) {
-                    // FIX 2 (A4.4): per-job retry count + exponential backoff +
-                    // a daily attempt cap. The retry stamp IS the backoff
-                    // carrier and composes with FIX 1 (catch-up honors
-                    // retryPendingUntilEpoch as a floor).
-                    let todayKey = runDateKey
-                    let sameDay = SchedulerJobRuntime.string(obj["retryDayKey"]) == todayKey
-                    let priorCount = sameDay ? SchedulerJobRuntime.int(obj["retryCount"], default: 0) : 0
-                    let attempt = priorCount + 1
-                    obj["retryDayKey"] = .string(todayKey)
-                    obj["retryCount"] = .int(Int64(attempt))
-                    if attempt > Self.maxRetryAttemptsPerDay {
-                        // Cap reached: PARK. Stop retrying today, reschedule to
-                        // the next natural run, drop the pending-retry floor,
-                        // and mark the day parked so catch-up stays disarmed.
-                        // A receipt is emitted below (never a silent give-up).
-                        obj["retryParkedDateKey"] = .string(todayKey)
-                        obj.removeValue(forKey: "retryPendingUntilEpoch")
-                        if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
-                            Self.stampNextRun(&obj, epoch: next)
-                        }
-                        parkedAttempts = attempt - 1
+                    if status == "completed" {
+                        obj["completedAt"] = .string(Self.isoTimestamp(runDate))
                     } else {
-                        let backoff = runDate
-                            .addingTimeInterval(Double(Self.retryBackoffSeconds(attempt: attempt)))
-                            .timeIntervalSince1970
-                        let retry = max(retryFloor, backoff)
-                        Self.stampNextRun(&obj, epoch: retry)
-                        obj["retryPendingUntilEpoch"] = .int(Int64(retry))
+                        obj.removeValue(forKey: "completedAt")
+                        obj["pausedAt"] = .string(Self.isoTimestamp(runDate))
+                        obj["disabledReason"] = .string("occurrence was not completed; review its retained result before resuming")
                     }
+                    Self.clearRetryState(&obj)
                 } else if let next = try? SchedulerJobRuntime.nextRunEpochAfterNow(for: .object(obj), now: { runDate }) {
                     Self.stampNextRun(&obj, epoch: next)
                     Self.clearRetryState(&obj)
@@ -922,7 +897,6 @@ extension SwiftNativeTriggerScheduler {
                 ])
             }
             try await persistence.writeDataAtomicDurable(SwiftNativeTriggerScheduler.jobsDataForWrite(rows), to: jobsPath)
-            return parkedAttempts
         }
 
     }
@@ -1044,37 +1018,6 @@ extension SwiftNativeTriggerScheduler {
             rows.append(nextValue)
         }
         return true
-    }
-
-    static func retryEpoch(from output: JSONValue, runDate: Date) -> Double? {
-        guard case .object(let obj) = output else { return nil }
-        if let explicit = SchedulerJobRuntime.epoch(from: obj["retryAtEpoch"] ?? obj["retry_at_epoch"]) {
-            return max(explicit, runDate.addingTimeInterval(60).timeIntervalSince1970)
-        }
-        let after = SchedulerJobRuntime.int(
-            obj["retryAfterSeconds"] ?? obj["retry_after_seconds"],
-            default: 0
-        )
-        guard after > 0 else { return nil }
-        return runDate.addingTimeInterval(Double(max(60, after))).timeIntervalSince1970
-    }
-
-    // MARK: - FIX 2 (A4.4): retry count + exponential backoff + daily cap.
-
-    /// Consecutive retryable failures a job may accrue in a single day before
-    /// it is PARKED (stops retrying, reschedules to its next natural run, and
-    /// leaves a receipt) instead of retrying forever at the 60s due-floor.
-    static let maxRetryAttemptsPerDay = 6
-
-    /// Exponential backoff carried by the retry stamp: 15m → 30m → 60m (cap).
-    /// The stamp itself is the backoff carrier — FIX 1's floor keeps the
-    /// catch-up path from collapsing it.
-    static func retryBackoffSeconds(attempt: Int) -> Int {
-        switch attempt {
-        case ..<2: return 15 * 60
-        case 2: return 30 * 60
-        default: return 60 * 60
-        }
     }
 
     /// Stamp the canonical next-run trio on a job row.

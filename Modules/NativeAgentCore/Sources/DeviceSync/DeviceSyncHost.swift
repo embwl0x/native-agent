@@ -17,6 +17,13 @@ public typealias DeviceSyncSnapshotRows = any Encodable & Sendable
 public protocol DeviceSyncTranscriptMessage: Encodable {
     var id: String { get }
     var content: String { get set }
+    /// False for a row that is hers alone (her wake inputs): the phone's view
+    /// of the conversation omits it, though it still anchors history paging.
+    var isPersonVisible: Bool { get }
+}
+
+extension DeviceSyncTranscriptMessage {
+    public var isPersonVisible: Bool { true }
 }
 
 /// A transcript row in a published chat snapshot: the app's own encoding.

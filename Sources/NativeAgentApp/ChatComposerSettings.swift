@@ -238,7 +238,7 @@ extension QuietComposerCommands {
         let leftSimple = SimpleViewMode.isShowing
         if leftSimple { UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key) }
         guard coordinator.currentPage?.item == shown else {
-            return .refuse("rail", "page_not_shown", "The window has not switched to \(title).")
+            return .refuse("rail", "page_not_shown", "The window has not switched to \(title).", effects: .unknown)
         }
         return .done(
             "rail row \"\(title)\"",

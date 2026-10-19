@@ -35,7 +35,8 @@ public enum DeskSequencing {
     public struct ItemPlan: Sendable, Equatable {
         public var handle: String
         /// Live, NON-TERMINAL blockers only. A blocker that closed, was canceled,
-        /// was archived, or simply isn't in live state DOES NOT BLOCK.
+        /// was archived, or simply isn't in live state DOES NOT BLOCK. An exp:
+        /// condition blocks until its settlement is written back (MyQueueReady.release).
         public var effectiveBlockers: [String]
         /// `deferUntil` parses AND is strictly in the future.
         public var isDeferred: Bool
@@ -130,8 +131,10 @@ public enum DeskSequencing {
 
         // A blocker only blocks while it is LIVE and NON-TERMINAL. Absent from
         // live state (archived, never existed, aged out) → does not block. THIS
-        // is the cascade.
+        // is the cascade. An experience condition blocks until its release is
+        // written onto the item, so every reader of the Desk sees the same wait.
         func blocks(_ handle: String) -> Bool {
+            if handle.hasPrefix("exp:") { return true }
             guard let item = byHandle[handle] else { return false }
             return !item.status.isTerminal
         }
@@ -162,7 +165,7 @@ public enum DeskSequencing {
             while let cur = current, depth < deskMaxGraphDepth, seen.insert(cur).inserted {
                 depth += 1
                 guard let ancestor = byHandle[cur] else { return false }
-                if ancestor.requiresOwnerInput { return true }
+                if ancestor.status == .blocked || ancestor.requiresOwnerInput || ancestor.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false { return true }
                 if deferred[cur] == true { return true }
                 if !(effectiveBlockers[cur] ?? []).isEmpty { return true }
                 if onCycle.contains(cur) { return true }
@@ -178,8 +181,9 @@ public enum DeskSequencing {
             let isDef = deferred[item.handle] ?? false
             let cyc = onCycle.contains(item.handle)
             let rollup = subtreeRollup(item.handle, childrenOf: childrenOf, byHandle: byHandle)
-            let ready = !item.status.isTerminal
+            let ready = !item.status.isTerminal && item.status != .blocked
                 && !item.requiresOwnerInput
+                && item.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
                 && blockers.isEmpty
                 && !isDef
                 && !cyc
@@ -246,7 +250,7 @@ public enum DeskSequencing {
             visited.insert(node)
             onStack.insert(node)
             stackOrder.append(node)
-            for next in effectiveBlockers[node] ?? [] {
+            for next in effectiveBlockers[node] ?? [] where !next.hasPrefix("exp:") {
                 visit(next, depth: depth + 1)
             }
             onStack.remove(node)

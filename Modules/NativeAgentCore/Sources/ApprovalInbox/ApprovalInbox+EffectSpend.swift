@@ -81,29 +81,30 @@ extension SwiftNativeApprovalInbox {
 
     /// 2026-09-18: the executor's spend and the dispatch's consumption share
     /// one durable marker; a restart cannot reuse a still-fresh exemption.
-    func consumeApprovedReplayDispatch(id: String) async -> Bool {
+    func consumeApprovedReplayDispatch(id: String) async throws -> ApprovedReplayVerification {
         let path = effectSpendPath
-        do {
-            return try await persistence.withFileLock(path) { [persistence] in
-                var spends = try Self.loadEffectSpends(at: path)
-                guard case .object(var marker)? = spends[id],
-                      marker["dispatched"] == .bool(false) else { return false }
-                marker["dispatched"] = .bool(true)
-                spends[id] = .object(marker)
-                try await persistence.writeJSON(.object([
-                    "schema": .string(Self.effectSpendSchema), "spends": .object(spends),
-                ]), to: path)
-                return true
+        return try await persistence.withFileLock(path) { [persistence] in
+            var spends = try Self.loadEffectSpends(at: path)
+            guard case .object(var marker)? = spends[id] else { return .notSpentByExecutor }
+            guard case .bool(let dispatched)? = marker["dispatched"] else {
+                throw ApprovalInboxError.malformedResponse("approval effect spend marker has no valid dispatched state")
             }
-        } catch { return false }
+            if dispatched { return .alreadyConsumed }
+            marker["dispatched"] = .bool(true)
+            spends[id] = .object(marker)
+            try await persistence.writeJSON(.object([
+                "schema": .string(Self.effectSpendSchema), "spends": .object(spends),
+            ]), to: path)
+            return .verified
+        }
     }
 
     /// Read-only probe for the durable spend marker. Public since 2026-09-06:
     /// the dispatcher verifies a post-approval replay against it (an honest
     /// replay is one the executor spent moments before dispatching). Never
     /// mutates.
-    public func approvedEffectSpend(id: String) async -> JSONValue? {
-        guard let spends = try? Self.loadEffectSpends(at: effectSpendPath) else { return nil }
+    public func approvedEffectSpend(id: String) async throws -> JSONValue? {
+        let spends = try Self.loadEffectSpends(at: effectSpendPath)
         return spends[id.trimmingCharacters(in: .whitespacesAndNewlines)]
     }
 

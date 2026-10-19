@@ -180,6 +180,7 @@ extension ChatStore {
         message: String,
         args: ChatStore.PendingSendArgs
     ) {
+        iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
         var record = pendingExchanges[correlationID] ?? ChatPendingExchange(
             correlationID: correlationID,
             sessionID: Self.cleanSessionID(args.sessionID),
@@ -253,6 +254,7 @@ extension ChatStore {
     /// A terminal result — reply, error, cancel or session retirement — closes
     /// the record. Nothing else does.
     func closePendingExchange(_ correlationID: String) {
+        iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
         PhoneTurnActivity.shared.finish(correlationID)
         pendingExchanges.removeValue(forKey: correlationID)
     }

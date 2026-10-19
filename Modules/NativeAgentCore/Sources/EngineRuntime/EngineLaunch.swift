@@ -1,11 +1,13 @@
 import AuthoredCapabilities
 import Foundation
+import Context
 import OSLog
 import ApprovalTransactions
 import BackgroundLoops
 import BackgroundWork
 import Browser
 import ChatOrchestration
+import ChatToolRuntime
 import ChatSessionWork
 import Cognition
 import Connectors
@@ -57,7 +59,6 @@ public protocol EngineBackgroundWorkHost: Sendable {
     func postMacNotification(title: String, body: String, userInfo: [String: String], soundName: String?) async -> NativeAgentNotificationPostResult
     func notifyIfAttentionWorthy(dataRoot: URL, itemId: String, title: String, summary: String, source: String, severity: String) async
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult]
-    func wakeDoctorForPendingTransitions(dataRoot: URL) async
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String)
     func makeCompletionSender(dataRoot: URL, silentTelegram: Bool, requestedResultDeliveryID: String?, authorizeTelegramReply: @escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending
     var speechPermission: SpeechPermissionSnapshot { get }
@@ -94,19 +95,6 @@ extension NativeAgentEngine {
     }
 
     public static func installRuntimeObservationsAtLaunch(dataRoot: URL) {
-        AbilityStore.runVoices = { file in
-            Array(Set((file.kind == .skill ? SkillScript.voices(file.record ?? [:]) : []) + PeerDataTaint.abilitySources)).sorted()
-        }
-        AbilityStore.skillRollback = { root, id, version in
-            guard let entry = try InstalledSkillInventory.entries(dataRoot: root).first(where: { $0.id == id }) else { throw SkillsError.unknownSkill(id) }
-            _ = try SwiftNativeSkillsClient(root: root).rollbackScript(entry, version: version, steer: SkillScript.origin(steeredBy: PeerDataTaint.abilitySources))
-        }
-        AbilityStore.healArrival = { root, id, line, peers in
-            let line = TurnSecretRedactor.redactText(line)
-            return ResidentWake.shared.request(dataRoot: root, reason: "a part's run failed",
-                items: peers.isEmpty ? [.init(id: id, line: line, home: true)]
-                    : peers.map { .init(id: id + ":" + $0, line: line, agent: $0, home: true) })
-        }
         let crashLog = BodyReport.crashBreadcrumbs(dataRoot)
         do {
             try FileManager.default.createDirectory(at: crashLog.deletingLastPathComponent(),
@@ -210,7 +198,7 @@ extension NativeAgentEngine {
         }
         AbilityFilesCheck.recordSeedFailures(failures, root: dataRoot)
         if !failures.isEmpty {
-            _ = await MaintenanceBackgroundWork.routeDoctorRows([await AbilityFilesCheck(root: dataRoot).run()], dataRoot: dataRoot)
+            await DoctorStatusProjection.recordReadings([await AbilityFilesCheck(root: dataRoot).run()], dataRoot: dataRoot)
         }
     }
 
@@ -288,7 +276,22 @@ extension NativeAgentEngine {
             }
         }
         Task.detached(priority: .utility) { await NativeAgentEngine.liveCognition.bootstrap() }
-        Task.detached(priority: .utility) { await reconcileTranscriptsAtLaunch(dataRoot: dataRoot) }
+        Task.detached(priority: .utility) {
+            await reconcileTranscriptsAtLaunch(dataRoot: dataRoot)
+            // Behind her: the first launch with the index builds it; later
+            // launches absorb only what changed while she was away.
+            _ = ChatHistoryIndex.shared(dataRoot: dataRoot).absorbAll()
+        }
+        // The person's login PATH, read once here so no caller waits on it later.
+        Task.detached(priority: .utility) { _ = AgentHostCommandLines.loginEnvironment }
+        Task.detached(priority: .utility) {
+            do { try AgentLaneHandles.migrate(dataRoot: dataRoot) } catch {
+                Logger(subsystem: "com.nativeagent.app", category: "agents")
+                    .error("lane handles not migrated: \(String(describing: error), privacy: .public)")
+            }
+            _ = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: dataRoot)
+            await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot)
+        }
         Task.detached(priority: .utility) {
             await startBackgroundWorkAtLaunch(
                 dataRoot: dataRoot,
@@ -381,7 +384,8 @@ extension NativeAgentEngine {
             NativeAgentEngine.liveDeviceSync.bridge.setup()
             NativeAgentEngine.liveDeviceSync.bridge.observeIncomingMessages(onMessage: forward)
         }
-        Task.detached(priority: .userInitiated) { await PairingSecretManager.publishMaterialToKVS() }
+        // The bridge publishes the pairing key once it knows this Mac holds
+        // the phone; a launch never writes it over another Mac's.
         if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: PersistenceCore.defaultDataRoot()) {
             registerLoginItem()
         }
@@ -613,12 +617,12 @@ extension NativeAgentEngine {
             await MaintenanceBackgroundWork.fileLoopFailureNotice(
                 dataRoot: dataRoot, loopId: loopId, error: error)
         }
-        await manager.setFailureRecoveryPush { loopId, healthyAt in
-            await MaintenanceBackgroundWork.resolveLoopFailureNotice(
+        await manager.setFailureRecoveryPush { loopId, _ in
+            guard let healthyAt = await manager.status().first(where: { $0.name == loopId })?.lastSuccessfulWorkAt else { return false }
+            return await MaintenanceBackgroundWork.resolveLoopFailureNotice(
                 dataRoot: dataRoot, loopId: loopId, healthyAt: healthyAt)
         }
         guard await manager.start(loops: loops) else { return }
-        Task { await live.ports.backgroundWork.wakeDoctorForPendingTransitions(dataRoot: dataRoot) }
         // Refresh the heartbeat receipt after restart without blocking startup.
         Task { await manager.runTickOnce(loopId: "heartbeat") }
         guard NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot) else { return }
@@ -1122,7 +1126,7 @@ extension NativeAgentEngine {
     /// one-dream-per-night diary contract); the persisted Sunday job passes
     /// false so a "Run REM now" earlier the same week and the 04:30 job never
     /// distil the same dreams twice.
-    public static func runRem(dataRoot root: URL, force: Bool = true) async throws -> [String: Any] {
+    public static func runRem(dataRoot root: URL, force: Bool = true, repair: Bool = false) async throws -> [String: Any] {
         let cognition = cognitionRuntime(for: root)
         let impl = makeDreamREMCycle(
             root: root,
@@ -1130,6 +1134,10 @@ extension NativeAgentEngine {
             remStageApproval: DreamBackgroundWork.makeREMProposalStager(dataRoot: root, notifications: EngineREMProposalNotifications()),
             lifecycleObserver: cognition
         )
+        if repair {
+            let archived = try await impl.repairREM()
+            return ["ok": true, "archivedEntries": archived, "proposalsGenerated": 0, "repaired": true]
+        }
         return try await DreamBackgroundWork.runREM(
             dataRoot: root, cycle: impl, cognitionRuntime: cognition, force: force
         )
@@ -1267,6 +1275,11 @@ extension NativeAgentEngine {
 }
 
 extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
+    func diskStorageOwners(dataRoot: URL) -> [DiskStorageOwner] {
+        [TrustBackupPersistence.diskStorageOwner(dataRoot: dataRoot), ChatSessionRetention.diskStorageOwner,
+         ContextSQLiteStore.diskStorageOwner]
+    }
+
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult] {
         try await NativeAgentEngine.live.ports.backgroundWork.runAutoDoctor(checks: checks, dataRoot: dataRoot)
     }
@@ -1307,9 +1320,7 @@ extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
 // task. This wrapper owns no Task and no timer of its own.
 
 extension NativeAgentEngine {
-    public static func makeTriggerSchedulerLoop(
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> some LoopRunner {
+    public static func makeNativeTriggerScheduler(dataRoot: URL) -> SwiftNativeTriggerScheduler {
         let standardized = dataRoot.standardizedFileURL
         let isLiveRoot = standardized
             == PersistenceCore.defaultDataRoot().standardizedFileURL
@@ -1319,19 +1330,24 @@ extension NativeAgentEngine {
         let notifier: TriggerNotifier? = isLiveRoot
             ? NativeAgentEngine.live.ports.backgroundWork.triggerNotifier
             : nil
-        let native = SwiftNativeTriggerScheduler(
+        return SwiftNativeTriggerScheduler(
             root: standardized,
             workshopRunner: workshopRunner,
             notifier: notifier,
             worklogPath: isLiveRoot
                 ? nil
                 : standardized.appendingPathComponent("no-such-worklog.jsonl"),
-            // L5 G3: the time trigger fires the blueprint turn. Live root only —
-            // a secondary/test root must never borrow the provider, the tools,
-            // or the cost. nil there means the deterministic counts brief,
-            // exactly as before.
+            // Secondary roots never borrow the live turn or its provider spend.
             morningBriefSynthesizer: isLiveRoot ? makeMorningBriefSynthesizer() : nil
         )
+    }
+
+    public static func makeTriggerSchedulerLoop(
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
+    ) -> some LoopRunner {
+        let standardized = dataRoot.standardizedFileURL
+        let isLiveRoot = standardized == PersistenceCore.defaultDataRoot().standardizedFileURL
+        let native = makeNativeTriggerScheduler(dataRoot: standardized)
         let mirror: @Sendable (TriggerFireResult) async -> Bool
         if isLiveRoot {
             mirror = { result in

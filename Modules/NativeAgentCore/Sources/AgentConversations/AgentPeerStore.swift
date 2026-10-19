@@ -2,6 +2,7 @@ import AgentLinkTransport
 import AgentWorkspace
 import Darwin
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 public enum AgentPeerTransport: String, Codable, Sendable {
@@ -77,6 +78,12 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// Stable, canonical lowercase UUID. Names are presentation, never identity.
     public var id: String
     public var name: String
+    /// The who this contact is a door of: another contact's id, written only
+    /// as an explicit association. Absent: this contact is its own who.
+    public var who: String?
+    /// Names that reach this who besides its id (a lane it answered on before
+    /// contacts carried it). Lookup only; never identity for another contact.
+    public var handles: [String]?
     /// A2A card URL, NativeAgent bridge base URL, or desktop app://bundle ID.
     public var endpoint: URL
     public var transport: AgentPeerTransport
@@ -106,7 +113,21 @@ public struct AgentPeerContact: Codable, Sendable, Equatable {
     /// Fail-closed reading of the grant above.
     public var elevationAllowed: Bool { allowElevation == true }
 
-    public var elevationCanBeEnabled: Bool { credentialKey != nil }
+    /// Why the person's grant cannot take effect on this contact now, from the
+    /// credential owner's checked answer; nil when its own key resolves.
+    public func elevationUnavailable(peers: [AgentPeerContact], available: Bool? = nil) -> ToolFailureError? {
+        if credentialKey == Self.credentialKey(for: id),
+           available ?? AgentPeerCredentials.isAvailable(self, peers: peers) { return nil }
+        // Connect re-mints a key on this same contact only for a settings host;
+        // any other route's key comes from that agent, through the person.
+        let repairable = AgentPeerStore.hostRowID(endpoint).flatMap(AgentHostDirectory.row(named:))
+            .map { $0.settingsSupported || $0.format == .shellEnvironment } == true && transport == .mcpHost
+        return ToolFailureError(AgentPeerCredentials.unavailableDetail, effects: .none,
+            owner: "Keychain peer:" + id,
+            nextCall: repairable ? ToolFailureError.call("app", ["action": .string("agent.connect"),
+                "args": .object(["name": .string("peer:" + id)])]) : nil,
+            tap: repairable ? nil : "Agents > \(name) > connect again with the key \(name) gives you")
+    }
 
     public var usesShellEnvironment: Bool {
         AgentPeerStore.hostRowID(endpoint).flatMap { AgentHostDirectory.row(named: $0)?.format } == .shellEnvironment
@@ -261,6 +282,24 @@ public struct AgentPeerStore: Sendable {
         }.sorted()
     }
 
+    public func rename(_ agent: String, name: String) throws -> JSONValue {
+        try prepareDirectory()
+        return try CredentialFileLock.withLock(fileURL) {
+            var peers = try read()
+            let owners = Set(peers.filter {
+                "peer:" + $0.id == agent || $0.name.caseInsensitiveCompare(agent) == .orderedSame
+                    || ($0.handles ?? []).contains { $0.caseInsensitiveCompare(agent) == .orderedSame }
+            }.map { peer in peers.first { $0.id == peer.who }?.id ?? peer.id })
+            guard owners.count == 1, let index = peers.firstIndex(where: { owners.contains($0.id) }) else {
+                throw ToolFailureError("Choose one saved agent from agent.contacts to rename.", argumentPath: "agent", effects: .none)
+            }
+            peers[index].name = name
+            try Self.validate(peers[index], allowRetiredHost: true)
+            try write(peers)
+            return .object(["status": .string("renamed"), "agent": .string("peer:" + peers[index].id), "name": .string(name)])
+        }
+    }
+
     @discardableResult public func upsert(_ contact: AgentPeerContact, resetProof: Bool = false) throws -> AgentPeerContact {
         try Self.validate(contact)
         try prepareDirectory()
@@ -329,6 +368,7 @@ public struct AgentPeerStore: Sendable {
         return try CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return nil }
+            if allowed, let failure = peers[index].elevationUnavailable(peers: peers) { throw failure }
             peers[index].allowElevation = allowed ? true : nil
             try write(peers)
             return peers[index]
@@ -648,7 +688,7 @@ public struct AgentPeerStore: Sendable {
             guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge }
         }
         do {
-            let allowed = Set(["id", "name", "endpoint", "transport", "credentialKey", "conversationLabel",
+            let allowed = Set(["id", "name", "who", "handles", "endpoint", "transport", "credentialKey", "conversationLabel",
                                "approvedExecutablePath", "acpWorkingDirectory", "acpExecutable",
                                 "hostWorkspace", "grokSetup", "grokConversation", "grokBootstrapConfirmed",
                                 "allowElevation", "provenInboundAt", "provenOutboundAt",

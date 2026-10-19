@@ -2,9 +2,17 @@ import Foundation
 import MacControl
 import MCPDispatcher
 import PersistenceCore
+import TurnTrace
 
-/// Exact result evidence shared by transcript projection and live turn receipts.
+/// Exact result evidence shared by approvals, transcripts and live turn receipts.
 public enum ChatToolOutcome {
+    /// The caller refused before execution. Preserve any effects its owner already counted.
+    public static func refusedBeforeRunning(_ refusal: JSONValue) -> JSONValue {
+        guard case .object(var fields) = refusal, fields["effects"] == nil else { return refusal }
+        fields["effects"] = .string("none")
+        return .object(fields)
+    }
+
     /// The same truth for an inline interaction: a boundary that raised a need
     /// DID NOT RUN. It is waiting on a person, so it is neither progress nor a
     /// failure — the tool loop stops here and the turn suspends, exactly as it
@@ -163,7 +171,7 @@ public enum ChatToolOutcome {
         guard case .object(let fields) = output else { return nil }
         for key in keys {
             guard case .string(let text)? = fields[key] else { continue }
-            let line = ChatSecretRedactor.redactText(text).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let line = TurnTraceRedactor.redactText(text).split(whereSeparator: \.isWhitespace).joined(separator: " ")
             if !line.isEmpty { return String(line.prefix(limit)) }
         }
         return nil
@@ -173,7 +181,7 @@ public enum ChatToolOutcome {
         let raw = (error as? LocalizedError)?.errorDescription
             ?? ((error as Any) as? CustomStringConvertible)?.description
             ?? String(describing: error)
-        let redacted = ChatSecretRedactor.redactText(raw)
+        let redacted = TurnTraceRedactor.redactText(raw)
         let home = NSHomeDirectory().trimmingCharacters(in: .whitespacesAndNewlines)
         let pathSafe = home.isEmpty ? redacted : redacted.replacingOccurrences(of: home, with: "~")
         return String(pathSafe.prefix(2_000))
@@ -249,6 +257,9 @@ public enum ChatToolOutcome {
             guard case .string(let raw)? = object["status"] else { return nil }
             return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         }()
+        // A tool that says its call completed owns its outcome: a command's
+        // exit code and timeout are then the command's answer, not the call's.
+        let completed = status.map(successStatuses.contains) == true
         // Explicit failure/refusal/timeout evidence outranks pending states,
         // dry runs, and even an otherwise completed operation record. A
         // refusal says why it failed, so it outranks the generic markers.
@@ -261,11 +272,11 @@ public enum ChatToolOutcome {
         if case .bool(true)? = object["isError"] { return .failed }
         if case .bool(true)? = object["is_error"] { return .failed }
         if case .bool(true)? = object["failed"] { return .failed }
-        if case .bool(true)? = object["timed_out"] { return .timeout }
+        if !completed, case .bool(true)? = object["timed_out"] { return .timeout }
         if case .bool(true)? = object["timeout"] { return .timeout }
         if let status, failureStatuses.contains(status) { return .failed }
         if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
-        if let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
+        if !completed, let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
         if case .bool(true)? = object["dryRun"] ?? object["dry_run"] { return .unknown }
         // Consult the operation record only after explicit failures are ruled out.
         if let projected = MacControlReceiptOutcome.projecting(envelope: output) {

@@ -183,7 +183,7 @@ extension TelegramPollLoop {
         var saved: TelegramAssistantDeliveryState?
         if let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: sessionId, runId: runId) {
             saved = TelegramAssistantDeliveryState(reply: TelegramRichMessageRenderer.sanitize(
-                TelegramRichMessageRenderer.stripBoldMarkers(response.output)), imagePaths: replyImagePaths(response))
+                TelegramRichMessageRenderer.stripBoldMarkers(response.output)), imagePaths: Self.replyImagePaths(response))
         }
         var delivery = claim.assistantDelivery ?? saved
         if delivery?.imagePaths == nil { delivery?.imagePaths = saved?.imagePaths }
@@ -195,13 +195,9 @@ extension TelegramPollLoop {
         )
     }
 
-    func replyImagePaths(_ response: ChatResponse) -> [String] {
-        let root = dataRoot.appendingPathComponent("generated_images").standardizedFileURL.path + "/"
-        return (response.attachments ?? []).compactMap { image in
-            guard image.type == "image", let path = image.path,
-                  URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(root) else { return nil }
-            return path
-        }
+    /// The images of her reply's face, sent beside its words.
+    public static func replyImagePaths(_ response: ChatResponse) -> [String] {
+        (response.attachments ?? []).compactMap { $0.type == "image" ? $0.path : nil }
     }
 
     func repairInterruptedTurnCardsIfNeeded() async {
@@ -265,7 +261,7 @@ extension TelegramPollLoop {
         suppressUserAppend: Bool = false,
         sessionId: String? = nil,
         runId: String? = nil
-    ) async throws -> String {
+    ) async throws -> (reply: String, imagePaths: [String]) {
         let typing = await startTypingHeartbeat(destination: destination)
         let displayProgress: TelegramChatProgressSink = { event in
             if case .replyTextSettled(let settled) = event {
@@ -303,7 +299,7 @@ extension TelegramPollLoop {
         suppressUserAppend: Bool,
         sessionId: String?,
         runId: String?
-    ) async throws -> String {
+    ) async throws -> (reply: String, imagePaths: [String]) {
         // The retired model/effort/fast/persona commands, said in words.
         // This is the single choke point every non-slash Telegram text turn
         // passes through, so the words reach the preference writers without
@@ -312,7 +308,7 @@ extension TelegramPollLoop {
         // everything else falls straight through to the chat handler.
         if attachments.isEmpty,
            let spoken = await spokenPreferenceReply(destination: destination, text: text) {
-            return spoken
+            return (spoken, [])
         }
 
         let context = TelegramChatAttemptContext(
@@ -331,9 +327,9 @@ extension TelegramPollLoop {
                 kind: "image",
                 reason: "no attachment-capable chat handler wired",
                 chatId: destination.chatId, updateId: 0)
-            return "(I received your image but this bot configuration "
+            return ("(I received your image but this bot configuration "
                 + "has no vision-capable handler wired — the image was "
-                + "not processed.)"
+                + "not processed.)", [])
         }
         throw TelegramBotError.unavailable
     }

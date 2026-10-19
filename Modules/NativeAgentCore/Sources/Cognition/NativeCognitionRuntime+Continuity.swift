@@ -4,6 +4,7 @@
 // contributes nothing, never a provider call, never a memory write.
 
 import AgentConversations
+import ChatTurnRuntime
 import CognitiveSubstrate
 import Desk
 import Foundation
@@ -236,10 +237,7 @@ extension NativeCognitionRuntime {
         // counted. Only a builder User elevated in Trust speaks here: these are
         // its own words, and an un-elevated agent's must not be laundered into
         // her inner voice, so it is left out.
-        let builders: [(name: String, lane: String, shipped: [(Date, String)])] = [
-            ("Claude", "claude", claudeShipped(worklogURL ?? defaultClaudeWorklog())),
-            ("Codex", "codex", codexShipped(codexURL ?? defaultCodexRecord())),
-        ]
+        let builders = builderNews(dataRoot: dataRoot, worklogURL: worklogURL, codexURL: codexURL)
         let news = builders.compactMap { builder -> (Date, String)? in
             let inside = builder.shipped.filter { inGap($0.0) && $0.1.count >= 6 }
             guard let newest = inside.max(by: { $0.0 < $1.0 }),
@@ -249,6 +247,24 @@ extension NativeCognitionRuntime {
         }
         items += news.sorted { $0.0 > $1.0 }.map(\.1)
         return items
+    }
+
+    nonisolated static func builderNews(dataRoot: URL, worklogURL: URL? = nil, codexURL: URL? = nil, unseenOnly: Bool = false) -> [(name: String, lane: String, shipped: [(Date, String)])] {
+        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let quietWindow = unseenOnly ? TurnQuietHoursWindow.read(dataRoot: dataRoot) : nil
+        return peers.filter { peer in !peers.contains { $0.id == peer.who } }.compactMap { who in
+            let key = "peer:" + who.id
+            guard PeerTrust.ownerTrusts(key, dataRoot: dataRoot),
+                  let door = AgentConversationDelivery.door(for: key, dataRoot: dataRoot) else { return nil }
+            let shipped: [(Date, String)]
+            switch door.tool {
+            case "claude_message": shipped = claudeShipped(worklogURL ?? defaultClaudeWorklog(), kinds: unseenOnly ? ["feature"] : ["feature", "fix"])
+                .filter { !unseenOnly || quietWindow?.contains(hour: Calendar.current.component(.hour, from: $0.0)) == true }
+            case "codex_message": shipped = codexShipped(codexURL ?? defaultCodexRecord())
+            default: return nil
+            }
+            return (who.name, key, shipped)
+        }
     }
 
     nonisolated static func defaultClaudeWorklog() -> URL {

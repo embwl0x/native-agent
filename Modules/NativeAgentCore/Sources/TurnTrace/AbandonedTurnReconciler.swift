@@ -1,3 +1,4 @@
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -31,6 +32,20 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public var hasRedeliveryOwner: Bool {
         guard helperDefinition == nil, case .string(let surface)? = replyRoute["surface"] else { return false }
         return AgentBridgeCompletionRoute.Kind(surface: surface)?.hasRedeliveryOwner == true
+    }
+
+    /// What a turn that ended with `status` owes its door: its reply, kept here
+    /// for redelivery, as `deliver:<surface>` to `<surface>:<destination>`, owed
+    /// until that door says it holds it. Nil when nothing redelivers it, or when
+    /// the door cannot yet say so (the phone): an obligation must be able to settle.
+    public func owedDelivery(status: String) -> (key: String, to: String)? {
+        guard hasRedeliveryOwner, status == "completed" || status == "waiting",
+              case .string(let surface)? = replyRoute["surface"],
+              AgentBridgeCompletionRoute.Kind(surface: surface)?.acceptsDurably == true else { return nil }
+        let at = ["destinationId", "sourceKey", "threadId"].compactMap { key -> String? in
+            if case .string(let value)? = replyRoute[key] { value } else { nil }
+        }
+        return ("deliver:" + surface, ([surface] + at).joined(separator: ":"))
     }
 
     public init(runId: String, turnId: String, sessionId: String, surface: String, userMessage: String,
@@ -86,7 +101,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     }
 }
 
-/// Checkpointed turns resume; older turns without a checkpoint retain an honest terminal.
+/// Checkpointed turns resume; a missing checkpoint keeps recovery owed.
 public struct AbandonedTurnReconciler: Sendable {
     /// Ordinary trace window; checkpoints are discovered independently of age.
     public static let dayWindow = 3
@@ -95,7 +110,7 @@ public struct AbandonedTurnReconciler: Sendable {
     /// that has been off for months would read its whole trace history.
     public static let maximumDayWindow = 30
 
-    /// Bound guarded rereads as well as durable appends, including failed writes.
+    /// Bound newly recorded obligations per sweep, including failed writes.
     public static let maximumWritesPerPass = 25
 
     /// Pinned at launch; only a previous process's turns are candidates.
@@ -150,7 +165,7 @@ public struct AbandonedTurnReconciler: Sendable {
         let today = now()
         var accepted: [String: Accepted] = [:]
         var terminated: Set<String> = []
-        var terminalIndex: [URL: (terminated: Set<String>, replyReady: Set<String>)] = [:]
+        var terminalIndex: [URL: (terminated: Set<String>, replyReady: Set<String>, repairPending: Set<String>)] = [:]
 
         let scan = scanRange(today: today)
         // Catch-up terminals are written today, outside a historical window.
@@ -161,10 +176,11 @@ public struct AbandonedTurnReconciler: Sendable {
             guard terminalIndex[path] == nil else { return }
             var terminalTurns = Set<String>()
             var replyReadyTurns = Set<String>()
+            var repairPendingTurns = Set<String>()
             if FileManager.default.fileExists(atPath: path.path) {
                 let text = try String(contentsOf: path, encoding: .utf8)
                 for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                    guard Self.lifecycleKinds.contains(where: { line.utf8.firstRange(of: $0.utf8) != nil }),
+                    guard Self.mentionsLifecycleKind(line),
                           let data = String(line).data(using: .utf8),
                           let value = try? JSONValue.parse(data),
                           case .object(let row) = value,
@@ -178,8 +194,13 @@ public struct AbandonedTurnReconciler: Sendable {
                         accepted[turnId] = Accepted(ts: ts,
                             sessionId: Self.string(row["sessionId"]), surface: Self.string(row["surface"]))
                     case "turn.terminal", "turn.cancelled", "turn.failed":
+                        if case .object(let payload)? = row["payload"], payload["status"] == .string("abandoned") { continue }
                         terminalTurns.insert(turnId)
-                        if case .object(let payload)? = row["payload"],
+                        // A terminal still waiting on recollection repair has no reply
+                        // ready: its checkpoint stays until that repair lands.
+                        if case .object(let payload)? = row["payload"], payload["repairPending"] == .bool(true) {
+                            repairPendingTurns.insert(turnId)
+                        } else if case .object(let payload)? = row["payload"],
                            payload["status"] == .string("completed") || payload["status"] == .string("waiting") {
                             replyReadyTurns.insert(turnId)
                         }
@@ -188,7 +209,7 @@ public struct AbandonedTurnReconciler: Sendable {
                     }
                 }
             }
-            terminalIndex[path] = (terminalTurns, replyReadyTurns)
+            terminalIndex[path] = (terminalTurns, replyReadyTurns, repairPendingTurns)
         }
         for dayOffset in terminalOnlyDays + Array(scan.newestOffset...scan.oldestOffset) {
             guard let day = Self.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
@@ -229,13 +250,16 @@ public struct AbandonedTurnReconciler: Sendable {
                         }
                     } catch {
                         unreadableSessions.insert(session.lastPathComponent)
-                        persistenceFailures.append("Turn checkpoint is unreadable; repair chat/session_state/\(session.lastPathComponent) before resuming: \(error)")
+                        let detail = "Turn checkpoint is unreadable; repair chat/session_state/\(session.lastPathComponent) before resuming: \(error)"
+                        persistenceFailures.append(detail)
+                        Self.owe(dataRoot: dataRoot, sessionId: session.lastPathComponent, turnId: "", detail: detail)
                     }
                 }
             }
         } catch {
-            return Outcome(acceptedScanned: accepted.count, reconciled: [], tooRecentToJudge: 0,
-                failure: "Turn checkpoint is unreadable; repair chat/session_state before resuming: \(error)")
+            let detail = "Turn checkpoint is unreadable; repair chat/session_state before resuming: \(error)"
+            Self.owe(dataRoot: dataRoot, sessionId: "", turnId: "", detail: detail)
+            return Outcome(acceptedScanned: accepted.count, reconciled: [], tooRecentToJudge: 0, failure: detail)
         }
         let candidates = accepted
             .filter { (!terminated.contains($0.key) || checkpoints[$0.key] != nil)
@@ -246,7 +270,6 @@ public struct AbandonedTurnReconciler: Sendable {
                 return $0.value.ts < $1.value.ts
             }
         for (turnId, row) in candidates {
-            let age = today.timeIntervalSince(row.ts)
             // A turn this process accepted is never abandoned by this process;
             // one a previous process accepted cannot still be running.
             guard row.ts < processEpoch else {
@@ -259,6 +282,13 @@ public struct AbandonedTurnReconciler: Sendable {
                         [day] + [-1, 1].compactMap { Self.dayCalendar.date(byAdding: .day, value: $0, to: day) }
                     }.map { lane.path(for: $0) })
                     for path in days { try readDay(path, includeAccepted: false) }
+                    if days.contains(where: { terminalIndex[$0]!.repairPending.contains(turnId) }),
+                       !days.contains(where: { terminalIndex[$0]!.replyReady.contains(turnId) }) {
+                        Self.owe(dataRoot: dataRoot, sessionId: checkpoint.sessionId, turnId: turnId,
+                            detail: "This turn awaits recollection repair. Reconcile its saved checkpoint without repeating completed effects.",
+                            id: "turn-recovery:" + turnId)
+                        continue
+                    }
                     let hasTerminal = days.contains { terminalIndex[$0]!.terminated.contains(turnId) }
                     if hasTerminal, checkpoint.deliveryPending, !checkpoint.hasRedeliveryOwner {
                         // A finished turn whose route cannot redeliver: the retirement row
@@ -278,7 +308,18 @@ public struct AbandonedTurnReconciler: Sendable {
                         && days.contains { terminalIndex[$0]!.replyReady.contains(turnId) }
                     if !hasTerminal || replyReady { resumable.append(checkpoint) }
                     else { try checkpoint.remove(dataRoot: dataRoot) }
-                } catch { persistenceFailures.append("Cannot check checkpoint terminal: \(error)") }
+                } catch {
+                    let detail = "Cannot check checkpoint terminal: \(error)"
+                    persistenceFailures.append(detail)
+                    Self.owe(dataRoot: dataRoot, sessionId: checkpoint.sessionId, turnId: turnId, detail: detail)
+                }
+                continue
+            }
+            let id = "turn-recovery:" + turnId
+            // A turn whose recovery is already owed is settled for this sweep;
+            // only a new record spends the pass's write quota.
+            if (try? await ExperienceStore.at(dataRoot).experience(id)) != nil {
+                written.append(turnId)
                 continue
             }
             guard writeAttempts < Self.maximumWritesPerPass else {
@@ -286,94 +327,12 @@ public struct AbandonedTurnReconciler: Sendable {
                 break
             }
             writeAttempts += 1
-            let minutes = Int((age / 60).rounded())
-            // CHECK AND APPEND IN ONE CRITICAL SECTION. The scan above is
-            // unlocked, so a real terminal can land between it and this write;
-            // the guard re-reads the target day file under the lane's own
-            // write lock and stands down if one did (GPT-5.6 round review,
-            // 2026-09-11). A terminal always wins over an abandoned verdict.
-            //
-            // ACROSS DAY FILES. The guard only sees the file this row is being
-            // appended to (today's). A real terminal for a turn accepted
-            // yesterday evening lands in the turn's OWN day file, or in the
-            // next one if it crossed local midnight — neither of which is
-            // today's when the sweep runs a day later. Those are read here too,
-            // so an abandoned verdict never stands next to a real terminal.
-            // They are passed as `alsoLocking` so the predicate reads them
-            // UNDER THEIR OWN LOCKS, inside the same critical section as the
-            // append — a real terminal can no longer land between the sibling
-            // read and the synthetic write (GPT-5.6 round review, 2026-09-11).
-            //
-            // CALENDAR DAYS, not 86_400s: across a DST transition a fixed
-            // interval names the day after (or before) the real neighbour, so
-            // the file the true terminal landed in would never be locked or
-            // read (GPT-5.6 round review r2, 2026-09-11). Sorted so every
-            // caller takes these nested locks in the same order.
-            let siblingDays = Set(
-                ([row.ts]
-                    + [-1, 1].compactMap {
-                        Self.dayCalendar.date(byAdding: .day, value: $0, to: row.ts)
-                    })
-                    .map { lane.path(for: $0) }
-            )
-            .filter { $0 != lane.path(for: today) }
-            .sorted { $0.path < $1.path }
-            let event = TurnTraceEvent(
-                turnId: turnId,
-                ts: today,
-                kind: "turn.terminal",
-                sessionId: row.sessionId,
-                surface: row.surface,
-                payload: .object([
-                    "schema": .string("turn.lifecycle.v1"),
-                    "status": .string("abandoned"),
-                    "observedBy": .string("terminal_reconciliation"),
-                    "reason": .string("abandoned: no terminal after \(minutes) minutes"),
-                    "acceptedAt": .string(Self.iso8601String(row.ts)),
-                ])
-            )
+            await Self.owe(dataRoot: dataRoot, sessionId: row.sessionId ?? "unknown", turnId: turnId,
+                detail: "The accepted turn has no saved checkpoint or confirmed terminal. Restore its checkpoint from retained evidence before resuming; do not repeat uncertain effects.", id: id).value
             do {
-                let wrote = try await lane.appendGuarded(
-                    event,
-                    alsoLocking: siblingDays,
-                    shouldAppend: { current in
-                        if Self.containsTerminal(forTurn: turnId, in: current) { return false }
-                        for path in siblingDays {
-                            // Missing sibling: nothing there. Unreadable sibling:
-                            // it may hold the real terminal, so fail the sweep.
-                            guard FileManager.default.fileExists(atPath: path.path) else { continue }
-                            let text = try String(contentsOf: path, encoding: .utf8)
-                            if Self.containsTerminal(forTurn: turnId, in: text) { return false }
-                        }
-                        return true
-                    }
-                )
-                if wrote {
-                    await TurnTraceBus.shared.deliverToSubscribers(event)
-                    written.append(turnId)
-                    if processEpoch.timeIntervalSince(row.ts) <= 3600,
-                       let sessionId = row.sessionId, NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId,
-                       let surface = row.surface,
-                       ["telegram", "agent-bridge", "slack", "ios", "phone", "siri"].contains(surface) || sessionId.hasPrefix("agent-") {
-                        let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
-                        if FileManager.default.fileExists(atPath: path.path) {
-                            let persistence = SwiftNativePersistenceCore()
-                            let note: JSONValue = .object([
-                                "id": .string(UUID().uuidString.lowercased()), "sessionId": .string(sessionId),
-                                "role": .string("system"), "source": .string(surface),
-                                "content": .string("This reply did not finish before the app restarted."),
-                                "createdAt": .string(Self.iso8601String(today)),
-                                "metadata": .object(["kind": .string("interrupted_turn_note")])])
-                            try await persistence.withFileLock(path) { try await persistence.appendJSONL(note, to: path) }
-                        }
-                    }
-                }
-            } catch {
-                persistenceFailures.append("guarded append failed: \(error)")
-                FileHandle.standardError.write(
-                    Data("TurnTracePersistLane: guarded append failed (turn \(turnId)): \(error)\n".utf8)
-                )
-            }
+                guard try await ExperienceStore.at(dataRoot).experience(id) != nil else { throw CocoaError(.fileWriteUnknown) }
+                written.append(turnId)
+            } catch { persistenceFailures.append("Turn recovery could not keep its repair obligation: \(error)") }
         }
         // Once every eligible candidate in the days ACTUALLY SCANNED has been
         // confirmed, the cursor advances over exactly those days and no
@@ -383,7 +342,7 @@ public struct AbandonedTurnReconciler: Sendable {
         // of the old jump to today that abandoned it forever (GPT-5.6 round
         // review, 2026-09-11).
         // A failed read/append or deferred candidate leaves the window pending.
-        // Already confirmed terminals make the next pass idempotent.
+        // Stable repair identities make another sweep of unfinished turns idempotent.
         if persistenceFailures.isEmpty, !deferred, let newestScannedDay = Self.dayCalendar.date(
             byAdding: .day, value: -scan.newestOffset, to: today
         ) {
@@ -398,7 +357,40 @@ public struct AbandonedTurnReconciler: Sendable {
         )
     }
 
+    static func operation(sessionId: String, turnId: String) -> String {
+        "turn.reconcile:" + (turnId.isEmpty ? "session:" + sessionId : turnId)
+    }
+
+    static func owner(sessionId: String, turnId: String) -> String {
+        "chat/session_state/" + sessionId + (turnId.isEmpty ? "" : "/turn-\(turnId).json")
+    }
+
+    public static func repairCall(sessionId: String, turnId: String) -> String {
+        ToolFailureError.call("app", ["action": .string("turn.reconcile"),
+            "args": .object(["session_id": .string(sessionId), "turn_id": .string(turnId)])])
+    }
+
+    @discardableResult
+    static func owe(dataRoot: URL, sessionId: String, turnId: String, detail: String, id: String = UUID().uuidString) -> Task<Void, Never> {
+        RepairOwed.owe(dataRoot, id: id, kind: .run,
+            evidence: [.init(source: "turn_traces", id: turnId)], operation: operation(sessionId: sessionId, turnId: turnId),
+            owner: owner(sessionId: sessionId, turnId: turnId), words: detail,
+            nextCall: repairCall(sessionId: sessionId, turnId: turnId))
+    }
+
     private static let lifecycleKinds = ["turn.accepted", "turn.terminal", "turn.cancelled", "turn.failed"]
+
+    /// A byte search before any parse. The generic `firstRange(of:)` over a
+    /// line's UTF-8 view cost ~5 s per launch on three busy trace days.
+    private static func mentionsLifecycleKind(_ line: Substring) -> Bool {
+        line.utf8.withContiguousStorageIfAvailable { bytes in
+            lifecycleKinds.contains { kind in
+                kind.utf8.withContiguousStorageIfAvailable { needle in
+                    memmem(bytes.baseAddress, bytes.count, needle.baseAddress, needle.count) != nil
+                } ?? false
+            }
+        } ?? lifecycleKinds.contains { line.contains($0) }
+    }
 
     /// Day-offsets from `today` this sweep reads (0 = today), oldest offset
     /// last. Ordinarily `dayWindow` days ending today; after a gap it reaches

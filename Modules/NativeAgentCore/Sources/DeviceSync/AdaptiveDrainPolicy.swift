@@ -1,73 +1,58 @@
-// Keep the Mac's missed-push backstop responsive even when the phone is idle.
-// APNs registration and a saved subscription do not prove push delivery.
 import Foundation
 
-/// Pure state machine for the device-transport drain cadence. Kept value-only
-/// so the interval decision can be tested without a CloudKit container.
+/// Receive deadlines exist only while delivery or a transport without proven
+/// push needs them. The sender owns recovery from a lost individual push.
 struct AdaptiveDrainPolicy: Equatable {
     /// Cadence while a correlation is outstanding or the peer is recently active.
     var fastInterval: TimeInterval = 8
-    /// Keep idle pulls within ten seconds while push delivery is unproven.
-    let idleInterval: TimeInterval = 10
+    /// Without proven push, polling is the receive mechanism.
+    let receivePollInterval: TimeInterval = 10
     /// How long after the last peer message/reply the fast cadence is kept.
     var peerActivityWindow: TimeInterval = 120
-    /// A correlation nobody ever answered must not pin the fast cadence forever.
-    var correlationMaxAge: TimeInterval = 300
 
-    private(set) var outstanding: [String: Date] = [:]
+    private(set) var outstanding: Set<String> = []
     private(set) var lastPeerActivityAt: Date?
 
-    /// An inbound peer message was delivered to the runtime; its reply is owed.
+    /// The runtime currently owns an inbound delivery.
     mutating func noteOutstanding(_ correlationID: String, at date: Date) {
-        outstanding[correlationID] = date
+        outstanding.insert(correlationID)
         lastPeerActivityAt = date
     }
 
-    /// The reply or action response for `correlationID` has been sent.
+    /// Runtime ownership ended: a reply was sent or retry returned to the sender.
     mutating func resolve(_ correlationID: String, at date: Date) {
-        outstanding.removeValue(forKey: correlationID)
+        outstanding.remove(correlationID)
         lastPeerActivityAt = date
     }
 
-    /// Any traffic with the phone — including a push wake — keeps us fast.
+    /// Verified traffic with the phone keeps the receive window open.
     mutating func notePeerActivity(at date: Date) {
         lastPeerActivityAt = date
     }
 
-    /// Drop correlations older than `correlationMaxAge` so an unanswered turn
-    /// cannot hold the fast cadence for the life of the process.
-    mutating func prune(now: Date) {
-        outstanding = outstanding.filter { now.timeIntervalSince($0.value) <= correlationMaxAge }
-    }
-
-    func hasFreshOutstanding(now: Date) -> Bool {
-        outstanding.contains { now.timeIntervalSince($0.value) <= correlationMaxAge }
-    }
-
-    func interval(now: Date) -> TimeInterval {
-        if hasFreshOutstanding(now: now) { return fastInterval }
-        if let lastPeerActivityAt, now.timeIntervalSince(lastPeerActivityAt) <= peerActivityWindow {
+    func interval(now: Date, polling: Bool, active: Bool) -> TimeInterval? {
+        if active || !outstanding.isEmpty { return fastInterval }
+        if let lastPeerActivityAt, now.timeIntervalSince(lastPeerActivityAt) < peerActivityWindow {
             return fastInterval
         }
-        return idleInterval
+        return polling ? receivePollInterval : nil
     }
 
-    /// Delay for a one-shot fallback timer. A transport that has never drained
-    /// gets one prompt fast-cadence check; after that, the timer sleeps exactly
-    /// until the policy's next useful deadline instead of waking every eight
-    /// seconds merely to rediscover that the idle cadence is not due.
+    /// A one-shot delivery deadline, absent when the receiver is resting.
     func nextDrainDelay(
         now: Date,
         lastDrainAt: Date,
+        polling: Bool,
+        active: Bool,
         minimumDelay: TimeInterval = 1
-    ) -> TimeInterval {
-        let desiredInterval = lastDrainAt == .distantPast
-            ? fastInterval
-            : interval(now: now)
+    ) -> TimeInterval? {
+        guard let desiredInterval = interval(now: now, polling: polling, active: active) else { return nil }
         guard lastDrainAt != .distantPast else {
             return max(minimumDelay, desiredInterval)
         }
         let elapsed = max(0, now.timeIntervalSince(lastDrainAt))
-        return max(minimumDelay, desiredInterval - elapsed)
+        let delay = max(minimumDelay, desiredInterval - elapsed)
+        guard !polling, !active, outstanding.isEmpty, let lastPeerActivityAt else { return delay }
+        return min(delay, max(0, lastPeerActivityAt.addingTimeInterval(peerActivityWindow).timeIntervalSince(now)))
     }
 }

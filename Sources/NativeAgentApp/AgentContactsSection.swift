@@ -1,4 +1,5 @@
 import ApprovalTransactions
+import AppKit
 import EngineRuntime
 import SwiftUI
 import NativeAgentCore
@@ -15,16 +16,17 @@ struct AgentContactsSection: View {
     @State private var loadError: String?
     @State private var loading = true
     @State private var busy = false
-    @State private var discovery: [AgentDiscoveryCandidate] = []
     @State private var refreshGeneration = 0
     /// Reads can finish out of order; only the newest one applies.
     @State private var reloadGeneration = 0
-    private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
+    private var root: URL { appModel.firstRunDataRoot }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-            if let loadError { ConnectorsNote(text: loadError, color: NativeAgentShell.trouble) }
+            if let loadError {
+                AgentContactReadFailure(message: loadError, dataRoot: root) { Task { await reload() } }
+            }
             if loading && fixtureRows == nil { ProgressView("Looking for agents…") }
             if !loading && (fixtureRows ?? rows).isEmpty && loadError == nil {
                 ConnectorsCard { ConnectorsNote(text: "No agent contacts or supported apps found on this Mac.") }
@@ -100,14 +102,13 @@ struct AgentContactsSection: View {
         // last discovery, and is counted so the capture waits for it.
         .quietReadTask(live: false) {
             guard fixtureRows == nil else { return }
-            discovery = await AgentDiscoverySession.shared.candidates(dataRoot: root)
             await reload()
         }
         // A refresh offers what it finds (discovery.json, her wake), so the
         // offscreen copy never runs it.
         .liveTask(id: refresh + refreshGeneration) {
             guard fixtureRows == nil else { return }
-            discovery = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: root)
+            _ = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: root)
             // Any chat append rewrites the chat index, so a contact's session moving shows here.
             let events = FileChangeEvents(paths: [root.appendingPathComponent("agents/peers.json"),
                                                   root.appendingPathComponent("agents/conversations.json"),
@@ -132,11 +133,8 @@ struct AgentContactsSection: View {
         // Peers (under their lock), the lanes, Keychain and the conversations
         // file: all read off the main actor, once.
         let root = root
-        let discovery = discovery
         let read = await Task.detached(priority: .utility) {
-            Result {
-                try AgentContactRow.read(dataRoot: root, candidates: discovery)
-            }
+            await AgentContactRow.read(dataRoot: root)
         }.value
         guard generation == reloadGeneration else { return }
         loading = false
@@ -144,8 +142,8 @@ struct AgentContactsSection: View {
         case .success(let next):
             rows = next
             loadError = nil
-        case .failure:
-            loadError = "Could not load agent contacts. Refresh Agents to try again."
+        case .failure(let error):
+            loadError = error.localizedDescription
         }
     }
 
@@ -160,6 +158,21 @@ struct AgentContactsSection: View {
             let sessionID = appModel.activeChatSessionId
             guard !sessionID.isEmpty, sessionID != previousSessionID else { return }
             _ = await appModel.startActiveChatTurn(row.prompt(action), expectedSessionId: sessionID)
+        }
+    }
+}
+
+struct AgentContactReadFailure: View {
+    let message: String
+    let dataRoot: URL
+    let retry: () -> Void
+
+    var body: some View {
+        let file = AgentPeerStore(dataRoot: dataRoot).fileURL
+        ConnectorsNote(text: "The address book at \(file.path) could not load: \(message)", color: NativeAgentShell.trouble)
+        HStack {
+            Button("Reveal address book") { NSWorkspace.shared.activateFileViewerSelecting([file]) }
+            Button("Try again", action: retry)
         }
     }
 }

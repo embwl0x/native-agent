@@ -63,7 +63,16 @@ public enum ChatSurfaceBackgroundWork {
             } else {
                 sessionId = try await telegramSessions.activeSessionId(destination: destination)
             }
-            let effectiveText = TelegramReplyPromptRenderer.messageWithReplyContext(
+            var correctedTranscript = false
+            if mediaAttachments.isEmpty, let reply = context.replyTo, let sender = context.fromUserId,
+               let prefix = text.range(of: "Correction:", options: [.anchored, .caseInsensitive]) {
+                let replacement = text[prefix.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !replacement.isEmpty {
+                    correctedTranscript = try await client.correctSpeechTranscript(
+                        sessionId: sessionId, reference: "telegram:\(chatId):\(sender):\(reply.messageId)", text: replacement)
+                }
+            }
+            let effectiveText = correctedTranscript ? text : TelegramReplyPromptRenderer.messageWithReplyContext(
                 text: text,
                 replyTo: context.replyTo
             )
@@ -85,7 +94,8 @@ public enum ChatSurfaceBackgroundWork {
                     base64: bytes.base64EncodedString(),
                     mime: resolved.mime,
                     name: media.captureFilename,
-                    byteSize: bytes.count
+                    byteSize: bytes.count,
+                    utterance: media.utterance
                 )
             }
             // Bind the verified Telegram chatId so the security gates resolve
@@ -146,11 +156,12 @@ public enum ChatSurfaceBackgroundWork {
                 )
                 }
             }
-            // The streamed draft showed her working; the settled message is the answer.
-            return ChatOrchestration.ChatResponse.answerOnly(
+            // The streamed draft showed her working; the settled message is the
+            // answer, with the images she chose.
+            return (ChatOrchestration.ChatResponse.answerOnly(
                 response.output,
                 workingCommentaryCharacters: response.workingCommentaryCharacters
-            )
+            ), TelegramPollLoop.replyImagePaths(response))
         }
         return handler
     }

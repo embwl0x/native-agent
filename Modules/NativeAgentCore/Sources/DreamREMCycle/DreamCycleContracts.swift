@@ -11,6 +11,7 @@ public enum DreamTrigger: String, Sendable, Equatable, CaseIterable {
 }
 
 public struct DreamReport: Sendable, Equatable {
+    public var repair: JSONValue?
     public var sessionsProcessed: Int
     public var entriesWritten: Int
     public var errors: [String]
@@ -21,6 +22,8 @@ public struct DreamReport: Sendable, Equatable {
     /// `already_dreamt` (the target day's entry exists — typically because a
     /// manual dream beat the 03:30 job to it) or `no_new_material`.
     public var skipReason: String?
+    /// The exact committed entry, delivered to reflection without a latest-item lookup.
+    public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
 
     public init(
         sessionsProcessed: Int = 0,
@@ -115,35 +118,10 @@ public typealias DreamFeltOriginProvider = @Sendable () async throws -> [DreamFe
 /// a no-op.
 public typealias DreamReceiptSink = @Sendable (_ kind: String, _ payload: JSONValue) async -> Void
 
-/// Completion sink for the nightly dream's own MOOD line — the felt tone of what she
-/// dreamt. Fired exactly once per dream, AFTER the diary entry has actually been written
-/// (a cancelled, failed, or no-op dream must never move her), and only when the LLM
-/// emitted a non-empty `mood` field. The counterpart to `DreamFeltSummaryProvider`:
-/// that one carries the day's feeling INTO the dream, this one carries the dream's
-/// feeling back OUT into her slow disposition layer. Default is a no-op so
-/// focused runner tests need not wire one.
-///
-/// 2026-09-06, two changes:
-///   • the DATE KEY of the dream being delivered is passed explicitly. The sink
-///     used to recover it by scanning for the greatest `.mood_integrated_*`
-///     marker on disk, and those markers accumulate — a 03:30 scheduled dream
-///     keys to the PREVIOUS day, so any newer marker named a different dream
-///     and the residue mint was suppressed against the wrong night's claim.
-///   • it returns whether the integration is DURABLE. The runner claims the day
-///     before calling (that claim is what makes the sink fire once), and
-///     releases the claim again when this returns false, so a night whose
-///     disposition write failed is retryable instead of permanently spent.
-///
-/// 2026-09-06 (second pass): both of those ride a SECOND, optional sink rather
-/// than a widened parameter list. A Swift closure type cannot give a parameter
-/// a default, so changing `DreamMoodSink` in place broke every one-argument
-/// caller in the tree, test targets included. The plain sink is restored
-/// exactly as it was and is still honoured; a runner given the dated one
-/// prefers it.
-public typealias DreamMoodSink = @Sendable (String) async -> Void
-
-/// The dated, answering form of `DreamMoodSink` — see the two changes above.
+/// Her explicit affect judgment, after the dream commits. The dated sink answers
+/// whether persistence landed, so a failed integration releases the existing claim.
 public typealias DreamDatedMoodSink = @Sendable (
-    _ mood: String,
+    _ affect: Double,
     _ dateKey: String
 ) async -> Bool
+import CognitiveSubstrate

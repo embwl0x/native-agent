@@ -41,7 +41,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// Production uses the shared persisted authority; injected executors
     /// may carry a hermetic real store without replacing the gate itself.
     private let macIntegrationPermissionStore: MacIntegrationPermissionStore
-    private let doctorStatusProvider: @Sendable (_ repair: Bool?) async throws -> JSONValue
+    private let doctorStatusProvider: @Sendable (_ repair: Bool?, _ checkID: String?) async throws -> JSONValue
     private let telegramStatusProvider: @Sendable () async throws -> JSONValue
     private let humanConversationReplyHandler: @Sendable ([String: JSONValue]) async throws -> JSONValue
     /// Deny, or under Full Mac approve (true), a Desk task's waiting step:
@@ -58,7 +58,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         mobileNotificationSender: @escaping @Sendable (String, String, [String: String]) async throws -> MobileNotificationDeliveryReceipt,
         macNotificationSender: @escaping @Sendable (String, String) async throws -> NativeAgentNotificationPostResult,
         macIntegrationPermissionStore: MacIntegrationPermissionStore,
-        doctorStatusProvider: @escaping @Sendable (_ repair: Bool?) async throws -> JSONValue,
+        doctorStatusProvider: @escaping @Sendable (_ repair: Bool?, _ checkID: String?) async throws -> JSONValue,
         telegramStatusProvider: @escaping @Sendable () async throws -> JSONValue,
         humanConversationReplyHandler: @escaping @Sendable ([String: JSONValue]) async throws -> JSONValue,
         workshopStepDecider: @escaping @Sendable (String, Bool) async throws -> JSONValue,
@@ -278,13 +278,13 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         ) {
             return InlineInteractionNeed.envelope(need)
         }
-        return .object([
+        return ChatToolOutcome.refusedBeforeRunning(.object([
             "status": .string("denied"),
             "reason": .string("integration_permission_denied"),
             "integration": .string(integration),
             "mode": .string(mode),
             "fix": .string("Toggle \(mode.capitalized) ON for \(integration) in Settings → Mac Integration."),
-        ])
+        ]))
     }
 
     // MARK: - Health
@@ -292,7 +292,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
     /// Doctor's checks or Telegram's status, read and changing nothing: the
     /// `app` door's diagnostics/doctor and telegram/status item reads.
     func healthRead(_ item: String) async throws -> JSONValue {
-        item == "doctor" ? try await doctorStatusProvider(nil) : try await telegramStatusProvider()
+        item == "doctor" ? try await doctorStatusProvider(nil, nil) : try await telegramStatusProvider()
     }
 
     private static func healthResult(_ result: JSONValue, surface: String) -> JSONValue {
@@ -318,12 +318,13 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             guard let perform = AppDoorReentry.perform else {
                 return Self.doorRefusal("door_unavailable",
                     "This call did not come through a chat's tool chain, so it has no gate to pass. Nothing ran.",
-                    remedy: "none", "Use app from a chat turn.")
+                    remedy: "correct_arguments", "Call app from a chat turn's tool chain; this caller cannot bind a chat by supplying a session id.")
             }
             // The contact's own send, dry, under agent_message's own gates.
             if action.id == "agent.verify" {
                 return try await AgentContactHealth.repair(Self.inputString(input["agent"]) ?? "",
-                    dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(), perform: perform)
+                    dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                    workspace: Self.inputString(input["workspace"]), perform: perform)
             }
             let call = ChatToolSessionInjection.apply(toolName: action.tool, input: input,
                                                       sessionId: Self.inputString(input["__session_id"]))
@@ -333,8 +334,6 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
                 if action.read, case .object(var fields) = result, fields["status"] == .string("failed"),
                    fields["effects"] != .string("occurred"), fields["effects"] != .string("partial") {
                     fields["effects"] = .string("none")
-                    fields["remedy"] = .object(["kind": .string("inspect"), "next_call": .null,
-                        "instruction": .string("Nothing changed. Do what the reason names, or tell the person why.")])
                     result = .object(fields)
                 }
                 if action.partAction, case .object(let fields) = result, let returned = fields["returned"] {
@@ -393,6 +392,8 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
                                 + "; an app on a volume Spotlight does not index is not listed")])
         case "undo":
             return try await doorUndo(input: input)
+        case "read_file" where action.id == "reply.attach":
+            return await runReplyAttach(input: input)
         case "read_file" where action.id == "chrome.history":
             return try await runChromeHistory(input: input, surface: surface)
         case "claude_worklog":
@@ -402,6 +403,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         case "agent_connect" where action.id == "agent.recipe_write":
             return AgentRecipeStore.write(host: Self.inputString(input["host"]) ?? "", document: input["recipe"] ?? .null,
                                           undoing: Self.undoReceipt)
+        case "agent_connect" where action.id == "agent.rename": return try AgentPeerStore(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()).rename(Self.inputString(input["agent"]) ?? "", name: Self.inputString(input["name"]) ?? "")
         case "app_page_read" where action.id == "layout.read":
             return SurfaceLayoutStore.read(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         case "app_setting_set" where action.id == "layout.write":
@@ -423,11 +425,21 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
         case "make_studio":
             return await runMake(verb: verb, input: input)
         case "doctor_status":
-            return Self.healthResult(try await doctorStatusProvider(input["repair"] == .bool(true)), surface: surface)
+            return Self.healthResult(try await doctorStatusProvider(input["repair"] == .bool(true), Self.inputString(input["check_id"])), surface: surface)
         case "my_queue":
             return await runMyQueue(verb: verb, input: input, surface: surface)
         case "house_file":
             return await runHouseFile(input: input, surface: surface)
+        case "repair_let_go":
+            return await runRepairLetGo(input: input)
+        case "abilities_restore_state":
+            let root = quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+            let archive = try AbilityStore(dataRoot: root).restoreState(input["state"] ?? .null,
+                expectedDigest: Self.inputString(input["expected_digest"]) ?? "")
+            return .object(["status": .string("ok"), "effects": .string("occurred"),
+                "preserved": .string(archive.path), "detail": .string("Recovered ability run state was read back. Damaged bytes were preserved; ability files and authority were unchanged.")])
+        case "turn_reconcile", "arrival_accept":
+            return await runBackgroundRepair(tool: action.tool, input: input)
         case "resident_wake":
             let line = (Self.inputString(input["line"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard let part = SkillRunContext.partID else {
@@ -500,7 +512,7 @@ public final class AppToolExecutor: ToolExecutor, @unchecked Sendable {
             let answer = action.tool == "provider"
                 ? await host.provider(verb: verb, input: input) : await host.connections(verb: verb, input: input)
             guard case .object(var body) = answer else {
-                return Self.failure("\(action.tool)_failed", "The app gave no answer for that verb.")
+                return Self.failure("\(action.tool)_failed", "The app gave no answer for that verb.", extra: ["effects": .string("unknown")])
             }
             body["verb"] = .string(verb)
             if action.tool == "connections" { body["decided_by"] = .string("agent") }

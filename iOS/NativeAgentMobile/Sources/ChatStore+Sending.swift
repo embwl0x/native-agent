@@ -72,6 +72,7 @@ extension ChatStore {
             }
         }
         guard (!text.isEmpty || !attachments.isEmpty), !isSwitchingSession else { return .rejected }
+        let attachments = ChatAttachmentTypeResolver.submittingSpeech(attachments, text: text)
         if isLoading {
             guard appendUser else { return .rejected }
             let queued = QueuedChatSend(
@@ -114,7 +115,8 @@ extension ChatStore {
                     type: $0.type,
                     mime: $0.mime,
                     base64: $0.base64,
-                    byteSize: $0.byteSize
+                    byteSize: $0.byteSize,
+                    utterance: $0.utterance
                 )
             }
             let userMsg = ChatMessage(

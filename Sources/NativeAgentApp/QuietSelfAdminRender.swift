@@ -515,7 +515,7 @@ extension QuietSelfAdminRender {
     // MARK: Today
 
     private static func todayProjection(appModel: AppModel) async -> [JSONValue] {
-        let pending = appModel.engine.approvals.records.filter { $0.status.lowercased() == "pending" }
+        let pending = WorkOverviewRead.waitingApprovals(appModel.engine.approvals.records)
         let waitingNotes = appModel.engine.inbox.items.filter { $0.status == "unread" }
         let proposals = appModel.engine.memory.proposals
         var waiting: [String] = []

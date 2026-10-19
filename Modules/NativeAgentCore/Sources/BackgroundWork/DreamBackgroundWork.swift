@@ -40,7 +40,8 @@ public enum DreamBackgroundWork {
             intensity: 0.62,
             valence: 0.35,
             arousal: 0.12,
-            metadata: metadata
+            metadata: metadata,
+            reflectionMaterial: result.reflectionMaterial
         )
         return response
     }
@@ -82,7 +83,8 @@ public enum DreamBackgroundWork {
                 "archivedEntries": .int(Int64(archived)),
                 "force": .bool(force),
                 "feltDaySummary": .string("REM integrated \(proposals) proposal(s) from recent dream evidence."),
-            ]
+            ],
+            reflectionMaterial: result.reflectionMaterial
         )
         return response
     }
@@ -161,26 +163,11 @@ public enum DreamBackgroundWork {
     ) async -> Int {
         guard limit > 0 else { return 0 }
         let store = REMProposalStore(dataRoot: dataRoot)
-        let unstaged = store.loadAll().filter { $0.status == "pending" && $0.approvalId == nil }
-        guard !unstaged.isEmpty else { return 0 }
         let inner = stager ?? makeREMProposalStager(dataRoot: dataRoot, notifications: notifications)
-        let budget = REMStagingCatchUpBudget(limit: limit)
-        let bounded: REMApprovalStager = { row in
-            guard await budget.claim() else { return nil }
-            return await inner(row)
-        }
         do {
-            let staged = try await store.stagePendingApprovals(bounded)
-            if staged > 0 {
-                FileHandle.standardError.write(Data(
-                    "REMStagingCatchUp: staged \(staged) of \(unstaged.count) unstaged pending proposal(s)\n".utf8
-                ))
-            }
-            return staged
+            return try await store.stagePendingApprovals(inner, limit: limit)
         } catch {
-            FileHandle.standardError.write(Data(
-                "REMStagingCatchUp: staging failed: \(error)\n".utf8
-            ))
+            nativeLog("REM approval staging remains owed: %@", error.localizedDescription)
             return 0
         }
     }
@@ -188,7 +175,7 @@ public enum DreamBackgroundWork {
     public static func makeREMProposalStager(dataRoot: URL, notifications: any REMProposalNotificationPort) -> REMApprovalStager {
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         let securityCenter = SwiftNativeSecurityCenter(dataRoot: dataRoot)
-        return { row in
+        return { row, experiences in
             let yolo = await securityCenter.fullMacYoloAuthority(
                 tool: "rem.proposal",
                 origin: SecurityOriginContext(
@@ -215,32 +202,21 @@ public enum DreamBackgroundWork {
             // pending approval instead of staging a duplicate. The dedupe
             // read FAILS CLOSED — if list() throws we cannot know whether a
             // prior approval exists, and falling through to create could
-            // double-stage; return nil and let the next pass retry.
-            let pendingREM: [ApprovalRecord]
-            do {
-                pendingREM = try await inbox.list(
-                    filter: ApprovalFilter(status: "pending", action: "rem.proposal"))
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "REMProposalStager: dedupe list failed for \(row.id): \(error)\n".utf8))
-                return nil
-            }
+            // double-stage; the error remains owed against these same proposal IDs.
+            let pendingREM = try await inbox.list(
+                filter: ApprovalFilter(status: "pending", action: "rem.proposal"))
             if let existing = pendingREM.first(where: { rec in
                 guard case .object(let p) = rec.payload,
                       case .object(let proposal)? = p["proposal"],
                       case .string(let pid)? = proposal["id"] else { return false }
                 return pid == row.id
             }) {
-                do {
-                    try await ensureREMProposalInboxCard(
-                        dataRoot: dataRoot, approvalId: existing.id, row: row, notifications: notifications)
-                    return existing.id
-                } catch {
-                    FileHandle.standardError.write(Data(
-                        "REMProposalStager: card ensure failed for \(row.id): \(error)\n".utf8))
-                    return nil
-                }
+                try await ensureREMProposalInboxCard(
+                    dataRoot: dataRoot, approvalId: existing.id, row: row,
+                    experiences: experiences, notifications: notifications)
+                return existing.id
             }
+            let preview = remProposalPreview(row, experiences: experiences)
             let cardTitle = "REM growth lesson"
             let body: JSONValue = .object([
                 "title": .string(cardTitle),
@@ -278,23 +254,13 @@ public enum DreamBackgroundWork {
                         }),
                     ]),
                 ]),
-                "payloadPreview": .string(remProposalPreview(row)),
+                "payloadPreview": .string(preview),
             ])
-            do {
-                let rec = try await inbox.create(body)
-                // Card failure must FAIL the stage (return nil → row stays
-                // unstamped → retried next pass, where the dedupe above
-                // reuses this approval record and re-attempts the card).
-                // Returning the id anyway would stamp the row terminal with
-                // no visible card (gpt-5.5 review 2026-06-10).
-                try await ensureREMProposalInboxCard(
-                    dataRoot: dataRoot, approvalId: rec.id, row: row, notifications: notifications)
-                return rec.id
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "REMProposalStager: stage failed for \(row.id): \(error)\n".utf8))
-                return nil
-            }
+            let rec = try await inbox.create(body)
+            try await ensureREMProposalInboxCard(
+                dataRoot: dataRoot, approvalId: rec.id, row: row,
+                experiences: experiences, notifications: notifications)
+            return rec.id
         }
     }
 
@@ -304,16 +270,19 @@ public enum DreamBackgroundWork {
     /// `recurring · 3 nights` can never render as the same line. Rows with no
     /// support field (written before it existed) get no label rather than a
     /// guessed one.
-    public static func remSupportLabel(_ row: REMProposalRow) -> String? {
-        let lived = row.livedDates ?? []
+    public static func remSupportLabel(_ row: REMProposalRow, experiences: Int?) -> String? {
+        guard row.support != .standing, row.support != nil else { return nil }
+        guard let experiences else {
+            return "provenance unavailable · whether it recurred is not known"
+        }
         let dreams = max(row.evidenceDates.count, row.supportingPassages?.count ?? 0)
-        func nights(_ n: Int) -> String { "\(n) night" + (n == 1 ? "" : "s") }
+        func support(_ n: Int) -> String { "\(n) experience" + (n == 1 ? "" : "s") }
         switch row.support {
         case .recurring:
-            return "recurring · " + nights(max(lived.count, 2))
+            return "recurring · " + support(experiences)
         case .dweltOn:
             return "dwelt on · \(dreams) dream" + (dreams == 1 ? "" : "s")
-                + ", " + nights(max(lived.count, 1))
+                + ", " + support(experiences)
         case .provenanceUnavailable:
             return "provenance unavailable · whether it recurred is not known"
         case .standing, nil:
@@ -324,7 +293,7 @@ public enum DreamBackgroundWork {
     /// The preview every REM surface prints: the support label on its own line
     /// above her words, so the label travels with the proposal wherever the row
     /// is shown instead of living in one view's formatting.
-    public static func remProposalPreview(_ row: REMProposalRow) -> String {
+    public static func remProposalPreview(_ row: REMProposalRow, experiences: Int?) -> String {
         // A standing lesson says what it is before it quotes the line: the
         // card moves a correction into GROWTH, it is not a dream's lesson.
         if row.support == .standing {
@@ -332,7 +301,7 @@ public enum DreamBackgroundWork {
                 + "and retire the memory:\n“\(row.proposalText)”"
         }
         // Her words first: a card shows its first line, and the lesson is the point.
-        guard let label = remSupportLabel(row) else { return row.proposalText }
+        guard let label = remSupportLabel(row, experiences: experiences) else { return row.proposalText }
         return row.proposalText + "\n" + label
     }
 
@@ -345,6 +314,7 @@ public enum DreamBackgroundWork {
         dataRoot: URL,
         approvalId: String,
         row: REMProposalRow,
+        experiences: Int?,
         notifications: any REMProposalNotificationPort
     ) async throws {
         let inboxPath = dataRoot
@@ -352,13 +322,14 @@ public enum DreamBackgroundWork {
             .appendingPathComponent("inbox.jsonl")
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let preview = remProposalPreview(row, experiences: experiences)
         let card: JSONValue = .object([
             "id": .string(approvalId),
             "created_at": .string(fmt.string(from: Date())),
             "source": .string("rem_cycle"),
             "severity": .string("actionable"),
             "title": .string("REM growth lesson"),
-            "summary": .string(String(remProposalPreview(row).prefix(220))),
+            "summary": .string(String(preview.prefix(220))),
             "detail": .string(
                 "Approve to add this compact lesson to GROWTH.md; deny to tombstone it."),
             "related_mission_id": .null,
@@ -387,7 +358,7 @@ public enum DreamBackgroundWork {
                 dataRoot: dataRoot,
                 itemId: approvalId,
                 title: "REM growth lesson",
-                summary: String(remProposalPreview(row).prefix(220)),
+                summary: String(preview.prefix(220)),
                 source: "rem_cycle",
                 severity: "actionable"
             )
@@ -543,27 +514,16 @@ public enum DreamBackgroundWork {
         }
     }
 
-    /// The return channel of the felt dream (U2a, 2026-07-09): the dream's own mood
-    /// line nudges her SLOW disposition layer — the day's considered conclusion, not
-    /// just the day's events. `feltDaySummary` carries the day's feeling into the
-    /// dream; this carries the dream's feeling back out.
-    ///
-    /// The substrate owns every gate: cognition/affect off, a mixed or unfelt mood
-    /// line, the ±cap and the day-scale decay. Fired at most once per calendar day
-    /// (one dream per day) and only after the diary entry committed.
-    ///
-    /// Exposed as `static` (not `private`) for the same reason as the two providers
-    /// above: the scheduler-driven path (BackgroundLoopsAssembly.runDream →
-    /// SwiftNativeDreamREMCycle) builds its own runner and must wire the same sink,
-    /// or the scheduled nightly dream never reaches her disposition.
+    /// Return her explicit dream affect to the existing disposition/residue owner,
+    /// after commit, under its existing claims, caps and decay.
     public static func makeDreamMoodSink(
         cognitionRuntime: NativeCognitionRuntime
     ) -> DreamDatedMoodSink {
         let runtime = cognitionRuntime
-        return { @Sendable mood, dateKey in
+        return { @Sendable affect, dateKey in
             let substrate = await runtime.substrateForIntegration()
             return await substrate.integrateDreamDisposition(
-                moodLine: mood,
+                tone: affect,
                 at: Date(),
                 // Item 7 (2026-09-02): the night's residue is claimed PER
                 // COMMITTED DREAM. Without this the substrate falls back to the
@@ -582,19 +542,5 @@ public enum DreamBackgroundWork {
                 dreamId: "dream:\(dateKey)"
             )
         }
-    }
-}
-
-
-/// One-shot counter bounding how many rows a single catch-up pass may stage.
-private actor REMStagingCatchUpBudget {
-    private var remaining: Int
-
-    init(limit: Int) { self.remaining = limit }
-
-    func claim() -> Bool {
-        guard remaining > 0 else { return false }
-        remaining -= 1
-        return true
     }
 }

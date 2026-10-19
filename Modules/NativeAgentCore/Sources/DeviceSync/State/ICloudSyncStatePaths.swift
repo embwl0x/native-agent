@@ -7,6 +7,8 @@ public struct ICloudBridgeHealthSnapshot: Sendable {
         case unmeasured, available, signedOut, notEntitled, quotaExceeded
         case accountFailure(code: Int, detail: String)
         case unavailable(String)
+        /// Another Mac on this Apple Account holds the phone's pairing.
+        case pairedElsewhere
     }
 
     public let transport: Transport

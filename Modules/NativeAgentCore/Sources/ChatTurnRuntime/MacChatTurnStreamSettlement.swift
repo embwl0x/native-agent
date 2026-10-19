@@ -284,7 +284,7 @@ public extension MacChatStreamAdapter {
     static func chatStream(
         client: SwiftNativeChatOrchestrationClient,
         text: String, attachments: [NativeAgentShared.MultimodalAttachment],
-        sessionId: String, activityIdentity: MacChatTurnIdentity, metaBox: MetaBox,
+        sessionId: String, activityIdentity: MacChatTurnIdentity, replyRowId: String, metaBox: MetaBox,
         hideUserBubble: Bool, serviceTier: @escaping @Sendable () -> String?,
         onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void,
         onScreenPreview: @escaping @Sendable (MacScreenPreviewUpdate) async -> Void
@@ -300,7 +300,7 @@ public extension MacChatStreamAdapter {
                 model: "", reasoningEffort: "", fileAccess: "auto",
                 attachments: attachments, persona: nil, surface: "chat",
                 suppressUserAppend: hideUserBubble, choice: nil, serviceTier: serviceTier(),
-                consumerRendersInlineCards: true
+                consumerRendersInlineCards: true, replyRowID: replyRowId
             )
         }
     }

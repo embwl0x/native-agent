@@ -2,6 +2,7 @@ import Foundation
 
 /// Reading copies and explicit edits only. The Mac's helper and contact stores own all state.
 public struct MobileHelpersSnapshot: Codable, Sendable {
+    public var experienceRevision: Int? = 1
     public var helpers: [MobileHelperRow] = []
     public var agents: [MobileAgentRow] = []
     public var truncated = false
@@ -9,6 +10,8 @@ public struct MobileHelpersSnapshot: Codable, Sendable {
 }
 
 public struct MobileHelperRow: Codable, Identifiable, Sendable {
+    public var resultID: String? = nil
+    public var resultPreview: String? = nil
     public var id: UUID
     public var name: String
     public var status: String
@@ -46,6 +49,8 @@ public struct MobileHelperEdit: Codable, Sendable {
 }
 
 public struct MobileAgentRow: Codable, Identifiable, Sendable, Equatable {
+    public var experiences: [Experience]? = nil
+    public var experienceIDs: [String]? = nil
     public var id: String
     public var name: String
     public var via: String
@@ -60,6 +65,7 @@ public struct MobileAgentRow: Codable, Identifiable, Sendable, Equatable {
 }
 
 public struct MobileAgentThread: Codable, Sendable {
+    public var experienceRevision: Int? = 1
     public var agent: MobileAgentRow
     public var lines: [MobileAgentLine]
     public var truncated: Bool

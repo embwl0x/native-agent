@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 
@@ -51,7 +52,7 @@ public struct SessionIdentityCheck: DoctorCheck {
 
         // Fresh install: no index yet. Honest "ok" with an explicit zero.
         guard indexExists else {
-            return CheckResult(
+            return CheckResult(source: "chat/sessions.json",
                 id: id, title: title, status: "ok",
                 detail: "No chat session index yet — 0 hot session(s), nothing minted.",
                 repair: nil
@@ -59,7 +60,9 @@ public struct SessionIdentityCheck: DoctorCheck {
         }
 
         if !report.indexReadable {
-            return CheckResult(
+            return CheckResult(source: "chat/sessions.json",
+                nextCall: ToolFailureError.fileRepairCall(sessionsPath, dataRoot: root,
+                    shape: "This is a JSON array of saved chat session objects, each with its original nonempty id and saved metadata."),
                 id: id, title: title, status: "fail",
                 detail: "chat/sessions.json is unreadable or malformed."
                     + " Session identity cannot be measured.",
@@ -134,13 +137,12 @@ public struct SessionIdentityCheck: DoctorCheck {
                 "\(report.unreadableSessionCount) transcript(s) UNREAD (missing, empty,"
                     + " or over the scan budget) and therefore unjudged"
             )
-            if status == "ok" { status = "warn" }
+            if status == "ok" { status = "unmeasured" }
         }
 
-        // Both warnings are build findings — a mint site stamping the wrong
-        // source, or a transcript with content that cannot be scanned — so
-        // they go to the harness queue, never to her as a triage.
-        return CheckResult(
+        // A disagreement is a build finding — a mint site stamped the wrong
+        // source — so it goes to the builder, never to her as a triage.
+        return CheckResult(source: "chat/sessions.json",
             id: id, title: title, status: status,
             detail: parts.joined(separator: "; ") + ".",
             harm: status == "warn" ? "Conversation messages cannot be reliably matched to their saved session and surface." : nil,

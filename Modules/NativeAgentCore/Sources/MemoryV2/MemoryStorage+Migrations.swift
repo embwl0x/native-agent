@@ -303,6 +303,16 @@ extension MemoryStorage {
                     """)
             }
         }
+        m.registerMigration("v16_action_embeddings") { db in
+            try db.execute(sql: """
+                CREATE TABLE action_embeddings (
+                  epoch TEXT NOT NULL,
+                  text_hash TEXT NOT NULL,
+                  vector BLOB NOT NULL,
+                  PRIMARY KEY (epoch, text_hash)
+                );
+                """)
+        }
         return m
     }
 

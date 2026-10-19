@@ -64,10 +64,13 @@ public struct OwnedProgramAction: Sendable {
     /// The action runs a program she wrote; a recording never runs one.
     public let program: Bool
     public let readOnly: @Sendable ([String: JSONValue]) -> Bool
+    /// False for calls that answer the script without a ledger row of their
+    /// own (a watch's frames: the watch leaves one receipt for them all).
+    public let journaled: Bool
     public init(id: String, page: String, read: Bool, advisory: Bool = false, partID: String? = nil, program: Bool = false,
-                readOnly: @escaping @Sendable ([String: JSONValue]) -> Bool) {
+                journaled: Bool = true, readOnly: @escaping @Sendable ([String: JSONValue]) -> Bool) {
         self.id = id; self.partID = partID; self.page = page; self.read = read; self.advisory = advisory; self.program = program
-        self.readOnly = readOnly
+        self.journaled = journaled; self.readOnly = readOnly
     }
 }
 
@@ -101,6 +104,8 @@ public protocol OwnedProgramHostProfile: Sendable {
     func secretLine(_ text: String) -> Bool
     func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence
     func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue?
+    /// What a program's call gets back from its receipt: the tool's own data.
+    func answer(_ receipt: JSONValue) -> JSONValue
     func perform(_ input: [String: JSONValue]) async -> JSONValue
     func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue
     func decide(_ question: String, data: JSONValue) async throws -> JSONValue?
@@ -114,6 +119,7 @@ public protocol OwnedProgramHostProfile: Sendable {
 }
 
 extension OwnedProgramHostProfile {
+    public func answer(_ receipt: JSONValue) -> JSONValue { receipt }
     public func validationPerform(_ input: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue {
         await fixture.reply(input)
     }

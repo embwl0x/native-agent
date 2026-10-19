@@ -394,11 +394,7 @@ public enum MacContactsExecutor {
         switch status {
         case .authorized:
             return true
-        case .notDetermined:
-            // A skill never asks macOS for access (`SkillRunContext`); its step hands back.
-            guard !SkillRunContext.handsBack else { return false }
-            return (try? await store.requestAccess(for: .contacts)) ?? false
-        case .denied, .restricted:
+        case .notDetermined, .denied, .restricted:
             return false
         @unknown default:
             return false
@@ -411,9 +407,7 @@ public enum MacContactsExecutor {
             "status": .string("denied"),
             "reason": .string("os_permission_denied"),
             "integration": .string("contacts"),
-            "fix": .string(
-                "Grant NativeAgent access to Contacts in System Settings → Privacy & Security → Contacts."
-            ),
+            "remedy": SystemPermissionPreflight.remedy("contacts") ?? .null,
         ])
     }
 

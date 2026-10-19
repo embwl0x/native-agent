@@ -359,14 +359,13 @@ extension SwiftNativeTurnEngine {
         slots.reserveCapacity(prepared.count)
         // Only the named pixel-capable tools can mint pixels — the file reader,
         // the tools that MAKE an image, and the agent's own page screenshot.
-        // Bound each iteration to eight such calls, including parallel
-        // dispatches — the same eight `boundConversation` keeps (was four: a
-        // fifth read_file in one batch came back without pixels, 2026-09-23).
-        // Every `screen` gets a sink (her-screen Phase 6): it attaches pixels
-        // only for a thin-AX window or on pixels:true, and never otherwise.
+        // Their sinks share one round budget (`LocalToolImage.Round`), parallel
+        // dispatches included. Every `screen` gets a sink (her-screen Phase 6):
+        // it attaches pixels only for a thin-AX window or on pixels:true.
         let imageIndices = Set(prepared.indices.filter {
             imagesEnabled && LocalToolImage.pixelCapableTools.contains(ran[$0])
-        }.prefix(8))
+        })
+        let imageRound = LocalToolImage.Round()
         let heldResult = Self.heldOutboundResult(stepToolNames: stepToolNames ?? ran)
         let held = heldResult == nil ? [] : Set(prepared.indices.filter {
             outboundMessageTools.contains(ran[$0])
@@ -407,7 +406,7 @@ extension SwiftNativeTurnEngine {
                                                 result: result, isError: true, images: []))
                     continue
                 }
-                let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
+                let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink(round: imageRound) : nil
                 let (dispatched, result, isError) = await Self.runSingleDispatch(
                     prepared: p, modelId: modelId, surface: surface,
                     personaID: personaID,
@@ -449,7 +448,7 @@ extension SwiftNativeTurnEngine {
                                 continue
                             }
                             taskGroup.addTask {
-                                let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink() : nil
+                                let imageSink = imageIndices.contains(idx) ? LocalToolImage.Sink(round: imageRound) : nil
                                 let (dispatched, result, isError) = await Self.runSingleDispatch(
                                     prepared: p, modelId: modelId, surface: surface,
                                     personaID: personaID,
@@ -567,11 +566,6 @@ extension SwiftNativeTurnEngine {
             sessionId: sessionId,
             turnId: TurnTraceContext.turnId,
             originalResultClass: ChatToolOutcome.exactResultClass(result),
-            query: {
-                let input = prepared.ranCall.input
-                if case .string(let query)? = input["query"] { return query }
-                return nil
-            }(),
             appDoor: appDoor
         )
         let block = LLMContentBlock.toolResult(

@@ -2,6 +2,7 @@ import Cognition
 import SwiftUI
 import EngineRuntime
 import ApprovalInbox
+import Desk
 import ApprovalTransactions
 import NativeAgentShared
 import Observation
@@ -242,7 +243,7 @@ final class ApprovalLoadState {
             return hasLoadedSnapshot ? "Approval refresh failed" : "Approval status unavailable"
         }
         guard hasLoadedSnapshot else { return "Checking approvals…" }
-        let count = approvals.filter { $0.status.lowercased() == "pending" && !$0.isAgentsOwnDecision }.count
+        let count = WorkOverviewRead.waitingApprovals(approvals).count
         return count == 0 ? "No actions need approval" : "\(count) \(count == 1 ? "action needs" : "actions need") approval"
     }
 
@@ -315,7 +316,7 @@ struct ApprovalsView: View {
     /// Her own decisions (her canon) are hers: no button here resolves them.
     private var pending: [ApprovalRecord] {
         approvalLoadState.approvals.filter {
-            $0.status.lowercased() == "pending" && !$0.isAgentsOwnDecision && (focusedID == nil || $0.id == focusedID)
+            OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) && (focusedID == nil || $0.id == focusedID)
         }
     }
 

@@ -284,6 +284,12 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private let seenMessageIDsCap = 2000
     private var accountFailureHandler: (@Sendable (DeviceSyncAccountFailure) async -> Void)?
     private var assetSecretProvider: (@Sendable () async -> Data?)?
+    // Set by `claimPairing`: another Mac on this Apple Account holds the
+    // account's Mac pairing record, so the phone is that Mac's.
+    private var heldElsewhere = false
+    // Counts this transport's own pairing publications, so a claim whose read
+    // began before one of them cannot undo it.
+    private var pairingPublications: UInt64 = 0
 
     public func useAssetSecret(_ provider: @escaping @Sendable () async -> Data?) {
         lock.lock(); defer { lock.unlock() }
@@ -398,6 +404,17 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return DeviceCloudKitSubscriptionID.recognizes(subID)
     }
 
+    /// True when the push says a pairing record changed: some Mac on this
+    /// Apple Account may have just taken or released the phone.
+    public static func isPairingNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
+        guard let subID = CKNotification(fromRemoteNotificationDictionary: userInfo)?.subscriptionID else { return false }
+        return subID == DeviceCloudKitSubscriptionID.pairing || subID.hasPrefix("NAPairingDevice.")
+    }
+
+    public static func isChatNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
+        CKNotification(fromRemoteNotificationDictionary: userInfo)?.subscriptionID == DeviceCloudKitSubscriptionID.chat
+    }
+
     /// The private CloudKit database. Constructing `CKContainer(identifier:)` is
     /// the 2026-06-03 `_os_crash` trap site — so this property MUST NOT be reached
     /// unless `configured` is true. Every PUBLIC entry point below opens with a
@@ -418,6 +435,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     public func send(_ message: BridgeMessage, beforeDispatch: @Sendable () async throws -> Void) async throws {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
+        try refuseWhilePairedElsewhere()
         let fields = try NAChatMessageCodec.encode(message)
         let recordType = Self.recordType(for: fields)
         let usesAsset = NAChatMessageCodec.usesAsset(fields)
@@ -499,7 +517,8 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
                 do { try await self.performModifyRecords(op) }
                 catch let error as DeviceSyncError {
                     if case .conflict = error, await self.existingMessageRecordMatches(fields) {
-                        await self.touchExistingRecord(named: fields.recordName)
+                        do { try await self.resignalMessage(named: fields.recordName) }
+                        catch { throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription) }
                         return
                     }
                     switch error {
@@ -522,18 +541,23 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         }
     }
 
-    /// Re-save the server record unchanged so its `___modTime` advances. Only
-    /// the retention clock moves — no field is written, and
-    /// `.ifServerRecordUnchanged` means a record the peer changed underneath us
-    /// is left alone. Best effort: a failed touch costs the record its
-    /// refreshed clock, never the send's success.
-    private func touchExistingRecord(named recordName: String) async {
-        _ = await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayTouch", onFailure: accountFailureReporter) {
-            let record = try await self.database.record(
-                for: CKRecord.ID(recordName: recordName)
-            )
+    /// Renew the original delivery, never mint a second request. A changed
+    /// query clock makes it eligible for an update push; the signed payload keeps
+    /// its original timestamp and identity. Uses the existing CloudKit schema.
+    public func resignalMessage(named recordName: String) async throws {
+        guard configured else { throw DeviceSyncError.notConfigured }
+        try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.resignal", onFailure: accountFailureReporter) {
+            let id = CKRecord.ID(recordName: recordName)
+            let records = try await self.database.records(for: [id], desiredKeys: ["direction", "createdAt"])
+            guard let fetched = records[id] else { throw CKError(.unknownItem) }
+            let record = try fetched.get()
+            let direction: NAChatDirection = self.role == .mac ? .mac2ios : .ios2mac
+            guard record["direction"] as? String == direction.rawValue else {
+                throw DeviceSyncError.underlying(message: "Cannot re-signal another device's message.")
+            }
+            record["createdAt"] = ISO8601DateFormatter().string(from: Date()) as CKRecordValue
             let op = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: nil)
-            op.savePolicy = .ifServerRecordUnchanged
+            op.savePolicy = .changedKeys
             op.qualityOfService = .userInitiated
             try await self.performModifyRecords(op)
         }
@@ -564,19 +588,15 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     // MARK: observeIncoming
 
-    public func observeIncoming(_ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool) async {
+    @discardableResult
+    public func observeIncoming(_ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool) async -> Bool {
         guard configured else {
             nativeLog("[ck-device] observeIncoming: CloudKit entitlement absent — not subscribing (notConfigured). Legacy transport should own delivery.")
-            return
+            return false
         }
         setIncomingHandler(onMessage)  // last registration wins (single forwarder)
-        // Register the durable silent-push subscription so the peer's writes
-        // notify this device, then do an initial drain to pick up anything
-        // already waiting. Live push → drain wiring is CK-3; drainIncoming() is
-        // the pull half and is exercisable now.
-        _ = await ensurePushSubscriptions()
-        let result = await drainIncoming()
-        devicePushLog.info("Initial incoming drain role=\(self.role.rawValue, privacy: .public) dispatched=\(result.dispatchedCount)")
+        // Let the bridge record subscription failure before its initial drain.
+        return await ensurePushSubscriptions()
     }
 
     public func ensurePushSubscriptions() async -> Bool {
@@ -601,6 +621,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     public func drainIncoming() async -> DeviceSyncDrainResult {
         guard NADeviceSyncRecoveryBudget.hasTime else { return .skipped(0) }
         guard configured else { return .skipped(0) }  // crash-guard: pull() touches CKContainer
+        guard !pairingHeldElsewhere else { return .skipped(0) }
         // CK-3c: serialize via SYNC lock helpers (the codebase keeps every NSLock
         // use in a synchronous scope — never held across an await). The body's own
         // fine-grained locking still works since the slot flag isn't held here.
@@ -762,7 +783,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     @discardableResult
     public func drainIncomingControls() async -> Int {
-        guard configured, role == .mac, NADeviceSyncRecoveryBudget.hasTime,
+        guard configured, role == .mac, NADeviceSyncRecoveryBudget.hasTime, !pairingHeldElsewhere,
               loadControlAdmission() != nil, beginControlDrain() else { return 0 }
         defer { endControlDrain() }
         let (_, since) = loadHandlerAndCursor()
@@ -904,6 +925,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     @discardableResult
     public func sweepExpiredRecords() async -> Int {
         guard configured else { return 0 }  // crash-guard: no CKContainer
+        guard !pairingHeldElsewhere else { return 0 }
         let now = Date()
         guard claimRetentionSweep(now: now) else { return 0 }
         let cutoff = now.addingTimeInterval(-Self.retentionWindow)
@@ -1170,6 +1192,67 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         } catch is DeviceCKLandmineTimeout {
             throw DeviceSyncError.transient(message: "CloudKit publishPairing timed out")
         }
+        notePairingPublished()
+    }
+
+    /// Every Mac on one Apple Account shares the account's Mac pairing record,
+    /// and the phone follows whichever key it holds. A Mac takes the record
+    /// only when it is free or already its own; another Mac's key stays until
+    /// the person moves the phone, which is `publishPairing`. While another Mac
+    /// holds it this transport neither reads the phone's records nor writes
+    /// any: the phone is that Mac's. Returns whether this Mac holds the
+    /// pairing, or nil when the record could not be read (nothing changes).
+    @discardableResult
+    public func claimPairing(secret: Data) async -> Bool? {
+        guard configured, role == .mac, secret.count == 32 else { return nil }
+        let recordName = "pairing.\(role.rawValue)"
+        let publications = pairingPublicationCount()
+        let slot: PairingSlot? = await withDeviceCKTimeout("CloudKitDeviceTransport.claimPairing", onFailure: accountFailureReporter) {
+            do {
+                let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
+                return (record["secretHex"] as? String).flatMap(Self.data(fromHex:)).map(PairingSlot.holds) ?? .empty
+            } catch let error as CKError where error.code == .unknownItem {
+                return .empty
+            }
+        }
+        switch slot {
+        case nil:
+            return nil
+        case .holds(let held)?:
+            return settleClaim(elsewhere: held != secret, since: publications)
+        case .empty?:
+            do { try await publishPairing(secret: secret) } catch { return nil }
+            return true
+        }
+    }
+
+    /// True while another Mac on this Apple Account holds the pairing.
+    public var pairingHeldElsewhere: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return heldElsewhere
+    }
+
+    private func notePairingPublished() {
+        lock.lock(); defer { lock.unlock() }
+        pairingPublications &+= 1
+        heldElsewhere = false
+    }
+
+    private func pairingPublicationCount() -> UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return pairingPublications
+    }
+
+    /// A publication that landed while the claim was reading is newer than
+    /// what the read saw, and already decided the answer.
+    private func settleClaim(elsewhere: Bool, since publications: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if pairingPublications == publications { heldElsewhere = elsewhere }
+        return !heldElsewhere
+    }
+
+    private func refuseWhilePairedElsewhere() throws {
+        if pairingHeldElsewhere { throw DeviceSyncError.pairedElsewhere }
     }
 
     public func observePairing(onChange: @escaping @Sendable (Data) async -> Bool) async {
@@ -1235,6 +1318,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     public func setStatus(key: String, value: String) async throws {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
+        try refuseWhilePairedElsewhere()
         let recordType = NADeviceSyncRecordType.status
         let recordName = "status.\(role.rawValue).\(key)"
         let updatedAt = isoNow()
@@ -1280,6 +1364,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     public func setPresence(pairingSecret: Data) async throws {
         guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
+        try refuseWhilePairedElsewhere()
         guard pairingSecret.count == 32 else { throw DeviceSyncError.notConfigured }
         let recordName = Self.presenceRecordName(pairingSecret: pairingSecret)
         do {
@@ -1392,6 +1477,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     public func drainStatus() async -> Int {
         guard NADeviceSyncRecoveryBudget.hasTime else { return 0 }
         guard configured else { return 0 }  // crash-guard: record(for:) touches CKContainer
+        guard !pairingHeldElsewhere else { return 0 }
         // 2026-09-06: serialized, exactly as drainIncoming is. Unserialized,
         // two drains could claim two generations of one key and then apply them
         // concurrently — an older snapshot finishing last overwrites newer bytes.
@@ -2186,6 +2272,7 @@ public extension DeviceSyncTransportResolver {
 /// Sendable value carriers for the pairing/status singleton drains (returned
 /// across the withDeviceCKTimeout race boundary).
 private struct PeerPairingHit: Sendable { let secret: Data; let modDate: Date? }
+private enum PairingSlot: Sendable { case empty, holds(Data) }
 private struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
 
 /// Thread-safe recordName → modificationDate map for a single pull page (the

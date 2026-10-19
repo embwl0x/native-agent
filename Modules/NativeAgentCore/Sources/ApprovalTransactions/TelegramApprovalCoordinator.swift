@@ -112,6 +112,7 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
             // without userId, an allowed_user_ids Telegram install loses its
             // proof and an approved high-risk action can still fail closed.
             "origin": .object([
+                "answerExperienceID": Self.nonEmptyStringValue(envelope.answerExperienceID),
                 "sessionId": Self.nonEmptyStringValue(sessionId),
                 "chatId": .string(chatIdString),
                 "userId": Self.nonEmptyStringValue(userId),
@@ -579,15 +580,19 @@ public actor TelegramApprovalFiler: NonBlockingApprovalFiler, TelegramApprovalHa
         // A card raised elsewhere keeps its own heading: who asked, or what for.
         let heading = approval.title.isEmpty || approval.title == "Approve \(toolName)"
             ? "Approval required: \(ToolActivityPresentation.title(toolName))" : approval.title
-        return """
-        \(TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(heading)))
-        ID: \(approval.id)
-        Reason: \(TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(ToolActivityPresentation.approvalText(approval.reason, tool: toolName))))
-
-        \(Self.preview(payload))
-
-        You can also reply with /approve \(approval.id) or /deny \(approval.id).
-        """
+        func redacted(_ text: String) -> String { TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(text)) }
+        let reason = ToolActivityPresentation.approvalText(approval.reason, tool: toolName)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A card whose filer wrote readable words (a REM lesson) shows them,
+        // not its payload as JSON; a tool's card still shows its arguments.
+        let readable = approval.readableAsk
+        let body = approval.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !readable.isEmpty
+            ? redacted(readable.count > 1400 ? String(readable.prefix(1400)) + "..." : readable)
+            : Self.preview(payload)
+        var lines = [redacted(heading), "ID: \(approval.id)"]
+        if !reason.isEmpty { lines.append("Reason: \(redacted(reason))") }
+        lines += ["", body, "", "You can also reply with /approve \(approval.id) or /deny \(approval.id)."]
+        return lines.joined(separator: "\n")
     }
 
     public static func sendTelegramApprovalPrompt(

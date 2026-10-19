@@ -258,7 +258,9 @@ public struct BotRunQueue: Sendable {
     }
 
     func claim(bot id: UUID, requestID: UUID?, manual: Bool = false) throws -> ClaimedRun {
-        try admit(bot: id, runID: requestID, manual: manual)
+        let run = try admit(bot: id, runID: requestID, manual: manual)
+        NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
+        return run
     }
 
     func claimWhenAvailable(bot id: UUID, requestID: UUID?, manual: Bool = false) async throws -> ClaimedRun {

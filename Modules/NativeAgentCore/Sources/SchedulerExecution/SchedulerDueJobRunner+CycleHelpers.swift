@@ -5,7 +5,7 @@ import TelegramBot
 import TriggerScheduler
 
 extension SchedulerDueJobRunner {
-    /// Keep recent one-shot completion and unknown-outcome history for review.
+    /// Keep recent one-shot completions; held outcomes are never age-retired.
     static let oneShotRetentionSeconds: Double = 7 * 86_400
 
     static func pruneRetiredRows(
@@ -24,6 +24,14 @@ extension SchedulerDueJobRunner {
             }
             let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
             let enabled = SchedulerJobRuntime.bool(obj["enabled"], default: true)
+            // Held work retains the owner of its resume/reconciliation lever.
+            if SchedulerJobRuntime.string(obj["lastRunStatus"]) == "unknown"
+                || SchedulerJobRuntime.string(obj["pausedAt"]) != nil
+                || (!enabled && SchedulerJobRuntime.string(obj["completedAt"]) == nil
+                    && !(SchedulerJobRuntime.string(obj["disabledReason"]) ?? "").isEmpty) {
+                kept.append(row)
+                continue
+            }
             let lastRun = SchedulerJobRuntime.string(obj["lastRunAt"]).flatMap(parseISODate)
             var why: String?
             if JobKind(rawValue: kind) == nil {
@@ -37,13 +45,7 @@ extension SchedulerDueJobRunner {
                           SchedulerJobRuntime.string(obj["pausedAt"]) == nil,
                           let due = SchedulerJobRuntime.epoch(from: obj["nextRunAt"])
                             ?? SchedulerJobRuntime.epoch(from: obj["nextRunAtEpoch"]), due < nowEpoch {
-                    if SchedulerJobRuntime.string(obj["lastRunStatus"]) == "unknown" {
-                        if nowEpoch - max(due, lastRun?.timeIntervalSince1970 ?? due) > oneShotRetentionSeconds {
-                            why = "unknown one-shot outcome past 7-day review window"
-                        }
-                    } else {
-                        why = "disabled or cancelled one-shot past its scheduled time"
-                    }
+                    why = "disabled or cancelled one-shot past its scheduled time"
                 }
             } else if !enabled,
                       SchedulerJobRuntime.string(obj["pausedAt"]) == nil,
@@ -191,11 +193,7 @@ extension SchedulerDueJobRunner {
             if let detail = firstErrorDetailLine(errors) {
                 lines.append(detail)
             }
-            if dreamErrorsAreRetryable(errors) {
-                lines.append("No dream file was created. NativeAgent will retry automatically.")
-            } else {
-                lines.append("No dream file was created. This needs attention before the next scheduled dream.")
-            }
+            lines.append("No dream file was created. Repair remains owed; app mind.dream runs the pass again.")
             if sessionsProcessed > 0 {
                 lines.append("Recent sessions scanned: \(sessionsProcessed).")
             }
@@ -233,37 +231,6 @@ extension SchedulerDueJobRunner {
             }
         }
         return nil
-    }
-
-    static func dreamErrorsAreRetryable(_ errors: [String]) -> Bool {
-        let text = errors.joined(separator: "\n").lowercased()
-        if text.isEmpty { return false }
-        if text.contains("notconfigured")
-            || text.contains("not configured")
-            || text.contains("unauthorized")
-            || text.contains("forbidden")
-            || text.contains("401")
-            || text.contains("403") {
-            return false
-        }
-        return text.contains("transient")
-            || text.contains("network")
-            || text.contains("connection")
-            || text.contains("timed out")
-            || text.contains("timeout")
-            || text.contains("rate limited")
-            || text.contains("unparseable llm response")
-    }
-
-    /// A default cycle job parked (retry cap reached) on `dateKey`. While
-    /// parked for the day the catch-up path must stay disarmed.
-    static func containsRetryParkedToday(rows: [JSONValue], kind: String, dateKey: String) -> Bool {
-        rows.contains { row in
-            guard case .object(let obj) = row else { return false }
-            let rowKind = (SchedulerJobRuntime.string(obj["kind"]) ?? "").lowercased()
-            guard rowKind == kind else { return false }
-            return SchedulerJobRuntime.string(obj["retryParkedDateKey"]) == dateKey
-        }
     }
 
     static func remInboxMessage(

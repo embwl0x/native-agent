@@ -1,20 +1,25 @@
+import CryptoKit
 import Foundation
 import PersistenceCore
 
+/// The artifacts a reply carries: its face's, which every surface renders.
 public enum ChatGeneratedImageArtifacts {
+    /// What she chose, explicitly: every image her generation made in this
+    /// turn (from its receipts), and every image she attached to it with
+    /// `reply.attach` (`ReplyChoices`, in the order she chose them).
     public static func attachments(
         from dispatches: [TurnEngineResult.ToolDispatchRecord],
+        chosen: [String] = [],
         dataRoot: URL
     ) -> [MultimodalAttachment] {
         var out: [MultimodalAttachment] = []
         var seen: Set<String> = []
         // app image.generate is image_generate too.
-        for dispatch in dispatches where dispatch.ranCall.tool == "image_generate" {
-            for attachment in attachments(fromToolResult: dispatch.result, dataRoot: dataRoot) {
-                guard let path = attachment.path, !seen.contains(path) else { continue }
-                seen.insert(path)
-                out.append(attachment)
-            }
+        let generated = dispatches.filter { $0.ranCall.tool == "image_generate" }
+            .flatMap { attachments(fromToolResult: $0.result, dataRoot: dataRoot) }
+        for attachment in generated + chosen.compactMap({ attachment(URL(fileURLWithPath: $0)) })
+            where attachment.path.map({ seen.insert($0).inserted }) == true {
+            out.append(attachment)
         }
         return out
     }
@@ -40,31 +45,33 @@ public enum ChatGeneratedImageArtifacts {
             guard !path.isEmpty else { continue }
             let url = URL(fileURLWithPath: path).standardizedFileURL
             guard url.path == generatedRoot || url.path.hasPrefix(generatedRoot + "/") else { continue }
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
-            guard let mime = imageMimeType(for: url) else { continue }
-
-            let byteSize = fileByteSize(url)
-                ?? intValue(imageObject["byteSize"])
-                ?? intValue(imageObject["byte_size"])
-                ?? 0
-            let name: String
+            let name: String?
             if case .string(let filename)? = imageObject["filename"],
                !filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 name = filename.trimmingCharacters(in: .whitespacesAndNewlines)
             } else {
-                name = url.lastPathComponent
+                name = nil
             }
-            out.append(MultimodalAttachment(
-                id: stableAttachmentId(for: url),
-                type: "image",
-                base64: "",
-                mime: mime,
-                name: name,
-                byteSize: byteSize,
-                path: url.path
-            ))
+            if let attachment = attachment(url, name: name,
+                    byteSize: intValue(imageObject["byteSize"]) ?? intValue(imageObject["byte_size"])) {
+                out.append(attachment)
+            }
         }
         return out
+    }
+
+    /// An image file on disk as a reply attachment; nil for anything else.
+    public static func attachment(_ url: URL, name: String? = nil, byteSize: Int? = nil) -> MultimodalAttachment? {
+        guard FileManager.default.fileExists(atPath: url.path), let mime = imageMimeType(for: url) else { return nil }
+        return MultimodalAttachment(
+            id: stableAttachmentId(for: url),
+            type: "image",
+            base64: "",
+            mime: mime,
+            name: name ?? url.lastPathComponent,
+            byteSize: fileByteSize(url) ?? byteSize ?? 0,
+            path: url.path
+        )
     }
 
     private static func imageMimeType(for url: URL) -> String? {
@@ -91,7 +98,8 @@ public enum ChatGeneratedImageArtifacts {
         }
     }
 
+    /// From the whole path: two files of one name are two attachments.
     private static func stableAttachmentId(for url: URL) -> String {
-        "generated-image-\(url.deletingPathExtension().lastPathComponent)"
+        "image-" + SHA256.hash(data: Data(url.path.utf8)).prefix(12).map { String(format: "%02x", $0) }.joined()
     }
 }

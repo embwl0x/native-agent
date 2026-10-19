@@ -36,6 +36,7 @@ struct ChatAttachmentSummary: Identifiable, Codable, Hashable {
     var mime: String?
     var base64: String?
     var byteSize: Int?
+    var utterance: SpeechUtterance?
 
     init(
         id: String = UUID().uuidString,
@@ -43,7 +44,8 @@ struct ChatAttachmentSummary: Identifiable, Codable, Hashable {
         type: String,
         mime: String? = nil,
         base64: String? = nil,
-        byteSize: Int? = nil
+        byteSize: Int? = nil,
+        utterance: SpeechUtterance? = nil
     ) {
         self.id = id
         self.name = name
@@ -51,6 +53,7 @@ struct ChatAttachmentSummary: Identifiable, Codable, Hashable {
         self.mime = mime
         self.base64 = base64
         self.byteSize = byteSize
+        self.utterance = utterance
     }
 }
 

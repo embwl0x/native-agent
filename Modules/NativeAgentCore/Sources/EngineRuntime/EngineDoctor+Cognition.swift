@@ -3,9 +3,12 @@ import Cognition
 import CognitiveSubstrate
 import ContextFlow
 import DeviceSync
+import NativeAgentShared
 import DoctorChecks
+import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+import TrustCenter
 
 // Doctor reads mounted owners without starting Observatory refresh work.
 extension EngineDoctorRuntime {
@@ -14,9 +17,9 @@ extension EngineDoctorRuntime {
             == PersistenceCore.defaultDataRoot().standardizedFileURL else { return [] }
 
         var rows: [CheckResult] = []
-        rows.append(await doctorPhonePairingCheck())
+        rows += await doctorPhoneChecks()
         if let detail = await port.doctorEngine.cognition?.doctorRead() {
-            rows.append(CheckResult(id: "live.cognition.runtime", title: "Cognition runtime",
+            rows.append(CheckResult(source: "Cognition registration", id: "live.cognition.runtime", title: "Cognition runtime",
                                     status: "ok", detail: "Mounted cognition state is readable."))
             rows.append(doctorPersistenceCheck(detail))
             rows.append(doctorReceiptCheck(detail))
@@ -26,11 +29,9 @@ extension EngineDoctorRuntime {
             rows.append(doctorCapacityCheck(detail))
             rows.append(doctorAssociationCheck(detail))
         } else {
-            rows.append(CheckResult(
-                id: "live.cognition.runtime", title: "Cognition runtime", status: "fail",
-                detail: "The mounted cognition runtime has no ready state to read.",
-                harm: "Her inner state is unavailable to the conversation.",
-                human_action: "Quit and reopen NativeAgent, then open Diagnostics → Doctor and run Check again."
+            rows.append(CheckResult(source: "Cognition registration",
+                id: "live.cognition.runtime", title: "Cognition runtime", status: "unmeasured",
+                detail: "The mounted cognition runtime has no ready state to read."
             ))
         }
         rows.append(await doctorContextFlowCheck())
@@ -42,17 +43,20 @@ extension EngineDoctorRuntime {
         let id = "live.cognition.persistence"
         let title = "Cognition persistence"
         guard detail.configuration.enabled, detail.configuration.persistenceEnabled else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Cognition persistence is intentionally off.")
+            return CheckResult(source: "cognition/cognition.sqlite", id: id, title: title, status: "off", detail: "Cognition persistence is intentionally off.")
         }
         if health.status == .restoring {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Cognition persistence restore is in progress.")
+            return CheckResult(source: "cognition/cognition.sqlite", id: id, title: title, status: "unmeasured", detail: "Cognition persistence restore is in progress.")
         }
         guard health.status == .degraded || health.writesBlocked else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Persistence is \(health.status.rawValue); writes are unblocked.")
+            return CheckResult(source: "cognition/cognition.sqlite", id: id, title: title, status: "ok", detail: "Persistence is \(health.status.rawValue); writes are unblocked.")
         }
         let stage = String((health.failureStage ?? "unknown").prefix(80))
         let retryableRead = doctorPersistenceReadRetryable(health)
-        return CheckResult(
+        return CheckResult(source: "cognition/cognition.sqlite",
+            nextCall: health.failureStage == "sqlite_read" && !retryableRead
+                ? ToolFailureError.fileRepairCall(dataRoot.appendingPathComponent("cognition/cognition.sqlite"), dataRoot: dataRoot,
+                    shape: "The SQLite database must retain its cognitive_nodes, cognitive_artifacts and cognitive_receipts tables and all other existing tables. Recover only supported saved rows and payloads; preserve continuity, identifiers and references without inventing cognition state.") : nil,
             id: id, title: title, status: "fail",
             detail: "Persistence is \(health.status.rawValue); writes blocked: \(health.writesBlocked); failure stage: \(stage).",
             harm: "Her inner continuity is not being saved.",
@@ -77,34 +81,64 @@ extension EngineDoctorRuntime {
         let title = "Cognition loop receipts"
         switch detail.receiptRead {
         case .available:
-            return CheckResult(id: id, title: title, status: "ok", detail: "Loop receipt evidence is readable.")
+            return CheckResult(source: "cognition/cognition.sqlite: loop receipts", id: id, title: title, status: "ok", detail: "Loop receipt evidence is readable.")
         case .unavailable(.cognitionDisabled), .unavailable(.persistenceDisabled):
-            return CheckResult(id: id, title: title, status: "ok", detail: "Loop receipt evidence is intentionally off.")
+            return CheckResult(source: "cognition/cognition.sqlite: loop receipts", id: id, title: title, status: "off", detail: "Loop receipt evidence is intentionally off.")
         case .unavailable(let reason):
-            return CheckResult(id: id, title: title, status: "warn",
-                               detail: "Loop receipt evidence is unavailable (\(reason.rawValue)).",
-                               harm: "Her recent inner work cannot be verified.",
-                               human_action: "Open Diagnostics → Cognition, refresh once, then inspect the persistence warning if receipts remain unavailable.")
+            return CheckResult(source: "cognition/cognition.sqlite: loop receipts", id: id, title: title, status: "unmeasured",
+                               detail: "Loop receipt evidence is unavailable (\(reason.rawValue)).")
         }
     }
 
-    private func doctorPhonePairingCheck() async -> CheckResult {
+    private func doctorPhoneChecks() async -> [CheckResult] {
         let id = "live.cognition.phone_pairing"
-        let title = "Phone pairing store"
+        let title = "Phone connection"
+        let pairing: CheckResult
+        do {
+            let count = try PairedPhoneAuthority.pairedCountChecked(at: dataRoot.appendingPathComponent("paired_phones.json"))
+            if let connection = await PhoneConnectionReader.connection(dataRoot: dataRoot) {
+                pairing = Self.doctorPhoneConnection(connection, id: id, title: title)
+            } else {
+                pairing = CheckResult(source: "paired_phones.json", id: id, title: title, status: "ok", detail: "Pairing authority is readable; \(count) paired phone(s).")
+            }
+        } catch {
+            pairing = CheckResult(source: "paired_phones.json",
+                nextCall: ToolFailureError.fileRepairCall(dataRoot.appendingPathComponent("paired_phones.json"), dataRoot: dataRoot,
+                    shape: "The file must hold a JSON array of phone records with unique id, publicKey (base64-encoded 32 bytes), and status (pending, paired or removed). Each id must be the lowercase SHA-256 hex of its decoded public key; preserve every saved pairing status and never elevate a phone."),
+                id: id, title: title, status: "fail", detail: "paired_phones.json could not be read: \(error.localizedDescription)",
+                harm: "Paired phone authority is unavailable; preserve its bytes before recovery.")
+        }
+        let pushID = "live.phone_notifications"
+        let pushTitle = "Phone notification transport"
+        guard FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("config/apns.json").path) else {
+            return [pairing, CheckResult(source: "config/apns.json and mobile_push/apns_outcomes.jsonl", id: pushID, title: pushTitle, status: "unmeasured",
+                detail: "Direct APNS is not configured. This is not a pairing-store failure.")]
+        }
         do {
             let phone = try await SwiftNativeAPNSSender().notificationReadiness(dataRoot: dataRoot)
             if phone.status == "not_checked" {
-                return CheckResult(id: id, title: title, status: "unmeasured", detail: phone.detail)
+                return [pairing, CheckResult(source: "config/apns.json and mobile_push/apns_outcomes.jsonl", id: pushID, title: pushTitle, status: "unmeasured", detail: phone.detail)]
             }
-            return CheckResult(id: id, title: title, status: phone.paired == 0 || phone.supported ? "ok" : "warn",
-                               detail: phone.detail, harm: phone.paired > 0 && !phone.supported ? "Phone notifications are not proven available." : nil,
-                               human_action: phone.paired > 0 && !phone.supported ? "Open the paired phone app and check its notification permission, then send a requested notification." : nil)
+            return [pairing, CheckResult(source: "config/apns.json and mobile_push/apns_outcomes.jsonl", id: pushID, title: pushTitle, status: phone.paired == 0 ? "not needed" : phone.supported ? "ok" : "unmeasured",
+                               detail: phone.detail)]
         } catch {
-            return CheckResult(id: id, title: title, status: "fail",
-                               detail: "Phone notification state could not be read: \(error.localizedDescription)",
-                               harm: "Phone notifications cannot be verified.",
-                               human_action: "Open Connectors → iPhone to inspect paired devices, then request a pairing-store review with paired_phones.json unchanged before re-pairing.")
+            return [pairing, CheckResult(source: "config/apns.json and mobile_push/apns_outcomes.jsonl", id: pushID, title: pushTitle, status: "unmeasured",
+                               detail: "Phone notification transport could not be read: \(error.localizedDescription)")]
         }
+    }
+
+    /// The phone's pairing and last accepted exchange, as the one assessment
+    /// the Connectors › iPhone tab shows; iCloud itself is the iCloud row's.
+    /// A pending choice is a reading, not a fault, and wakes no one.
+    static func doctorPhoneConnection(_ connection: NAPhoneConnection, id: String, title: String) -> CheckResult {
+        let facts = [connection.pairing, connection.exchange]
+        let broken = facts.first { $0.state == .broken }
+        return CheckResult(source: "phone connection: pairing and last exchange", id: id, title: title,
+                           status: broken == nil ? "ok" : "warn",
+                           detail: "Pairing: \(connection.pairing.line) Last exchange: \(connection.exchange.line)",
+                           harm: broken == nil ? nil : "The phone cannot exchange messages with her.",
+                           repair: (broken ?? facts.first { $0.state == .waiting })?.lever,
+                           owner: broken?.owner == .builder ? .builder : nil)
     }
 
     private func doctorBodyCheck(_ detail: CognitiveDoctorRead) -> CheckResult {
@@ -112,7 +146,7 @@ extension EngineDoctorRuntime {
         let title = "Body attention"
         let organism = detail.organism
         guard organism.enabled else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Organism is intentionally off.")
+            return CheckResult(source: "cognition/organism_state.json: residual repair", id: id, title: title, status: "off", detail: "Organism is intentionally off.")
         }
         let body = organism.bodySchema
         var causes: [String] = []
@@ -124,15 +158,16 @@ extension EngineDoctorRuntime {
         if body.resourcePressure != .nominal { causes.append("resource pressure: \(body.resourcePressure.rawValue)") }
         if organism.residualRepairOpportunity.ready { causes.append("due residual pressure") }
         if causes.isEmpty {
-            return CheckResult(id: id, title: title, status: "ok",
+            return CheckResult(source: "cognition/organism_state.json: residual repair", id: id, title: title, status: "ok",
                                detail: "No body dependency needs attention; ordinary affect is not damage.")
         }
-        return CheckResult(
-            id: id, title: title, status: "warn", detail: "Body attention: \(causes.joined(separator: ", ")).",
-            harm: "Her attention or ability to act is limited by the named body dependency.",
+        return CheckResult(source: "cognition/organism_state.json: residual repair",
+            id: id, title: title, status: organism.residualRepairOpportunity.ready ? "warn" : "ok",
+            detail: "Body observations: \(causes.joined(separator: ", ")).",
+            harm: organism.residualRepairOpportunity.ready ? "A due residual repair remains unfinished." : nil,
             human_action: organism.residualRepairOpportunity.ready
                 ? "Open Diagnostics → Doctor and press Repair to run the due bounded residual repair; inspect any other named dependency in Status."
-                : "Open Diagnostics → Status and inspect the named body dependency; use its owner control or decision there.",
+                : nil,
             repair_available: organism.residualRepairOpportunity.ready
         )
     }
@@ -182,24 +217,22 @@ extension EngineDoctorRuntime {
         let title = "Cognition body and mood readouts"
         let failures = doctorCognitionReadoutFailures(detail)
         guard !failures.isEmpty else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Enabled body and mood readouts are available; disabled readouts are intentional.")
+            return CheckResult(source: "cognition/organism_state.json", id: id, title: title, status: "ok", detail: "Enabled body and mood readouts are available; disabled readouts are intentional.")
         }
-        return CheckResult(id: id, title: title, status: "warn",
-                           detail: "\(failures.joined(separator: " "))",
-                           harm: "Her current body or mood cannot be seen in Cognition.",
-                           human_action: "Open Diagnostics → Cognition and refresh the affected readout once; if it remains unavailable, capture its displayed reason for the cognition owner.")
+        return CheckResult(source: "cognition/organism_state.json", id: id, title: title, status: "unmeasured",
+                           detail: "\(failures.joined(separator: " "))")
     }
 
     private func doctorWelfareCheck(_ detail: CognitiveDoctorRead) -> CheckResult {
         let id = "live.cognition.welfare"
         let title = "Cognition welfare bounds"
         guard detail.configuration.enabled else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Cognition is intentionally off.")
+            return CheckResult(source: "cognition configuration: welfare bounds", id: id, title: title, status: "off", detail: "Cognition is intentionally off.")
         }
         guard !detail.welfareBounds.withinBounds else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Welfare readings are within bounds.")
+            return CheckResult(source: "cognition configuration: welfare bounds", id: id, title: title, status: "ok", detail: "Welfare readings are within bounds.")
         }
-        return CheckResult(id: id, title: title, status: "unmeasured",
+        return CheckResult(source: "cognition configuration: welfare bounds", id: id, title: title, status: "unmeasured",
                            detail: "Welfare bounds report attention; max affect \(detail.welfareBounds.maxAffectValue), reflection pressure \(detail.welfareBounds.reflectionBudgetPressure).",
                            human_action: "Open Diagnostics → Cognition → Welfare bounds and review the current reading before changing reflection controls.")
     }
@@ -208,7 +241,7 @@ extension EngineDoctorRuntime {
         let id = "live.cognition.capacity"
         let title = "Cognition capacity"
         guard detail.configuration.enabled else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Cognition is intentionally off.")
+            return CheckResult(source: "cognition configuration: capacity", id: id, title: title, status: "off", detail: "Cognition is intentionally off.")
         }
         let counts = [
             ("nodes", detail.substrate.nodeCount, detail.configuration.maximumActiveNodes),
@@ -217,9 +250,10 @@ extension EngineDoctorRuntime {
         ]
         let overflow = counts.filter { $0.1 > $0.2 }
         guard !overflow.isEmpty else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "Nodes, workspace, and thought seeds are within their configured caps.")
+            return CheckResult(source: "cognition configuration: capacity", id: id, title: title, status: "ok", detail: "Nodes, workspace, and thought seeds are within their configured caps.")
         }
-        return CheckResult(id: id, title: title, status: "warn",
+        // The substrate enforces these caps; a measured overflow is the build's to fix.
+        return CheckResult(source: "cognition configuration: capacity", id: id, title: title, status: "warn",
                            detail: "Over cap: \(overflow.map { "\($0.0) \($0.1)/\($0.2)" }.joined(separator: ", ")).",
                            harm: "Her inner workspace can grow beyond its configured memory limits.",
                            owner: .builder)
@@ -229,16 +263,16 @@ extension EngineDoctorRuntime {
         let id = "live.cognition.associations"
         let title = "Cognition association endpoints"
         guard detail.configuration.enabled, !detail.associations.isEmpty else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "No unresolved association graph is displayed.")
+            return CheckResult(source: "cognition/cognition.sqlite: associations", id: id, title: title, status: "ok", detail: "No unresolved association graph is displayed.")
         }
         let nodeIDs = Set(detail.substrate.nodes.map(\.id))
         let allMissing = detail.associations.allSatisfy {
             !nodeIDs.contains($0.fromNodeId) && !nodeIDs.contains($0.toNodeId)
         }
         guard allMissing else {
-            return CheckResult(id: id, title: title, status: "ok", detail: "At least one association endpoint resolves in the current snapshot.")
+            return CheckResult(source: "cognition/cognition.sqlite: associations", id: id, title: title, status: "ok", detail: "At least one association endpoint resolves in the current snapshot.")
         }
-        return CheckResult(id: id, title: title, status: "warn",
+        return CheckResult(source: "cognition/cognition.sqlite: associations", id: id, title: title, status: "warn",
                            detail: "Neither endpoint resolves for any of \(detail.associations.count) association links in this snapshot.",
                            harm: "The displayed associations no longer connect to her current thoughts.",
                            human_action: "Preserve the association graph evidence.", owner: .builder)
@@ -251,15 +285,13 @@ extension EngineDoctorRuntime {
         let health = await owner.observatoryHealthState()
         switch health {
         case .off:
-            return CheckResult(id: id, title: title, status: "ok", detail: "Context Flow is intentionally off.")
+            return CheckResult(source: "Context Flow source registrations", id: id, title: title, status: "off", detail: "Context Flow is intentionally off.")
         case .unavailable:
-            return CheckResult(id: id, title: title, status: "fail",
-                               detail: "Configured Context Flow health is unavailable from its owner.",
-                               harm: "The conversation may miss current context from her enabled sources.",
-                               human_action: "Open Diagnostics → Cognition → Context flow, refresh once, then reopen NativeAgent if health remains unavailable.")
+            return CheckResult(source: "Context Flow source registrations", id: id, title: title, status: "unmeasured",
+                               detail: "Configured Context Flow health is unavailable from its owner.")
         case .health(let state):
             if state.mode == .off {
-                return CheckResult(id: id, title: title, status: "ok", detail: "Context Flow is intentionally off.")
+                return CheckResult(source: "Context Flow source registrations", id: id, title: title, status: "off", detail: "Context Flow is intentionally off.")
             }
             var causes: [String] = []
             if !state.started { causes.append("not started") }
@@ -267,10 +299,10 @@ extension EngineDoctorRuntime {
             if state.lastError != nil { causes.append("owner error") }
             if state.arenaMetrics.pressure != .normal { causes.append("arena pressure: \(state.arenaMetrics.pressure.rawValue)") }
             guard !causes.isEmpty else {
-                return CheckResult(id: id, title: title, status: "ok", detail: "Context Flow is started and its sources are healthy.")
+                return CheckResult(source: "Context Flow source registrations", id: id, title: title, status: "ok", detail: "Context Flow is started and its sources are healthy.")
             }
             let canReconcile = !state.started || state.degradedSourceCount > 0 || state.lastError != nil
-            return CheckResult(id: id, title: title, status: canReconcile ? "warn" : "unmeasured",
+            return CheckResult(source: "Context Flow source registrations", id: id, title: title, status: canReconcile ? "warn" : "unmeasured",
                                detail: "Context Flow: \(causes.joined(separator: ", ")).",
                                harm: canReconcile ? "The conversation may miss current context from her enabled sources." : nil,
                                human_action: canReconcile

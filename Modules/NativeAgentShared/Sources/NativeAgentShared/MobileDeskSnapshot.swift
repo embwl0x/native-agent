@@ -45,6 +45,10 @@ public struct WorkOverviewRow: Codable, Equatable, Identifiable, Sendable {
 }
 
 public struct WorkOverview: Codable, Equatable, Sendable {
+    public var experienceRevision: Int? = 1
+    public var experiences: [Experience]? = nil
+    /// Full owner counts, before the phone's bounded list is cut.
+    public var needsYouCounts: [WorkOverviewReference.Kind: Int]? = nil
     public var capturedAt: String
     public var now: [WorkOverviewRow]
     public var needsYou: [WorkOverviewRow]

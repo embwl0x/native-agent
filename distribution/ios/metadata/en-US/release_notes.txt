@@ -1,7 +1,10 @@
-NativeAgent 0.5.0 brings a refreshed iPhone and iPad interface, smoother conversations, and clearer approval cards.
+NativeAgent 0.6.7 for iPhone and iPad goes with NativeAgent 0.6.7 on your Mac.
 
-- Fixed a crash while processing a push in the background.
-- Fixed a crash when opening a notification.
-- Closing a pinned chat now reports a send failure clearly and settles on the Mac's answer.
+- Your iPhone stays with the Mac you paired it with. Opening NativeAgent on another Mac signed in to the same Apple Account no longer takes it over; to move it, choose Use my iPhone with this Mac in Connectors → iPhone on that Mac.
+- Replies stream as formatted text and settle in place, including turns started from another door.
+- A quiet Mac shows as here instead of unreachable, and a stale page explains itself and opens connection repair.
+- History pages back past the newest 50 and opens whole conversations from the Mac.
+- Approvals read in words; answer shared cards and send files from your phone.
+- Activity opens on Approvals, Inbox, Memories to keep and Improvements; every Mac setting sits behind one Settings door.
 
-Requires NativeAgent on a Mac signed in to the same Apple Account. Until the next Mac update, some proposal cards ask you to answer on your Mac.
+Requires NativeAgent on a Mac signed in to the same Apple Account.

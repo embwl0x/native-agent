@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import CognitiveSubstrate
 
 // DreamCycleRunner — Swift replacement for the retired daemon nightly
 // reflective-journal pass. Merges the recent stretch of user/assistant messages
@@ -23,7 +24,6 @@ public actor DreamCycleRunner {
     private let feltSummaryProvider: DreamFeltSummaryProvider
     private let feltOriginProvider: DreamFeltOriginProvider
     private let receiptSink: DreamReceiptSink
-    private let moodSink: DreamMoodSink?
     private let datedMoodSink: DreamDatedMoodSink?
     /// The already-resolved trust gate, when the caller has one. Supplied, it
     /// IS the answer; nil falls back to the local policy read below.
@@ -60,7 +60,6 @@ public actor DreamCycleRunner {
         feltSummaryProvider: @escaping DreamFeltSummaryProvider = { nil },
         feltOriginProvider: @escaping DreamFeltOriginProvider = { [] },
         receiptSink: @escaping DreamReceiptSink = { _, _ in },
-        moodSink: DreamMoodSink? = nil,
         datedMoodSink: DreamDatedMoodSink? = nil,
         gate: DreamREMGatePolicy? = nil,
         now: @Sendable @escaping () -> Date = { Date() }
@@ -75,7 +74,6 @@ public actor DreamCycleRunner {
         self.feltSummaryProvider = feltSummaryProvider
         self.feltOriginProvider = feltOriginProvider
         self.receiptSink = receiptSink
-        self.moodSink = moodSink
         self.datedMoodSink = datedMoodSink
         self.gate = gate
         self.now = now
@@ -173,14 +171,14 @@ public actor DreamCycleRunner {
             : (readDreamMark() ?? now().addingTimeInterval(-recencyWindow))
 
         var report = DreamReport(trigger: trigger)
-        // WHERE the day's feeling came from (desk 903 phase 2). Read BEFORE the
-        // message gather now: besides citing studio entries it also tells the
-        // gather which exchanges moved her, so the sampled material is weighted
-        // by feeling rather than by recency. Unlike the felt SUMMARY, a failed
-        // origin read is never a reason to lose a dream — it cites nothing and
-        // the gather falls back to recency.
-        let feltOrigins = (try? await feltOriginProvider()) ?? []
-        let gathered: (messages: [(sessionId: String, role: String, content: String)], newest: Date?, sources: [DreamSourceRef])
+        let feltOrigins: [DreamFeltOrigin]
+        do {
+            feltOrigins = try await feltOriginProvider()
+        } catch {
+            report.errors.append("felt origin read failed: \(error)")
+            return report
+        }
+        let gathered: (messages: [(sessionId: String, role: String, content: String, source: String?)], newest: Date?, sources: [DreamSourceRef], material: [String: CognitiveReflectionCause])
         do {
             gathered = try gatherRecentMessagesAcrossSessions(
                 since: mark,
@@ -192,7 +190,7 @@ public actor DreamCycleRunner {
             FileHandle.standardError.write(Data("DreamCycleRunner: \(message)\n".utf8))
             return report
         }
-        let (messages, newestIncluded, messageSources) = gathered
+        let (messages, newestIncluded, messageSources, sourceMaterial) = gathered
         report.sessionsProcessed = Set(messages.map { $0.sessionId }).count
 
         // Nothing new since the last dream → no empty entry, mark untouched.
@@ -234,17 +232,36 @@ public actor DreamCycleRunner {
 
         let prompt = buildCombinedPrompt(
             dateKey: dateKey,
-            messages: messages, memoryDeltas: memoryDeltas, feltSummary: feltSummary)
+            messages: messages, memoryDeltas: memoryDeltas, feltSummary: feltSummary,
+            sourcePeerIds: CognitiveReflectionCause.unionPeerIds(messages.map { row in
+                row.source.flatMap { sourceMaterial[$0]?.sourcePeerIds }
+            }))
         let raw: String
         do {
             raw = try await llm.complete(
-                prompt: prompt,
+                prompt: prompt.text,
                 system: dreamSystem,
                 model: pickedModel,
                 surface: "dream", purpose: "dream"
             )
         } catch {
             report.errors.append("llm error: \(error)")
+            if ProviderFailure.classify(error) == .authExpired {
+                let provider: String? = if case LLMError.authRejected(let provider, _) = error { provider }
+                    else { await llm.servingProviderID(model: pickedModel, surface: "dream") }
+                let account: String? = switch provider {
+                case "openai_oauth_direct", "codex": "ChatGPT"
+                case "anthropic_oauth_direct": "Claude"
+                case "xai_oauth_direct": "xAI Grok"
+                default: nil
+                }
+                if let account {
+                    let signedIn = NativeOAuthFlow.signInStatus(providerID: provider ?? "", dataRoot: dataRoot).isSignedIn
+                    let control = signedIn ? "Re-authenticate \(account)" : "Sign in with \(account)"
+                    report.repair = Repair.remedy(owner: (provider ?? "dream provider") + " authorization", nextCall: nil,
+                        tap: "Providers > Sign in, reconnect or add an account > \(account) > \(control)")
+                }
+            }
             return report
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -259,13 +276,13 @@ public actor DreamCycleRunner {
             report.errors.append("invalid dream payload")
             return report
         }
-        let markdown = renderCombinedEntry(
+        let markdown = try renderCombinedEntry(
             dateKey: dateKey,
             sessionCount: report.sessionsProcessed,
             payload: payload,
             studioEntryIDs: citedStudioEntryIDs,
-            sources: messageSources + Self.studioSourceRefs(
-                from: feltOrigins, cited: citedStudioEntryIDs)
+            sources: messageSources,
+            sourcePeerIds: prompt.peerIds
         )
         // A timed-out scheduler body is cancel()ed and abandoned; the LLM call
         // above honors cancellation, but a body that already got its response
@@ -319,6 +336,9 @@ public actor DreamCycleRunner {
             return report
         }
         report.entriesWritten += 1
+        report.reflectionMaterial = sourceMaterial
+        report.reflectionMaterial["dream_diary/\(dateKey).md"] = CognitiveReflectionCause(
+            text: markdown, sourcePeerIds: prompt.peerIds, sourceRefs: sourceMaterial.keys.sorted())
         // Change-only: a dream whose feeling owes nothing to the journal emits
         // NO receipt at all — the ordinary case must not become the loudest
         // thing in the ledger. Fired after the entry committed, for the same
@@ -332,8 +352,8 @@ public actor DreamCycleRunner {
         }
         // The dream's own felt tone flows back into her slow disposition layer —
         // AFTER the entry committed, so a cancelled/failed/no-op dream can never
-        // move her. Same `mood` string the diary renders as `_Mood: …_`; empty
-        // mood has already passed the typed, nonblank payload boundary.
+        // move her. The optional affect value is her judgment from that same call;
+        // the mood phrase remains her prose and is never scored.
         //
         // At most ONE nudge per calendar day (gpt-5.5 review, 2026-07-09): the
         // file-exists guard above is skipped by `force` and racy between two
@@ -350,7 +370,7 @@ public actor DreamCycleRunner {
         // it. The dream's own date key goes to the sink so the residue is
         // claimed against THIS night rather than whichever marker sorts last.
         await integrateMoodIfClaimed(
-            mood: payload.mood, in: diaryDir, dateKey: dateKey)
+            affect: payload.affect, in: diaryDir, dateKey: dateKey)
         return report
     }
 
@@ -358,29 +378,18 @@ public actor DreamCycleRunner {
     /// sink says the integration is not durable. One place, because the
     /// `already_dreamt` path below retries through it too.
     private func integrateMoodIfClaimed(
-        mood: String,
+        affect: Double?,
         in diaryDir: URL,
         dateKey: String
     ) async {
-        guard claimMoodIntegration(in: diaryDir, dateKey: dateKey) else { return }
-        if await deliverMood(mood, dateKey: dateKey) { return }
+        guard let affect, let datedMoodSink,
+              claimMoodIntegration(in: diaryDir, dateKey: dateKey) else { return }
+        if await datedMoodSink(affect, dateKey) { return }
         releaseMoodIntegrationClaim(in: diaryDir, dateKey: dateKey)
         FileHandle.standardError.write(Data(
             ("DreamCycleRunner: mood integration for \(dateKey) did not persist; "
              + "claim released so a later run can retry it\n").utf8
         ))
-    }
-
-    /// Whichever sink this runner was built with. The dated one wins when both
-    /// are present; the plain one never sees the date and cannot report back,
-    /// so it counts as durable — exactly the behaviour it had before.
-    private func deliverMood(_ mood: String, dateKey: String) async -> Bool {
-        if let datedMoodSink { return await datedMoodSink(mood, dateKey) }
-        if let moodSink {
-            await moodSink(mood)
-            return true
-        }
-        return true
     }
 
     /// Retry an unclaimed night from the entry already on disk. Claiming is
@@ -392,19 +401,19 @@ public actor DreamCycleRunner {
         dateKey: String
     ) async {
         guard let markdown = try? String(contentsOf: entry, encoding: .utf8),
-              let mood = Self.moodLine(inDiaryMarkdown: markdown) else { return }
-        await integrateMoodIfClaimed(mood: mood, in: diaryDir, dateKey: dateKey)
+              let affect = Self.affectJudgment(inDiaryMarkdown: markdown) else { return }
+        await integrateMoodIfClaimed(affect: affect, in: diaryDir, dateKey: dateKey)
     }
 
-    /// The `_Mood: …_` line of an already-written diary entry, so a night whose
-    /// integration failed can be retried from the entry rather than re-dreamt.
-    static func moodLine(inDiaryMarkdown markdown: String) -> String? {
+    /// Retry only a recorded judgment; older prose is never reinterpreted.
+    static func affectJudgment(inDiaryMarkdown markdown: String) -> Double? {
         for raw in markdown.split(separator: "\n", omittingEmptySubsequences: true) {
             let line = raw.trimmingCharacters(in: .whitespaces)
-            guard line.hasPrefix("_Mood: "), line.hasSuffix("_"), line.count > 8 else { continue }
-            let body = String(line.dropFirst(7).dropLast())
+            guard line.hasPrefix("_Affect: "), line.hasSuffix("_") else { continue }
+            let body = String(line.dropFirst(9).dropLast())
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            return body.isEmpty ? nil : body
+            guard let value = Double(body), value.isFinite, (-1...1).contains(value) else { return nil }
+            return value
         }
         return nil
     }
@@ -485,10 +494,11 @@ public actor DreamCycleRunner {
     /// same window don't blur together in her reflection.
     private func buildCombinedPrompt(
         dateKey: String,
-        messages: [(sessionId: String, role: String, content: String)],
+        messages: [(sessionId: String, role: String, content: String, source: String?)],
         memoryDeltas: [String],
-        feltSummary: String? = nil
-    ) -> String {
+        feltSummary: String? = nil,
+        sourcePeerIds: [String]?
+    ) -> (text: String, peerIds: [String]?) {
         var convLines: [String] = []
         var lastSession: String? = nil
         for m in messages {
@@ -496,7 +506,7 @@ public actor DreamCycleRunner {
                 convLines.append("\n[conversation \(String(m.sessionId.prefix(8)))]\n")
                 lastSession = m.sessionId
             }
-            convLines.append("[\(m.role)] \(m.content)\n")
+            convLines.append("[\(m.role) | \(m.source ?? "source unavailable")] \(m.content)\n")
         }
         let worldHalf = convLines.joined()
 
@@ -540,7 +550,10 @@ public actor DreamCycleRunner {
             feltBlock = ""
         }
 
-        return """
+        // These prose-only providers carry no provenance attestation.
+        let peers = CognitiveReflectionCause.unionPeerIds([sourcePeerIds]
+            + (selfHalf.isEmpty && feltBlock.isEmpty ? [] : [nil]))
+        return ("""
         Date: \(dateKey)
 
         --- WORLD HALF (what happened recently across the user's conversations) ---
@@ -552,7 +565,7 @@ public actor DreamCycleRunner {
         voice — neither a recap of the user's side nor a status report. If the \
         recent stretch was user-heavy, the Self half is what keeps this from \
         echoing him.
-        """
+        """, peers)
     }
 
     // Full-Agent-persona-bypass: the dream pass runs OUTSIDE the live
@@ -590,9 +603,14 @@ public actor DreamCycleRunner {
 
         --- OUTPUT CONTRACT ---
         Output ONLY a single JSON object with these exact keys: title \
-        (string), summary (string, one paragraph), mood (string), \
+        (string), summary (string, one paragraph), mood (string), affect \
+        (your own optional felt judgment: a number from -1 to 1, or null when none), \
         emerging_themes (array of strings), surprising_moments (array of \
-        strings). No prose outside the JSON. No code fences.
+        strings), claims (array of {quote: string, source_refs: array of strings}). \
+        For each claim in the summary, themes or moments, quote its exact words \
+        and cite only the source identities beside the exchanges supporting it. \
+        Use an empty source_refs array when no supplied exchange supports it. \
+        No prose outside the JSON. No code fences.
         """
     }
 
@@ -629,45 +647,19 @@ public actor DreamCycleRunner {
         return "_Felt from: \(refs)_\n\n"
     }
 
-    /// The cited studio encounters as source refs, for the encounters whose
-    /// felt origin carries the date the encounter was FILED. The substrate's
-    /// felt origin does not currently carry that date (it carries the entry id
-    /// only), so in practice this yields nothing today and the studio citation
-    /// line above remains the encounter's provenance. Written date-tolerantly
-    /// so the refs appear the moment the seam does, without a change here.
-    static func studioSourceRefs(
-        from origins: [DreamFeltOrigin],
-        cited: [String]
-    ) -> [DreamSourceRef] {
-        guard !cited.isEmpty else { return [] }
-        let citedSet = Set(cited)
-        var refs: [DreamSourceRef] = []
-        for origin in origins {
-            guard let id = origin.studioEntryID, citedSet.contains(id) else { continue }
-            let raw = ["filedAt", "occurredAt", "at", "timestamp"]
-                .compactMap { origin.metadata[$0] }
-                .first { !$0.isEmpty }
-            guard let raw, let when = Self.parseDaemonISO(raw) else { continue }
-            refs.append(DreamSourceRef(
-                kind: "studio_entry",
-                id: id,
-                livedDate: DreamEntryProvenance.dateStem(for: when)
-            ))
-        }
-        return refs
-    }
-
     private func renderCombinedEntry(
         dateKey: String,
         sessionCount: Int,
         payload: DreamPayload,
         studioEntryIDs: [String] = [],
-        sources: [DreamSourceRef] = []
-    ) -> String {
+        sources: [DreamSourceRef] = [],
+        sourcePeerIds: [String]?
+    ) throws -> String {
         var out = "# Dream — \(dateKey)\n\n"
         out += "**\(payload.title)**\n\n"
         out += "\(payload.summary)\n\n"
         out += "_Mood: \(payload.mood)_\n\n"
+        if let affect = payload.affect { out += "_Affect: \(affect)_\n\n" }
         // Beside the mood, because it is that line's provenance: the dream's
         // felt-summary naming the entries it owes the feeling to. NOTHING about
         // this rides the prompt (NORTHSTAR clause 6) — it is written after the
@@ -683,16 +675,11 @@ public actor DreamCycleRunner {
             for moment in payload.surprisingMoments { out += "- \(moment)\n" }
             out += "\n"
         }
-        // PROVENANCE, not a count (item 4). The conversation count below stays —
-        // it says how wide the night was — but it is no longer the ONLY thing
-        // the dream keeps about where its material came from. The lines above
-        // name the source rows and the dates those rows actually happened on,
-        // so REM can tell a week of living from a week of dreaming about one
-        // night. A dream with nothing to bind says "provenance unavailable"
-        // rather than leaving the reader to assume support.
-        out += DreamEntryProvenance.renderBlock(sources)
         let convNote = sessionCount == 1 ? "1 conversation" : "\(sessionCount) conversations"
         out += "_(woven from \(convNote))_\n"
+        let claims = try DreamEntryProvenance.renderBlock(payload.claims, content: out, sources: sources)
+        out += try DreamEntryProvenance.peerBlock(sourcePeerIds)
+        out += claims
         return out
     }
 

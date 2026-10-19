@@ -63,11 +63,12 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
 /// image bytes (`TelegramMediaAttachment.bytes` set) the app-layer handler
 /// converts to ChatOrchestration's MultimodalAttachment and threads onto the
 /// chat turn. Carrying `TelegramMediaAttachment` keeps this module free of a
-/// ChatOrchestration dependency.
+/// ChatOrchestration dependency. It returns her reply's face: its words and
+/// the images she chose, which Telegram renders together.
 public typealias TelegramProgressChatHandlerWithAttachments = @Sendable (
     _ chatId: Int,
     _ text: String,
     _ attachments: [TelegramMediaAttachment],
     _ progress: @escaping TelegramChatProgressSink,
     _ context: TelegramChatAttemptContext
-) async throws -> String
+) async throws -> (reply: String, imagePaths: [String])

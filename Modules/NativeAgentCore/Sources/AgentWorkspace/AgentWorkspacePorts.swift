@@ -5,7 +5,6 @@ import MacIntegration
 /// Synchronous projections over the existing conversation owner. The lower
 /// target shares values, never the store, settlement, or send authority.
 package protocol AgentWorkspaceConversationPort: Sendable {
-    func refreshHealth(dataRoot: URL)
     func liveHealth(dataRoot: URL) -> [String: AgentLocalHealth]
     func records(dataRoot: URL, locked: Bool) throws -> [AgentConversationRecord]
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?

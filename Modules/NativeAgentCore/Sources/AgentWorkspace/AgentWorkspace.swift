@@ -160,6 +160,9 @@ struct AgentWorkspaceButton: Sendable {
     var label: String
     var action: AgentWorkspaceAction
     var needsText: Bool = false
+    var consumed = false
+    var retired = false
+    var viewName: String?
 }
 
 struct AgentWorkspaceItem: Sendable {
@@ -227,6 +230,10 @@ package actor AgentWorkspaceNavigation {
         var watched: [AgentWorkspaceLocation] = []
         var buttonPrefix = ""
         var buttonCount = 0
+
+        mutating func retireButtons() {
+            for id in buttons.keys { buttons[id]?.retired = true }
+        }
     }
     var sessions: [String: Session] = [:]
     private let capacity = 64
@@ -299,16 +306,17 @@ package actor AgentWorkspaceNavigation {
         if sessions[key]?.arrivals?.pending.contains(where: { $0.id == id }) == true {
             return .openArrival(id)
         }
-        guard let session = sessions[key], Date().timeIntervalSince(session.issuedAt) <= 1800,
-              let button = session.buttons[id] else {
-            if case .form(let form)? = sessions[key]?.path.last, form.tool.hasPrefix("desk_") {
-                throw AgentWorkspaceFailure(message: "That Desk form action is not current. Call app {item: \"\(form.lastingName)\"} to get fresh field and submit actions in one step; your entered values are preserved. Nothing was run.")
-            }
-            throw AgentWorkspaceFailure(message: "That item is no longer in this chat's current view, and it is not a name on your home screen. Read app {} for home and use a name from it. Nothing was repeated.")
+        let session = sessions[key], button = session?.buttons[id]
+        guard let session, Date().timeIntervalSince(session.issuedAt) <= 1800,
+              let button, !button.consumed, !button.retired else {
+            var next: [String: JSONValue] = [:]
+            if let name = button?.viewName { next["item"] = .string(name) }
+            throw ToolFailureError("That reference is expired, consumed or no longer in this view. Nothing was repeated; entered form values remain. Open next_call for current controls.",
+                argumentPath: "item", effects: .none, nextCall: ToolFailureError.call("app", next))
         }
         // Claim before dispatch. In particular, retrying a lost send response
         // cannot repeat a message using the same button reference.
-        sessions[key]?.buttons.removeValue(forKey: id)
+        sessions[key]?.buttons[id]?.consumed = true
         return button.action
     }
 
@@ -420,7 +428,7 @@ package actor AgentWorkspaceNavigation {
                 session.places.remove(at: index)
             }
         }
-        session.buttons = [:]
+        session.retireButtons()
         if oldPlaces != session.places || oldWatched != session.watched { session.arrivals?.monitor.invalidate() }
         sessions[key] = session
     }
@@ -570,7 +578,7 @@ package actor AgentWorkspaceNavigation {
 
     func back(key: String) -> AgentWorkspaceLocation {
         if (sessions[key]?.path.count ?? 0) > 1 { sessions[key]?.path.removeLast() }
-        sessions[key]?.buttons = [:]
+        sessions[key]?.retireButtons()
         return current(key: key)
     }
 
@@ -578,7 +586,7 @@ package actor AgentWorkspaceNavigation {
         guard var session = sessions[key], let anchor = session.workAnchor else { return current(key: key) }
         if let index = session.path.lastIndex(of: anchor) { session.path = Array(session.path.prefix(index + 1)) }
         else { session.path = [.home, anchor] }
-        session.buttons = [:]
+        session.retireButtons()
         session.document = nil
         sessions[key] = session
         return current(key: key)
@@ -587,11 +595,10 @@ package actor AgentWorkspaceNavigation {
     func present(_ projection: AgentWorkspaceProjection, key: String, outcome: JSONValue) -> JSONValue {
         let projection = AgentWorkspaceReadiness.filter(projection)
         guard var session = sessions[key] else { return .object(["status": .string("unavailable")]) }
-        session.buttons = [:]
+        session.retireButtons()
         session.issuedAt = Date()
-        // 2026-09-22: short ids, unique for the session's life: one random
-        // prefix per session and a counter that never resets, so a stale id
-        // is simply absent from the current table.
+        // References retain their names within the existing bound; a prior
+        // view cannot run them. The session's counter never reuses an id.
         if session.buttonPrefix.isEmpty {
             session.buttonPrefix = String((0..<4).map { _ in "abcdefghijkmnpqrstuvwxyz23456789".randomElement()! })
         }
@@ -727,10 +734,18 @@ package actor AgentWorkspaceNavigation {
             }
         }
         var rendered: [JSONValue] = []
-        for value in values.prefix(limit) {
+        for var value in values.prefix(limit) {
+            if session.buttons.count == 176, let retired = session.buttons.filter({ $0.value.retired }).keys.min(by: {
+                (Int($0.split(separator: ".").last ?? "") ?? 0) < (Int($1.split(separator: ".").last ?? "") ?? 0)
+            }) { session.buttons.removeValue(forKey: retired) }
             guard session.buttons.count < 176 else { break }
             session.buttonCount += 1
             let id = session.buttonPrefix + "." + String(session.buttonCount)
+            if case .form(let form)? = session.path.last { value.viewName = form.lastingName }
+            else if let place = session.path.last, place != .home {
+                value.viewName = Self.recognizedPlaces(session).contains(place)
+                    ? Self.windowReference(place) : HerScreen.textRoomName(place)
+            }
             session.buttons[id] = value
             // An item of home's: app {item: id}, with args.text when it needs text.
             rendered.append(.object(["label": .string(String(value.label.prefix(200))),
@@ -807,7 +822,7 @@ package enum AgentWorkspace {
         if case .string(let value)? = input["text"] { rawText = value } else { rawText = nil }
         let suppliedFields = input["fields"] == .null ? nil : input["fields"]
         guard !(query != nil && action != nil), (query?.count ?? 0) <= 400,
-              (action?.count ?? 0) <= 80, (rawText?.count ?? 0) <= 16000 else {
+              (action?.count ?? 0) <= 400, (rawText?.count ?? 0) <= 16000 else {
             throw AgentWorkspaceFailure(message: "Use find alone (a window name opens it; anything else finds it, up to 400 characters) or one item. Its text is limited to 16000 characters.")
         }
         if action == nil, suppliedText != nil || suppliedFields != nil || suppliedConversation != nil {
@@ -824,6 +839,13 @@ package enum AgentWorkspace {
         // Her screen's stable names (desk.4, claude, crew.1…) open the same way.
         var named: AgentWorkspaceAction?
         func screenName(_ raw: String) async throws -> HerScreen.Target? {
+            if raw.hasPrefix("window:"), let window = await navigation.window(named: String(raw.dropFirst(7)), key: key) {
+                return .action(window)
+            }
+            if raw.hasPrefix("window:") {
+                throw ToolFailureError("That window is no longer open. Call app {} for current places; nothing was repeated.",
+                    argumentPath: "item", effects: .none, nextCall: ToolFailureError.call("app"))
+            }
             func resolve(_ name: String) async -> HerScreen.Target? {
                 await HerScreen.resolve(name, dataRoot: dataRoot, scope: scope, browserPages: await navigation.browserPages(key: key),
                                         openPlaces: await navigation.places(key: key), currentPlace: await navigation.current(key: key))
@@ -1232,9 +1254,8 @@ package enum AgentWorkspace {
         if case .home = location {
             // Her home is text: the model's picture. Earlier views' action ids stay valid.
             await navigation.enterHome(key: key)
-            let notable = await AgentWorkspaceMail.notableToday(perform: perform)
             return .string(await HerScreen.home(dataRoot: dataRoot, scope: scope, browserPages: await navigation.browserPages(key: key),
-                                                windows: await navigation.openWindowTitles(key: key), notable: notable))
+                                                windows: await navigation.openWindowTitles(key: key)))
         }
         try await navigation.navigate(location, key: key)
         // The other rooms home names (places, conversations, arrivals, windows,
@@ -1253,12 +1274,14 @@ package enum AgentWorkspace {
             if case .area = place { AgentWorkspaceScreenPreview.keep(room: room, text: text, dataRoot: dataRoot) }
             return .object(["status": outcome, "content": .string(text)])
         }
+        var roomObservation: (world: HerWorld, at: Date, health: Set<String>)?
         // Her own rooms that need no owner read first: desk, mac, helpers, people, conversations.
         if [.area("ongoing"), .area("computer"), .area("helpers"), .area("browser"), .people(page: 0), .conversations(page: 0),
             .area("files"), .area("code"), .area("github"), .area("x")].contains(location)
             || { if case .conversations = location { return true }; return false }(),
-           let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope) {
-            await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope)
+           let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope,
+                                           observed: { roomObservation = ($0, $1, $2) }) {
+            await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope, observation: roomObservation)
             return .string(room)
         }
         if case .find(let query) = location {
@@ -1425,9 +1448,8 @@ package enum AgentWorkspace {
             let row: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
             return [row["detail"], row["error"], row["message"]].compactMap { if case .string(let text)? = $0 { text } else { nil } }.first ?? "The read did not complete."
         }()
-        var roomObservation: (world: HerWorld, at: Date)?
         if let room = await HerScreen.room(location, dataRoot: dataRoot, scope: scope, issue: issue, value: value,
-                                           observed: { roomObservation = ($0, $1) }) {
+                                           observed: { roomObservation = ($0, $1, $2) }) {
             _ = await navigation.observe(location: location, result: value, key: key)
             await HerScreen.markRoomSeen(location, dataRoot: dataRoot, scope: scope, observation: roomObservation)
             return .object(["status": outcome, "content": .string(room)])

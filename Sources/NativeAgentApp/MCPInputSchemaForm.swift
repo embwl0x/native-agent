@@ -2,6 +2,16 @@ import SwiftUI
 import MCPDispatcher
 import PersistenceCore
 
+func inputSchemaContainsSecret(_ schema: JSONValue?) -> Bool {
+    switch schema {
+    case .object(let fields):
+        fields["format"] == .string("password") || fields["writeOnly"] == .bool(true)
+            || fields.values.contains { inputSchemaContainsSecret($0) }
+    case .array(let values): values.contains { inputSchemaContainsSecret($0) }
+    default: false
+    }
+}
+
 // JSON Schema-driven input form for an MCP tool. Renders one control per
 // property in `schema.properties` and writes back to `values`. MVP supports
 // string/integer/number/boolean/array/object plus enum, min/max, default,
@@ -17,6 +27,7 @@ struct MCPInputSchemaForm: View {
     @Binding var values: [String: JSONValue]
     @Binding var jsonErrors: [String: String]
     @Binding var draft: Draft
+    var onEdit: () -> Void = {}
 
     private var fallbackError: String? {
         get { jsonErrors["$input"] }
@@ -115,6 +126,7 @@ struct MCPInputSchemaForm: View {
                 return ""
             },
             set: { newValue in
+                defer { onEdit() }
                 draft.strings[name] = newValue
                 values[name] = .string(newValue)
             }
@@ -133,7 +145,7 @@ struct MCPInputSchemaForm: View {
             // first option when values[name] is nil, but submit would carry
             // .null (server sees absence, not the displayed value). Eager
             // seed of the visible default also handled in applyDefaultsIfNeeded.
-            set: { values[name] = .string($0) }
+            set: { values[name] = .string($0); onEdit() }
         )
         let p = Picker(name, selection: binding) {
             ForEach(options, id: \.self) { opt in Text(opt).tag(opt) }
@@ -151,6 +163,7 @@ struct MCPInputSchemaForm: View {
                 return ""
             },
             set: { newValue in
+                defer { onEdit() }
                 draft.strings[name] = newValue
                 if let parsed = Int64(newValue) {
                     values[name] = .int(parsed)
@@ -173,7 +186,7 @@ struct MCPInputSchemaForm: View {
                 if case .int(let v) = values[name] ?? .null { return Int(v) }
                 return lo
             },
-            set: { values[name] = .int(Int64($0)) }
+            set: { values[name] = .int(Int64($0)); onEdit() }
         )
         let s = Stepper(value: binding, in: lo...hi) {
             Text("\(binding.wrappedValue)").font(.caption)
@@ -190,6 +203,7 @@ struct MCPInputSchemaForm: View {
                 return ""
             },
             set: { newValue in
+                defer { onEdit() }
                 draft.strings[name] = newValue
                 if newValue.isEmpty {
                     values.removeValue(forKey: name)
@@ -215,7 +229,7 @@ struct MCPInputSchemaForm: View {
                 if case .bool(let v) = values[name] ?? .null { return v }
                 return false
             },
-            set: { values[name] = .bool($0) }
+            set: { values[name] = .bool($0); onEdit() }
         )
         let t = Toggle("", isOn: binding).labelsHidden()
         return Group { if let d = description { t.help(d) } else { t } }
@@ -225,6 +239,7 @@ struct MCPInputSchemaForm: View {
         let binding = Binding<String>(
             get: { draft.strings[name] ?? "" },
             set: { newValue in
+                defer { onEdit() }
                 draft.strings[name] = newValue
                 let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 if trimmed.isEmpty {
@@ -261,6 +276,7 @@ struct MCPInputSchemaForm: View {
             TextEditor(text: Binding(
                 get: { draft.input },
                 set: { newValue in
+                    defer { onEdit() }
                     draft.input = newValue
                     let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmed.isEmpty {

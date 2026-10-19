@@ -86,6 +86,53 @@ public struct TelegramUpdateInbox: Sendable {
 
     private init(directory: URL) { self.directory = directory }
 
+    /// Reconstruct only the derived index; claims retain every phase and delivery uncertainty.
+    public static func repair(dataRoot: URL, inbox: String) async throws -> JSONValue {
+        let root = dataRoot.appendingPathComponent("telegram", isDirectory: true).resolvingSymlinksInPath()
+        let directory = dataRoot.appendingPathComponent(inbox, isDirectory: true).standardizedFileURL
+        guard directory.resolvingSymlinksInPath().path.hasPrefix(root.path + "/"),
+              directory.lastPathComponent == "update_inbox" || directory.lastPathComponent.hasSuffix(".inbox"),
+              FileManager.default.fileExists(atPath: directory.path) else {
+            throw ToolFailureError("Pass the existing Telegram inbox path named by the failure.",
+                                   argumentPath: "inbox", effects: .none)
+        }
+        let store = Self(directory: directory)
+        do {
+            return try await store.persistence.withFileLock(store.indexPath) {
+                let claims = try await store.snapshots()
+                let preserved = store.indexPath.appendingPathExtension("preserved-" + UUID().uuidString)
+                if FileManager.default.fileExists(atPath: store.indexPath.path) {
+                    try await store.persistence.writeDataAtomicDurable(Data(contentsOf: store.indexPath), to: preserved)
+                }
+                try await store.writeIndex(InboxClaimIndex(claims: claims))
+                _ = try await store.recoverableClaimsLocked()
+                return .object(["status": .string("ok"), "inbox": .string(inbox),
+                    "detail": .string("Telegram admission index rebuilt from its checked claims. Claim phases and uncertain effects are unchanged; the next successful inbox recovery settles the repair.")])
+            }
+        } catch {
+            throw store.repairFailure(error, dataRoot: dataRoot, effects: .unknown)
+        }
+    }
+
+    func repairFailure(_ error: Error, dataRoot: URL, effects: ToolFailureError.Effects = .none) -> ToolFailureError {
+        let name: String
+        switch error {
+        case TelegramUpdateInboxError.malformedClaim(let claim): name = claim
+        case TelegramUpdateInboxError.mismatchedUpdateId(let expected, _): name = "\(expected).json"
+        default: name = indexPath.lastPathComponent
+        }
+        let owner = directory.appendingPathComponent(name).path
+        let inbox = String(directory.path.dropFirst(dataRoot.path.count + 1))
+        let next = name == indexPath.lastPathComponent
+            ? ToolFailureError.call("app", ["action": .string("telegram.repair"), "args": .object(["inbox": .string(inbox)])])
+            : ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(owner)])])
+        return ToolFailureError("Telegram admission recovery failed at \(owner): \(error.localizedDescription) "
+            + (name == indexPath.lastPathComponent
+                ? "Rebuild the index from its checked claims; restarting the poller cannot repair this state."
+                : "Read this claim and restore it only from authoritative admission or delivery evidence, preserving unknown effects; then call telegram.repair for \(inbox)."),
+            effects: effects, owner: owner, nextCall: next)
+    }
+
     public static func failedReplyClaims(dataRoot: URL) async throws -> [(path: URL, at: String)] {
         let telegram = dataRoot.appendingPathComponent("telegram", isDirectory: true)
         let bots = telegram.appendingPathComponent("bots", isDirectory: true)

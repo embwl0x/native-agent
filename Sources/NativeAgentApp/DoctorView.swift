@@ -467,7 +467,7 @@ struct DoctorView: View {
             // What only a person can do (sign in, choose a model) lives on
             // Providers: take them there instead of leaving a note.
             if appModel.engine.doctor.report?.checks.contains(where: {
-                $0.id == "live.providers" && DoctorSafeRepairPolicy.isAdverse($0.status)
+                $0.checkID == "live.providers" && DoctorSafeRepairPolicy.isAdverse($0.status)
             }) == true {
                 NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
             }

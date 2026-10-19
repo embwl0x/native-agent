@@ -56,6 +56,7 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             "sourceKey": Self.nonEmptyStringValue(route.sourceKey),
             "replyTo": Self.nonEmptyStringValue(route.replyTo),
             "correlationId": Self.nonEmptyStringValue(route.correlationId),
+            "answerExperienceID": Self.nonEmptyStringValue(envelope.answerExperienceID),
         ])
         var request: [String: JSONValue] = [
             "kind": .string("chat_tool_approval"),
@@ -156,6 +157,12 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
     /// the arguments and the initiating conversation all match. `origin` carries
     /// the reply route, which is part of the identity: the same call from two
     /// chats must stay two approvals.
+    private static func attributionFree(_ origin: JSONValue?) -> JSONValue? {
+        guard case .object(var fields)? = origin else { return origin }
+        fields["answerExperienceID"] = nil
+        return .object(fields)
+    }
+
     private static func isSameRequest(_ lhs: JSONValue, _ rhs: JSONValue) -> Bool {
         guard case .object(let left) = lhs, case .object(let right) = rhs,
               left["kind"] == .string("chat_tool_approval") else { return false }
@@ -164,7 +171,9 @@ public actor NativeAgentChatApprovalFiler: NonBlockingApprovalFiler {
             && left["surface"] == right["surface"]
             && left["input"] == right["input"]
             && left["agentExactProtocol"] == right["agentExactProtocol"]
-            && left["origin"] == right["origin"]
+            // Which answer asked is attribution, not identity: the same request from a
+            // later turn is the same pending card (and the card keeps its first answer).
+            && attributionFree(left["origin"]) == attributionFree(right["origin"])
             && left["peer"] == right["peer"]
             && left["hostCallID"] == right["hostCallID"]
             // A card filed with other hands is another request (an old card has none).

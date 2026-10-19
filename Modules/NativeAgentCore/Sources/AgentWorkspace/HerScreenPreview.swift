@@ -10,6 +10,7 @@ import PersistenceCore
 /// runs: a place that opens with an owner read shows the copy she was last
 /// shown, or says what it would read.
 package enum AgentWorkspaceScreenPreview {
+    public static let didChange = Notification.Name("NativeAgent.herWorldDidChange")
     /// Home, then every place home's PLACES rows show, in order, then the
     /// rooms home's own sections and footer open.
     public static func tabs(_ layout: SurfaceLayout, profile: String?) -> [String] {
@@ -37,7 +38,7 @@ package enum AgentWorkspaceScreenPreview {
         return await HerScreen.$previewing.withValue(true) {
             let now = Date()
             async let abilities = AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: now)
-            let home = await HerScreen.renderGlance(dataRoot: dataRoot, scope: scope.isEmpty ? nil : scope, now: now, reach: .unlocked)
+            let home = await HerScreen.renderGlance(dataRoot: dataRoot, scope: scope.isEmpty ? nil : scope, now: now)
             return await [home, abilities].compactMap { $0 }.joined(separator: "\n")
         }
     }

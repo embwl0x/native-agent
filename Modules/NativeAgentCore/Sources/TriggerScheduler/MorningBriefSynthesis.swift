@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // MARK: - Morning-brief synthesis seam (L5 G3 + G1)
@@ -17,12 +18,6 @@ import PersistenceCore
 // graph. The synthesizer is therefore injected from the app layer, exactly
 // like `notifier` and `workshopRunner` already are.
 //
-// FAIL-OPEN IS THE CONTRACT, NOT AN OPTIMISATION. The synthesizer returns
-// `String?`. A nil — provider down, no API key, tools denied, turn threw,
-// blank output — degrades the brief to the byte-identical deterministic text
-// it produced before this seam existed. The trigger tick must never fail
-// because a model was unavailable.
-
 /// Everything the synthesizer is allowed to see: the deterministic brief that
 /// already resolved. The evidence layer is the prompt; the turn's job is the
 /// read on top of it, not a second gathering pass over the same files.
@@ -41,12 +36,9 @@ public struct MorningBriefSynthesisRequest: Sendable, Equatable {
     }
 }
 
-/// Injected at the app layer. Returns the synthesized lead, or nil to fall
-/// back to the deterministic brief. MUST NOT throw — a synthesizer that can
-/// fail swallows its own errors and returns nil, so the fail-open contract is
-/// enforced by the type, not by a caller remembering to `try?`.
+/// The synthesized lead is required; a failed read leaves the brief owed.
 public typealias MorningBriefSynthesizer =
-    @Sendable (MorningBriefSynthesisRequest) async -> String?
+    @Sendable (MorningBriefSynthesisRequest) async throws -> String
 
 extension TriggerContentBuilder {
 
@@ -57,26 +49,27 @@ extension TriggerContentBuilder {
 
     /// The brief, led by the turn's synthesized read (G1) when one resolved.
     ///
-    /// Layering, top to bottom: her read, then the deterministic sections as
-    /// the evidence layer beneath it. Passing `synthesizer: nil` — every test
-    /// and every non-live root — reproduces `morningBrief()` exactly.
-    public func morningBrief(synthesizer: MorningBriefSynthesizer?) async -> TriggerContent {
+    /// Her read leads; the deterministic sections preserve its evidence.
+    public func morningBrief(synthesizer: MorningBriefSynthesizer?) async throws -> TriggerContent {
         let deterministic = await morningBrief()
-        guard let synthesizer else { return deterministic }
+        guard let synthesizer else {
+            throw TriggerSchedulerError.persistenceFailure("Morning-brief synthesis is not connected to its turn owner.")
+        }
 
         let detailText: String?
         if case .string(let body) = deterministic.detail { detailText = body } else { detailText = nil }
 
-        let lead = await synthesizer(
+        let lead = try await synthesizer(
             MorningBriefSynthesisRequest(
                 dayLabel: Self.todayLabel(now()),
                 deterministicSummary: deterministic.summary,
                 deterministicDetail: detailText
             )
         )
-        guard let lead else { return deterministic }
         let trimmedLead = lead.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedLead.isEmpty else { return deterministic }
+        guard !trimmedLead.isEmpty else {
+            throw TriggerSchedulerError.persistenceFailure("Morning-brief synthesis returned no lead.")
+        }
 
         // Card summary: the lead, bounded. Detail: the lead in full, then the
         // deterministic evidence under a rule so it reads as backing material

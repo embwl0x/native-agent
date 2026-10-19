@@ -297,10 +297,8 @@ public actor SwiftNativeWorkshopRunner {
 
     // MARK: planWorkshopExecution
 
-    /// Return steps and any planner failure for the `planner_fallback` receipt.
-    private func _planWorkshopExecutionWithReason(spec: WorkshopExecutionSpec) async throws -> ([WorkshopExecutionStep], String?) {
+    private func planWorkshopExecution(spec: WorkshopExecutionSpec) async throws -> [WorkshopExecutionStep] {
         try Task.checkCancellation()
-        let stub = Self.stubFallback(spec: spec)
 
         // Build tools_summary. Always include chat.synthesize.
         let connectorActions = await planner.availableConnectorActions()
@@ -390,27 +388,37 @@ public actor SwiftNativeWorkshopRunner {
             )
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as ToolFailureError {
+            throw error
         } catch {
-            return (stub, String(describing: error))
+            throw planningFailure(error, spec: spec)
         }
         try Task.checkCancellation()
 
         // Strip markdown fences.
         let raw = Self.stripMarkdownFences(rawOutput).trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Parse + validate.
         do {
             let steps = try Self.parsePlanJSON(raw, validTools: Set(availableTools.map(\.id)), schemas: schemas)
-            if steps.isEmpty {
-                return (stub, "codex returned 0 valid steps")
+            guard !steps.isEmpty else {
+                throw WorkshopExecutionError.plannerFailure("planner returned no steps")
             }
-            return (steps, nil)
-        } catch let error as WorkshopExecutionError {
-            if case .invalidRequest = error { throw error }
-            return (stub, String(describing: error))
+            return steps
         } catch {
-            return (stub, String(describing: error))
+            throw planningFailure(error, spec: spec)
         }
+    }
+
+    private func planningInput(_ spec: WorkshopExecutionSpec) -> JSONValue {
+        var input: [String: JSONValue] = ["text": .string(String(spec.objective.prefix(2000))), "context": .string(String(spec.title.prefix(160)))]
+        if let handle = spec.deskHandle { input["desk_handle"] = .string(handle) }
+        if let outputs = spec.expectedOutputs { input["expected_outputs"] = .array(outputs.map(JSONValue.string)) }
+        return .object(input)
+    }
+
+    private func planningFailure(_ error: Error, spec: WorkshopExecutionSpec) -> ToolFailureError {
+        ToolFailureError("Workshop planner failed; no substitute plan was queued: \(error.localizedDescription)",
+            effects: .none, nextCall: ToolFailureError.call("app", ["action": .string("workshop.submit"), "args": planningInput(spec)]))
     }
 
     // MARK: submit
@@ -463,10 +471,7 @@ public actor SwiftNativeWorkshopRunner {
         let objectiveTrunc = String(spec.objective.prefix(2000))
         let nowStr = Self.isoTimestamp(now())
 
-        // Plan it (stub or real). Capture the planner failure reason so we
-        // can emit Python's `planner_fallback` timeline event before
-        // `enqueued` when the LLM path bailed to the stub.
-        let (plan, plannerFailureReason) = try await _planWorkshopExecutionWithReason(
+        let plan = try await planWorkshopExecution(
             spec: WorkshopExecutionSpec(
                 title: titleTrunc,
                 objective: objectiveTrunc,
@@ -577,46 +582,7 @@ public actor SwiftNativeWorkshopRunner {
         try FileManager.default.createDirectory(at: receipts, withIntermediateDirectories: true)
 
 
-        // ORDER MATTERS — wave-12 gpt-5.5 finding #4.
-        // Write timeline.jsonl FIRST so a crash between the two writes leaves
-        // an execution with no mission.json (cleanly absent, scanner skips it)
-        // rather than a mission.json with no enqueued event in the timeline
-        // (poisoned audit trail). The Python side writes mission.json first
-        // (L353-L359), which has the inverse failure mode; wave 21 fixes
-        // both sides.
-        // Mirror Python's planner_fallback event:
-        // emitted BEFORE the enqueued event when the codex path bailed.
-        //
-        // Each timeline append is wrapped in withFileLock(timeline).
-        // timeline.jsonl can be appended concurrently by Swift execution
-        // planning/execution paths and the trigger scheduler;
-        // O_APPEND alone does not keep a record contiguous across the
-        // appendBytes short-write loop, so an unlocked concurrent append can
-        // tear the JSON line. Each append takes the lock independently,
-        // preserving the wave-12 ordering (planner_fallback BEFORE enqueued)
-        // and the cancel checkpoints between them.
-        //
-        // WAVE 35 W10 (CUTOVER §6.117): the wave-34 W03/W07 merge had left BOTH
-        // the W03 inline `appendTimeline(_:)` closure AND the W07
-        // appendTimelineLocked() call live for each event, double-writing every
-        // planner_fallback + enqueued line to timeline.jsonl. appendTimelineLocked
-        // is the canonical single append; the redundant W03 closure is removed.
-        if let reason = plannerFailureReason {
-            let fallbackEvent: JSONValue = .object([
-                "event": .string("planner_fallback"),
-                "reason": .string(reason),
-                "ts": .string(nowStr),
-            ])
-            do {
-                // WAVE 34 W07 (§6.96 round-2 #3): cross-process flock on
-                // timeline.jsonl — see appendTimelineLocked + the Python
-                // file_lock(_append_jsonl) symmetry.
-                try await appendTimelineLocked(fallbackEvent, to: timeline)
-            } catch {
-                throw WorkshopExecutionError.persistenceFailure("timeline append failed: \(error)")
-            }
-            try Task.checkCancellation() // cancel between planner_fallback append and enqueued append should NOT continue
-        }
+        // Write the timeline first, so an interrupted enqueue has no execution record.
         let timelineEvent: JSONValue = .object([
             "event": .string("enqueued"),
             "title": .string(titleTrunc),
@@ -1343,38 +1309,12 @@ public actor SwiftNativeWorkshopRunner {
             guard case .object(let o) = item else { continue }
             let id: String = { if case .string(let s) = o["id"] ?? .null { return s }; return "" }()
             let desc: String = { if case .string(let s) = o["description"] ?? .null { return s }; return "" }()
-            let tool: String = { if case .string(let s) = o["tool_or_action"] ?? .null { return s }; return "chat.synthesize" }()
+            let tool: String = { if case .string(let s) = o["tool_or_action"] ?? .null { return s }; return "" }()
             let auto: String = { if case .string(let s) = o["autonomy"] ?? .null { return s }; return "auto" }()
             let args: JSONValue = { if case .object = o["args"] ?? .null { return o["args"]! }; return .object([:]) }()
             out.append(WorkshopExecutionStep(id: id, description: desc, toolOrAction: tool, args: args, autonomy: auto, argumentSchema: o["argument_schema"]))
         }
         return out
-    }
-
-    // MARK: stub fallback (PUBLIC FOR TESTS)
-
-    /// 2-step stub plan — byte-for-byte against the retired daemon.
-    public static func stubFallback(spec: WorkshopExecutionSpec) -> [WorkshopExecutionStep] {
-        return [
-            WorkshopExecutionStep(
-                id: "step-plan",
-                description: "Analyze objective and gather context",
-                toolOrAction: "chat.synthesize",
-                args: .object([
-                    "prompt": .string("Given this objective: \(spec.objective)\n\nProduce a brief action plan."),
-                ]),
-                autonomy: "auto"
-            ),
-            WorkshopExecutionStep(
-                id: "step-report",
-                description: "Summarize findings",
-                toolOrAction: "chat.synthesize",
-                args: .object([
-                    "prompt": .string("Summarize the outcome for: \(spec.objective)"),
-                ]),
-                autonomy: "auto"
-            ),
-        ]
     }
 
     // MARK: parse helpers
@@ -1392,7 +1332,6 @@ public actor SwiftNativeWorkshopRunner {
 
     /// Mirror of the Python parse loop.
     /// Returns the validated steps; raises if the top-level shape is wrong.
-    /// Unknown step tools fall back to chat.synthesize per L1679-L1681.
     /// Autonomy hints not in {auto, needs_approval} clamp to "auto" per
     /// L1683-L1684. Max 8 steps per L1675.
     static func parsePlanJSON(_ raw: String, validTools: Set<String>, schemas: [String: JSONValue] = [:]) throws -> [WorkshopExecutionStep] {
@@ -1404,13 +1343,14 @@ public actor SwiftNativeWorkshopRunner {
         }
         var out: [WorkshopExecutionStep] = []
         for (i, s) in stepsRaw.prefix(8).enumerated() {
-            guard case .object(let sobj) = s else { continue }
-            var tool: String = {
-                if case .string(let v) = sobj["tool_or_action"] ?? .null { return v }
-                return "chat.synthesize"
-            }()
-            if !validTools.contains(tool) && tool != "chat.synthesize" {
-                tool = "chat.synthesize"
+            guard case .object(let sobj) = s else {
+                throw WorkshopExecutionError.plannerFailure("step \(i + 1) must be a JSON object")
+            }
+            guard case .string(let tool)? = sobj["tool_or_action"], !tool.isEmpty else {
+                throw WorkshopExecutionError.plannerFailure("step \(i + 1).tool_or_action is missing")
+            }
+            guard validTools.contains(tool) || tool == "chat.synthesize" else {
+                throw WorkshopExecutionError.plannerFailure("step \(i + 1).tool_or_action '\(tool)' is unavailable; the intended action was not replaced")
             }
             var hint: String = {
                 if case .string(let v) = sobj["autonomy_hint"] ?? .null { return v }
@@ -1430,7 +1370,7 @@ public actor SwiftNativeWorkshopRunner {
             }()
             // Python: dict(s.get("args") or {}) — None/missing/empty-dict → {};
             // a non-dict truthy value (string/array/number) raises TypeError,
-            // which cascades to the outer planWorkshopExecution stub-fallback path.
+            // which refuses the plan before enqueue.
             let args: JSONValue
             switch sobj["args"] ?? .null {
             case .null:

@@ -18,7 +18,12 @@ public enum GrokBotConnection {
                 guard await port.ensureRunning() else { return result("desktop app not running", "Grok Bot desktop app not running. No message was sent.") }
                 guard case .string(let text)? = plan["text"], case .string(let id)? = plan["message_id"],
                       case .string(let conversation)? = plan["conversation_id"] else { return result("invalid", "Missing message.") }
-                return try await port.send(peer: contact, text: text, conversation: conversation,
+                // The asking turn's door, as its conversation row keeps it.
+                let asked = ChatToolSessionContext.replyRoute
+                let route = AgentBridgeCompletionRoute(surface: asked?.surface ?? surface, sessionId: conversation,
+                    destinationId: asked?.destinationId, threadId: asked?.threadId, sourceKey: asked?.sourceKey,
+                    replyTo: asked?.replyTo, correlationId: asked?.correlationId, requesterUserId: asked?.requesterUserId)
+                return try await port.send(peer: contact, text: text, conversation: conversation, route: route,
                     messageID: id, dataRoot: dataRoot,
                     quiet: PersonInitiatedSend.current?.admitted == true)
             case .string("grok_disconnect"):

@@ -34,7 +34,7 @@ extension MacAppleScriptBridge {
             "reason": .string("os_automation_denied"),
             "integration": .string(integration),
             "app": .string(app),
-            "fix": .string("Grant NativeAgent automation access to \(app) in System Settings → Privacy & Security → Automation."),
+            "remedy": SystemAppleScriptAdapter.automationTargetBundleIDs[app].flatMap { SystemPermissionPreflight.remedy("applescript:" + $0) } ?? .null,
         ])
     }
 

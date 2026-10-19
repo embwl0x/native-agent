@@ -115,6 +115,7 @@ extension SwiftToolDispatcher {
         let unreadable: [String: JSONValue] = listing.unreadableEntries > 0
             ? [
                 "unreadable_entries": .int(Int64(listing.unreadableEntries)),
+                "unreadable_files": .object(listing.failures.mapValues(JSONValue.string)),
                 "partial": .bool(true),
                 "storage": .string("partial (\(listing.unreadableEntries) skipped)"),
                 "note": .string(

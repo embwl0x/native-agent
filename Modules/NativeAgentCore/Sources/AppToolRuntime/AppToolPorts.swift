@@ -6,11 +6,11 @@ import ChatOrchestration
 import ProviderRouting
 
 public struct BrowserToolPlatformPort: Sendable {
-    public let setUpChrome: @Sendable () async -> (folder: URL?, extensionsPageOpened: Bool, message: String)
+    public let setUpChrome: @Sendable () async throws -> (folder: URL?, message: String)
     public let readStatus: @Sendable () async throws -> JSONValue
     public let runNativeAction: @Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue
     public init(
-        setUpChrome: @escaping @Sendable () async -> (folder: URL?, extensionsPageOpened: Bool, message: String),
+        setUpChrome: @escaping @Sendable () async throws -> (folder: URL?, message: String),
         readStatus: @escaping @Sendable () async throws -> JSONValue,
         runNativeAction: @escaping @Sendable (String, Bool, [String: JSONValue]) async throws -> JSONValue
     ) { self.setUpChrome = setUpChrome; self.readStatus = readStatus; self.runNativeAction = runNativeAction }
@@ -67,15 +67,15 @@ public struct QuietComposerOutcome: Sendable {
     public var element: String
     public var detail: String
     public var status: String
-    public var refusal: (reason: String, detail: String)?
-    public init(changed: Bool, element: String, detail: String, refusal: (reason: String, detail: String)?, status: String = "ok") {
+    public var refusal: (reason: String, detail: String, effects: ToolFailureError.Effects)?
+    public init(changed: Bool, element: String, detail: String, refusal: (reason: String, detail: String, effects: ToolFailureError.Effects)?, status: String = "ok") {
         self.changed = changed; self.element = element; self.detail = detail; self.refusal = refusal; self.status = status
     }
     public static func done(_ element: String, _ detail: String, changed: Bool = true, status: String = "ok") -> Self {
         Self(changed: changed, element: element, detail: detail, refusal: nil, status: status)
     }
-    public static func refuse(_ element: String, _ reason: String, _ detail: String) -> Self {
-        Self(changed: false, element: element, detail: detail, refusal: (reason, detail))
+    public static func refuse(_ element: String, _ reason: String, _ detail: String, effects: ToolFailureError.Effects = .none) -> Self {
+        Self(changed: false, element: element, detail: detail, refusal: (reason, detail, effects))
     }
 }
 

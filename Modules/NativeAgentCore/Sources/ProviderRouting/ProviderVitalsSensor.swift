@@ -313,14 +313,24 @@ public actor ProviderVitalsSensor {
 
     // MARK: First outputs
 
-    /// Launch-owned, once: the trace's first outputs and cuts into memory.
+    /// Launch-owned, once, read behind her: the retained trace's first outputs
+    /// and cuts up to `cutoff`, joined ahead of the calls this run has already
+    /// observed live (their rows are the ones after the cutoff).
     public func readFirstOutputs(
-        dataRoot: URL
+        dataRoot: URL, before cutoff: Date
     ) async throws {
         let read = try await TurnTraceRecentReader(dataRootOverride: dataRoot)
-            .traceEvidence(since: .distantPast)
+            .traceEvidence(now: cutoff, since: .distantPast)
         unreadableTraceRows = read.report.malformedLineCount
-        for case .object(let row) in read.rows {
+        // Oldest first; the ledger part is not windowed by `now`.
+        var rows = read.rows[...]
+        while case .object(let last)? = rows.last, case .string(let raw)? = last["createdAt"],
+              let at = TurnTraceEvent.parseISO8601(raw), at > cutoff {
+            rows.removeLast()
+        }
+        let live = firstOutputs
+        firstOutputs = [:]
+        for case .object(let row) in rows {
             guard case .object(let payload)? = row["payload"], case .string(let provider)? = payload["provider"]
             else { continue }
             if row["kind"] == .string("provider.noReply") {
@@ -331,6 +341,7 @@ public actor ProviderVitalsSensor {
                 joinFirstOutput(firstOutputKey(provider, model, kind), seconds: Double(ms) / 1000)
             }
         }
+        for (key, seconds) in live { seconds.forEach { joinFirstOutput(key, seconds: $0) } }
     }
 
     /// The stream guard's question at stream start.

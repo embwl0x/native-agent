@@ -9,8 +9,7 @@
 // action methods as the full views.
 //
 // Counts come from:
-//   • ApprovalsStore  — tabBadge (pending count)
-//   • InboxStore      — tabBadge (unread count)
+//   • WorkOverview   — owner attention, before list bounds
 //   • iCloudSyncEngine.memoryProposals
 //   • iCloudSyncEngine.trainingProposals + .promotionCandidates
 import SwiftUI
@@ -26,19 +25,8 @@ enum ActivitySection: String, CaseIterable, Hashable {
     case selfImprovement
 }
 
-/// The one presentation seam for the Activity tab and its badge. Keeping the
-/// count and affordance rules here prevents the tab from telling a different
-/// story than the four rows it opens.
+/// Activity's queue affordances. Attention counts arrive from the Mac overview.
 enum ActivityScreenPresentation {
-    struct Counts: Equatable {
-        let approvals: Int
-        let inbox: Int
-        let memoryProposals: Int
-        let selfImprovement: Int
-
-        var total: Int { approvals + inbox + memoryProposals + selfImprovement }
-    }
-
     enum SectionCountState: Equatable {
         case unavailable
         case clear
@@ -57,46 +45,6 @@ enum ActivityScreenPresentation {
         case .memoryProposals: return .proposals
         case .approvals, .inbox, .selfImprovement: return .memories
         }
-    }
-
-    static func counts(
-        storedApprovals: Int?,
-        snapshotApprovals: [ApprovalRequest],
-        storedInbox: Int?,
-        snapshotInbox: [InboxItemRecord],
-        memoryProposals: [MemoryProposalRecord],
-        trainingProposals: [TrainingProposalSummary],
-        promotionCandidates: [PromotionCandidateSummary]
-    ) -> Counts {
-        counts(
-            storedApprovals: storedApprovals,
-            snapshotApprovalsPending: snapshotApprovals.filter { $0.status.lowercased() == "pending" }.count,
-            storedInbox: storedInbox,
-            snapshotInboxPending: snapshotInbox.filter {
-                let status = $0.status.lowercased()
-                return status == "unread" || status == "active"
-            }.count,
-            memoryProposalsPending: memoryProposals.filter(\.isPending).count,
-            trainingProposalsPending: trainingProposals.filter(\.isHumanActionable).count,
-            promotionCandidatesPending: promotionCandidates.filter(\.isHumanActionable).count
-        )
-    }
-
-    static func counts(
-        storedApprovals: Int?,
-        snapshotApprovalsPending: Int,
-        storedInbox: Int?,
-        snapshotInboxPending: Int,
-        memoryProposalsPending: Int,
-        trainingProposalsPending: Int,
-        promotionCandidatesPending: Int
-    ) -> Counts {
-        Counts(
-            approvals: storedApprovals ?? snapshotApprovalsPending,
-            inbox: storedInbox ?? snapshotInboxPending,
-            memoryProposals: memoryProposalsPending,
-            selfImprovement: trainingProposalsPending + promotionCandidatesPending
-        )
     }
 
     /// Signed, paired iOS may decide owner cards regardless of origin or flags.
@@ -255,32 +203,24 @@ struct ActivityView: View {
     private var isDesignSample: Bool { MobileDesignSamples.screen != nil }
 
     private var pendingApprovalsCount: Int? {
-        (sync.approvalsSnapshotLoaded || isDesignSample) ? activityCounts.approvals : nil
+        guard let overview = sync.workOverview, overview.unavailable.isEmpty,
+              let counts = overview.needsYouCounts else { return nil }
+        return counts[.approval] ?? 0
     }
 
     private var pendingInboxCount: Int? {
-        (sync.inboxSnapshotLoaded || isDesignSample) ? activityCounts.inbox : nil
+        guard let overview = sync.workOverview, overview.unavailable.isEmpty,
+              let counts = overview.needsYouCounts else { return nil }
+        return counts[.inbox] ?? 0
     }
 
     private var pendingMemoryProposalsCount: Int? {
-        (sync.memoryProposalsSnapshotLoaded || isDesignSample) ? activityCounts.memoryProposals : nil
+        (sync.memoryProposalsSnapshotLoaded || isDesignSample) ? pendingMemoryProposals.count : nil
     }
 
     private var pendingSelfImprovementCount: Int? {
         (sync.selfImprovementSnapshotPublishedAt != nil || isDesignSample)
-            ? activityCounts.selfImprovement : nil
-    }
-
-    private var activityCounts: ActivityScreenPresentation.Counts {
-        ActivityScreenPresentation.counts(
-            storedApprovals: approvalsStore.hasLoadedSnapshot && !isDesignSample ? approvalsStore.pendingCount : nil,
-            snapshotApprovals: MobileDesignSamples.rows(sync.approvals),
-            storedInbox: inboxStore.hasLoadedSnapshot && !isDesignSample ? inboxStore.activeCount : nil,
-            snapshotInbox: MobileDesignSamples.rows(sync.inboxItems),
-            memoryProposals: sync.memoryProposals,
-            trainingProposals: MobileDesignSamples.rows(sync.trainingProposals),
-            promotionCandidates: sync.promotionCandidates
-        )
+            ? pendingTrainingProposals.count + pendingPromotionCandidates.count : nil
     }
 
     /// The first two of each queue, in one list, so the landing can answer
@@ -303,6 +243,9 @@ struct ActivityView: View {
     var body: some View {
         NavigationStack(path: $path) {
             AlivePage(title: "Activity", line: headerLine, style: .root) {
+                // The inboxes come first, always (User, 10-18: approvals sat a
+                // long scroll down, under work that only needs reading).
+                AliveSection("Everything") { queueRows }
                 MobileWorkOverviewView()
                 if !waitingItems.isEmpty {
                     AliveSection("Other reviews", surface: .waiting) {
@@ -312,7 +255,6 @@ struct ActivityView: View {
                         }
                     }
                 }
-                AliveSection("Everything") { queueRows }
             }
             // Sweep R4 C11.3 / C11.4 — render-only surfacing of state this
             // screen's own `sync` engine and the shared bridge client already
@@ -441,7 +383,7 @@ struct ActivityView: View {
                          line: "What I'll do once you say yes", count: pendingApprovalsCount)
         AliveDivider()
         ActivityQueueRow(section: .inbox, title: "Inbox",
-                         line: "Things I noticed for you", count: pendingInboxCount)
+                         line: "Notes that need you", count: pendingInboxCount)
         AliveDivider()
         ActivityQueueRow(section: .memoryProposals, title: "Memories to keep",
                          line: "What I'd like to remember", count: pendingMemoryProposalsCount)

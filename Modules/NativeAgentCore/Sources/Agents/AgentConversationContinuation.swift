@@ -64,7 +64,7 @@ public struct AgentConversationContinuation: Sendable {
         ResidentWake.shared.turnEnded(dataRoot: dataRoot)
         // Every agent row below reads its recipe: seeded and loaded first.
         AgentRecipeStore.load(dataRoot: dataRoot)
-        grok.resumeHandOvers(dataRoot: dataRoot)
+        grok.resumeHandOvers(dataRoot: dataRoot, continuation: self)
         // Dot's room is pushed to her from here on; nothing pulls it.
         ChatGPTDotIPCTransport.listen(dataRoot: dataRoot)
         Task {
@@ -183,7 +183,6 @@ public struct AgentConversationContinuation: Sendable {
     public func tick() async throws {
         resumeQueues()
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
-        Task.detached(priority: .utility) { await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot) }
         // Her wake is this tick's one full turn; the reads wait a second.
         if try await wakeHer() { return }
         let now = Date()
@@ -279,7 +278,7 @@ public struct AgentConversationContinuation: Sendable {
                 }
                 if settled, row.personInitiated == true {
                     // The person's own send: its answer settles in the thread, no agent turn.
-                    try finish(row, delivered: true, runID: nil, sessionID: row.scopeSessionID)
+                    try await finish(row, delivered: true, runID: nil, sessionID: row.scopeSessionID)
                     continue
                 }
                 if settled {
@@ -338,7 +337,11 @@ public struct AgentConversationContinuation: Sendable {
                 }
                 carriedItems[handle] = item
                 if let index = items.firstIndex(where: { $0.id == arrival.id }) {
-                    items[index].line = ResidentWake.carriedArrival(item, crossing: arrival.at).line
+                    // What this offer says is the item as it is now: that is what a later change is measured from.
+                    let offered = ResidentWake.carriedArrival(item, crossing: arrival.at)
+                    items[index].line = offered.line
+                    items[index].materialFingerprint = offered.materialFingerprint
+                    items[index].at = now
                 }
             }
         }
@@ -555,77 +558,109 @@ public struct AgentConversationContinuation: Sendable {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let digest = try await lifecycle.cachedRequestDigest(deliveryId: deliveryID)
             ?? SHA256.hash(data: try encoder.encode(receipt)).map { String(format: "%02x", $0) }.joined()
-        let responseRunID = CausalTransitionEvidence.opaqueIdentity(deliveryID)
-        let response: ChatOrchestration.ChatResponse
-        switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest, sessionId: session, responseRunId: responseRunID, route: route,
-                                        principal: row.agent, source: row.agent) {
-        case .cached(let cached): response = cached
-        case .settled(let result):
-            if let notice { return try told(row, notice) }
-            try finish(row, delivered: result?.status == "completed" || result?.status == "sent_unconfirmed", runID: row.deliveryRunID, sessionID: session,
-                       sentUnconfirmed: result?.status == "sent_unconfirmed")
-            return
-        case .inProgress, .outcomeUnknown, .conflict:
-            // Never a second turn for one event; the thread itself is untouched.
-            if let notice { return try told(row, notice) }
-            try attention(row, "Reply handling was interrupted. The original reply is retained; no second turn or message was started.", receipt: receipt)
-            return
-        case .start:
-            // The turn puts it in her hands: the glance and arrivals don't repeat it.
-            _ = try store.update(id: row.id, operationID: row.operationID, touch: notice == nil) {
-                if notice == nil { $0.phase = "ready"; $0.deliveryState = "delivering"; $0.receipt = receipt }
-                $0.shownInline = $0.operationID + ":" + $0.phase
-            }
-            do {
+        let answered: Answered
+        do {
+            answered = try await answer(deliveryID, digest: digest, session: session, route: route, principal: row.agent,
+                                        notify: isTerminalCompletion, start: {
+                // The turn puts it in her hands: the glance and arrivals don't repeat it.
+                _ = try store.update(id: row.id, operationID: row.operationID, touch: notice == nil) {
+                    if notice == nil { $0.phase = "ready"; $0.deliveryState = "delivering"; $0.receipt = receipt }
+                    $0.shownInline = $0.operationID + ":" + $0.phase
+                }
+            }) { runID, binding in
                 let client = bot == nil ? clients.bridgeChatClient() : clients.backgroundChatClient()
                 let request = TurnRequest(message: incoming, sessionID: session, surface: turnSurface,
                     envelope: turnEnvelope, verifiedSessionID: session, replyRoute: route.chatToolReplyRoute,
-                    origin: origin, pinnedRunID: responseRunID, codexCompletion: CodexCompletionTranscriptBinding(deliveryId: deliveryID, requestDigest: digest,
-                                                                                      model: "", reasoningEffort: nil,
-                                                                                      isTerminalCompletion: isTerminalCompletion))
-                response = try await TurnAdmission.shared.run(sessionID: session) {
+                    origin: origin, pinnedRunID: runID, codexCompletion: binding)
+                let response = try await TurnAdmission.shared.run(sessionID: session) {
                     try await request.chat(on: client)
                 }
-                try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
                 if notice == nil { _ = try? store.update(id: row.id, operationID: row.operationID) { $0.deliveryRunID = response.runId } }
-            } catch is TurnAdmission.Full {
-                try await lifecycle.markNotStarted(deliveryId: deliveryID, requestDigest: digest)
-                if notice != nil {
-                    // Not started: not in her hands yet either.
-                    _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
-                        if $0.shownInline == $0.operationID + ":" + $0.phase { $0.shownInline = nil }
-                        $0.nextReadAt = Date().addingTimeInterval(30)
-                    }
-                    return
-                }
-                _ = try store.update(id: row.id, operationID: row.operationID) {
-                    $0.phase = "waiting"
-                    // Retry admission using this exact frozen reply/digest;
-                    // rereading the peer could change the claimed payload.
-                    $0.deliveryState = "delivering"
-                    $0.automaticRead = true
+                return response
+            }
+        } catch is TurnAdmission.Full {
+            if notice != nil {
+                // Not started: not in her hands yet either.
+                _ = try store.update(id: row.id, operationID: row.operationID, touch: false) {
+                    if $0.shownInline == $0.operationID + ":" + $0.phase { $0.shownInline = nil }
                     $0.nextReadAt = Date().addingTimeInterval(30)
                 }
                 return
+            }
+            _ = try store.update(id: row.id, operationID: row.operationID) {
+                $0.phase = "waiting"
+                // Retry admission using this exact frozen reply/digest;
+                // rereading the peer could change the claimed payload.
+                $0.deliveryState = "delivering"
+                $0.automaticRead = true
+                $0.nextReadAt = Date().addingTimeInterval(30)
+            }
+            return
+        } catch {
+            if let notice {
+                // At most once: never rerun. Said in the log, and the thread
+                // is not marked as in her hands.
+                FileHandle.standardError.write(Data(("AgentConversationContinuation: delegation notice turn "
+                    + "\(deliveryID) interrupted; not rerun: \(error.localizedDescription)\n").utf8))
+                try? told(row, notice, handed: false)
+            } else { try? attention(row, "Reply handling was interrupted. The peer reply is retained; no message was repeated.", receipt: receipt) }
+            throw error
+        }
+        if let notice { return try told(row, notice) }
+        switch answered {
+        case .held:
+            // Never a second turn for one event; the thread itself is untouched.
+            try attention(row, "Reply handling was interrupted. The original reply is retained; no second turn or message was started.", receipt: receipt)
+        case .settled(let result):
+            try await finish(row, delivered: result?.status == "completed" || result?.status == "sent_unconfirmed", runID: row.deliveryRunID, sessionID: session,
+                       sentUnconfirmed: result?.status == "sent_unconfirmed")
+        case .delivered(let result, let runID):
+            try await finish(row, delivered: result.status == "completed" || result.status == "sent_unconfirmed", runID: runID, sessionID: session,
+                       sentUnconfirmed: result.status == "sent_unconfirmed")
+        }
+    }
+
+    enum Answered {
+        case delivered(AgentBridgeCompletionDelivery, runID: String)
+        case settled(AgentBridgeCompletionDelivery?)
+        /// In progress, of unknown outcome, or claimed with other content: never a second turn.
+        case held
+    }
+    /// Thrown by a turn that found, under admission, that it is no longer owed.
+    struct NotStarted: Error {}
+
+    /// One answer to the door that asked, once: claimed in the contacts' ledger,
+    /// her turn run (`run`, under its own admission) and cached, then delivered
+    /// after admission is released. Every contact's reply and Grok's hand-over.
+    func answer(_ deliveryID: String, digest: String, session: String, route: AgentBridgeCompletionRoute, principal: String,
+                notify: Bool = true, start: () throws -> Void = {},
+                run: (_ runID: String, _ binding: CodexCompletionTranscriptBinding) async throws -> ChatOrchestration.ChatResponse)
+        async throws -> Answered {
+        let runID = CausalTransitionEvidence.opaqueIdentity(deliveryID)
+        let response: ChatOrchestration.ChatResponse
+        switch try await lifecycle.claim(deliveryId: deliveryID, requestDigest: digest, sessionId: session, responseRunId: runID,
+                                        route: route, principal: principal, source: principal) {
+        case .cached(let cached): response = cached
+        case .settled(let result): return .settled(result)
+        case .inProgress, .outcomeUnknown, .conflict: return .held
+        case .start:
+            try start()
+            do {
+                response = try await run(runID, CodexCompletionTranscriptBinding(deliveryId: deliveryID, requestDigest: digest,
+                    model: "", reasoningEffort: nil, isTerminalCompletion: notify))
+                try await lifecycle.cacheResponse(response, deliveryId: deliveryID, requestDigest: digest)
+            } catch let error where error is TurnAdmission.Full || error is NotStarted {
+                try await lifecycle.markNotStarted(deliveryId: deliveryID, requestDigest: digest)
+                throw error
             } catch {
                 try? await lifecycle.markOutcomeUnknown(deliveryId: deliveryID, requestDigest: digest,
                     detail: "Resident continuation interrupted; never rerun automatically")
-                if let notice {
-                    // At most once: never rerun. Said in the log, and the thread
-                    // is not marked as in her hands.
-                    FileHandle.standardError.write(Data(("AgentConversationContinuation: delegation notice turn "
-                        + "\(deliveryID) interrupted; not rerun: \(error.localizedDescription)\n").utf8))
-                    try? told(row, notice, handed: false)
-                } else { try? attention(row, "Reply handling was interrupted. The peer reply is retained; no message was repeated.", receipt: receipt) }
                 throw error
             }
         }
-        let result = await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: deliveryID, requestDigest: digest,
+        return .delivered(await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: deliveryID, requestDigest: digest,
             text: response.output, attachments: response.attachments ?? [], route: route, client: clients.bridgeChatClient(),
-            sender: completionSender, lifecycle: lifecycle, notifyRequestedResult: isTerminalCompletion)
-        if let notice { return try told(row, notice) }
-        try finish(row, delivered: result.status == "completed" || result.status == "sent_unconfirmed", runID: response.runId, sessionID: session,
-                   sentUnconfirmed: result.status == "sent_unconfirmed")
+            sender: completionSender, lifecycle: lifecycle, notifyRequestedResult: notify), runID: response.runId)
     }
 
     /// The event is hers now: clear it, leaving the thread's own state (a
@@ -731,7 +766,7 @@ public struct AgentConversationContinuation: Sendable {
         """
     }
 
-    private func finish(_ row: AgentConversationRecord, delivered: Bool, runID: String?, sessionID: String, sentUnconfirmed: Bool = false) throws {
+    private func finish(_ row: AgentConversationRecord, delivered: Bool, runID: String?, sessionID: String, sentUnconfirmed: Bool = false) async throws {
         // Agent can already have answered and advanced this conversation while
         // the old human-facing completion is delivered. Never overwrite it.
         _ = try? store.update(id: row.id, operationID: row.operationID) {
@@ -740,8 +775,8 @@ public struct AgentConversationContinuation: Sendable {
             $0.deliveryRunID = runID; $0.automaticRead = false; $0.nextReadAt = nil
         }
         if delivered, let runID {
-            try SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot,
-                sessionId: sessionID, runId: runID)
+            try await SwiftNativeChatOrchestrationClient.settleReplyCheckpoint(dataRoot: dataRoot,
+                sessionId: sessionID, runId: runID, verdict: sentUnconfirmed ? "sent_unconfirmed" : "completed")
         }
     }
 

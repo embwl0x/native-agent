@@ -214,8 +214,11 @@ public extension MacChatTurnPresentationPort {
                 return MacChatStartedTurn(acceptance: rejectMacChatTurn("Send-next queue is full (20 messages)"), task: nil)
             }
             presentMacChatTurn(.status(existingQueue.isEmpty ? "Message queued to send next" : "Message added to queue"))
-            // User, 2026-10-04: a send while she works waits its turn in the
-            // queue. Handing it to the running turn is his choice (Steer).
+            // User, 2026-10-18: a send while she works goes to her working turn,
+            // which takes it at its next step; until then it stays queued here.
+            if sessionIsRunning, turn.canSteerRunningTurn {
+                steerQueuedChatTurn(turn.id, sessionId: targetSessionId)
+            }
             if !sessionIsRunning && !macChatTurns.pausedQueueSessions.contains(targetSessionId) {
                 Task { @MainActor in await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId) }
             }

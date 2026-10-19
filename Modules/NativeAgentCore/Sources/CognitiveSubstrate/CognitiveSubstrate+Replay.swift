@@ -27,8 +27,6 @@ extension CognitiveSubstrate {
         var stagedSchemas: [UUID: CognitiveSchemaProposal] = [:]
         var stagedTimeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
         var insertedReplayEvidence: Set<String> = []
-        /// Bounded by the `prefix(8)` on the proposal loop below.
-        var acceptedIdentityBoundaries: [(title: String, summary: String, evidenceNodeIds: [UUID])] = []
 
         do {
 
@@ -74,53 +72,8 @@ extension CognitiveSubstrate {
 
         for proposal in input.remProposals.prefix(8) {
             let evidenceId = remReplayEvidenceID(proposal)
-            let status = schemaStatus(from: proposal.status)
-            if let existingId = schemaProposals.values.first(where: { $0.externalEvidenceIds.contains(evidenceId) })?.id,
-               var existing = schemaProposals[existingId] {
-                if existing.status == status {
-                    skippedEvidenceIds.append(evidenceId)
-                    continue
-                }
-                existing.status = status
-                schemaProposals[existingId] = existing
-                stagedSchemas[existing.id] = existing
-                // Item 47 (2026-09-01): `recordEpisode` shipped with no
-                // production caller. This is the episode boundary the system
-                // already HAS — a REM proposal she lived through crossing into
-                // accepted is the moment experience becomes identity
-                // (NORTHSTAR clause 1's episodic→identity spine). No scheduler
-                // invented; the transition already happens right here.
-                // Recorded AFTER the commit below so a failed transaction
-                // cannot leave an episode for an integration that rolled back.
-                if status == .accepted {
-                    acceptedIdentityBoundaries.append((
-                        title: existing.title,
-                        summary: existing.body,
-                        evidenceNodeIds: existing.evidenceNodeIds
-                    ))
-                }
-                writes.append(CognitiveArtifactWrite(
-                    kind: "schema_proposal", id: existing.id, status: existing.status.rawValue,
-                    score: existing.confidence, payload: existing.toJSON()
-                ))
-                let timeline = recordTimelineEventInMemory(
-                    kind: .proposalResolution,
-                    title: "Schema proposal \(existing.status.rawValue)",
-                    summary: existing.body,
-                    artifactId: existing.id,
-                    lineageId: existing.lineageId,
-                    // The machine-readable outcome, so the growth-week readout
-                    // does not have to guess from the title (Agent, 2026-09-14:
-                    // "Schema proposal accepted — proposed"). Nobody signs a REM
-                    // resolution, so accepted is HELD (her own), never approved.
-                    externalEvidenceIds: existing.externalEvidenceIds + growthOutcomeTagIds(for: status)
-                )
-                stagedTimeline[timeline.id] = timeline
-                writes.append(CognitiveArtifactWrite(
-                    kind: "developmental_timeline", id: timeline.id, status: "recorded",
-                    score: 0.5, payload: timeline.toJSON()
-                ))
-                timelineEventIds.append(timeline.id)
+            if schemaProposals.values.contains(where: { $0.externalEvidenceIds.contains(evidenceId) }) {
+                skippedEvidenceIds.append(evidenceId)
                 continue
             }
 
@@ -129,7 +82,6 @@ extension CognitiveSubstrate {
                 title: bounded("\(proposal.target) REM proposal", maxCharacters: 120),
                 body: bounded(proposal.text.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),
                 target: bounded(proposal.target.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
-                status: status,
                 confidence: proposal.confidence,
                 createdAt: dateFromInternetDate(proposal.createdAt) ?? now,
                 externalEvidenceIds: [evidenceId] + proposal.evidenceDates.map { bounded("dream:\($0)", maxCharacters: 120) },
@@ -144,23 +96,9 @@ extension CognitiveSubstrate {
             schemaProposalIds.append(schema.id)
             markDirty(at: now)
             writes.append(CognitiveArtifactWrite(
-                kind: "schema_proposal", id: schema.id, status: schema.status.rawValue,
+                kind: "schema_proposal", id: schema.id, status: "referenced",
                 score: schema.confidence, payload: schema.toJSON()
             ))
-            let timeline = recordTimelineEventInMemory(
-                kind: .schemaProposal,
-                title: schema.title,
-                summary: schema.body,
-                artifactId: schema.id,
-                lineageId: schema.lineageId,
-                externalEvidenceIds: schema.externalEvidenceIds
-            )
-            stagedTimeline[timeline.id] = timeline
-            writes.append(CognitiveArtifactWrite(
-                kind: "developmental_timeline", id: timeline.id, status: "recorded",
-                score: 0.5, payload: timeline.toJSON()
-            ))
-            timelineEventIds.append(timeline.id)
         }
 
         let receiptPayload: JSONValue? =
@@ -198,17 +136,6 @@ extension CognitiveSubstrate {
         enforceEpisodeCap()
         enforceSchemaProposalCap()
         enforceReplayEvidenceCap()
-        // Item 47: the episode boundaries this integration crossed, recorded
-        // only now that the integration is durable. `recordEpisode` enforces
-        // its own cap and persists its own artifact; a failure there loses an
-        // episode, never the integration.
-        for boundary in acceptedIdentityBoundaries {
-            await recordEpisode(
-                title: "Became mine: \(boundary.title)",
-                summary: boundary.summary,
-                evidenceNodeIds: boundary.evidenceNodeIds
-            )
-        }
         return CognitiveReplayIntegrationResult(
             episodeIds: episodeIds,
             schemaProposalIds: schemaProposalIds,
@@ -247,29 +174,6 @@ extension CognitiveSubstrate {
     // ran here was removed in R8c (2026-07-01); the vestigial assimilate() no-op seam and
     // its ChatOrchestration callers were retired in the follow-up (2026-07-02).
 
-    @discardableResult
-    public func recordEpisode(
-        title: String,
-        summary: String,
-        evidenceNodeIds: [UUID] = []
-    ) async -> CognitiveEpisodeReference? {
-        await waitForMaintenanceTransition()
-        guard configuration.enabled else { return nil }
-        let now = dependencies.now()
-        let episode = CognitiveEpisodeReference(
-            id: dependencies.makeUUID(),
-            title: bounded(title.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 120),
-            summary: bounded(summary.trimmingCharacters(in: .whitespacesAndNewlines), maxCharacters: 500),
-            occurredAt: now,
-            evidenceNodeIds: unique(evidenceNodeIds)
-        )
-        guard !episode.title.isEmpty || !episode.summary.isEmpty else { return nil }
-        episodes[episode.id] = episode
-        enforceEpisodeCap()
-        await persistArtifact(kind: "episode", id: episode.id, status: "recorded", score: 0.5, payload: episode.toJSON())
-        return episode
-    }
-
     public func episodeSnapshot() async -> [CognitiveEpisodeReference] {
         episodes.values.sorted { lhs, rhs in
             if lhs.occurredAt != rhs.occurredAt { return lhs.occurredAt > rhs.occurredAt }
@@ -278,37 +182,65 @@ extension CognitiveSubstrate {
     }
 
     public func schemaProposalSnapshot() async -> [CognitiveSchemaProposal] {
-        schemaProposals.values.sorted { lhs, rhs in
+        let decisions = await dependencies.decisions()
+        return schemaProposals.values.sorted { lhs, rhs in
             if lhs.createdAt != rhs.createdAt { return lhs.createdAt > rhs.createdAt }
             return lhs.id.uuidString < rhs.id.uuidString
+        }.map { proposal in
+            var proposal = proposal
+            proposal.decision = decisions[String(proposal.lineageId.dropFirst(4))]
+            return proposal
         }
     }
 
     public func developmentalTimelineSnapshot(limit: Int = 40) async -> [CognitiveDevelopmentalTimelineEvent] {
+        developmentalTimelineSnapshot(proposals: await schemaProposalSnapshot(), limit: limit)
+    }
+
+    public func developmentalTimelineSnapshot(proposals: [CognitiveSchemaProposal], limit: Int) -> [CognitiveDevelopmentalTimelineEvent] {
         // Phase 5 D: flag off, opinion and interest history is hidden too.
         let hidden: Set<UUID> = configuration.viewsExperimentEnabled ? [] : Set(standingViews.values
             .filter { $0.status == .opinion || $0.status == .interest }.map(\.id))
-        return developmentalTimeline.values
-            .filter { event in event.artifactId.map { !hidden.contains($0) } ?? true }
-            .sorted { lhs, rhs in
+        let regenerated = Set(proposals.map(\.lineageId))
+        var result = developmentalTimeline.values.compactMap { event -> CognitiveDevelopmentalTimelineEvent? in
+            let isProposal = event.kind == .schemaProposal || event.kind == .proposalResolution
+            guard !(isProposal && regenerated.contains(event.lineageId)),
+                  event.artifactId.map({ !hidden.contains($0) }) ?? true else { return nil }
+            var event = event
+            if isProposal && event.lineageId.hasPrefix("rem:") {
+                event.externalEvidenceIds.removeAll { $0.hasPrefix("outcome:") }
+                event.externalEvidenceIds += growthOutcomeTagIds(for: nil)
+                event.summary = "Proposal reference unavailable. Recorded: \(event.summary)"
+            }
+            return event
+        }
+        // REM history is a view of its proposal and current decision, including
+        // decisions made after the creation left the retained timeline window.
+        for proposal in proposals {
+            var event = CognitiveDevelopmentalTimelineEvent(
+                id: stableArtifactID("proposal|\(proposal.id)"), kind: .schemaProposal,
+                title: proposal.title, summary: proposal.body, occurredAt: proposal.createdAt,
+                artifactId: proposal.id, lineageId: proposal.lineageId,
+                externalEvidenceIds: proposal.externalEvidenceIds)
+            let decision = proposal.decision
+            if let decision, let stamp = decision.outcome?.at, let at = dateFromInternetDate(stamp) {
+                var resolution = event
+                resolution.id = stableArtifactID("decision|\(decision.id)")
+                resolution.kind = .proposalResolution
+                resolution.occurredAt = at
+                resolution.title = Self.growthRowTitle(for: event)
+                resolution.summary = decision.face?.words ?? ""
+                resolution.externalEvidenceIds += growthOutcomeTagIds(for: decision)
+                result.append(resolution)
+            } else {
+                event.externalEvidenceIds += growthOutcomeTagIds(for: decision)
+            }
+            result.append(event)
+        }
+        return Array(result.sorted { lhs, rhs in
             if lhs.occurredAt != rhs.occurredAt { return lhs.occurredAt > rhs.occurredAt }
             return lhs.id.uuidString < rhs.id.uuidString
-        }
-        .prefix(max(0, limit))
-        .map { $0 }
-    }
-
-    public func resolveSchemaProposal(
-        id: UUID,
-        accepted: Bool
-    ) async -> CognitiveSchemaProposal? {
-        // Compatibility no-op for older callers. These rows mirror canonical
-        // REM status and never owned an association-model effect. Review must
-        // happen through the REM approval path, which writes GROWTH and then
-        // returns here through replay integration.
-        _ = id
-        _ = accepted
-        return nil
+        }.prefix(max(0, limit)))
     }
 
     @discardableResult
@@ -385,17 +317,6 @@ extension CognitiveSubstrate {
             .filter { !$0.isEmpty }
             .joined(separator: " ")
         return bounded(normalized, maxCharacters: 500)
-    }
-
-    private func schemaStatus(from raw: String) -> CognitiveSchemaProposalStatus {
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "approved", "accepted", "applied":
-            return .accepted
-        case "denied", "rejected", "dismissed", "archived":
-            return .rejected
-        default:
-            return .proposed
-        }
     }
 
     private func dateFromFullDate(_ raw: String) -> Date? {

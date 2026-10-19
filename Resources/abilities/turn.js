@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id": "turn", "kind": "turn", "version": 1,
+{"id": "turn", "kind": "turn", "version": 2,
  "reach": {"capabilities": ["model"], "readPaths": [], "hosts": [], "apps": []},
  "wake": [], "face": {}, "resident": false, "learned": {}, "choices": {}}
 */
@@ -23,6 +23,8 @@ function step(state, event) {
       return next({purpose: "tool_round", calls: left}, left ? [] : [{effect: "model.call", purpose: "tool_round"}]);
     case "observation":
       return next(state, [{effect: "model.call", purpose: state.purpose}]);
+    case "provider_failure":
+      return next(state, [{effect: "reply.stream", text: event.text}, {effect: "reply.end"}]);
     case "resumed":
       var purpose = event.steps ? "tool_round" : state.purpose;
       return next({purpose: purpose, calls: 0}, [{effect: "model.call", purpose: purpose}]);

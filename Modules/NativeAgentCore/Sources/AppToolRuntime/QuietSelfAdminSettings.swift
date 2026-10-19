@@ -9,12 +9,14 @@ import NativeAgentShared
 import PersistenceCore
 import Studio
 import ProviderRouting
+import DeviceSync
 import StandingBots
 import TrustCenter
 
 public typealias QuietSettingsHostProvider = @MainActor @Sendable () -> (any QuietSettingsHost)?
 
 public enum QuietSettingError: Error, LocalizedError {
+    /// A rejected value, before any mutation. Failed saves are unavailable.
     case badValue(String)
     case unavailable(String)
     /// The value would raise Trust: User's call, refused as `owners_call`.
@@ -1269,6 +1271,21 @@ public enum QuietSettings {
         ))
 
         // ── Providers ───────────────────────────────────────────────────────
+        rows.append(QuietSetting(
+            id: "providers.routing_repair", page: "providers", label: "Reconstruct provider routing", kind: .text,
+            note: "Read the three BaseHash values and preserved source bytes (base64). Set JSON text with those same hashes and complete surfaces and active objects, including Chat. Choose every model/account explicitly; omitted overrides are removed. Original bytes are retained by digest. No credentials change.",
+            read: { host in
+                do {
+                    let input = try await SwiftNativeProviderRouting(dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()).routingRepairInput()
+                    return .string(try input.serialize(pretty: false))
+                } catch { return .string(error.localizedDescription) }
+            },
+            write: { host, value in
+                let input = try JSONValue.parse(Data(try stringValue(value, "Provider routing reconstruction").utf8))
+                try await SwiftNativeProviderRouting(dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot()).reconstructRouting(input)
+                QuietWriteDetail.record("undo_unavailable", .string("Original routing bytes are retained beside each file by digest; reconstruct explicitly to restore them."))
+            }
+        ))
         for group in ProviderSurfaceGroups.all {
             rows.append(providerGroupModel(group))
             rows.append(providerGroupEffort(group))
@@ -1659,7 +1676,7 @@ public enum QuietSettings {
             write: { appModel, value in
                 let name = try stringValue(value, "Name")
                 if let problem = await appModel.savePersonalityName(name) {
-                    throw QuietSettingError.badValue("The name was not saved: \(problem)")
+                    throw QuietSettingError.unavailable("The name was not saved: \(problem)")
                 }
             }
         ))
@@ -1824,7 +1841,7 @@ public enum QuietSettings {
                 do {
                     try await appModel.saveSearchServiceURL(raw)
                 } catch {
-                    throw QuietSettingError.badValue(
+                    throw QuietSettingError.unavailable(
                         "The search service was not saved: \(error.localizedDescription). Pass an address "
                         + "like http://localhost:8888, or auto.")
                 }

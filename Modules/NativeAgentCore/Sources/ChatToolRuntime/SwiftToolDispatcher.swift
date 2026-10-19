@@ -436,19 +436,12 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
 
     /// The same, for the `app` door's generated `authored.<id>` actions, with
     /// the primitive permissions and app dependencies each declares.
-    /// Memoized per data root until the ability store writes (its
-    /// `generation`) or the reserved tool namespace grows: a binding miss on
-    /// any route (a historical call shown back, receipt redaction, trace
-    /// ranking, policy) resolves her parts from memory instead of re-reading
-    /// and migrating the store per call. (10-17: the crash itself was the
-    /// thunk accumulation fixed in AppActionBinding; this walk ran once per
-    /// row of a chat-history search and is simply too much work per miss.)
-    /// The store's own lock guards the read and the memo (it is recursive,
-    /// and a store write that reaches a part lookup already holds it); a
-    /// failed read is not memoized; the key is the one read before the walk.
+    /// The store's lock and canonical revision cover local and external changes.
+    /// A failed read is not memoized; the key is read before the catalog walk.
     package static func authoredTools(dataRoot: URL) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
         AbilityStore.withLock {
-            let key = (dataRoot.path, AbilityStore.generation, AppActionBinding.registeredToolCount)
+            guard let revision = try? AbilityStore(dataRoot: dataRoot).revision() else { return [] }
+            let key = (dataRoot.path, revision, AppActionBinding.registeredToolCount)
             if let memo = authoredToolsMemo, memo.key == key { return memo.tools }
             guard case .array(let rows)? = try? AbilityStore(dataRoot: dataRoot).registry(kind: .tool) else { return [] }
             let records = rows.compactMap { try? JSONRow($0) }
@@ -458,9 +451,7 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             return tools
         }
     }
-    /// Keyed by root, the store's generation and the reserved tool namespace
-    /// (a built-in registered later may take an authored name).
-    nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, UInt64, Int),
+    nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, [String], Int),
         tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)])?
 
     private static func authoredTools(records: [JSONRow], named names: Set<String>? = nil) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {

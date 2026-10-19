@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentShared
 import PersistenceCore
+import Experiences
 import TurnTrace
 
 extension MacSyncEngine {
@@ -8,96 +9,38 @@ extension MacSyncEngine {
         workActivityObservationTask?.cancel()
         let generation = snapshotLifecycleGeneration
         workActivityObservationTask = Task {
-            let subscription = await TurnTraceBus.shared.subscribe(capacity: 256)
-            defer { Task { await TurnTraceBus.shared.unsubscribe(subscription.id) } }
-            do {
-                let reader = TurnTraceRecentReader(dataRootOverride: sync.dataRoot)
-                let previous = try await reader.read(now: Date().addingTimeInterval(-86400))
-                let current = try await reader.read()
-                guard generation == snapshotLifecycleGeneration, isActive else { return }
-                for event in (previous.events + current.events).sorted(by: { $0.ts < $1.ts }) {
-                    reduceWorkActivity(event)
-                }
+            for await _ in await ExperienceStore.at(sync.dataRoot).changes() {
+                guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
+                workActivityVersion &+= 1
                 requestWorkActivityPublication()
-            } catch {
-                syncError = "Work activity history could not be read: \(error.localizedDescription)"
-            }
-            var drops = 0
-            for await event in subscription.stream {
-                guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { break }
-                let count = await TurnTraceBus.shared.dropCount(subscription.id)
-                if count != drops {
-                    drops = count
-                    for id in Array(workActivities.keys) where workActivities[id]?.content.state.isTerminal == false {
-                        workActivities[id]?.content.state = .unknown
-                        workActivities[id]?.content.status = "Updates were missed — state unknown"
-                    }
-                    workActivityVersion &+= 1
-                    requestWorkActivityPublication()
-                }
-                if reduceWorkActivity(event) { requestWorkActivityPublication() }
+                await writeSnapshots()
             }
         }
     }
 
-    @discardableResult
-    private func reduceWorkActivity(_ event: TurnTraceEvent) -> Bool {
-        guard case .object(let payload) = event.payload else { return false }
-        func text(_ key: String) -> String? {
-            guard case .string(let value)? = payload[key] else { return nil }
-            return value
-        }
-        let id = "turn:\(event.turnId)"
-        if event.kind == "work.identified" {
-            guard let title = text("title"), !title.isEmpty, workActivities[id] == nil else { return false }
-            workActivities[id] = MobileWorkActivity(id: id, sessionID: event.sessionId, startedAt: event.ts,
-                content: .init(title: title, state: .preparing, status: "Preparing", updatedAt: event.ts))
+    private func activity(_ experience: Experience) -> MobileWorkActivity? {
+        // Only the person's conversations: a worker's brief answers its caller, never him.
+        guard experience.kind == .heard, let answer = experience.owes["answer"], answer.to.hasPrefix("conversation:"),
+              let started = DeskActivityState.movementDate(experience.at) else { return nil }
+        let state: MobileWorkActivity.State
+        let status: String
+        if answer.phase == .accepted { state = .completed; status = "Reply ready" }
+        else if answer.phase == .letGo {
+            state = answer.reason == .cancelled ? .stopped : .failed
+            status = answer.reason == .cancelled ? "Stopped" : "Failed — open the conversation"
+        } else if experience.progress == "waiting" || (experience.progress == nil && experience.outcome?.status == "waiting") {
+            state = .waiting; status = "Answer owed"
+        } else if experience.evidence.contains(.init(source: "runtime", id: ExperienceStore.processID)) {
+            state = .working; status = "Answering"
         } else {
-            guard var row = workActivities[id], event.ts >= row.content.updatedAt,
-                  !row.content.state.isTerminal else { return false }
-            let state: MobileWorkActivity.State
-            let status: String
-            switch event.kind {
-            case "context.ready": state = .preparing; status = "Context ready"
-            case "provider.requestStarted": state = .working; status = "Waiting for the model"
-            case "provider.retry": state = .retrying; status = "Retrying the model request"
-            case "provider.firstDelta": state = .working; status = "Model is responding"
-            case "surface.outputEnqueued": state = .replying; status = "Writing the reply"
-            case "tool.dispatch":
-                // An app call reads as the action it ran (`shown`).
-                if text("phase") == "begin", let name = text("shown") ?? text("name") {
-                    state = .tool; status = String(ToolActivityPresentation.progress(name).prefix(120))
-                } else if text("status") == "waiting" || text("status") == "blocked" {
-                    state = .blocked; status = "Needs your decision"
-                } else { state = .working; status = "Tool returned — continuing" }
-            case "turn.cancelled": state = .stopped; status = "Stopped"
-            case "turn.failed": state = .failed; status = "Failed — open the conversation"
-            case "turn.terminal":
-                switch text("status") {
-                case "completed": state = .completed; status = "Reply ready"
-                case "waiting":
-                    state = .waiting
-                    switch text("terminalReason") {
-                    case "approval_required": status = "Approval required"
-                    case "provider_required": status = "Model connection needs attention"
-                    case "human_takeover": status = "Waiting for Mac control"
-                    default: status = "Needs your answer"
-                    }
-                case "failed": state = .failed; status = "Failed — open the conversation"
-                case "interrupted": state = .interrupted; status = "Stopped before completion"
-                default: state = .unknown; status = "Outcome unknown"
-                }
-            default: return false
-            }
-            row.content.state = state
-            row.content.status = status
-            row.content.updatedAt = event.ts
-            workActivities[id] = row
+            state = .unknown; status = "Answer settlement unconfirmed"
         }
-        let retained = Set(workActivities.values.sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64).map(\.id))
-        workActivities = workActivities.filter { retained.contains($0.key) }
-        workActivityVersion &+= 1
-        return true
+        let destination = answer.to
+        return MobileWorkActivity(id: "turn:" + experience.id,
+            sessionID: destination.hasPrefix("conversation:") ? String(destination.dropFirst(13)) : nil,
+            startedAt: started, content: .init(
+                title: String((experience.face?.words ?? "Conversation").prefix(96)), state: state,
+                status: status, updatedAt: DeskActivityState.movementDate(experience.updatedAt) ?? started))
     }
 
     func projectWorkshopWorkActivities(_ data: Data) throws {
@@ -157,20 +100,38 @@ extension MacSyncEngine {
                     publishedVersion = workActivityVersion
                     guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive,
                           let snapshotDir else { return }
-                    let rows = Array(workActivities.values.sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64))
+                    let experiences: [Experience]
+                    let unavailable: String?
+                    do {
+                        experiences = try await ExperienceStore.at(sync.dataRoot).projection()
+                        unavailable = nil
+                    } catch {
+                        experiences = []
+                        unavailable = error.localizedDescription
+                    }
+                    var rows = Array((experiences.compactMap(activity) + workActivities.values)
+                        .sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64))
+                    if let unavailable {
+                        rows.append(.init(id: "experience:unavailable", sessionID: nil, startedAt: Date(),
+                            content: .init(title: "Work state unavailable", state: .unknown,
+                                status: unavailable, updatedAt: Date())))
+                    }
                     guard let pairing = try PairingSecretManager.existingSecretBase64() else { return }
                     let configuration = await sync.apns.workActivityConfiguration(dataRoot: sync.dataRoot)
-                    let snapshot = MobileWorkActivitySnapshot(activities: rows,
+                    var snapshot = MobileWorkActivitySnapshot(activities: rows,
                         pairingFingerprint: WorkActivityPushRegistration.fingerprint(pairing), pushConfigured: configuration.configured,
                         pushConfigurationError: configuration.error)
+                    snapshot.experiences = experiences.map(\.mobile)
+                    snapshot.unavailable = unavailable
                     let data = try await MobileSnapshotBuilder.shared.encode(snapshot)
+                    var changed: Set<String> = []
                     switch await writeSnapshotData(data, to: "work_activity.json", in: snapshotDir, lifecycleGeneration: generation) {
-                    case .changed:
-                        await publishChangedSnapshots(["work_activity.json"], in: snapshotDir,
-                            lifecycleGeneration: generation, scope: .standard)
+                    case .changed: changed.insert("work_activity.json")
                     case .failed(let reason): syncError = "Work activity sync failed: \(reason)"
                     case .unchanged: break
                     }
+                    await publishChangedSnapshots(changed, in: snapshotDir,
+                        lifecycleGeneration: generation, scope: .standard)
                     guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
                     if configuration.usable {
                         let errors = await sync.apns.sendWorkActivities(rows, dataRoot: sync.dataRoot)

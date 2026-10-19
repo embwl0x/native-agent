@@ -50,6 +50,8 @@ public enum PeerTurnEffectPolicy {
             if name == "app", input["preview"] == .bool(true) { return false }
             if name == "app", !passesThrough, !action.isEmpty, appAction == nil, !AppActionBinding.isRegistered { return true }
             // A delete to trash is reversible, but still belongs on the delete floor.
+            // inbox.approve stays on this floor for a peer turn: a card can carry a
+            // persona or growth change, and only the person approves those for a peer.
             if !passesThrough, appAction?.isHis == true || appAction?.irreversible == true
                 || appAction?.lifecycle == .drop { return true }
             if capabilities.contains("external_send"), !capabilities.contains("notification"),

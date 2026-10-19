@@ -256,6 +256,7 @@ public struct TurnEnvelope: Sendable, Equatable {
     public let macContinuation: MacWorkContinuation?
     /// Work attribution only; it grants no authority.
     public let workIdentity: String?
+    public var answerExperienceID: String?
 
     public init(
         surface: String,
@@ -266,7 +267,8 @@ public struct TurnEnvelope: Sendable, Equatable {
         deliveryRoute: DeliveryRoute? = nil,
         declaredRemote: Bool? = nil,
         macContinuation: MacWorkContinuation? = nil,
-        workIdentity: String? = nil
+        workIdentity: String? = nil,
+        answerExperienceID: String? = nil
     ) {
         self.surface = surface
         self.agent = agent
@@ -277,12 +279,14 @@ public struct TurnEnvelope: Sendable, Equatable {
         self.declaredRemote = declaredRemote
         self.macContinuation = macContinuation
         self.workIdentity = workIdentity
+        self.answerExperienceID = answerExperienceID
     }
 
     public func withMacContinuation(_ continuation: MacWorkContinuation) -> TurnEnvelope {
         TurnEnvelope(surface: surface, agent: agent, verifiedChatId: verifiedChatId,
             verifiedUserId: verifiedUserId, commandSignatureVerified: commandSignatureVerified,
-            deliveryRoute: deliveryRoute, declaredRemote: declaredRemote, macContinuation: continuation, workIdentity: workIdentity)
+            deliveryRoute: deliveryRoute, declaredRemote: declaredRemote, macContinuation: continuation, workIdentity: workIdentity,
+            answerExperienceID: answerExperienceID)
     }
 
     /// The delivery projection. `ReplyRoute` predates the envelope and has
@@ -308,6 +312,7 @@ public struct TurnEnvelope: Sendable, Equatable {
         }
         put("agent", Self.cleaned(agent))
         put("workIdentity", workIdentity)
+        put("answerExperienceID", answerExperienceID)
         put("chatId", verifiedChatId)
         put("userId", verifiedUserId)
         put("requesterUserId", Self.cleaned(deliveryRoute?.requesterUserId))
@@ -343,7 +348,8 @@ public struct TurnEnvelope: Sendable, Equatable {
             verifiedChatId: read("chatId"),
             verifiedUserId: read("userId"),
             deliveryRoute: route,
-            workIdentity: read("workIdentity")
+            workIdentity: read("workIdentity"),
+            answerExperienceID: read("answerExperienceID")
         )
     }
 
@@ -448,4 +454,15 @@ public enum ChatTurnRuntimeContext {
         }
     }
     @TaskLocal public static var current: Active?
+}
+
+/// What her reply carries by her own hand: bound for the whole turn, so a
+/// direct call, a batch at any depth and a script's call all choose here.
+public final class ReplyChoices: @unchecked Sendable {
+    @TaskLocal public static var current: ReplyChoices?
+    private let lock = NSLock()
+    private var chosen: [String] = []
+    public init() {}
+    public func choose(_ path: String) { lock.withLock { if !chosen.contains(path) { chosen.append(path) } } }
+    public var paths: [String] { lock.withLock { chosen } }
 }

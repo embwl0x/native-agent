@@ -67,30 +67,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         self.conversationScope = conversationScope
     }
 
-    /// Usable builder lanes retain their bare names; otherwise a saved contact owns its name.
+    /// Saved contacts and their explicit handles own their names.
     private func namingSavedContact(_ tool: String, _ input: [String: JSONValue]) throws -> [String: JSONValue] {
-        guard ["agent_message", "agent_read", "agent_cancel"].contains(tool), let root = peerDataRoot,
-              case .string(let agent)? = input["agent"], !agent.contains(":")
-        else { return input }
-        var input = input
-        let name = agent.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lane = name.lowercased() == "claude" ? "claude" : name.lowercased()
-        if builtInLanes?.builtInAgentLaneUsable(lane) == true {
-            input["agent"] = .string(lane)
-            return input
-        }
-        var matches = try AgentPeerStore(dataRoot: root).list().filter {
-            $0.id == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
-        }.map { "peer:" + $0.id }
-        matches += try BotDefinitionStore(dataRoot: root).list().filter {
-            $0.id.uuidString.lowercased() == name.lowercased() || $0.name.caseInsensitiveCompare(name) == .orderedSame
-        }.map { "bot:" + $0.id.uuidString }
-        guard matches.count <= 1 else {
-            throw AgentConversationStore.Failure(message: "More than one contact is named \(name). Choose its exact contact from agent_contacts.")
-        }
-        if let exact = matches.first { input["agent"] = .string(exact) }
-        else if ["codex", "claude", "omp"].contains(lane) { input["agent"] = .string(lane) }
-        return input
+        try AgentConversationRouting.namingSavedContact(tool, input, dataRoot: peerDataRoot)
     }
 
     /// The one alias table (`ToolNameAliases`) over the built-in catalog —
@@ -139,7 +118,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
             }
             if !AgentConversationContext.isInternalRead, Self.canonical(tool) == "agent_read",
                case .object(var fields) = result,
-               case .string(let agent)? = fields["agent_id"] ?? fields["agent"], agent.lowercased() == "claude" {
+               case .string(let agent)? = fields["agent_id"] ?? fields["agent"], let root = peerDataRoot, AgentConversationDelivery.door(for: agent, dataRoot: root)?.liveReader == true {
                 fields["worklog"] = AgentConversationView.claudeWorklog()
                 return .object(fields)
             }
@@ -193,7 +172,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         if Self.canonical(tool) == "workspace" {
             guard let root = peerDataRoot,
                   let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty else {
-                return .object(["status": .string("unavailable"), "message": .string("Workspace needs a verified chat session. No action was performed.")])
+                throw ToolFailureError("Workspace needs a transport-bound chat session. No action was performed. Call app {} from a chat turn's tool chain; creating a transcript or supplying __session_id cannot bind this caller.",
+                    argumentPath: "context", accepted: "a chat turn's verified tool chain", effects: .none,
+                    nextCall: ToolFailureError.call("app"))
             }
             // Admission to the facade is checked first. Each selected read or
             // send then re-enters the SAME complete chain under its real name
@@ -230,8 +211,8 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         // is connected first, through agent_connect's own gates and card.
         if tool == "agent_message", PersonInitiatedSend.current == nil, !AgentRecipeStore.dryRun,
            case .string(let name)? = input["agent"], !name.contains(":"),
-           !["codex", "claude", "omp", "claude"].contains(name.lowercased()),
            let row = AgentHostDirectory.row(named: name), let root = peerDataRoot,
+           AgentConversationDelivery.door(for: name, dataRoot: root) == nil,
            // "Grok" while "Grok Bot" is saved means that contact, not a second route.
            !((try? AgentPeerStore(dataRoot: root).list()) ?? []).contains(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
             return try await connectThenMessage(row: row, input: input, surface: surface)
@@ -333,7 +314,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
 
     private func dispatchExact(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let route: AgentConversationRouting.Route?
-        do { route = try AgentConversationRouting.route(tool: tool, input: input) }
+        do { route = try AgentConversationRouting.route(tool: tool, input: input, dataRoot: peerDataRoot) }
         catch let error as AgentConversationRouting.InvalidRequest {
             throw ToolFailureError(error.message, argumentPath: "args",
                 accepted: tool == "agent_read"

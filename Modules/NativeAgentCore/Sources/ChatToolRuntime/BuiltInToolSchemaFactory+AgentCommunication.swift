@@ -6,7 +6,7 @@ extension BuiltInToolSchemaFactory {
     func agentCommunicationSchemas() -> [LLMToolSchema?] {
         let names: Set<String> = ["agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel"]
         guard requestedNames == nil || !names.isDisjoint(with: requestedNames!) else { return [] }
-        let agent = strSchema("Contact name, if it identifies exactly one saved agent, or an exact reference from agent_contacts: codex, claude, omp, bot:<UUID>, or peer:<UUID>. Ambiguous names need a specific contact; never guess.")
+        let agent = strSchema("A unique saved contact name or handle, bot:<UUID>, or peer:<UUID> from agent_contacts. Ambiguous names need an exact reference; never guess.")
         let conversation = strSchema("Optional human conversation label, such as browser work, for adapters supporting separate discussions. Omit to use this contact's current conversation. Home message shortcuts also take args {text, conversation}. Bots have one continuous session: omit this field for bots. Opening a bot by name shows its latest full saved reply. On supported routes, an unused label starts a separate conversation; on a read it selects an existing one. The app retains the underlying identities.")
         return [
             requestedSchema(name: "agent_contacts", toolClass: .read, description: "Find a contact to ask, tell, or message by name, including saved agents, coding helpers and bots, with availability and status. Includes local agents, remote peers and agent hosts available to connect by name. Use contacts to identify an agent before connecting or disconnecting it. Set discover true only when the person asks about agents or asks to find agents; ordinary calls reuse observations without discovery.", parametersJSON: agentCommunicationParams(properties: [("discover", obj([("anyOf", .array([obj([("type", .string("boolean"))]), obj([("type", .string("string"))]), obj([("type", .string("null"))])])), ("description", .string("true, or a name to find."))]))], required: [])),
@@ -26,18 +26,11 @@ extension BuiltInToolSchemaFactory {
                 ("agent", agent), ("text", strSchema("The message to send.")),
                 ("conversation", conversation),
                 ("new_conversation", boolSchema()),
-                ("expects_reply", boolSchema("false for an FYI, report or receipt that needs no answer: it shows delivered, never waiting. Omit to let the app judge; a question or request expects one.")),
+                ("expects_reply", boolSchema("false for a message needing no answer. Acceptance is still owed until the recipient receives it. Omit for questions and work.")),
                 ("conversation_id", strSchema("Advanced override: exact existing remote conversation identity. Normally omit; the app remembers it. A failed resume never falls back to a fresh session. Bots retain their own session.")),
                 ("message_id", strSchema("Optional caller message identity for coding agents or A2A; NativeAgent accepts a UUID for receipt correlation, not deduplication. Not supported for bot sends. Use returned request identity for recovery.")),
                 ("task_id", strSchema("A2A only: exact task to continue, especially when it needs input.")),
-                ("options", obj([("type", .string("object")), ("additionalProperties", .bool(false)), ("properties", obj([
-                    ("working_directory", strSchema("Local coding agents only: workspace for a new conversation.")),
-                    ("topic", strSchema("Local coding agents only: title for a new conversation.")),
-                    ("model", strSchema("Codex only: explicit model selection.")),
-                    ("reasoning_effort", strSchema("Codex only: supported reasoning level.")),
-                    ("fast", boolSchema()), ("pair_reviewer", boolSchema()),
-                    ("timeout_seconds", intSchema("OMP only: 60 to 3600 seconds. Omit for Codex and Claude.", minimum: 60, maximum: 3600))
-                ]))]))
+                ("options", inboxOptionsSchema())
             ], required: ["agent", "text"])),
             requestedSchema(name: "agent_read", toolClass: .read, description: "Open your conversation with an agent by name. Omit identities: the app uses this session's current conversation and retained exact reply locator. Use conversation to open a named discussion. Default output shows who replied, their words and the conversation's state; details true exposes technical receipts. Reading never sends a message or invents completion. Pending replies are collected by the runtime where the route supports retrieval; you do not need to repeatedly poll. Advanced message_id, conversation_id and task_id remain available for exact recovery, and explicit listing filters retain adapter-specific behavior. Send-only routes cannot read another app's window, and standalone routes cannot promise persistent history. Missing or uncertain evidence remains explicit. wait_seconds waits for the reply in flight: back the moment it settles, with the conversation then.", parametersJSON: agentCommunicationParams(properties: [
                 ("agent", agent),

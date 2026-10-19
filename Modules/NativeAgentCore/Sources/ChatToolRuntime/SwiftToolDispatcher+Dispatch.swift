@@ -521,6 +521,7 @@ extension SwiftToolDispatcher {
             )
         case "agent_swarm": return try await impl_agent_swarm(input: input, surface: surface)
         case "market_status": return try await impl_market_status(input: input)
+        case "market_configure": return try await impl_market_configure(input: input)
         case "market_watchlists": return try await impl_market_watchlists(input: input)
         case "tradingview_watchlist": return try await impl_tradingview_watchlist(input: input)
         case "market_quote": return try await impl_market_quote(input: input)
@@ -826,7 +827,7 @@ extension SwiftToolDispatcher {
                 input: input,
                 run: { bridge, input in try await bridge.mailListRecent(input: input) }
             )
-            HerMailStatus.shared.note(inbox) // home's mail count, no read of its own
+            HerMailStatus.shared.note(inbox, dataRoot: dataRoot) // home's mail count, no read of its own
             return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: inbox, dataRoot: dataRoot)
         case "mail_read_batch", "mail_triage_batch":
             return try await dispatchMacIntegrationTool(
@@ -852,6 +853,7 @@ extension SwiftToolDispatcher {
                     return try await bridge.mailSearch(input: input)
                 }
             )
+            HerMailStatus.shared.note(result, dataRoot: dataRoot)
             return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: result, dataRoot: dataRoot)
         case "mail_send":
             return try await dispatchMacIntegrationTool(
@@ -1258,11 +1260,11 @@ extension SwiftToolDispatcher: PreApprovalToolValidating {
         "remote_node_list", "remote_node_execute", "install_app", "restart_app"]
 
     /// Every chat tool whose own gate needs the accessibility category, and
-    /// those of them that only read.
+    /// those of them that only read. A part's hands on its watch are act's.
     static let screenControlReadToolNames = Set(fullMacAccessibilityReadToolNames + macMenuReadToolNames
         + macClipboardReadToolNames + macReadToolNames)
     static let screenControlToolNames = screenControlReadToolNames.union(["act", "go"] + fullMacAccessibilityInjectionToolNames
-        + macClipboardWriteToolNames + macMenuPressToolNames)
+        + macClipboardWriteToolNames + macMenuPressToolNames).union(AuthoredToolEffects.handOperations)
 
     /// Connect-by-name, before a card exists. An agent this build has no row
     /// for, or one that is not installed, is a certain "no" — the person should

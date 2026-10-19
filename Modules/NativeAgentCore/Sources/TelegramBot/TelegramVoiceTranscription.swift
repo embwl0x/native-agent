@@ -5,17 +5,19 @@ import Darwin
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import NativeAgentShared
 
 // MARK: - Telegram voice transcription
 
 public struct TelegramVoiceTranscription: Sendable, Codable, Equatable {
-    public let text: String
+    public let utterance: SpeechUtterance
+    public var text: String { utterance.text }
     public let backend: String
     public let model: String
     public let latencyMilliseconds: Int?
 
-    public init(text: String, backend: String, model: String, latencyMilliseconds: Int? = nil) {
-        self.text = text
+    public init(utterance: SpeechUtterance, backend: String, model: String, latencyMilliseconds: Int? = nil) {
+        self.utterance = utterance
         self.backend = backend
         self.model = model
         self.latencyMilliseconds = latencyMilliseconds
@@ -129,14 +131,14 @@ private final class TelegramFFmpegCancellation: @unchecked Sendable {
 private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
     private let lock = NSLock()
     private var task: SFSpeechRecognitionTask?
-    private var continuation: CheckedContinuation<String, Error>?
+    private var continuation: CheckedContinuation<SpeechUtterance, Error>?
     // Completion and cancellation can both precede recognitionTask returning.
     // Keep the winning result until the continuation has been registered.
-    private var result: Result<String, Error>?
+    private var result: Result<SpeechUtterance, Error>?
     private var wasCancelled = false
 
-    func set(_ task: SFSpeechRecognitionTask, continuation: CheckedContinuation<String, Error>) {
-        let completed = lock.withLock { () -> (Result<String, Error>, Bool)? in
+    func set(_ task: SFSpeechRecognitionTask, continuation: CheckedContinuation<SpeechUtterance, Error>) {
+        let completed = lock.withLock { () -> (Result<SpeechUtterance, Error>, Bool)? in
             if let result { return (result, wasCancelled) }
             self.task = task
             self.continuation = continuation
@@ -151,12 +153,12 @@ private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
         finish(with: .failure(CancellationError()), cancelling: true)
     }
 
-    func resume(with result: Result<String, Error>) {
+    func resume(with result: Result<SpeechUtterance, Error>) {
         finish(with: result, cancelling: false)
     }
 
-    private func finish(with result: Result<String, Error>, cancelling: Bool) {
-        let completed = lock.withLock { () -> (CheckedContinuation<String, Error>?, SFSpeechRecognitionTask?)? in
+    private func finish(with result: Result<SpeechUtterance, Error>, cancelling: Bool) {
+        let completed = lock.withLock { () -> (CheckedContinuation<SpeechUtterance, Error>?, SFSpeechRecognitionTask?)? in
             guard self.result == nil else { return nil }
             self.result = result
             wasCancelled = cancelling
@@ -425,19 +427,18 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
         defer { prepared.cleanup() }
 
         let started = Date()
-        let text = try await recognize(url: prepared.url)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let utterance = try await recognize(url: prepared.url)
         let elapsed = max(0, Int(Date().timeIntervalSince(started) * 1000))
         return TelegramVoiceTranscription(
-            text: text,
+            utterance: utterance,
             backend: TelegramVoiceTranscriptionBackends.appleSpeech,
             model: TelegramVoiceTranscriptionBackends.appleSpeechModel,
             latencyMilliseconds: elapsed
         )
     }
 
-    private func recognize(url: URL) async throws -> String {
-        try await withThrowingTaskGroup(of: String.self) { group in
+    private func recognize(url: URL) async throws -> SpeechUtterance {
+        try await withThrowingTaskGroup(of: SpeechUtterance.self) { group in
             group.addTask {
                 try await self.recognizeWithoutTimeout(url: url)
             }
@@ -453,7 +454,7 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
         }
     }
 
-    private func recognizeWithoutTimeout(url: URL) async throws -> String {
+    private func recognizeWithoutTimeout(url: URL) async throws -> SpeechUtterance {
         if preferOnDevice {
             do {
                 return try await recognizeOnce(url: url, forceOnDevice: true)
@@ -467,7 +468,7 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
         return try await recognizeOnce(url: url, forceOnDevice: false)
     }
 
-    private func recognizeOnce(url: URL, forceOnDevice: Bool) async throws -> String {
+    private func recognizeOnce(url: URL, forceOnDevice: Bool) async throws -> SpeechUtterance {
         // Read authorization only: headless Telegram work cannot present the
         // macOS prompt safely. Permission requests belong to MainActor's
         // SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined().
@@ -496,7 +497,7 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
             try await withCheckedThrowingContinuation { continuation in
                 let task = recognizer.recognitionTask(with: request) { result, error in
                     if let result, result.isFinal {
-                        taskBox.resume(with: .success(result.bestTranscription.formattedString))
+                        taskBox.resume(with: .success(SpeechUtterance(result)))
                         return
                     }
                     if let error {

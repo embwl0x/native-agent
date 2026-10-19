@@ -9,11 +9,15 @@ import Network
 import Security
 import ProviderRouting
 import CFNetwork
+import MacControl
 
 /// Declared-reach primitives for the shared JavaScript executor.
 actor ToolPrimitiveBroker {
     static let readOperations = Set(AuthoredToolEffects.primitiveCapabilities.compactMap { $0.value.contains("safe_read") ? $0.key : nil })
-    static let operations = Set(AuthoredToolEffects.primitiveCapabilities.keys.filter { $0.hasPrefix("network.") }).union(["model.call", "fetch"])
+    static let operations = Set(AuthoredToolEffects.primitiveCapabilities.keys.filter { $0.hasPrefix("network.") })
+        .union(["model.call", "fetch", "screen.watch"]).union(frameOperations).union(AuthoredToolEffects.handOperations)
+    /// Reads inside the run's admitted watch: no admission and no receipt of their own.
+    static let frameOperations: Set<String> = ["screen.next", "frame.read"]
     static func knownPermission(_ permission: String) -> Bool {
         AbilityStore.knownReach(permission)
     }
@@ -28,6 +32,10 @@ actor ToolPrimitiveBroker {
     private let queue = DispatchQueue(label: "nativeagent.authored.network")
     private(set) var closed = false
     private static let byteLimit = 4 * 1024 * 1024
+    /// The run's one watch (a second replaces the first), and the receipts of those that ended.
+    private var watch: MacScreenWatch?
+    private var watched: [JSONValue] = []
+    private var abilityObserver: (any NSObjectProtocol)?
 
     init(permissions: Set<String>, host: any OwnedProgramToolHost, abilityID: String) {
         self.permissions = permissions
@@ -39,7 +47,13 @@ actor ToolPrimitiveBroker {
         guard !closed, Self.operations.contains(operation), case .object(let args) = arguments else {
             throw SenseFailure(code: "bad_input", message: "A known primitive and named arguments are required.")
         }
-        if operation == "model.call" || operation == "fetch" {
+        if operation.hasPrefix("screen.") || operation.hasPrefix("frame.") || operation.hasPrefix("hand.") {
+            let reach = operation.hasPrefix("hand.") ? "hands" : "screen.watch"
+            guard permissions.contains(reach) else {
+                throw SenseFailure(code: "undeclared", message: "Declare reach \(reach) to call \(operation).")
+            }
+            if operation == "screen.watch" { _ = try MacScreenWatch.Request(args) }
+        } else if operation == "model.call" || operation == "fetch" {
             let reach: String
             if operation == "model.call" { reach = "model" }
             else {
@@ -78,6 +92,36 @@ actor ToolPrimitiveBroker {
         try check(operation, arguments: arguments)
         let args = SwiftNativeToolExecution.fields(arguments)
         if operation == "model.call" { return try await model(args) }
+        if operation != "screen.watch", operation.hasPrefix("screen.") || operation.hasPrefix("frame.") || operation.hasPrefix("hand.") {
+            guard let watch else { throw SenseFailure(code: "no_watch", message: "Call screen.watch({app}) before \(operation).") }
+            switch operation {
+            case "screen.next":
+                let timeout: Double? = switch args["timeout"] { case .int(let n)?: Double(n); case .double(let n)?: n; default: nil }
+                return try await watch.next(timeout: timeout)
+            case "frame.read":
+                guard case .int(let generation)? = args["watch"], case .int(let seq)? = args["seq"],
+                      case .array(let queries)? = args["queries"] else {
+                    throw SenseFailure(code: "bad_input", message: "Read a frame through the frame screen.next() returns: frame.read([...]).")
+                }
+                return try await watch.read(watch: Int(generation), seq: Int(seq), queries: queries)
+            default: return try await watch.hand(String(operation.dropFirst("hand.".count)), args)
+            }
+        }
+        if operation == "screen.watch" {
+            guard let open = MacScreenWatch.open else {
+                throw SenseFailure(code: "unavailable", message: "screen.watch needs the app door of a conversation or wake run.")
+            }
+            let opened = try await open(try MacScreenWatch.Request(args), permissions.contains("hands"))
+            guard !closed else { opened.end("run_ended"); throw CancellationError() }
+            endWatch("replaced")
+            watch = opened
+            // A part changed or replaced mid-run stops watching with its old self.
+            let id = abilityID
+            abilityObserver = NotificationCenter.default.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { change in
+                if (change.object as? String).map({ URL(fileURLWithPath: $0).lastPathComponent }) == id { opened.end("part_changed") }
+            }
+            return opened.opened
+        }
         do {
             if operation == "fetch" {
                 let result = args["connector"] == nil ? try await fetch(args)
@@ -378,11 +422,22 @@ actor ToolPrimitiveBroker {
         } onCancel: { stream.continuation.finish(throwing: CancellationError()); cancel() }
     }
 
-    func close() {
+    /// Ends the run's reach; returns the receipts of its watches.
+    @discardableResult func close() -> [JSONValue] {
         closed = true
         for connection in connections.values { connection.cancel() }
         for slot in listeners.values { slot.0.cancel(); slot.2.finish() }
         connections.removeAll(); listeners.removeAll()
+        endWatch("run_ended")
+        return watched
+    }
+
+    private func endWatch(_ reason: String) {
+        guard let watch else { return }
+        watch.end(reason)
+        watched.append(watch.summary)
+        if let abilityObserver { NotificationCenter.default.removeObserver(abilityObserver) }
+        self.watch = nil; abilityObserver = nil
     }
 
 }

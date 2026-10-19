@@ -100,11 +100,11 @@ struct ChromeControlPermissionsView: View {
                 setUpChrome()
             }
             .accessibilityIdentifier("trust.chrome.setup")
-            Text("Set up Chrome puts the extension in your home folder, shows it in Finder and opens Chrome's extensions page. Then:\n1. On that page, turn on Chrome's Developer mode (top right).\n2. Click Load unpacked.\n3. Choose the \"\(ChromeExtensionFolder.visible.lastPathComponent)\" folder in your home folder, or drag it from Finder onto the page.")
+            Text("I'll open Chrome and load my extension. Allow Mac access if asked, then watch me set it up.")
                 .font(ShellType.rowDetail)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("I set up my part automatically. The extension is a separate step on each Mac and does not sync with your Google account. The purple NativeAgent tab group can sync even when the extension is missing.")
+            Text("Set up once on each Mac. Updates happen automatically.")
                 .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -127,7 +127,10 @@ struct ChromeControlPermissionsView: View {
 
     private func setUpChrome() {
         Task {
-            chromeSetupMessage = await ChromeExtensionFolder.setUp().message
+            do {
+                _ = try await ChromeExtensionFolder.setUp()
+                chromeSetupMessage = "Chrome connected."
+            } catch { chromeSetupMessage = ChromeExtensionFolder.setupMessage(error) }
         }
     }
 }
@@ -263,7 +266,7 @@ struct TrainingPermissionsView: View {
     /// Check the authority override independently of the raw autonomy toggle.
     private func refreshUnattended() async {
         let request = unattendedReadGate.begin()
-        let root = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
+        let root = appModel.firstRunDataRoot
         let forced = await WorkshopBackgroundWork.unattendedWorkForced(
             policy: appModel.engine.trust.policy, dataRoot: root)
         guard !Task.isCancelled, unattendedReadGate.accepts(request) else { return }

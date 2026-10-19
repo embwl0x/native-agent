@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TurnTrace
@@ -37,14 +38,19 @@ public struct RunLedgerIntegrityCheck: DoctorCheck {
     public func run() async -> CheckResult {
         do {
             guard let rowCount = try DoctorRunLedgerRead.rowCount(root: root) else {
-                return CheckResult(id: id, title: title, status: "ok", detail: "No runs ledger exists yet.")
+                return CheckResult(source: "runs/runs.json", id: id, title: title, status: "ok", detail: "No runs ledger exists yet.")
             }
-            return CheckResult(id: id, title: title, status: "ok", detail: "Runs ledger readable (\(rowCount) retained rows).")
+            return CheckResult(source: "runs/runs.json", id: id, title: title, status: "ok", detail: "Runs ledger readable (\(rowCount) retained rows).")
+        } catch DoctorRunLedgerRead.ReadError.oversized {
+            return CheckResult(source: "runs/runs.json", id: id, title: title, status: "unmeasured",
+                detail: "Runs ledger size is unavailable or exceeds the 12 MiB read budget; its rows were not measured.")
         } catch {
-            return CheckResult(id: id, title: title, status: "warn",
+            return CheckResult(source: "runs/runs.json",
+                nextCall: ToolFailureError.fileRepairCall(root.appendingPathComponent("runs/runs.json"), dataRoot: root,
+                    shape: "This ledger holds RunRecord objects in a JSON array or in an object with a runs array. Preserve every retained run and its original fields."),
+                id: id, title: title, status: "warn",
                 detail: "The runs ledger (data/runs/runs.json) cannot be read by the Runs page.",
-                harm: "Past runs cannot be reviewed in Runs.",
-                human_action: "If it is damaged JSON, the next recorded run moves it aside as runs.json.corrupt-*.bak and starts fresh. Otherwise move data/runs/runs.json aside yourself; the next run starts a fresh ledger.")
+                harm: "Past runs cannot be reviewed in Runs.")
         }
     }
 }
@@ -67,15 +73,18 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
         let coverage = "Checked \(lane.path(for: firstDay).deletingPathExtension().lastPathComponent) through \(lane.path(for: today).deletingPathExtension().lastPathComponent); older Replay dates were not checked."
         let folder = lane.path(for: today).deletingLastPathComponent()
         if FileManager.default.fileExists(atPath: folder.path), !FileManager.default.isReadableFile(atPath: folder.path) {
-            return CheckResult(id: id, title: title, status: "fail",
+            return CheckResult(source: folder.path,
+                nextCall: ToolFailureError.call("app", ["action": .string("shell.run"), "args": .object([
+                    "cmd": .string("chmod u+rX '" + folder.path.replacingOccurrences(of: "'", with: "'\\''") + "'"),
+                ])]), id: id, title: title, status: "fail",
                 detail: "The saved traces folder (\(folder.lastPathComponent)) exists but cannot be read, so Inspector Replay cannot open it.",
                 harm: "Saved turns cannot be reviewed in Inspector Replay.",
-                human_action: "Restore read permission on data/turn_traces for your user, then run Doctor again.",
-                ask: .permission)
+                human_action: "Restore read permission on data/turn_traces for your user, then run Doctor again.")
         }
         var inspected = 0
         var problems: [String] = []
         var unreadable: [String] = []
+        var oversized: [String] = []
         var unsalvageable: [String] = []
         var salvageable = false
         var receipts: [String] = []
@@ -105,25 +114,30 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
                 }
                 problems.append("\(day): \(malformed) unreadable, \(valid) readable row(s)")
                 if valid > 0 { salvageable = true } else { unsalvageable.append(day) }
+            } catch TraceReadError.oversized {
+                oversized.append(day)
             } catch {
                 problems.append("\(day): file could not be read")
                 unreadable.append(day)
             }
         }
         let receipt = receipts.isEmpty ? nil : "Completed: " + receipts.joined(separator: "; ") + "."
+        let scope = coverage + (oversized.isEmpty ? "" : " Size unavailable or beyond the 16 MiB read budget, unmeasured: \(oversized.joined(separator: ", ")).")
         guard !problems.isEmpty else {
-            return CheckResult(id: id, title: title, status: "ok",
-                detail: "Saved traces readable across \(inspected) day file(s). \(coverage)",
+            return CheckResult(source: "turn_traces/", id: id, title: title, status: oversized.isEmpty ? "ok" : "unmeasured",
+                detail: "Saved traces readable across \(inspected - oversized.count) day file(s). \(scope)",
                 receipt: receipt)
         }
         let humanDays = unreadable + unsalvageable
-        return CheckResult(id: id, title: title, status: unreadable.isEmpty ? "warn" : "fail",
-            detail: "Saved trace problems: " + problems.joined(separator: "; ") + ". \(coverage)",
+        let file = humanDays.first.map { folder.appendingPathComponent($0 + ".jsonl") }
+        return CheckResult(source: file?.path ?? "turn_traces/",
+            nextCall: file.map { ToolFailureError.fileRepairCall($0, dataRoot: folder.deletingLastPathComponent(),
+                shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload.") },
+            id: id, title: title, status: unreadable.isEmpty ? "warn" : "fail",
+            detail: "Saved trace problems: " + problems.joined(separator: "; ") + ". \(scope)",
             harm: "Parts of saved turns cannot be reviewed in Inspector Replay.",
             repair: salvageable ? "Run Repair Safe Issues to back up each damaged trace and keep its readable rows." : nil,
-            receipt: receipt,
-            human_action: humanDays.isEmpty ? nil
-                : "Open data/turn_traces and recover \(humanDays.map { "\($0).jsonl" }.joined(separator: ", ")) from your own backup, or fix its read permission or size; then run Doctor again.")
+            receipt: receipt)
     }
 
     private enum TraceReadError: Error { case oversized }
@@ -133,21 +147,21 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
 public enum InspectorFeedHealth {
     public static func check(isOpen: Bool, sinkActive: Bool, dropCount: Int?) -> CheckResult {
         guard isOpen else {
-            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "ok",
+            return CheckResult(source: "turn_traces/", id: "live.inspector_feed", title: "Inspector live feed", status: "ok",
                 detail: "Inspector is closed; no live sink is expected.")
         }
         switch dropCount {
         case nil:
-            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "fail",
+            return CheckResult(source: "Diagnostics → Inspector → Live feed", id: "live.inspector_feed", title: "Inspector live feed", status: "fail",
                 detail: "The Inspector live sink ended; its drop count is unavailable. Events since termination cannot be recovered.",
                 harm: "New live turn events are no longer reaching Inspector.",
                 human_action: "Open Diagnostics → Inspector after repair and inspect saved traces for the missing interval.")
         case let count? where count > 0:
-            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: "unmeasured",
+            return CheckResult(source: "turn_traces/", id: "live.inspector_feed", title: "Inspector live feed", status: "unmeasured",
                 detail: "Inspector dropped \(count) live event(s) under page backpressure; those live events cannot be recovered.",
                 human_action: "Open Diagnostics → Inspector → Replay and inspect today's saved trace for the affected turn.")
         case .some:
-            return CheckResult(id: "live.inspector_feed", title: "Inspector live feed", status: sinkActive ? "ok" : "unmeasured",
+            return CheckResult(source: "turn_traces/", id: "live.inspector_feed", title: "Inspector live feed", status: sinkActive ? "ok" : "unmeasured",
                 detail: sinkActive
                     ? "Inspector live sink is active with no measured drops."
                     : "Inspector live sink is starting; no drop count is available yet.")

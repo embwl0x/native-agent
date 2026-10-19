@@ -8,6 +8,7 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import Desk
+import Experiences
 import ProviderRouting
 
 extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
@@ -51,6 +52,29 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
                 await self?.pursuitSourceInvalidated()
             }
         }
+        carriedExperienceObservationTask = Task { [weak self, root = dataRoot] in
+            let changes = await ExperienceStore.at(root).changes()
+            for await _ in changes {
+                guard !Task.isCancelled else { return }
+                await self?.carriedConditionsChanged()
+            }
+        }
+    }
+
+    /// A condition that settled is written off the items that waited on it;
+    /// that Desk write is what re-considers them. One pass at a time, read
+    /// from the live Desk, so two settlements never write from a stale copy.
+    private func carriedConditionsChanged() async {
+        guard pursuitCandidates.contains(where: { !$0.status.isTerminal && $0.blockedOn.contains { $0.hasPrefix("exp:") } }) else { return }
+        guard !carriedReleaseRunning else { carriedReleaseAgain = true; return }
+        carriedReleaseRunning = true
+        defer { carriedReleaseRunning = false }
+        repeat {
+            carriedReleaseAgain = false
+            guard !isFlushedForTermination else { return }
+            do { try await MyQueueReady.release(items: SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items, dataRoot: dataRoot) }
+            catch { ModuleLog(category: "Cognition")("Wait conditions unavailable: %@", error.localizedDescription) }
+        } while carriedReleaseAgain
     }
 
     private func pursuitSourceInvalidated() {
@@ -114,6 +138,8 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
                 pursuitCandidates = state.items
                 pursuitCarriedContext = context
                 pursuitReadRevision = revision
+                // A condition may have settled before its wait reached the Desk.
+                Task { await self.carriedConditionsChanged() }
                 var signals: [(String, SomaticSignalKind)] = []
                 for item in state.items {
                     let wasCarried = before[item.handle].map(Self.carries) == true

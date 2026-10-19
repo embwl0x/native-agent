@@ -94,8 +94,8 @@ extension LocalPIMConnectorActions {
     /// otherwise returns current status without prompting. Returns the
     /// post-request status in the wizard vocabulary.
     public static func requestReminderAccess() async -> String {
-        let store = LocalPIMStore()
-        _ = try? await store.requestReminderAccess()
+        let store = EKEventStore()
+        if EKEventStore.authorizationStatus(for: .reminder) == .notDetermined { _ = try? await store.requestFullAccessToReminders() }
         return currentReminderAuthorizationStatus()
     }
 

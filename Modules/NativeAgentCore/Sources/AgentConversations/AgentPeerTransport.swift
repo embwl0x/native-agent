@@ -6,7 +6,7 @@ import PersistenceCore
 
 /// Dedicated per-peer secrets. Never consults generic provider or bridge keys.
 public enum AgentPeerCredentials {
-    public static let unavailableDetail = "unavailable now - its key is missing; reconnect"
+    public static let unavailableDetail = "unavailable now - its credential could not be resolved; agent.connect repairs a missing key on this same contact"
 
     /// The bearer-only door and current contact projections share this check.
     public static func resolve(_ token: String, peers: [AgentPeerContact],

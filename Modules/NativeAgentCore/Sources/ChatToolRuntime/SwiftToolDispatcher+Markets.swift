@@ -3,10 +3,46 @@ import NativeAgentCore
 import PersistenceCore
 
 extension SwiftToolDispatcher {
+    func impl_market_configure(input: [String: JSONValue]) async throws -> JSONValue {
+        guard let file = marketJSONString(input["file"]), ["markets", "tradingview"].contains(file),
+              case .object(let fields)? = input["fields"], !fields.isEmpty else {
+            throw ToolFailureError("Pass file (markets or tradingview) and nonempty fields. TradingView accepts scanner_endpoint and watchlist_endpoint; markets accepts watchlists. Credentials cannot be read or changed here.",
+                argumentPath: "fields", effects: .none)
+        }
+        let allowed: Set<String> = file == "markets" ? ["watchlists"] : ["scanner_endpoint", "watchlist_endpoint"]
+        guard Set(fields.keys).isSubset(of: allowed), fields.allSatisfy({ key, value in
+            if key == "watchlists", case .object(let lists) = value {
+                return lists.values.allSatisfy { if case .array(let symbols) = $0 { return symbols.allSatisfy { if case .string = $0 { return true }; return false } }; return false }
+            }
+            guard case .string(let endpoint) = value, let url = URL(string: endpoint) else { return false }
+            return Self.tradingViewOrigin(url) && url.query == nil && url.fragment == nil
+        }) else {
+            throw ToolFailureError("Use watchlists as an object of symbol arrays, or HTTPS endpoints on www.tradingview.com or scanner.tradingview.com, port 443, without credentials, query or fragment. No credential fields are accepted.", argumentPath: "fields", effects: .none)
+        }
+        let path = dataRoot.appendingPathComponent("secrets/\(file).json")
+        try CredentialFileLock.withLock(path) {
+            var saved: [String: JSONValue] = [:]
+            if FileManager.default.fileExists(atPath: path.path) {
+                let bytes = try Data(contentsOf: path)
+                if case .object(let object)? = try? JSONValue.parse(bytes) { saved = object }
+                else {
+                    guard input["replace_unreadable"] == .bool(true) else {
+                        throw ToolFailureError("The configuration is malformed. To rebuild only the supplied nonsecret fields, pass replace_unreadable:true. The original bytes will be kept in a private backup; sign in again if credentials cannot be recovered.", argumentPath: "replace_unreadable", effects: .none)
+                    }
+                    let backup = path.appendingPathExtension("unreadable-" + UUID().uuidString.lowercased())
+                    try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: backup)
+                }
+            }
+            saved.merge(fields) { _, new in new }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONValue.object(saved).serializedData(pretty: true), to: path)
+        }
+        return .object(["status": .string("ok"), "file": .string(file), "fields": .object(fields), "effects": .string("occurred")])
+    }
+
     func impl_market_status(input: [String: JSONValue]) async throws -> JSONValue {
         _ = input
-        let markets = readMarketSecretsConfig()
-        let tradingView = readTradingViewSecretsConfig()
+        let markets = try readMarketSecretsConfig()
+        let tradingView = try readTradingViewSecretsConfig()
         let sourceRows = marketSourceRows(from: markets)
         let watchlistRows = localMarketWatchlistRows(from: markets, includeSymbols: false, group: nil)
         return .object([
@@ -29,7 +65,7 @@ extension SwiftToolDispatcher {
             return try await fetchTradingViewWatchlists(includeSymbols: includeSymbols)
         }
         let group = marketJSONString(input["group"])?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let markets = readMarketSecretsConfig()
+        let markets = try readMarketSecretsConfig()
         let rows = localMarketWatchlistRows(from: markets, includeSymbols: includeSymbols, group: group)
         return .object([
             "status": .string(markets == nil ? "missing_config" : "ok"),
@@ -52,7 +88,7 @@ extension SwiftToolDispatcher {
         var symbols = marketSymbols(from: input)
         // A local watchlist by name quotes its symbols in the same call.
         if let group = marketJSONString(input["watchlist"])?.trimmingCharacters(in: .whitespacesAndNewlines) {
-            let config = readMarketSecretsConfig()
+            let config = try readMarketSecretsConfig()
             let lists = localMarketWatchlistRows(from: config, includeSymbols: true, group: group)
             guard case .object(let list)? = lists.first else {
                 let names = localMarketWatchlistRows(from: config, includeSymbols: false, group: nil)
@@ -64,50 +100,47 @@ extension SwiftToolDispatcher {
         guard !symbols.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "Give symbol (e.g. AAPL or \"AAPL, MSFT\") or watchlist (a name from market_watchlists).")
         }
-        // A named provider is that provider alone; the automatic order runs only when none was named.
         let named = marketJSONString(input["provider"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if let named, !["tradingview", "tv", "yahoo", "yfinance"].contains(named) {
             throw AutonomyGateError.toolDenied(reason: "provider is tradingview or yahoo, not '\(named)'.")
         }
-        let providers = named.map { [["yahoo", "yfinance"].contains($0) ? "yahoo" : "tradingview"] } ?? ["tradingview", "yahoo"]
-        var failures: [JSONValue] = []
-        for source in providers {
-            do {
-                let quote = source == "yahoo" ? try await fetchYahooQuote(symbols: symbols) : try await fetchTradingViewQuote(symbols: symbols)
-                guard case .object(var result) = quote else { return quote }
-                if case .array(let rows)? = result["quotes"], rows.isEmpty {
-                    throw AutonomyGateError.toolDenied(reason: "No quotes returned")
-                }
-                if !failures.isEmpty { result["provider_failures"] = .array(failures) }
-                return .object(result)
-            } catch {
-                try Task.checkCancellation()
-                failures.append(.object(["provider": .string(source), "error": .string(ChatToolOutcome.errorMessage(error))]))
+        let source = ["yahoo", "yfinance"].contains(named ?? "") ? "yahoo" : "tradingview"
+        do {
+            let quote = source == "yahoo" ? try await fetchYahooQuote(symbols: symbols) : try await fetchTradingViewQuote(symbols: symbols)
+            if case .object(let result) = quote, case .array(let rows)? = result["quotes"], rows.isEmpty {
+                throw AutonomyGateError.toolDenied(reason: "No quotes returned")
             }
+            return quote
+        } catch {
+            try Task.checkCancellation()
+            if let failure = error as? ToolFailureError { throw failure }
+            throw ToolFailureError("\(source) quote failed: \(ChatToolOutcome.errorMessage(error))", effects: .none,
+                nextCall: ToolFailureError.call("app", ["action": .string("market.quote"),
+                    "args": .object(input.merging(["provider": .string(source)]) { _, value in value })]))
         }
-        let detail = failures.compactMap { failure -> String? in
-            guard case .object(let row) = failure, case .string(let source)? = row["provider"],
-                  case .string(let error)? = row["error"] else { return nil }
-            return source + ": " + error
-        }.joined(separator: "; ")
-        return .object(["status": .string("failed"), "detail": .string(detail), "provider_failures": .array(failures),
-                        "quotes": .array([])])
     }
 
-    private func readMarketSecretsConfig() -> JSONValue? {
-        readSecretsJSON(named: "markets.json")
+    private func readMarketSecretsConfig() throws -> JSONValue? {
+        try readSecretsJSON(named: "markets.json")
     }
 
-    private func readTradingViewSecretsConfig() -> JSONValue? {
-        readSecretsJSON(named: "tradingview.json")
+    private func readTradingViewSecretsConfig() throws -> JSONValue? {
+        try readSecretsJSON(named: "tradingview.json")
     }
 
-    private func readSecretsJSON(named name: String) -> JSONValue? {
+    private func readSecretsJSON(named name: String) throws -> JSONValue? {
         let url = dataRoot
             .appendingPathComponent("secrets", isDirectory: true)
             .appendingPathComponent(name)
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONValue.parse(data)
+        do {
+            let value = try JSONValue.parse(Data(contentsOf: url))
+            guard case .object = value else { throw CocoaError(.propertyListReadCorrupt) }
+            return value
+        } catch CocoaError.fileReadNoSuchFile { return nil }
+        catch {
+            throw ToolFailureError("Market configuration could not be read as a JSON object: \(url.path): \(error.localizedDescription)",
+                effects: .none, nextCall: ToolFailureError.call("app", ["find": .string("market.configure")]))
+        }
     }
 
     private func marketSourceRows(from config: JSONValue?) -> [JSONValue] {
@@ -209,14 +242,16 @@ extension SwiftToolDispatcher {
     }
 
     private func fetchTradingViewWatchlists(includeSymbols: Bool) async throws -> JSONValue {
-        guard case .object(let cfg)? = readTradingViewSecretsConfig(),
+        guard case .object(let cfg)? = try readTradingViewSecretsConfig(),
               let endpoint = marketJSONString(cfg["watchlist_endpoint"]),
               let url = URL(string: endpoint) else {
-            throw AutonomyGateError.toolDenied(reason: "TradingView watchlist endpoint is not configured")
+            let path = dataRoot.appendingPathComponent("secrets/tradingview.json").path
+            throw ToolFailureError("\(path): watchlist_endpoint is not configured. Use market.configure with file:tradingview and fields.watchlist_endpoint set to the intended service URL.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["find": .string("market.configure")]))
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        applyTradingViewHeaders(to: &request, config: cfg)
+        try applyTradingViewHeaders(to: &request, config: cfg)
         let json = try await marketJSONRequest(request)
         let sanitized = sanitizeMarketPayload(json)
         if includeSymbols {
@@ -236,15 +271,17 @@ extension SwiftToolDispatcher {
     }
 
     private func fetchTradingViewQuote(symbols: [String]) async throws -> JSONValue {
-        guard case .object(let cfg)? = readTradingViewSecretsConfig(),
+        guard case .object(let cfg)? = try readTradingViewSecretsConfig(),
               let endpoint = marketJSONString(cfg["scanner_endpoint"]),
               let url = URL(string: endpoint) else {
-            throw AutonomyGateError.toolDenied(reason: "TradingView scanner endpoint is not configured")
+            let path = dataRoot.appendingPathComponent("secrets/tradingview.json").path
+            throw ToolFailureError("\(path): scanner_endpoint is not configured. Use market.configure with file:tradingview and fields.scanner_endpoint set to the intended service URL.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["find": .string("market.configure")]))
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyTradingViewHeaders(to: &request, config: cfg)
+        try applyTradingViewHeaders(to: &request, config: cfg)
         let tickers = symbols.map(tradingViewTicker)
         let columns = [
             "name", "description", "exchange", "type", "subtype", "close",
@@ -334,14 +371,24 @@ extension SwiftToolDispatcher {
     }
 
     private func marketJSONRequest(_ request: URLRequest) async throws -> JSONValue {
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request, delegate: OwnedFetchRedirects())
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw AutonomyGateError.toolDenied(reason: "Market request failed with HTTP \(http.statusCode)")
         }
         return try JSONValue.parse(data)
     }
 
-    private func applyTradingViewHeaders(to request: inout URLRequest, config: [String: JSONValue]) {
+    private static func tradingViewOrigin(_ url: URL) -> Bool {
+        url.scheme?.lowercased() == "https" && (url.port == nil || url.port == 443)
+            && ["www.tradingview.com", "scanner.tradingview.com"].contains(url.host?.lowercased() ?? "")
+            && url.user == nil && url.password == nil
+    }
+
+    private func applyTradingViewHeaders(to request: inout URLRequest, config: [String: JSONValue]) throws {
+        guard let url = request.url, Self.tradingViewOrigin(url) else {
+            throw ToolFailureError("TradingView credentials were not sent: the saved endpoint must use HTTPS on www.tradingview.com or scanner.tradingview.com, port 443, without URL credentials. Correct scanner_endpoint or watchlist_endpoint with market.configure.", effects: .none,
+                nextCall: ToolFailureError.call("app", ["find": .string("market.configure")]))
+        }
         var cookies: [String] = []
         if let session = marketJSONString(config["sessionid"]), !session.isEmpty {
             cookies.append("sessionid=\(session)")

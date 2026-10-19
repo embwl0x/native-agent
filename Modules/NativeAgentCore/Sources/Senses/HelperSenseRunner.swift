@@ -395,7 +395,7 @@ public actor HelperSenseRunner: SenseRunner, SenseViewEventReceiver {
         if error is CancellationError {
             return SenseFailure(code: "cancelled", message: "Sense request cancelled.", provenance: provenance)
         }
-        var failure = error as? SenseFailure ?? SenseFailure(code: "failed", message: error.localizedDescription)
+        var failure = SenseFailure(error)
         failure.provenance = provenance
         return failure
     }
@@ -732,11 +732,17 @@ private actor SenseHelperProcess {
         }
         do { try AbilityStore(dataRoot: dataRoot).recordRun(id: record.id, version: record.candidateDigest ?? String(record.version), receipt: receipt) }
         catch {
-            if case .acted(let result, let provenance) = outcome {
+            // recordRun owes the ledger's repair itself; the outcome keeps its own truth.
+            switch outcome {
+            case .acted(let result, let provenance):
                 var fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { ["result": result] }
                 fields["accounting_error"] = .string(error.localizedDescription)
                 outcome = .acted(.object(fields), provenance)
-            } else { outcome = .failed(SenseFailure(code: "accounting", message: error.localizedDescription)) }
+            case .failed(var failure):
+                failure.message += " Accounting failed: " + error.localizedDescription
+                outcome = .failed(failure)
+            case .page: break
+            }
         }
         current.events.finish(); transport.end(id); current.worker?.cancel()
         current.result.resume(returning: outcome)

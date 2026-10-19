@@ -8,6 +8,24 @@ typealias ChatComposerSupport = NativeAgentShared.ChatAttachmentTypeResolver
 extension NativeAgentShared.ChatAttachmentTypeResolver {
     static let attachmentContentTypes: [UTType] = [.fileURL, .image]
 
+    @MainActor
+    static func finishDictation(
+        _ result: VoiceInputStopResult, wasListening: Bool, base: inout String,
+        draft: inout String, attachments: inout [MultimodalAttachment],
+        attachment: MultimodalAttachment?, showToast: (String) -> Void
+    ) -> Bool {
+        defer { base = "" }
+        let final = result.transcriptForSubmission
+        guard !final.isEmpty else {
+            draft = base
+            showToast(result.userFacingFailureMessage ?? "No speech detected")
+            return false
+        }
+        if wasListening { draft = voiceDraft(base: base, transcript: final) }
+        if let attachment { attachments.append(attachment) }
+        return true
+    }
+
     /// Each surface captures its destination before asynchronous intake starts.
     @MainActor
     static func attachFromClipboardOrPickFile(

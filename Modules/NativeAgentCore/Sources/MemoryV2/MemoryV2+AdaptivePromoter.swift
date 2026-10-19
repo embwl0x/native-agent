@@ -593,8 +593,6 @@ public actor AdaptiveMemoryPromoter {
         // What is already known about this exchange. `recordingUsage: false`:
         // reading the store to decide what to keep is not the agent USING a
         // memory, and use_count is the signal that vetoes eviction.
-        let factsEnabled = factsAllowed && !assistant.isEmpty && (adaptivePromotionEnabled?() ?? true)
-        let keepsMoments = momentsAllowed
         let context: AfterTurnContext?
         if !recovery, let origin, origin.sessionId == sessionId {
             context = await prepareInterpretation?(origin)
@@ -603,14 +601,15 @@ public actor AdaptiveMemoryPromoter {
             peer: peerAuthority ?? (speaker != nil || context?.event.sourceClass == .imported))
         let isPeer = author != "user"
         let originalHumanName = humanName ?? personName?()
-        guard factsEnabled || keepsMoments || context != nil else { return empty(.skipped) }
-        // Phase 5A: nothing new worth keeping → no model call. The deferred
-        // affect turn still closes, exactly as a failed call closes it.
+        // Novelty governs storage, never whether the exchange gets appraised.
         let priorUserTurns = context?.caring?.context.filter { $0.speaker == .person }.map(\.text) ?? []
-        if !recovery, let reason = AfterTurnNoveltyGate.skipReason(userMessage: user, priorUserTurns: priorUserTurns) {
-            if let context { await finishInterpretation?(context, nil, true) }
+        let noveltySkip = recovery ? nil
+            : AfterTurnNoveltyGate.skipReason(userMessage: user, priorUserTurns: priorUserTurns)
+        let factsEnabled = noveltySkip == nil && factsAllowed && !assistant.isEmpty && (adaptivePromotionEnabled?() ?? true)
+        let keepsMoments = noveltySkip == nil && momentsAllowed
+        guard factsEnabled || keepsMoments || context != nil else {
             var skipped = empty(.skipped)
-            skipped.noveltySkipReason = reason
+            skipped.noveltySkipReason = noveltySkip
             return skipped
         }
         var existing: [MemoryManagerExistingMemory] = await {
@@ -838,7 +837,8 @@ public actor AdaptiveMemoryPromoter {
                 semanticCandidateCount: decisions.count
             ),
             rejectedCount: rejected,
-            moment: interpretation.moment.map(MomentExtractionOutcome.candidate) ?? .abstained,
+            moment: keepsMoments ? interpretation.moment.map(MomentExtractionOutcome.candidate) ?? .abstained : .unavailable,
+            noveltySkipReason: noveltySkip,
             savedCorrectionCount: 0,
             pendingCorrectionCount: pendingCorrections,
             failedCorrectionCount: failedCorrections,

@@ -27,6 +27,7 @@ public enum AgentBridgeRuntime {
 
     public static func startOMPReplyJobRecovery() async {
         let dataRoot = PersistenceCore.defaultDataRoot()
+        guard AgentConversationDelivery.lane(for: "omp", dataRoot: dataRoot) != nil else { return }
         var environment = AgentBridgeRuntime.processEnvironment()
         let configRoot = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
         environment.merge(InstallPaths.current.bridgeEnvironment(configRoot: configRoot)) { existing, _ in existing }

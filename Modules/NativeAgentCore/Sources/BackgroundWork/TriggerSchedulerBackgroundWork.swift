@@ -58,44 +58,15 @@ public enum TriggerSchedulerBackgroundWork {
     public static let morningBriefObjective = "Prepare today's concise briefing from canonical calendar, inbox, project, and Desk state. Cite the evidence used, identify unknowns, and surface the completed report in NativeAgent without sending externally unless separately approved."
     public static let morningBriefTools = ["app calendar.upcoming", "app mail.recent", "app workshop.status"]
 
-    /// Hard ceiling on the synthesis turn. The scheduler tick that awaits this
-    /// has a 1800s timeout of its own; a brief is not worth holding it for
-    /// minutes. On expiry the turn is cancelled and the brief degrades to the
-    /// deterministic text.
-    public static let morningBriefSynthesisTimeout: TimeInterval = 120
-
     public static func makeMorningBriefSynthesizer(
-        runTurn: @escaping @Sendable (String) async throws -> String,
-        failureMarker: @escaping @Sendable (String) -> Void = { marker in
-            nativeLog("%@", marker)
-        }
+        runTurn: @escaping @Sendable (String) async throws -> String
     ) -> MorningBriefSynthesizer {
         return { request in
-            let prompt = morningBriefSynthesisPrompt(
+            try await runTurn(morningBriefSynthesisPrompt(
                 request: request,
                 objective: morningBriefObjective,
                 requiredTools: morningBriefTools
-            )
-            do {
-                do {
-                    return try await TurnDeadline.withThrowingDeadline(seconds: morningBriefSynthesisTimeout) {
-                        let response = try await runTurn(prompt)
-                        let output = response.trimmingCharacters(in: .whitespacesAndNewlines)
-                        return output.isEmpty ? nil : output
-                    }
-                } catch is TurnDeadline.DeadlineExceeded {
-                    throw CancellationError()
-                }
-            } catch {
-                // FAIL-OPEN, NOT SILENT: nil restores the deterministic brief,
-                // and the reason is on the record. A brief that lost its lead
-                // is still true; a scheduler tick that threw is not.
-                failureMarker(
-                    "[morning-brief] synthesis turn failed (\(String(describing: error))) "
-                    + "— falling back to deterministic brief"
-                )
-                return nil
-            }
+            ))
         }
     }
 
@@ -116,7 +87,7 @@ public enum TriggerSchedulerBackgroundWork {
             lines.append(
                 "You may read live context with these tools if they are available: "
                 + requiredTools.joined(separator: ", ")
-                + ". If a tool is unavailable or denied, continue without it and do not mention it."
+                + ". If a required tool is unavailable or denied, name what remains unknown and the repair it needs."
             )
         }
         lines.append("")
@@ -227,13 +198,18 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         }
 
         let fires = await triggerScheduler.evaluateAndFireDetailed()
+        let failures = fires.filter { $0.status != "fired" }
         var mirrorFailures = 0
-        for fire in fires {
+        for fire in fires where fire.status == "fired" {
             guard !Task.isCancelled else { return .skipped(reason: "cancelled") }
             if !(await mirrorFire(fire)) { mirrorFailures += 1 }
         }
         guard mirrorFailures == 0 else {
             return .failed(error: "Could not add \(mirrorFailures) trigger notification(s) to the inbox.")
+        }
+
+        guard failures.isEmpty else {
+            return .failed(error: failures.map { $0.error ?? "Trigger \($0.name ?? "unknown") remains owed." }.joined(separator: "\n"))
         }
 
         let active = (fires.compactMap(\.name) + dueJobs).sorted()

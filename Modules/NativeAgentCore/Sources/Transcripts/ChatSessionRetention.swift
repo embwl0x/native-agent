@@ -58,6 +58,9 @@ public struct ChatSessionRetentionReport: Sendable, Equatable {
 /// order. If the nonblocking transcript lock is contended, that session stays
 /// hot for a later pass.
 public enum ChatSessionRetention {
+    public static let diskStorageOwner = DiskStorageOwner.retained(id: "chat", roots: ["chat"],
+        policy: "Transcripts, archives and compaction backups are memory; Clean Up keeps them. The history search index belongs to chat and is kept because launch rebuilds it. chat.archive organizes conversations without reclaiming transcript bytes. No history erasure control is provided by this cleanup.")
+
     public static let macPinnedSessionIdsDefaultsKey = "NativeAgent.pinnedChatSessionIds"
 
     /// The concrete outcome of a pinned-tab close request. Keeping refusal

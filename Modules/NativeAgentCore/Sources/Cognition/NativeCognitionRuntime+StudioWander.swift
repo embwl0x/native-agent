@@ -743,6 +743,7 @@ struct StudioWanderToolAllowlist: ToolDispatchClient {
     }
 
     static func admits(tool: String, input: [String: JSONValue]) -> Bool {
+        if tool == "workspace" { return input.allSatisfy { $0.key == "__session_id" || $0.value == .null } }
         guard tool == "app" else { return admitted.contains(tool) }
         // Home items can send or mutate at once; scripts hide their individual
         // actions from this witness. Use the bounded actions directly.
@@ -754,7 +755,7 @@ struct StudioWanderToolAllowlist: ToolDispatchClient {
     }
 
     static let admitted: Set<String> = [
-        "app",
+        "app", "workspace",
         // ── Perception. Every one of these is documented read-only; none of
         //    them activates, raises, opens, presses or types.
         "screen",

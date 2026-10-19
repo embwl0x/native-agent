@@ -1,4 +1,5 @@
 import AgentWorkspace
+import NativeAgentCore
 import Foundation
 import PersistenceCore
 import SwarmRuns
@@ -37,21 +38,50 @@ extension SwiftToolDispatcher {
             messageID = value.isEmpty ? nil : value
         default: return Self.invalidDelegationMessageLookup()
         }
-        let projector = DelegationStatusProjector(configRoot: agentBridgeConfigRoot, dataRoot: dataRoot)
+        var projector = DelegationStatusProjector(configRoot: agentBridgeConfigRoot, dataRoot: dataRoot)
         let limit = Self.delegationStatusLimit(input)
         let offset = Self.delegationStatusOffset(input)
-        let agentFilter = Self.delegationStatusAgentFilter(input)
+        let agentFilter = try Self.delegationStatusAgentFilter(input, dataRoot: dataRoot)
         let fullDetail = Self.delegationStatusFullDetail(input)
-
-        // Clock injection lives one layer down, on the projector: elapsed and
-        // stall arithmetic is what needs a deterministic `now`, and threading a
-        // mutable clock through the dispatcher would be process-global test
-        // state. Tests drive `DelegationStatusProjector.recentJobs(now:)`
-        // directly with a pinned date.
+        var inbox: (url: URL, retained: Bool)?
+        if let messageID, agentFilter == "claude" {
+            // Through any of her doors, or a lane since renamed: the retained receipt owns its inbox.
+            let matches = try AgentConversationStore(dataRoot: dataRoot).records().filter {
+                AgentConversationDelivery.claudeInbox($0) && $0.readInput?["message_id"] == .string(messageID)
+            }
+            guard matches.count <= 1 else {
+                throw ToolFailureError("More than one retained exchange owns this message_id; read its named conversation to reconcile it. Nothing was resent.", effects: .none)
+            }
+            var url = (agentBridgeConfigRoot ?? InstallPaths.current.bridgeConfigRoot).appendingPathComponent("claude-bridge/claude-inbox.jsonl")
+            if case .object(let receipt)? = matches.first?.receipt, case .string(let path)? = receipt["filePath"] {
+                let saved = URL(fileURLWithPath: path)
+                guard path.hasPrefix("/"), ["claude-inbox.jsonl", "claude-inbox.jsonl"].contains(saved.lastPathComponent),
+                      ["claude-bridge", "claude-bridge"].contains(saved.deletingLastPathComponent().lastPathComponent) else {
+                    throw ToolFailureError("The retained exchange has an invalid inbox address in agents/conversations.json filePath. Nothing was read or resent.", effects: .none)
+                }
+                url = saved
+            }
+            inbox = (url, !matches.isEmpty)
+            projector.claudeJobsDirectory = url.deletingLastPathComponent().appendingPathComponent("wake-jobs")
+        }
         let snapshot = projector.readSnapshot(now: Date(), limit: limit, offset: offset,
                                               agent: agentFilter, messageID: messageID)
+        // Not answered yet: her inbox says whether her live session read it.
+        // An answer reads below, in full, as every exact read does.
+        if let messageID, let inbox,
+           snapshot.jobs.allSatisfy({ ($0.runStatus ?? $0.status) == "delivered_live" && $0.agentReplyTextHead == nil }),
+           inbox.retained || DelegationStatusProjector.requestTexts(inbox: inbox.url, ids: [messageID], field: "id")[messageID] != nil {
+            let read = DelegationStatusProjector.requestTexts(inbox: inbox.url, ids: [messageID], field: "read")[messageID] == "true"
+            return .object(["status": .string(read ? "read" : "queued"), "message_id": .string(messageID),
+                "filePath": .string(inbox.url.path), "read": .bool(read),
+                "detail": .string(read ? "The recipient read this exact message; no answer is recorded yet." : "No recipient read is recorded. Delivery remains owed at the original inbox; nothing was resent.")])
+        }
+
         let matchedCount = snapshot.matchedCount
-        let sources = snapshot.sources.filter { agentFilter == nil || $0.agent == agentFilter }
+        // Contact names only decorate retained evidence; an unreadable address book never hides it.
+        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        let sources = snapshot.sources.filter { source in (agentFilter == nil || source.agent == agentFilter)
+            && (source.status != "absent" || peers.contains(where: { ($0.handles ?? []).contains(source.agent) })) }
         let evidenceStatus: String
         if sources.allSatisfy({ $0.status == "absent" }) {
             evidenceStatus = "no_evidence"
@@ -105,7 +135,15 @@ extension SwiftToolDispatcher {
                 let value = PeerDataTaintDispatcher.labelled(
                     fullDetail ? job.toJSON(includeReplyText: messageID != nil) : job.toCompactJSON(),
                     agent: job.agent, dataRoot: dataRoot)
-                guard let messageID, case .object(var object) = value else { return value }
+                guard case .object(var object) = value else { return value }
+                if let who = peers.first(where: { ($0.handles ?? []).contains(job.agent) }) {
+                    object["door"] = .string(job.agent)
+                    object["agent"] = .string("peer:" + who.id)
+                    object["agent_name"] = .string(who.name)
+                } else {
+                    object["owner"] = .string("\(job.agent) had no reader on this Mac")
+                }
+                guard let messageID else { return .object(object) }
                 object["matched_message_id"] = .string(messageID)
                 if let threadID = job.recordedThreadID { object["thread_id"] = .string(threadID) }
                 if let turnID = job.recordedTurnID { object["turn_id"] = .string(turnID) }
@@ -121,7 +159,7 @@ extension SwiftToolDispatcher {
                 "claude": .string(Self.homeRelativePath(projector.claudeJobsDirectory)),
                 "codex": .string(Self.homeRelativePath(projector.codexJobsDirectory)),
                 "omp": .string(Self.homeRelativePath(projector.ompJobsDirectory)),
-            ]),
+            ].filter { key, _ in sources.contains { $0.agent == key } }),
             "note": .string("Read-only wake-job projection. Source availability distinguishes readable empty stores, absent evidence, and skipped unreadable/malformed records. Readable jobs are retained; an empty or partial projection never proves no work exists. `none` stall basis is unmeasurable, not verified healthy; unknown delivery is not proven lost. Build counts describe this returned page."),
         ]
         if offset < matchedCount && jobs.count < matchedCount - offset {
@@ -202,18 +240,17 @@ extension SwiftToolDispatcher {
         return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "full"
     }
 
-    static func delegationStatusAgentFilter(_ input: [String: JSONValue]) -> String? {
+    static func delegationStatusAgentFilter(_ input: [String: JSONValue], dataRoot: URL) throws -> String? {
         guard case .string(let s)? = input["agent"] else { return nil }
         let normalized = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // "all"/"" mean no filter. An unrecognized value falls through to no
-        // filter too — silently returning zero rows for a typo'd agent name
-        // would look like "nothing is running".
-        switch normalized {
-        case "claude", "claude": return "claude"
-        case "codex": return "codex"
-        case "omp", "kimi": return "omp"
-        default: return nil
+        if normalized.isEmpty || normalized == "all" { return nil }
+        let named = try AgentConversationRouting.namingSavedContact("agent_read", ["agent": .string(normalized)], dataRoot: dataRoot)
+        let target: String = if case .string(let target)? = named["agent"] { target } else { normalized }
+        if let lane = AgentConversationDelivery.lane(for: target, dataRoot: dataRoot) { return lane == "claude" ? "claude" : lane }
+        if AgentConversationDelivery.inbox(agent: normalized, bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)) != nil {
+            return normalized == "claude" ? "claude" : normalized
         }
+        throw ToolFailureError("No retained inbox door matches this contact. Use agent.read for its own conversation.", argumentPath: "agent", effects: .none)
     }
 }
 

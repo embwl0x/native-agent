@@ -13,7 +13,7 @@ public enum ToolApprovalEligibility {
                 || (ownerAuthorized && tool.pendingCandidate) else {
                 return "Propose or roll back a candidate before approving this stopped tool."
             }
-            return fields["candidateValidation"] == .string("valid") ? nil : "This exact candidate has not passed runtime validation."
+            return fields["candidateValidation"] == .string("rehearsed") ? nil : "This exact candidate has not passed runtime validation."
         }
         let status = tool.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let selectedProposal = ownerAuthorized && status == "disabled" && tool.codeFingerprint != nil
@@ -27,7 +27,7 @@ public enum ToolApprovalEligibility {
             }
             return "Only proposed tools can be approved."
         }
-        guard tool.validationStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "valid" else {
+        guard tool.validationStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "rehearsed" else {
             return "This proposal has not passed validation."
         }
         return nil

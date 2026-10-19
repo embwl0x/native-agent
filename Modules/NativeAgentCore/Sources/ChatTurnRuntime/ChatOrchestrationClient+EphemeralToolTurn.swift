@@ -1,3 +1,4 @@
+import Experiences
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -117,11 +118,30 @@ extension SwiftNativeChatOrchestrationClient {
         // Temporary workers still own a real execution identity. Bind their
         // own run rather than leaving traces unknown or inheriting the parent
         // turn's ID; this creates no chat session or additional trace store.
+        // The worker run is a turn of her mind hearing its brief, caused by the
+        // turn that started it when one did; its answer returns to its caller.
+        let heard = Experience(id: runId, kind: .heard, cause: TurnTraceContext.turnId.map { [$0] } ?? [],
+                               face: Self.face(message, []), addressedTo: ["her"],
+                               owes: ["answer": .init(to: "caller")])
+        ExperienceStore.record(dataRoot, runId) { store in
+            try await store.begin(heard)
+            try await store.append([.evidence(.init(source: "runtime", id: ExperienceStore.processID))], to: runId)
+        }
+        var answered = false
+        defer {
+            if !answered {
+                ExperienceStore.record(dataRoot, runId) { store in
+                    try await store.append([.letGo(key: "answer", reason: .failed)], to: runId)
+                }
+            }
+        }
         let result: TurnEngineResult
         do {
             result = try await PeerDataTaint.withScope {
             try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(runId) {
+            // A worker answers its caller, never the parent's reply: nothing it attaches goes there.
+            try await ReplyChoices.$current.withValue(nil) {
             try await LLMCallContext.$turnActiveTools.withValue(requestTools) {
                 try await engine.executeTurnWithStreamingToolLoop(
                     surface: surface,
@@ -135,6 +155,7 @@ extension SwiftNativeChatOrchestrationClient {
                     providerAdmission: providerAdmission,
                     fileAccess: fileAccess
                 )
+            }
             }
             }
             }
@@ -171,6 +192,12 @@ extension SwiftNativeChatOrchestrationClient {
             from: result.toolDispatches,
             dataRoot: dataRoot
         )
+        // Its answer goes back to its caller; it has no transcript row to stand on.
+        Self.recordAnswer(id: Experience.answer(run: runId), heardID: runId, evidence: nil,
+                          state: result.resolvedTerminalReason(dataRoot: dataRoot).state, dataRoot: dataRoot) { [reply = result.reply] in
+            Experience(id: Experience.answer(run: runId), kind: .answer, cause: [runId], face: Self.face(reply, generatedAttachments))
+        }
+        answered = true
         return ChatResponse(
             runId: runId,
             model: result.modelUsed,

@@ -17,6 +17,10 @@ import PersistenceCore
 // that is a stable system word, a key-sized label, or one the app's own menu
 // bar carries. Never a field's value, a secure field, a row, or anything that
 // could be a name, subject or file name — when in doubt, nothing is stored.
+//
+// `learned` is the part's learned property, kept by the stem for every app
+// (docs/AGENT_IS_THE_APP.md): which route a press of a kind of control takes
+// in this app, `"press tab": "pointer"`, folded from what showed a consequence.
 
 /// One remembered control.
 public struct MacAppMapEntry: Codable, Sendable, Equatable {
@@ -33,6 +37,25 @@ public struct MacAppMapEntry: Codable, Sendable, Equatable {
     /// ISO-8601, UTC. LRU order.
     public var verified: String
     public var hits: Int
+}
+
+/// One app's file: its remembered controls and what use has taught.
+public struct MacAppMap: Codable, Sendable, Equatable {
+    public var controls: [MacAppMapEntry] = []
+    public var learned: [String: String] = [:]
+
+    public init() {}
+
+    /// A map written before `learned` existed is the bare controls array.
+    public init(from decoder: Decoder) throws {
+        if let controls = try? decoder.singleValueContainer().decode([MacAppMapEntry].self) {
+            self.controls = controls
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        controls = try container.decode([MacAppMapEntry].self, forKey: .controls)
+        learned = try container.decodeIfPresent([String: String].self, forKey: .learned) ?? [:]
+    }
 }
 
 public enum MacAppMaps {
@@ -85,7 +108,7 @@ public actor MacAppMapStore {
     )
 
     private let directory: URL
-    private var cache: [String: (mtime: Date?, entries: [MacAppMapEntry])] = [:]
+    private var cache: [String: (mtime: Date?, map: MacAppMap)] = [:]
     private var dirty: Set<String> = []
 
     public init(directory: URL) { self.directory = directory }
@@ -97,35 +120,46 @@ public actor MacAppMapStore {
     /// nil = the file exists but could not be read (I/O): nothing may be
     /// written over it this time. A malformed file is moved aside to
     /// `.corrupt` and the map starts fresh.
-    private func load(_ bundle: String) -> [MacAppMapEntry]? {
+    private func load(_ bundle: String) -> MacAppMap? {
         guard let url = url(bundle) else { return nil }
         // Unflushed changes are newer than the file.
-        if dirty.contains(bundle), let cached = cache[bundle] { return cached.entries }
+        if dirty.contains(bundle), let cached = cache[bundle] { return cached.map }
         let mtime = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
-        if let cached = cache[bundle], cached.mtime == mtime { return cached.entries }
+        if let cached = cache[bundle], cached.mtime == mtime { return cached.map }
         guard mtime != nil else {
-            cache[bundle] = (nil, [])
-            return []
+            cache[bundle] = (nil, MacAppMap())
+            return MacAppMap()
         }
         guard let data = try? Data(contentsOf: url) else { return nil }
-        if let entries = try? JSONDecoder().decode([MacAppMapEntry].self, from: data) {
-            cache[bundle] = (mtime, entries)
-            return entries
+        if let map = try? JSONDecoder().decode(MacAppMap.self, from: data) {
+            cache[bundle] = (mtime, map)
+            return map
         }
         let aside = url.appendingPathExtension("corrupt")
         try? FileManager.default.removeItem(at: aside)
         guard (try? FileManager.default.moveItem(at: url, to: aside)) != nil else { return nil }
-        cache[bundle] = (nil, [])
-        return []
+        cache[bundle] = (nil, MacAppMap())
+        return MacAppMap()
     }
 
-    private func store(_ bundle: String, _ entries: [MacAppMapEntry]) {
-        cache[bundle] = (cache[bundle]?.mtime, entries)
+    private func store(_ bundle: String, _ map: MacAppMap) {
+        cache[bundle] = (cache[bundle]?.mtime, map)
         dirty.insert(bundle)
     }
 
     public func entries(bundle: String, window: String) -> [MacAppMapEntry] {
-        (load(bundle) ?? []).filter { $0.window == window }
+        (load(bundle)?.controls ?? []).filter { $0.window == window }
+    }
+
+    public func learned(bundle: String, _ choice: String) -> String? {
+        load(bundle)?.learned[choice]
+    }
+
+    /// What use taught: `value` for `choice` in this app, or nil to forget it.
+    public func learn(bundle: String, _ choice: String, _ value: String?) {
+        guard var map = load(bundle), map.learned[choice] != value else { return }
+        map.learned[choice] = value
+        store(bundle, map)
     }
 
     public func paths(bundle: String, window: String) -> Set<[Int]> {
@@ -141,7 +175,8 @@ public actor MacAppMapStore {
     /// A verified act: add the entry, or refresh it (live path/label, date,
     /// hit). LRU-evicts past the cap.
     public func record(bundle: String, window: String, asked: String, label: String, kind: String, path: [Int], at date: Date = Date()) {
-        guard !asked.isEmpty, !label.isEmpty, !path.isEmpty, var entries = load(bundle) else { return }
+        guard !asked.isEmpty, !label.isEmpty, !path.isEmpty, var map = load(bundle) else { return }
+        var entries = map.controls
         let stamp = ISO8601DateFormatter().string(from: date)
         if let index = entries.firstIndex(where: { $0.window == window && $0.asked == asked && $0.kind == kind }) {
             entries[index].label = label
@@ -156,17 +191,18 @@ public actor MacAppMapStore {
             entries.sort { $0.verified > $1.verified }
             entries = Array(entries.prefix(MacAppMaps.maxEntriesPerApp))
         }
-        store(bundle, entries)
+        map.controls = entries
+        store(bundle, map)
     }
 
     /// The live window no longer agreed. `evict` when something ELSE is at that
     /// path now; otherwise one hit is taken off and the entry goes at zero.
     public func penalize(bundle: String, window: String, path: [Int], evict: Bool) {
-        guard var entries = load(bundle),
-              let index = entries.firstIndex(where: { $0.window == window && $0.path == path }) else { return }
-        entries[index].hits -= 1
-        if evict || entries[index].hits <= 0 { entries.remove(at: index) }
-        store(bundle, entries)
+        guard var map = load(bundle),
+              let index = map.controls.firstIndex(where: { $0.window == window && $0.path == path }) else { return }
+        map.controls[index].hits -= 1
+        if evict || map.controls[index].hits <= 0 { map.controls.remove(at: index) }
+        store(bundle, map)
     }
 
     /// One write per act call. A failed write stays dirty for the next one.
@@ -176,11 +212,11 @@ public actor MacAppMapStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         for bundle in dirty {
-            guard let url = url(bundle), let entries = cache[bundle]?.entries,
-                  let data = try? encoder.encode(entries),
+            guard let url = url(bundle), let map = cache[bundle]?.map,
+                  let data = try? encoder.encode(map),
                   (try? data.write(to: url, options: .atomic)) != nil else { continue }
             let mtime = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
-            cache[bundle] = (mtime, entries)
+            cache[bundle] = (mtime, map)
             dirty.remove(bundle)
         }
     }

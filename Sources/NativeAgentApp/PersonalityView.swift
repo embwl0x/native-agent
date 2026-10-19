@@ -97,13 +97,28 @@ struct PersonalityView: View {
     @State private var isLoadingProfile = true
     @State private var profileReadCompleted = false
     @State private var profileReadInFlight = false
-    @State private var documentDraftState = PersonalityDocumentDraftState()
-    @State private var personalityDocDraft = ""
+    @State private var documentSeed = PersonalityDocumentDraftState()
+    private var documentDraftState: PersonalityDocumentDraftState {
+        get { appModel.editDraft("persona.documents", seed: documentSeed) }
+        nonmutating set {
+            if newValue.hasUnsavedDrafts {
+                appModel.setEditDraft(newValue, for: "persona.documents")
+            } else {
+                documentSeed = newValue
+                appModel.clearEditDraft("persona.documents")
+            }
+        }
+    }
+    private var personalityDocDraft: String {
+        get { documentDraftState.unsavedDrafts[documentDraftState.selectedDocumentID] ?? selectedPersonalityDoc?.content ?? "" }
+        nonmutating set { documentDraftState.recordEdit(newValue, documents: appModel.personalityDocs) }
+    }
 
     // Starter card state (shown only while no persona exists).
-    @State private var starterAgentName = ""
-    @State private var starterUserName = ""
-    @State private var starterNotes = ""
+    private var starterAgentName: Binding<String> { appModel.editBinding("persona/new/agentName", seed: "") }
+    private var starterUserName: Binding<String> { appModel.editBinding("persona/new/userName", seed: "") }
+    private var starterNotes: Binding<String> { appModel.editBinding("persona/new/notes", seed: "") }
+    private var nameDraft: Binding<String> { appModel.editBinding("persona.name", seed: draft.name) }
     @State private var starterBusy = false
     @State private var starterError: String?
     @State private var documentsLoadLatch = PersonalityDocumentsLoadLatch()
@@ -195,15 +210,15 @@ struct PersonalityView: View {
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            TextField("Name", text: $starterAgentName)
+            TextField("Name", text: starterAgentName)
                 .textFieldStyle(.roundedBorder)
 
-            TextField("Your name (optional)", text: $starterUserName)
+            TextField("Your name (optional)", text: starterUserName)
                 .textFieldStyle(.roundedBorder)
 
             AdvancedTextEditor(
                 title: "A few things about the agent (optional)",
-                text: $starterNotes,
+                text: starterNotes,
                 minHeight: 92
             )
 
@@ -211,7 +226,7 @@ struct PersonalityView: View {
                 Button(starterBusy ? "Creating\u{2026}" : "Create") {
                     Task { await createStarterPersona() }
                 }
-                .disabled(starterBusy || starterAgentName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(starterBusy || starterAgentName.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                 if let starterError {
                     Text(starterError)
@@ -227,10 +242,11 @@ struct PersonalityView: View {
         starterBusy = true
         starterError = nil
         defer { starterBusy = false }
+        let submitted = [starterAgentName.wrappedValue, starterUserName.wrappedValue, starterNotes.wrappedValue]
         let outcome = await SwiftNativeOnboardingClient.createStarterPersona(
-            agentName: starterAgentName,
-            userName: starterUserName,
-            notes: starterNotes,
+            agentName: starterAgentName.wrappedValue,
+            userName: starterUserName.wrappedValue,
+            notes: starterNotes.wrappedValue,
             complete: { name, user in
                 try await appModel.completeOnboarding(agentName: name, personaType: "ai", userName: user)
             },
@@ -240,8 +256,10 @@ struct PersonalityView: View {
         )
         switch outcome {
         case .created:
+            clearStarterDraft(submitted: submitted)
             await loadProfile(forceRefresh: true)
         case .notesUnsaved(let documentID, let draft):
+            clearStarterDraft(submitted: submitted)
             // Onboarding is committed, but the second SOUL write is not.
             // Keep the exact draft in the real editor rather than discarding it.
             documentDraftState.keepUnsavedDraft(draft, for: documentID)
@@ -252,6 +270,11 @@ struct PersonalityView: View {
         }
     }
 
+    private func clearStarterDraft(submitted: [String]) {
+        guard [starterAgentName.wrappedValue, starterUserName.wrappedValue, starterNotes.wrappedValue] == submitted else { return }
+        for field in ["agentName", "userName", "notes"] { appModel.clearEditDraft("persona/new/\(field)") }
+    }
+
     // MARK: identity — the one live profile field
 
     private var identityPanel: some View {
@@ -260,7 +283,7 @@ struct PersonalityView: View {
             card: .single,
             note: "The name shown across the app and in chat."
         ) {
-            TextField("Name", text: $draft.name)
+            TextField("Name", text: nameDraft)
                 .textFieldStyle(.roundedBorder)
                 .disabled(isLoadingProfile)
 
@@ -272,9 +295,10 @@ struct PersonalityView: View {
                 // draft, but it still needs a successfully loaded profile to
                 // prove this is an edit rather than an accidental initialization.
                 .disabled(appModel.personality == nil || isSavingName || isLoadingProfile
-                    || draft.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    || nameDraft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 if isSavingName { ProgressView().controlSize(.small) }
                 Button(isLoadingProfile ? "Reloading…" : "Reload") {
+                    appModel.clearEditDraft("persona.name")
                     Task { await loadProfile(forceRefresh: true) }
                 }
                 .disabled(isLoadingProfile || isReloadingDocuments)
@@ -303,8 +327,10 @@ struct PersonalityView: View {
         guard !isSavingName else { return }
         isSavingName = true
         defer { isSavingName = false }
-        switch await appModel.savePersonalityName(draft.name) {
+        let submitted = nameDraft.wrappedValue
+        switch await appModel.savePersonalityName(submitted) {
         case .saved(let profile):
+            if nameDraft.wrappedValue == submitted { appModel.clearEditDraft("persona.name") }
             // The field reflects the writer's normalized, persisted profile;
             // it never claims the raw input was saved when the boundary
             // trimmed/capped it differently.
@@ -344,7 +370,6 @@ struct PersonalityView: View {
                 title: selectedPersonalityDoc.map { PersonalityDocumentPurpose.label(for: $0.id) } ?? "Document",
                 text: Binding(get: { personalityDocDraft }, set: { value in
                     personalityDocDraft = value
-                    documentDraftState.recordEdit(value, documents: appModel.personalityDocs)
                 }),
                 minHeight: 320,
                 isReadOnly: selectedPersonalityDocIsMemoryOwnedUser
@@ -442,7 +467,7 @@ struct PersonalityView: View {
         Binding(
             get: { documentDraftState.selectedDocumentID },
             set: { selectedID in
-                personalityDocDraft = documentDraftState.select(
+                _ = documentDraftState.select(
                     selectedID,
                     documents: appModel.personalityDocs
                 )
@@ -459,7 +484,7 @@ struct PersonalityView: View {
     }
 
     private func syncPersonalityDocDraft() {
-        personalityDocDraft = documentDraftState.reconcile(documents: appModel.personalityDocs)
+        _ = documentDraftState.reconcile(documents: appModel.personalityDocs)
     }
 
     @MainActor

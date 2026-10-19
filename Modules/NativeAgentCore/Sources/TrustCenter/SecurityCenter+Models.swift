@@ -107,6 +107,9 @@ public enum DrivenAgentLaunchPermission: Sendable, Equatable {
     public func arguments(_ flags: AgentHostCommandLine.PermissionFlags) -> [String] {
         switch flags {
         case .codex: return ["-c", "sandbox_mode=\"\(codexSandbox)\"", "-c", "approval_policy=\"\(codexApprovalPolicy)\""]
+        case .claude: return self == .fullMac
+            ? ["--permission-mode", "bypassPermissions"]
+            : ["--restricted", "--strict-mcp-config", "--permission-mode", "plan", "--permission-prompts", "none"]
         }
     }
 }
@@ -204,7 +207,7 @@ public struct SecurityReason: Codable, Sendable, Equatable {
     }
 
     public static func firstCause(in reasons: [Self]) -> String {
-        reasons.first { $0.kind == .cause }?.sentence ?? "Security policy evaluated this action."
+        reasons.last { $0.kind == .cause }?.sentence ?? "Security policy evaluated this action."
     }
 }
 
@@ -230,6 +233,8 @@ public struct SecurityToolEnvelope: Codable, Sendable, Equatable, Identifiable {
     public var untrustedInputKeys: [String]
     public var redactedInputPreview: JSONValue
     public var auditReceiptsEnabled: Bool
+    public var autonomyReason: String? = nil
+    public var remedy: JSONValue? = nil
 
     /// Canonical effect truth derived from the same capability vocabulary used
     /// by Security Center. Presentation layers must not maintain a second,

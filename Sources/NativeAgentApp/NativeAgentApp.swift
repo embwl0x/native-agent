@@ -83,7 +83,7 @@ private final class NativeAgentHotkeyBootstrap {
                 discardCapture: { voice.discardListening() },
                 captureFailureMessage: { voice.errorMessage },
                 submitTurn: { transcript in
-                    await appModel.sendChat(transcript)
+                    await appModel.sendChat(transcript, attachments: voice.attachment.map { [$0] } ?? [])
                 },
                 reportUnavailable: { message in
                     appModel.statusText = "Voice input unavailable: \(message)"
@@ -202,10 +202,6 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult] {
         try await AppDoctorPort(dataRoot: dataRoot).runtime.runDoctor(
             repair: true, repairScope: .automatic, checks: checks).checks
-    }
-
-    func wakeDoctorForPendingTransitions(dataRoot: URL) async {
-        _ = await AppDoctorPort(dataRoot: dataRoot).runtime.wakeDoctorForPendingTransitions()
     }
 
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String) {
@@ -570,11 +566,7 @@ private struct ActivityCaptureMenuBarContent: View {
             Task { await controller.setCaptureEnabled(false) }
         }
         Button("Activity settings…", systemImage: "gear") {
-            NSApp.activate(ignoringOtherApps: true)
-            // Activity capture is on Trust's Features tab. The route lands on
-            // the page's first tab, synchronously, so the tab is chosen after.
-            NativeAgentAppCoordinator.shared.request(.sidebar(.trust))
-            UserDefaults.standard.set(TrustTab.features.rawValue, forKey: ShellRailTab.storageKey(.trust))
+            SettingsLink.open(.trust, tab: TrustTab.features.rawValue)
         }
     }
 }

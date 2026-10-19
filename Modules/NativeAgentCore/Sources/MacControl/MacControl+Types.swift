@@ -65,7 +65,7 @@ public struct MacControlResult: Sendable, Equatable {
     }
 
     public func toJSON() -> JSONValue {
-        let fields: [String: JSONValue] = [
+        var fields: [String: JSONValue] = [
             "ok": .bool(ok),
             "action": .string(action),
             "output": output,
@@ -77,6 +77,7 @@ public struct MacControlResult: Sendable, Equatable {
             "operationState": operationState.map { .string($0.rawValue) } ?? .null,
             "verification": verification.map { .string($0.rawValue) } ?? .null,
         ]
+        if !ok, case .object(let output) = output, let remedy = output["remedy"] { fields["remedy"] = remedy }
         let result = JSONValue.object(fields)
         OwnedProgramRunner.ReadContent.current?.record(result,
             content: .object(fields.filter { !["durationMs", "operationId"].contains($0.key) }))
@@ -147,6 +148,53 @@ public protocol MacControlClient: MotorActionReadModelProviding, Sendable {
         body: [String: JSONValue],
         capability: MacInjectionCapability
     ) async throws -> MacControlResult
+}
+
+/// A client that counts what it let out that can change the world: every
+/// action outside the reads that the gate did not refuse before it ran. A
+/// verb that failed with none counted changed nothing, whatever its error
+/// says; one counted may have. A read that woke a covered screen or stepped
+/// her own windows aside changed nothing, as every read says.
+public final class MacMotorCount: MacControlClient, @unchecked Sendable {
+    private let host: any MacControlClient
+    private let lock = NSLock()
+    private var count = 0
+    public init(_ host: any MacControlClient) { self.host = host }
+    public var started: Int { lock.withLock { count } }
+
+    public func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
+        try await counted(action) { try await self.host.dispatch(action: action, body: body) }
+    }
+
+    public func dispatchApprovedInjection(
+        action: String, body: [String: JSONValue], capability: MacInjectionCapability
+    ) async throws -> MacControlResult {
+        try await counted(action) { try await self.host.dispatchApprovedInjection(action: action, body: body, capability: capability) }
+    }
+
+    public func cancel(operationId: String) async throws -> MacControlCancellationResult {
+        try await host.cancel(operationId: operationId)
+    }
+
+    public func motorActionReadModel(actionId: String) async throws -> MotorActionReadModel? {
+        try await host.motorActionReadModel(actionId: actionId)
+    }
+
+    private static let reads = macControlAccessibilityReadActions.union(macControlClipboardReadActions)
+        .union(macControlDocumentReadActions)
+
+    private func counted(_ action: String, _ run: () async throws -> MacControlResult) async throws -> MacControlResult {
+        let name = action.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !Self.reads.contains(name) else { return try await run() }
+        do {
+            let result = try await run()
+            if result.operationState != .refused, result.operationState != .blocked { lock.withLock { count += 1 } }
+            return result
+        } catch {
+            lock.withLock { count += 1 }
+            throw error
+        }
+    }
 }
 
 // MARK: - Sub-action classification

@@ -33,6 +33,10 @@ public struct AgentBridgeCompletionRoute: Sendable, Equatable, Codable {
     }
 
     public var hasRedeliveryOwner: Bool { self == .telegram || self == .slack || self == .ios }
+    /// Its destination says when it holds a reply (Telegram's and Slack's
+    /// servers keep the conversation). The phone does not yet: CloudKit
+    /// accepting a push is transport only.
+    public var acceptsDurably: Bool { self == .telegram || self == .slack }
   }
 
   public let surface: String
@@ -149,17 +153,14 @@ public struct CodexCompletionLifecycleProjection: Decodable, Sendable {
     guard let session = response?.sessionId ?? sessionId,
           NativeAgentChatSessionID.normalizedPathComponent(session) == session,
           let run = response?.runId ?? responseRunId else { return nil }
-    let path = dataRoot.appendingPathComponent("chat/messages/\(session).jsonl")
-    guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-    for line in try String(contentsOf: path, encoding: .utf8).split(whereSeparator: \.isNewline).reversed() {
-      guard let row = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
-      if row["role"] as? String == "user", row["runId"] as? String == run,
-         let metadata = row["metadata"] as? [String: Any], let origin = metadata["origin"] as? [String: Any] {
-        return origin["agent"] as? String
-      }
-    }
-    return nil
+    return try Self.transcriptOrigins.agent(
+      forRun: run, in: dataRoot.appendingPathComponent("chat/messages/\(session).jsonl"))
   }
+
+  /// Rescanning a row's whole transcript for each row made every delegation
+  /// read O(rows × transcript): ~10 s of launch CPU on a large root, growing
+  /// with history. Each transcript is now read once, then only what is appended.
+  private static let transcriptOrigins = TranscriptOrigins()
 
   public static func directories(configRoot: URL, dataRoot: URL) -> [URL] {
     [configRoot.appendingPathComponent("claude-bridge/codex-completion-lifecycle")]
@@ -185,5 +186,42 @@ public struct CodexCompletionLifecycleProjection: Decodable, Sendable {
       }
     }
     return rows
+  }
+}
+
+/// Each transcript's run → origin agent (the last user row of the run that
+/// names an origin). A run's origin is written once and never changes, so the
+/// index only grows; a transcript that got shorter was rewritten and is reread.
+private final class TranscriptOrigins: @unchecked Sendable {
+  private struct Indexed { var offset: UInt64 = 0; var agents: [String: String?] = [:] }
+  private let lock = NSLock()
+  private var transcripts: [String: Indexed] = [:]
+
+  func agent(forRun run: String, in path: URL) throws -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    var indexed = transcripts[path.path] ?? Indexed()
+    if let known = indexed.agents[run] { return known }
+    guard let size = (try? FileManager.default.attributesOfItem(atPath: path.path))?[.size] as? UInt64
+    else { return nil }
+    if size < indexed.offset { indexed = Indexed() }
+    if size > indexed.offset {
+      let handle = try FileHandle(forReadingFrom: path)
+      defer { try? handle.close() }
+      try handle.seek(toOffset: indexed.offset)
+      let data = try handle.readToEnd() ?? Data()
+      // Whole lines only: a row still being appended is read next time.
+      let end = data.lastIndex(of: UInt8(ascii: "\n")).map { $0 + 1 } ?? data.startIndex
+      for line in data[data.startIndex..<end].split(separator: UInt8(ascii: "\n")) {
+        guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+              row["role"] as? String == "user", let runId = row["runId"] as? String,
+              let metadata = row["metadata"] as? [String: Any],
+              let origin = metadata["origin"] as? [String: Any] else { continue }
+        indexed.agents[runId] = .some(origin["agent"] as? String)
+      }
+      indexed.offset += UInt64(end - data.startIndex)
+    }
+    transcripts[path.path] = indexed
+    return indexed.agents[run] ?? nil
   }
 }

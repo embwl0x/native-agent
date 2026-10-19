@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Desk
 
 /// The inbox reader deliberately keeps cards with a bad optional source rather
 /// than dropping the whole record. Preserve why the source is unavailable so
@@ -80,6 +81,16 @@ public struct InboxItemRecord: Identifiable, Encodable, Hashable, Sendable {
         status = Self.string(o["status"]) ?? "unread"
         read_at = Self.string(o["read_at"])
         chat_session_id = Self.string(o["chat_session_id"])
+    }
+
+    /// A producer may re-file a settled card under its stable id. Its newest
+    /// physical row owns the state, as LiveNotificationInbox.updateStatus does.
+    public static func latest(in rows: [JSONValue]) -> [InboxItemRecord] {
+        var seen = Set<String>()
+        return rows.reversed().compactMap { row in
+            guard let item = InboxItemRecord(row: row), seen.insert(item.id).inserted else { return nil }
+            return item
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -169,10 +180,15 @@ extension InboxItemRecord {
         status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    /// Still asking for attention: the phone's inbox keeps these ahead of the
-    /// resolved rows.
+    /// Unread/active ordering for the phone's inbox, separate from obligations.
     public var isActivityPending: Bool {
         normalizedStatus == "unread" || normalizedStatus == "active"
+    }
+
+    /// Every projection asks the same owner whether this card needs the person.
+    public var requiresOwnerInput: Bool {
+        OwnerAttentionPolicy.inboxAsks(pending: ["unread", "active", "read"].contains(normalizedStatus), systemLane: isSystemLane,
+            severity: severity, linkedApproval: !(related_approval_id ?? "").isEmpty, actionIDs: actions.map(\.id))
     }
 
     // MARK: - W6/G12 — "For you" vs "System"

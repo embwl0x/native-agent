@@ -180,7 +180,13 @@ package actor ProviderToolResultRecoveryStore {
             pageByteOffsets.append(byteOffset)
         }
 
-        let handle = UUID().uuidString.lowercased()
+        let fields: [String: JSONValue] = if case .object(let fields)? = try? JSONValue.parse(data) { fields } else { [:] }
+        let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
+        let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
+        let day = URL(fileURLWithPath: source).deletingPathExtension().lastPathComponent
+        let dated = source.hasPrefix("data/turn_traces/") && TurnTracePersistLane.day(from: day) != nil
+        let handle = (source == "data/traces/events.jsonl" ? nil : receipt)
+            .map { "receipt-" + $0.uuidString.lowercased() + (dated ? "." + day : "") } ?? UUID().uuidString.lowercased()
         let url = root.appendingPathComponent(handle, isDirectory: false)
         do {
             try data.write(to: url, options: .atomic)
@@ -191,7 +197,7 @@ package actor ProviderToolResultRecoveryStore {
         }
 
         let now = Date()
-        let version: JSONValue? = if case .object(let fields)? = try? JSONValue.parse(data) { fields["version"] } else { nil }
+        let version = fields["version"]
         let entry = Entry(
             handle: handle,
             toolName: toolName,
@@ -264,6 +270,7 @@ package actor ProviderToolResultRecoveryStore {
         let candidates = entries.values.filter { $0.scope == scope && (handle == nil || $0.handle == handle) }
             .sorted { $0.createdAt < $1.createdAt }
         guard candidates.count == 1, let entry = candidates.first else {
+            if candidates.isEmpty, let handle { return unavailable(handle: handle, reason: "result_handle_unavailable", sessionId: sessionId) }
             return .object([
                 "status": .string("failed"),
                 "effects": .string("none"),
@@ -293,6 +300,22 @@ package actor ProviderToolResultRecoveryStore {
         return pages
     }
 
+    private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
+        let parts = handle.dropFirst(8).split(separator: ".")
+        let receipt = handle.hasPrefix("receipt-") ? parts.first.flatMap { UUID(uuidString: String($0)) } : nil
+        var args: [String: JSONValue] = ["view": .string("receipts")]
+        if let receipt { args["receipt_id"] = .string(receipt.uuidString.lowercased()) }
+        if receipt != nil, parts.count == 2, TurnTracePersistLane.day(from: String(parts[1])) != nil {
+            args["trace"] = .string("turn_traces/\(parts[1]).jsonl")
+        }
+        if let sessionId { args["session_id"] = .string(sessionId) }
+        return .object(["status": .string("failed"), "effects": .string("none"), "reason": .string(reason),
+            "detail": .string("Retained output \(handle) is unavailable. \(receipt == nil ? "This older or untraced handle has no bound receipt; next_call lists this conversation's receipts." : "next_call reads the original dispatch receipt.") Missing output does not establish failure; never repeat a write to recover output."),
+            "remedy": .object(["kind": .string("inspect"),
+                "instruction": .string("Read the retained receipt with next_call; missing output never authorizes repeating a write."),
+                "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(args)])])])])
+    }
+
     private func readPage(
         handle: String, page: Int, sessionId: String?, turnId: String?, query: String?
     ) -> JSONValue {
@@ -300,12 +323,7 @@ package actor ProviderToolResultRecoveryStore {
         guard let scope = Scope(sessionId: sessionId, turnId: turnId),
               let entry = entries[handle],
               entry.scope == scope else {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("result_handle_unavailable"),
-                "detail": .string("The result handle is expired, invalid, or belongs to a different turn."),
-                "recovery_hint": .string("Inspect the original operation's status or durable receipt. Missing output does not establish failure; do not repeat a write or external action merely to recover its output."),
-            ])
+            return unavailable(handle: handle, reason: "result_handle_unavailable", sessionId: sessionId)
         }
         if let query, let pages = sectionPages(handle: handle, entry: entry, query: query) {
             guard pages.indices.contains(page) else {
@@ -331,11 +349,13 @@ package actor ProviderToolResultRecoveryStore {
                 "result_handle": .string(handle), "query": .string(query),
                 "page": .int(Int64(page)), "page_count": .int(Int64(pages.count)),
                 "sections": .array(sections),
+                "searched_sections": .int(Int64(entries[handle]?.sectionProjection?.count ?? 0)),
+                "matching_sections": .int(Int64(pages.reduce(0) { $0 + $1.count })),
                 "remaining_sections": .int(Int64(remaining)),
                 "has_more": .bool(page + 1 < pages.count),
                 "next_page": page + 1 < pages.count ? .int(Int64(page + 1)) : .null,
                 "raw_page_count": .int(Int64(max(1, entry.pageByteOffsets.count - 1))),
-                "detail": .string("Page \(page + 1) of \(pages.count). \(remaining) whole sections follow. Read tool_result_page with this result_handle, the same query and next_page as page. Paths and paragraph numbers identify the original positions. raw=true returns the original byte stream in separate pages."),
+                "detail": .string("Page \(page + 1) of \(pages.count). \(remaining) matching sections follow in source order. Paths and line numbers identify positions in this retained response only; unread source content was not searched. Continue with next_call. raw=true reads the original response bytes."),
             ])
         }
         let pageCount = max(1, entry.pageByteOffsets.count - 1)
@@ -351,22 +371,14 @@ package actor ProviderToolResultRecoveryStore {
         let endByte = entry.pageByteOffsets[page + 1]
         guard let file = try? FileHandle(forReadingFrom: entry.url) else {
             remove(handle: handle)
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("result_spill_unreadable"),
-                "recovery_hint": .string("Inspect the original operation's durable receipt before deciding whether another action is safe. Output recovery failed; the original action outcome is not changed."),
-            ])
+            return unavailable(handle: handle, reason: "result_spill_unreadable", sessionId: sessionId)
         }
         defer { try? file.close() }
         guard (try? file.seek(toOffset: UInt64(startByte))) != nil,
               let data = try? file.read(upToCount: endByte - startByte),
               let content = String(data: data, encoding: .utf8) else {
             remove(handle: handle)
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("result_spill_unreadable"),
-                "recovery_hint": .string("Inspect the original operation's durable receipt before deciding whether another action is safe. Output recovery failed; the original action outcome is not changed."),
-            ])
+            return unavailable(handle: handle, reason: "result_spill_unreadable", sessionId: sessionId)
         }
         // Reading renews the handle: a result the model is still working
         // through is in use, whatever the clock says.

@@ -44,7 +44,7 @@ public final class DoctorFacade {
         /// blocking onboarding on them would strand a user who skipped setup.
         public var failingScaffoldChecks: [CheckResult] {
             guard case .completed(_, let failing) = self else { return [] }
-            return failing.filter { !$0.id.hasPrefix("live.") }
+            return failing.filter { !$0.checkID.hasPrefix("live.") }
         }
 
         /// One line naming what to fix, for a user-facing surface.

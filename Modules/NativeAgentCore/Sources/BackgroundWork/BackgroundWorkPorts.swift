@@ -18,6 +18,7 @@ public protocol HeartbeatBackgroundWorkPort: BackgroundWorkEventPort, Background
 }
 
 public protocol MaintenanceBackgroundWorkPort: BackgroundWorkNotificationPort {
+    func diskStorageOwners(dataRoot: URL) -> [DiskStorageOwner]
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult]
     func routeDoctorAsk(eventID: String, title: String, detail: String) async throws
     var unavailableSkipPrefix: String { get }

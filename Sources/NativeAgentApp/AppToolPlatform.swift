@@ -27,12 +27,12 @@ import Browser
 extension AppToolExecutor {
     /// Read the last report, or explicitly run checks (false) or repair (true).
     @MainActor
-    static func doctorStatus(repair: Bool?) async throws -> JSONValue {
+    static func doctorStatus(repair: Bool?, checkID: String?) async throws -> JSONValue {
         guard let appModel = NativeAgentAppCoordinator.shared.appModel else {
             return AppToolExecutor.unattachedFailure()
         }
         if let repair {
-            if case .unavailable(let reason) = await appModel.runDoctor(repair: repair, repairScope: .button) {
+            if case .unavailable(let reason) = await appModel.runDoctor(repair: repair, repairScope: .button, checkID: checkID) {
                 return AppToolExecutor.failure("doctor_unavailable", "Doctor did not run: \(reason)")
             }
         }
@@ -51,7 +51,7 @@ extension AppToolExecutor {
             await NativeAgentNotifications.postMessage(title: title, body: body)
         },
         macIntegrationPermissionStore: MacIntegrationPermissionStore = .shared,
-        doctorStatusProvider: (@Sendable (_ repair: Bool?) async throws -> JSONValue)? = nil,
+        doctorStatusProvider: (@Sendable (_ repair: Bool?, _ checkID: String?) async throws -> JSONValue)? = nil,
         telegramStatusProvider: (@Sendable () async throws -> JSONValue)? = nil,
         humanConversationReplyHandler: (@Sendable ([String: JSONValue]) async throws -> JSONValue)? = nil
     ) {
@@ -64,7 +64,7 @@ extension AppToolExecutor {
             mobileNotificationSender: mobileNotificationSender,
             macNotificationSender: macNotificationSender,
             macIntegrationPermissionStore: macIntegrationPermissionStore,
-            doctorStatusProvider: doctorStatusProvider ?? { try await Self.doctorStatus(repair: $0) },
+            doctorStatusProvider: doctorStatusProvider ?? { try await Self.doctorStatus(repair: $0, checkID: $1) },
             telegramStatusProvider: telegramStatusProvider ?? { try await TelegramFacade(dataRoot: PersistenceCore.defaultDataRoot()).toolStatusEnvelope() },
             humanConversationReplyHandler: humanConversationReplyHandler ?? { input in
                 try await NativeAgentEngine.live.agents.humanReplies.reply(input: input)
@@ -88,8 +88,7 @@ extension AppToolExecutor {
             motorActionObserver: { await NativeAgentEngine.liveCognition.observeMotorActionState($0) },
             platform: BrowserToolPlatformPort(
                 setUpChrome: {
-                    let setup = await ChromeExtensionFolder.setUp()
-                    return (setup.folder, setup.extensionsPageOpened, setup.message)
+                    (try await ChromeExtensionFolder.setUp(), "Chrome connected.")
                 },
                 readStatus: {
                     try await BrowserActionRoutes.app.visibleBrowserStatus(JSONValue.fromEncodable(

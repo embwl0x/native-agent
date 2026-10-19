@@ -447,8 +447,8 @@ extension MacFourVerbs {
     static func lookRefusalWords(_ code: String) -> String {
         switch code {
         case "no_frontmost_window": return "There's no window up to look at."
-        case "ax_untrusted", "accessibility_untrusted":
-            return "Accessibility isn't granted to me, so I can't read any window."
+        case "accessibility_not_trusted", "ax_untrusted", "accessibility_untrusted":
+            return "Accessibility isn't granted to NativeAgent. System Settings > Privacy & Security > Accessibility > NativeAgent switch on."
         default: return "The read came back \(code)."
         }
     }
@@ -497,6 +497,10 @@ extension MacFourVerbs {
 
     static func operationDetail(_ result: MacControlResult) -> [String: JSONValue] {
         var detail: [String: JSONValue] = [:]
+        if case .object(let output) = result.output {
+            for key in ["note", "guidance", "message", "remedy", "matched_name", "bundle_identifier", "process_identifier"] { detail[key] = output[key] }
+        }
+        if let error = result.error { detail["error"] = .string(error) }
         if result.error?.hasPrefix("human_takeover:") == true, case .object(let receipt) = result.output {
             for key in ["status", "posted_events", "characters_sent", "text_character_count", "requested_events_emitted", "recovery_events_emitted", "gesture", "element", "app", "window", "frame_id", "handle", "method", "ax_delivered", "effect"] {
                 detail[key] = receipt[key]

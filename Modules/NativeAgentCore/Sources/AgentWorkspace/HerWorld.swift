@@ -1,4 +1,5 @@
 import ApprovalInbox
+import ChatSessionWork
 import Foundation
 import MemoryV2
 import NotificationInbox
@@ -9,18 +10,19 @@ import WorkshopExecution
 import SwarmRuns
 import NativeAgentShared
 
-/// Her world, read once and kept (her-screen Phase 2, 2026-09-23). Home,
-/// rooms and the per-turn glance all read this one value. Each part is kept
-/// until one of its input files changes (identity, size and mtime from a
-/// stat). Home and rooms read it fresh; the glance only ever reads what is
-/// already kept and refreshes it in the background, so a turn never waits
-/// on a file lock, a big read or SQLite.
+/// Home, rooms and the glance draw the same retained owner projections.
+/// Owner invalidations refresh each part independently, outside page assembly.
 struct HerWorld: @unchecked Sendable {
     var records: [AgentConversationRecord] = []
     /// Requested helper results already handed to her as a turn, by entry id.
     var handed: Set<String> = []
     var chats: [HerScreen.BridgeChat] = []
     var contacts: [HerScreen.Contact] = []
+    var routes: [HerScreen.Contact] = []
+    var threads: [String: HerScreen.BridgeChat] = [:]
+    var jobs: [DelegationJobProjection] = []
+    var doors: [HerScreen.DoorLine] = []
+    var senses: [String] = []
     var identity = AgentContactIdentity(peers: [])
     var answered: [String: Date] = [:]
     var health: [String: AgentLocalHealth] = [:]
@@ -44,10 +46,15 @@ struct HerWorld: @unchecked Sendable {
     var arrivals: [ResidentWake.Item] = []
     /// Agents discovery found and offered, still unanswered: one PEOPLE line each.
     var found: [String] = []
-    /// Some part is older than its files, or missing.
-    var stale = false
     /// Parts with no value at all yet (never read), by key.
     var unread: [String] = []
+    var pending: [String] = []
+    var oldest: Date?
+
+    func healthID(for contact: HerScreen.Contact, record: AgentConversationRecord?) -> String {
+        let id = record?.agent ?? contact.id
+        return health[id] == nil ? contact.id : id
+    }
 }
 
 /// Parts of the world by input stamp. A compute that started before another
@@ -56,24 +63,26 @@ struct HerWorld: @unchecked Sendable {
 final class HerMemo: @unchecked Sendable {
     static let shared = HerMemo()
     private let lock = NSLock()
-    private var store: [String: (stamp: [String], value: Any, generation: Int, used: Date)] = [:]
+    private var store: [String: (stamp: [String], value: Any, generation: Int, used: Date, at: Date)] = [:]
     private var generation = 0
-    private var refreshing: Set<String> = []
+    private var observations: [String: (id: UUID, revision: Int, task: Task<Void, Never>)] = [:]
     private var glances: [String: String?] = [:]
     private var glanceOrder: [String] = []
 
     /// Only the recent working window is retained, including transcript and send keys.
     private func prune(_ now: Date) {
+        let previous = Set(store.keys)
         store = store.filter { now.timeIntervalSince($0.value.used) <= 1800 }
         while store.count > 128, let oldest = store.min(by: { $0.value.used < $1.value.used }) {
             store.removeValue(forKey: oldest.key)
         }
+        for key in previous.subtracting(store.keys) { observations.removeValue(forKey: key)?.task.cancel() }
     }
 
     private func keep(_ key: String, stamp: [String], value: Any) {
         generation += 1
         let now = Date()
-        store[key] = (stamp, value, generation, now)
+        store[key] = (stamp, value, generation, now, now)
         prune(now)
     }
 
@@ -107,12 +116,13 @@ final class HerMemo: @unchecked Sendable {
     }
 
     /// Whatever is kept, and whether its stamp is still current.
-    func peek<T>(_ key: String, stamp: [String]) -> (value: T, current: Bool)? {
+    func peek<T>(_ key: String, stamp: [String]? = nil) -> (value: T, current: Bool, at: Date)? {
         lock.withLock {
             let now = Date()
             prune(now)
             store[key]?.used = now
-            return store[key].flatMap { entry in (entry.value as? T).map { ($0, entry.stamp == stamp) } }
+            let current = stamp ?? [String(observations[key]?.revision ?? 0)]
+            return store[key].flatMap { entry in (entry.value as? T).map { ($0, entry.stamp == current, entry.at) } }
         }
     }
 
@@ -120,9 +130,46 @@ final class HerMemo: @unchecked Sendable {
         lock.withLock { keep(key, stamp: stamp, value: value) }
     }
 
-    /// One inline glance read per data root at a time.
-    func begin(_ root: String) -> Bool { lock.withLock { refreshing.insert(root).inserted } }
-    func end(_ root: String) { lock.withLock { _ = refreshing.remove(root) } }
+    /// Owner events invalidate before reading; completions publish the retained picture.
+    func observe<T>(_ key: String, paths: @escaping @Sendable () -> [URL], notifications: [Notification.Name],
+                    compute: @escaping @Sendable () async -> T?) {
+        let ports = AgentWorkspacePorts.current
+        lock.withLock {
+            prune(Date())
+            store[key]?.used = Date()
+            guard observations[key] == nil else { return }
+            let id = UUID()
+            let task = Task.detached(priority: .utility) { [self] in
+                let events = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+                let invalidate: @Sendable () -> Void = { [self] in
+                    lock.withLock { if observations[key]?.id == id { observations[key]?.revision += 1 } }
+                    events.continuation.yield(())
+                }
+                let tokens = notifications.map { name in
+                    NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { _ in invalidate() }
+                }
+                defer { tokens.forEach(NotificationCenter.default.removeObserver); events.continuation.finish() }
+                while !Task.isCancelled {
+                    let watched = paths()
+                    let watcher = FileChangeWatcher(paths: watched) { _ in invalidate() }
+                    invalidate()
+                    for await _ in events.stream {
+                        guard paths() == watched else { break }
+                        let revision = lock.withLock { observations[key]?.revision ?? 0 }
+                        let value = await AgentWorkspacePorts.$binding.withValue(ports) { await compute() }
+                        if let value, !Task.isCancelled {
+                            lock.withLock {
+                                if observations[key]?.id == id { keep(key, stamp: [String(revision)], value: value) }
+                            }
+                        }
+                        if !Task.isCancelled { NotificationCenter.default.post(name: AgentWorkspaceScreenPreview.didChange, object: nil) }
+                    }
+                    watcher.cancel()
+                }
+            }
+            observations[key] = (id, 0, task)
+        }
+    }
 
     /// The glance a turn already rendered, so every iteration of it is the same bytes.
     func glance(_ key: String) -> String?? { lock.withLock { glances[key] } }
@@ -150,17 +197,6 @@ final class HerMemo: @unchecked Sendable {
     }
 }
 
-/// Resumes once: with the work's answer, or nil when the budget runs out first.
-final class OnceResume<T: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<T?, Never>?
-    init(_ continuation: CheckedContinuation<T?, Never>) { self.continuation = continuation }
-    func resume(_ value: T?) {
-        let pending: CheckedContinuation<T?, Never>? = lock.withLock { defer { continuation = nil }; return continuation }
-        pending?.resume(returning: value)
-    }
-}
-
 extension HerScreen {
     /// A file's identity, size and modification time; "-" when absent.
     static func stamp(_ url: URL) -> String {
@@ -177,87 +213,94 @@ extension HerScreen {
         }
     }
 
-    /// How a read may reach the owners: `.fresh` (home, rooms) through their
-    /// ordinary locked reads; `.unlocked` (the glance) recomputes only the
-    /// parts whose files moved, read-only and without locks, and a read that
-    /// fails keeps the last value; `.kept` never reads an owner at all.
-    enum Reach { case fresh, unlocked, kept }
-
-    static func readWorld(_ dataRoot: URL, now: Date = Date(), reach: Reach = .fresh) async -> HerWorld {
-        if reach == .fresh { AgentWorkspacePorts.current.conversations.refreshHealth(dataRoot: dataRoot) }
-        let fresh = reach == .fresh, locked = reach == .fresh
+    static func readWorld(_ dataRoot: URL, now: Date = Date()) async -> HerWorld {
         let root = dataRoot.standardizedFileURL.path + "\u{0}"
-        func at(_ path: String) -> URL { dataRoot.appendingPathComponent(path) }
+        @Sendable func at(_ path: String) -> URL { dataRoot.appendingPathComponent(path) }
+        @Sendable func files(_ dir: URL, file: String? = nil) -> [URL] {
+            let names = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
+            return [dir] + names.map { name in
+                file.map { dir.appendingPathComponent(name).appendingPathComponent($0) } ?? dir.appendingPathComponent(name)
+            }
+        }
         let memo = HerMemo.shared
         var world = HerWorld()
-        world.health = AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
-        func part<T>(_ key: String, _ stamp: [String], _ compute: () async -> T?) async -> T? {
-            if fresh { return await memo.value(root + key, stamp: stamp) { await compute() } ?? nil }
-            let kept: (value: T?, current: Bool)? = memo.peek(root + key, stamp: stamp)
-            if let kept, kept.current { return kept.value }
-            if reach == .unlocked, let value = await compute() {
-                return await memo.value(root + key, stamp: stamp) { value }
-            }
-            world.stale = true
+        func part<T>(_ key: String, _ paths: @autoclosure @escaping @Sendable () -> [URL], notifications: [Notification.Name] = [],
+                     _ compute: @escaping @Sendable () async -> T?) -> T? {
+            memo.observe(root + key, paths: paths, notifications: notifications, compute: compute)
+            let kept: (value: T, current: Bool, at: Date)? = memo.peek(root + key)
+            if let at = kept?.at { world.oldest = min(world.oldest ?? at, at) }
+            if kept?.current != true { world.pending.append(key) }
             if kept == nil { world.unread.append(key) }
-            return kept?.value ?? nil
+            return kept?.value
         }
 
-        if let events: [PhonePlaceEvent] = await part("phone places", [stamp(PhonePlaceHistory.url(dataRoot))], {
+        if let events: [PhonePlaceEvent] = part("phone places", [PhonePlaceHistory.url(dataRoot)], {
             try? PhonePlaceHistory.read(dataRoot)
         }) { world.phonePlaces = events }
-        if let arrivals: [ResidentWake.Item] = await part("arrivals", [stamp(ResidentWake.url(dataRoot))], {
+        if let arrivals: [ResidentWake.Item] = part("arrivals", [ResidentWake.url(dataRoot)], {
             ResidentWake.homeItems(dataRoot)
         }) { world.arrivals = arrivals }
-        if let found: [String] = await part("found", [stamp(AgentDiscoveryOffer.url(dataRoot))], {
+        if let found: [String] = part("found", [AgentDiscoveryOffer.url(dataRoot)], {
             (AgentDiscoveryOffer.read(dataRoot) ?? [:]).filter(\.value.open).map { AgentDiscoveryOffer.line(id: $0.key, name: $0.value.name) }.sorted()
         }) { world.found = found }
 
         typealias People = (records: [AgentConversationRecord], chats: [BridgeChat], answered: [String: Date],
                             handed: Set<String>)
-        if let people: People = await part("people", [stamp(at("agents/peers.json")), stamp(at("agents/conversations.json")),
-                stamp(at("chat/sessions.json"))] + stamps(at("agents/grok-requests")), {
-            guard let all = try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: locked) else {
-                if locked { return ([], [], [:], []) }
-                return nil
-            }
-            let records = all.filter { !$0.agent.hasPrefix("bot") }
+        if let people: People = part("people", [at("agents/conversations.json"), at("chat/sessions.json")]
+                + files(at("agents/grok-requests")), notifications: [.nativeAgentChatTranscriptDidChange], {
+            guard let all = try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: false) else { return nil }
             let handed = Set(all.compactMap { row -> String? in
                 guard row.agent.hasPrefix("bot-run:"), row.shownInline == row.operationID + ":" + row.phase,
                       case .string(let entry)? = row.readInput?["message_id"] else { return nil }
                 return entry.uppercased()
             })
             let chats = bridgeChats(dataRoot: dataRoot)
-            return (records, chats, grokAnswers(dataRoot: dataRoot), handed)
+            return (all, chats, grokAnswers(dataRoot: dataRoot), handed)
         }) {
             world.records = people.records; world.chats = people.chats; world.answered = people.answered
             world.handed = people.handed
         }
-        world.identity = AgentContactIdentity(dataRoot: dataRoot)
-        world.contacts = contacts(dataRoot: dataRoot, identity: world.identity)
+        let bridges = InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
+        if let people: (AgentContactIdentity, [Contact], [Contact], [String: BridgeChat]) = part("contacts", [at("agents/peers.json"), bridges,
+                bridges.appendingPathComponent("codex-nativeagent-bridge"), bridges.appendingPathComponent("omp-bridge"),
+                bridges.appendingPathComponent("claude-bridge"), bridges.appendingPathComponent("claude-bridge/bridge.json"),
+                bridges.appendingPathComponent("claude-bridge/token"), at("chat/messages"), ContactReplyReads.url(dataRoot)],
+                notifications: [.nativeAgentChatTranscriptDidChange], {
+            let identity = AgentContactIdentity(dataRoot: dataRoot)
+            let usable = AgentWorkspacePorts.current.tools.usableAgentLanes(dataRoot: dataRoot)
+            let people = contacts(identity: identity, usable: usable)
+            let threads = Dictionary(uniqueKeysWithValues: people.compactMap { contact in
+                thread(contact, dataRoot: dataRoot, identity: identity).map { (contact.id, $0) }
+            })
+            return (identity, people, contacts(identity: identity, usable: usable, mergeIdentities: false), threads)
+        }) {
+            (world.identity, world.contacts, world.routes, world.threads) = people
+        }
+        let delegations = DelegationStatusProjector(configRoot: bridges, dataRoot: dataRoot)
+        if let jobs: (jobs: [DelegationJobProjection], allStoresReadable: Bool) = part("delegations", delegations.watchedPaths, {
+            delegations.allJobsWithAvailability(now: Date())
+        }) {
+            world.jobs = jobs.jobs
+            if !jobs.allStoresReadable, !world.pending.contains("delegations") { world.pending.append("delegations") }
+        }
+        world.health = part("health", [AgentLocalHealth.url(dataRoot), at("agents/peers.json")]
+                + [bridges.appendingPathComponent("claude-bridge/claude-live")], {
+            AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
+        }) ?? [:]
 
-        // Parking is by whole days, so the day is part of the desk's stamp.
-        let day = String(Int(now.timeIntervalSince1970 / 86_400))
-        if let desk: (DeskState?, DeskSplit) = await part("desk", [stamp(at("desk/desk_ops.jsonl")),
-                stamp(at("desk/desk_ops_base.json")), day] + stamps(at("workshop/executions"), file: "execution.json"), {
+        // Parking is drawn from the owner's retained work and execution records.
+        if let desk: (DeskState, Set<String>) = part("desk", [at("desk/desk_ops.jsonl"),
+                at("desk/desk_ops_base.json")] + files(at("workshop/executions"), file: "execution.json"), {
             let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-            guard let state = try? await (locked ? store.liveState() : store.liveStateUnlocked()) else {
-                if locked { return (nil, DeskSplit()) }
-                return nil
-            }
-            return (state, await deskSplit(state, dataRoot: dataRoot, now: now))
-        }) { (world.desk, world.split) = desk }
+            guard let state = try? await store.liveStateUnlocked() else { return nil }
+            let live = Set(await SwiftNativeWorkshopRunner(root: dataRoot).listAll()
+                .filter { DeskParking.executionIsLive(status: $0.status) }.compactMap(\.deskHandle))
+            return (state, live)
+        }) { world.desk = desk.0; world.split = deskSplit(desk.0, live: desk.1, now: now) }
 
-        if let bots: ([BotDefinition], [UUID: ShelfEntry]) = await part("bots",
-                stamps(at("bots/definitions")) + [stamp(at("bots/shelf-index.json"))], {
+        if let bots: ([BotDefinition], [UUID: ShelfEntry]) = part("bots",
+                files(at("bots/definitions")) + [at("bots/shelf-index.json")], {
             let definitions = BotDefinitionStore(dataRoot: dataRoot), shelf = ShelfStore(dataRoot: dataRoot)
-            if locked {
-                let bots = (try? definitions.list()) ?? []
-                let entries = stride(from: 0, to: bots.count, by: 24).flatMap { start in
-                    (try? shelf.latestEntries(botIDs: Set(bots[start..<min(start + 24, bots.count)].map(\.id)))) ?? []
-                }
-                return (bots, Dictionary(entries.map { ($0.botId, $0) }, uniquingKeysWith: { a, _ in a }))
-            }
             guard let bots = try? definitions.listUnlocked(),
                   let entries = try? stride(from: 0, to: bots.count, by: 24).flatMap({ start in
                       try shelf.latestEntriesUnlocked(botIDs: Set(bots[start..<min(start + 24, bots.count)].map(\.id)))
@@ -265,50 +308,58 @@ extension HerScreen {
             return (bots, Dictionary(entries.map { ($0.botId, $0) }, uniquingKeysWith: { a, _ in a }))
         }) { (world.bots, world.latest) = bots }
 
-        world.approvals = await part("approvals", [stamp(at("workflows/approvals/requests.json"))]) {
+        world.approvals = part("approvals", [at("workflows/approvals/requests.json")]) {
             let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-            let rows: [ApprovalRecord]? = locked ? ((try? await inbox.list(filter: .all)) ?? []) : (try? inbox.pendingUnlocked())
-            guard let rows else { return nil }
-            return rows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }
+            guard let rows = try? inbox.pendingUnlocked() else { return nil }
+            return rows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }
                 .sorted { ($0.lastRequestedAt ?? $0.createdAt) > ($1.lastRequestedAt ?? $1.createdAt) }
         } ?? []
         // Memory proposals for the owner's review, the Today page's rule, from
         // the shared store only; kept until the memory database changes.
-        if SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot), let reviews: (count: Int, capped: Bool) = await part("reviews",
-                [stamp(at("memory/memory.sqlite")), stamp(at("memory/memory.sqlite-wal"))], {
+        if SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot), let reviews: (count: Int, capped: Bool) = part("reviews",
+                [at("memory/memory.sqlite"), at("memory/memory.sqlite-wal")], {
             guard let storage = try? await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot),
                   let pending = try? await storage.listProposals(status: "pending", limit: 100) else { return nil }
             return (pending.filter { SwiftNativeMemoryV2.awaitsReview(content: $0.content, source: $0.source, metadata: $0.metadata) }.count,
                     pending.count == 100)
         }) { world.reviews = reviews }
         let inboxPath = LiveNotificationInbox.livePath(dataRoot: dataRoot)
-        if let asks: (count: Int, newest: String?) = await part("asks", [stamp(inboxPath)], {
+        if let asks: (count: Int, newest: String?) = part("asks", [inboxPath], {
             let inbox = inboxPath == LiveNotificationInbox.livePath(dataRoot: PersistenceCore.defaultDataRoot()) ? LiveNotificationInbox.shared : LiveNotificationInbox(path: inboxPath)
             guard let rows = try? await inbox.rows() else { return nil }
-            let asks = rows.compactMap(InboxItemRecord.init(row:)).filter { item in
+            let asks = InboxItemRecord.latest(in: rows).filter { item in
                 item.id != item.related_approval_id
-                    && OwnerAttentionPolicy.inboxAsks(pending: item.isActivityPending, systemLane: item.isSystemLane,
-                        severity: item.severity, linkedApproval: !(item.related_approval_id ?? "").isEmpty, actionIDs: item.actions.map(\.id))
+                    && item.requiresOwnerInput
             }
             return (asks.count, asks.max { $0.created_at < $1.created_at }?.title)
         }) { world.asks = asks.count; world.newestAsk = asks.newest }
-        if let crews: [[String: Any]] = await part("crews", [stamp(at("swarms/live.json")), stamp(at("swarms/runs.json"))], {
-            try? SwiftNativeSwarmRunsReader(runsPath: at("swarms/runs.json")).readCrews(locked: locked)
+        if let crews: [[String: Any]] = part("crews", [at("swarms/live.json"), at("swarms/runs.json")], {
+            try? SwiftNativeSwarmRunsReader(runsPath: at("swarms/runs.json")).readCrews(locked: false)
         }) { world.crews = crews }
         else if !world.unread.contains("crews") { world.unread.append("crews") }
-        // The run queue takes the helpers' store lock and moments are SQLite:
-        // read fresh for home and rooms, the kept value for the glance.
-        if reach != .kept {
-            world.running = (try? BotRunQueue(dataRoot: dataRoot).activeOrQueuedIDs(locked: locked)) ?? []
-            if SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot) {
-                world.moments = await AdaptiveMemoryPromoter.shared.pendingMomentCount()
-            }
-            memo.put(root + "live", (world.running, world.moments))
-        } else if let kept: ((Set<UUID>, Int), Bool) = memo.peek(root + "live", stamp: []) {
-            (world.running, world.moments) = kept.0
-            world.stale = true
-        } else { world.unread.append("live"); world.stale = true }
+        world.running = part("running helpers", [at("bots/run-queue.json")], notifications: [BotRunQueue.didChange]) {
+            try? BotRunQueue(dataRoot: dataRoot).activeOrQueuedIDs(locked: false)
+        } ?? []
+        if SwiftNativeMemoryV2.usesDefaultDataRoot(dataRoot) {
+            world.moments = part("moments", [at("memory/memory.sqlite"), at("memory/memory.sqlite-wal")]) {
+                await AdaptiveMemoryPromoter.shared.pendingMomentCount()
+            } ?? 0
+        }
+        world.doors = part("elsewhere", [at("chat/messages"), at("trust/policy.json")],
+                notifications: [.nativeAgentChatTranscriptDidChange], {
+            MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) ? doorLines(dataRoot: dataRoot, now: Date()) : []
+        }) ?? []
+        world.senses = part("senses", files(at("abilities")) + [at("senses/news/unread.json")]
+                + files(at("senses"), file: "state.json") + files(at("tools"), file: "state.json")
+                + files(at("skills"), file: "state.json"), {
+            await sensesRows(dataRoot: dataRoot, now: Date())
+        }) ?? []
         return world
+    }
+
+    static func freshness(_ world: HerWorld, now: Date = Date()) -> String {
+        "Retained picture" + (world.oldest.map { "; oldest read " + age(now.timeIntervalSince($0)) + " ago" } ?? "; not read yet")
+            + (world.pending.isEmpty ? "" : "; pending: " + world.pending.joined(separator: ", "))
     }
 
     // MARK: - Since you looked
@@ -332,10 +383,11 @@ extension HerScreen {
     /// not depend on who is looking: bridge chats are marked per session
     /// (`chat:<id>`) by the other side's newest message, and the live chat is
     /// left out only when the changes are read (`changes(excluding:)`).
-    static func worldMarks(_ world: HerWorld, dataRoot: URL, person: String, now: Date) -> [String: Mark] {
+    static func worldMarks(_ world: HerWorld, dataRoot: URL, person: String, now: Date, currentOnly: Bool = false) -> [String: Mark] {
         var marks: [String: Mark] = [:]
+        func current(_ parts: String...) -> Bool { !currentOnly || parts.allSatisfy { !world.pending.contains($0) } }
         withNames(dataRoot) { book in
-            for contact in world.contacts {
+            for contact in world.contacts where current("contacts", "people") {
                 let slug = book.slug(id: contact.id, name: contact.name)
                 let record = latest(contact, records: world.records)
                 let message: String? = if case .string(let id)? = record?.readInput?["message_id"] { id } else { nil }
@@ -358,7 +410,7 @@ extension HerScreen {
                 marks[slug] = Mark(fp: [fp(record?.updatedAt), fp(answered), record?.phase ?? "-"].joined(separator: "|"),
                     line: line, at: ([record?.updatedAt, answered].compactMap { $0 }.max() ?? .distantPast).timeIntervalSince1970)
                 for id in Set([contact.id] + contact.agents) {
-                    if let health = world.health[id], health.current {
+                    if let health = world.health[id], health.current, current("health") {
                         marks["health:" + id] = Mark(fp: health.status + ":" + health.detail,
                             line: health.problem.map { slug + ": " + $0 } ?? "", at: health.checkedAt.timeIntervalSince1970)
                     }
@@ -370,7 +422,7 @@ extension HerScreen {
                     marks["chat:" + chat.id] = Mark(fp: fp(chat.heard), line: slug + " wrote", at: chat.heard!.timeIntervalSince1970)
                 }
             }
-            for bot in world.bots {
+            for bot in world.bots where current("bots", "running helpers", "people") {
                 let slug = book.slug(id: "bot:" + bot.id.uuidString, name: bot.name)
                 let entry = world.latest[bot.id], running = world.running.contains(bot.id)
                 var line = slug + " ran"
@@ -387,7 +439,7 @@ extension HerScreen {
                                       entry?.statusDetail ?? "-", entry?.approvalID ?? "-", running ? "running" : "idle"].joined(separator: "|"), line: line,
                                    at: (running ? now : entry?.runAt ?? .distantPast).timeIntervalSince1970)
             }
-            for row in world.crews where row["pid"] != nil {
+            for row in world.crews where row["pid"] != nil && current("crews") {
                 guard let id = row["id"] as? String else { continue }
                 let name = "crew.\(book.number("crew", id: id) { Set(world.crews.compactMap { $0["id"] as? String }) })"
                 let task = clip(firstLine(row["objective"] as? String ?? "A task"), 36)
@@ -395,7 +447,7 @@ extension HerScreen {
                                    at: ((row["createdAt"] as? String).flatMap(date) ?? now).timeIntervalSince1970)
             }
         }
-        if let desk = world.desk {
+        if let desk = world.desk, current("desk") {
             for item in desk.items where item.parent == nil || OwnerAttentionPolicy.waitsOnOwner(item) {
                 let name = "desk." + item.alias
                 let label = OwnerAttentionPolicy.waitsOnOwner(item) ? "waiting on " + person
@@ -404,7 +456,7 @@ extension HerScreen {
                                    gone: name + " closed", at: (date(item.updatedAt) ?? now).timeIntervalSince1970)
             }
         }
-        for approval in world.approvals {
+        for approval in world.approvals where current("approvals") {
             marks["approval:" + approval.id] = Mark(fp: "pending", line: "",
                 new: "approval: " + clip(ApprovalWords.title(action: approval.action, title: approval.title, reason: approval.reason), 40),
                 at: (date(approval.lastRequestedAt ?? approval.createdAt) ?? now).timeIntervalSince1970)
@@ -412,7 +464,7 @@ extension HerScreen {
         let placeClock = DateFormatter()
         placeClock.locale = Locale(identifier: "en_US_POSIX")
         placeClock.dateFormat = "HH:mm"
-        for event in world.phonePlaces {
+        for event in world.phonePlaces where current("phone places") {
             let prefix = "Phone " + event.transition.rawValue + " "
             let when = " (" + placeClock.string(from: event.timestamp) + ", " + age(now.timeIntervalSince(event.timestamp)) + " ago)"
             // Keep the observation time inside the glance's 44-character line budget.
@@ -421,10 +473,10 @@ extension HerScreen {
             marks["phone-place:" + event.id] = Mark(fp: event.id, line: line, new: line,
                 at: event.timestamp.timeIntervalSince1970)
         }
-        for item in world.arrivals {
+        for item in world.arrivals where current("arrivals") {
             marks["arrival:" + item.id] = Mark(fp: item.id, line: "", new: item.renderedLine, at: item.at.timeIntervalSince1970)
         }
-        marks["moments"] = Mark(fp: String(world.moments), line: "", at: now.timeIntervalSince1970)
+        if current("moments") { marks["moments"] = Mark(fp: String(world.moments), line: "", at: now.timeIntervalSince1970) }
         return marks
     }
 
@@ -481,7 +533,7 @@ extension HerScreen {
     /// A room's look: the names that room shows (a person's room includes
     /// their bridge chats).
     static func markRoomSeen(_ location: AgentWorkspaceLocation, dataRoot: URL, scope: String,
-                             observation: (world: HerWorld, at: Date)? = nil) async {
+                             observation: (world: HerWorld, at: Date, health: Set<String>)? = nil) async {
         if observation == nil, case .record("agent_read", let input, _) = location,
            case .string(let agent)? = input["agent"] {
             guard agent.lowercased().hasPrefix("bot:"),
@@ -491,7 +543,7 @@ extension HerScreen {
         let world: HerWorld
         if let observation { world = observation.world }
         else { world = await readWorld(dataRoot, now: now) }
-        let marks = worldMarks(world, dataRoot: dataRoot, person: names(dataRoot).person, now: now)
+        let marks = worldMarks(world, dataRoot: dataRoot, person: names(dataRoot).person, now: now, currentOnly: true)
         var names: Set<String> = []
         switch location {
         case .record("agent_read", let input, _):
@@ -517,7 +569,8 @@ extension HerScreen {
             names = withNames(dataRoot) { book in Set(world.contacts.map { book.slug(id: $0.id, name: $0.name) }) }
         default: return
         }
-        markSeen(dataRoot, marks: marks, only: names, now: now)
+        names.formUnion((observation?.health ?? []).map { "health:" + $0 })
+        markSeen(dataRoot, marks: marks, only: names.intersection(marks.keys), now: now)
     }
 
     // MARK: - The glance line
@@ -525,7 +578,7 @@ extension HerScreen {
     /// Rides every turn in the dynamic segment: what changed since she last
     /// looked, what needs her, and her live built/recent abilities.
     /// - Home changes stay pinned to the turn; ability names are read from
-    ///   their owners at assembly, outside that memo and its 150 ms budget.
+    ///   their owners at assembly, outside that memo.
     /// - Never advances what she has seen; never User's screen or activity data.
     package static func glance(dataRoot: URL, scope: String?, turn: Date?, includingMoments: Bool = true) async -> String? {
         async let abilities = AgentWorkspacePorts.current.tools.builtAbilities(dataRoot: dataRoot, now: turn ?? Date())
@@ -538,36 +591,13 @@ extension HerScreen {
             + "\u{0}" + String(includingMoments)
         if turn != nil, let kept = HerMemo.shared.glance(key) { return kept }
         let now = turn ?? Date()
-        // Parts whose files moved are recomputed inline (read-only, no locks)
-        // so the glance counts what home would. One such read per data root at
-        // a time; past 150 ms the kept values speak and that read finishes in
-        // the background for the next turn.
-        let root = dataRoot.standardizedFileURL.path
-        var text: String?
-        if HerMemo.shared.begin(root) {
-            let ports = AgentWorkspacePorts.current
-            let done: GlanceText? = await withCheckedContinuation { continuation in
-                let once = OnceResume<GlanceText>(continuation)
-                Task.detached(priority: .userInitiated) {
-                    let said = await AgentWorkspacePorts.$binding.withValue(ports) {
-                        await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .unlocked, includingMoments: includingMoments)
-                    }
-                    HerMemo.shared.end(root)
-                    once.resume(GlanceText(text: said))
-                }
-                Task.detached { try? await Task.sleep(for: .milliseconds(150)); once.resume(nil) }
-            }
-            text = done?.text
-            if done == nil { text = await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .kept, includingMoments: includingMoments) }
-        } else { text = await renderGlance(dataRoot: dataRoot, scope: scope, now: now, reach: .kept, includingMoments: includingMoments) }
+        let text = await renderGlance(dataRoot: dataRoot, scope: scope, now: now, includingMoments: includingMoments)
         if turn != nil { HerMemo.shared.keepGlance(key, text) }
         return text
     }
 
-    struct GlanceText: Sendable { let text: String? }
-
-    static func renderGlance(dataRoot: URL, scope: String?, now: Date, reach: Reach, includingMoments: Bool = true) async -> String? {
-        let world = await readWorld(dataRoot, now: now, reach: reach)
+    static func renderGlance(dataRoot: URL, scope: String?, now: Date, includingMoments: Bool = true) async -> String? {
+        let world = await readWorld(dataRoot, now: now)
         let person = names(dataRoot).person
         let seen = await lastSeen(dataRoot)
         // Home's own names (presence, Chrome, badges, tabs) are not the glance's to speak.
@@ -578,7 +608,7 @@ extension HerScreen {
         // their last-seen state, so an unread part reads as unchanged, not gone.
         // Only the desk and crews say "gone"; a helper's running state is the live part's.
         if !world.unread.isEmpty, let seen {
-            let helpers = world.unread.contains("live")
+            let helpers = world.unread.contains("running helpers")
                 ? withNames(dataRoot) { book in Set(world.bots.map { book.slug(id: "bot:" + $0.id.uuidString, name: $0.name) }) } : []
             for (name, mark) in seen.marks where helpers.contains(name)
                 || marks[name] == nil && (world.unread.contains("desk") && name.hasPrefix("desk.")
@@ -606,10 +636,10 @@ extension HerScreen {
             }
         }
         let words = ["people": "people", "desk": "desk", "bots": "helpers", "approvals": "approvals",
-                     "reviews": "memories to review", "crews": "crews", "live": "running helpers and moments"]
+                     "reviews": "memories to review", "crews": "crews"]
         let unread = world.unread.map { words[$0] ?? $0 }
         guard !changed.isEmpty || !waits.isEmpty || !mine.isEmpty || !unread.isEmpty else { return nil }
-        var parts = ["Home glance — snapshot as of \(now.formatted(.iso8601))\(world.stale ? "; retained values may be older" : ""). Desk, inbox, approvals, exchanges, helper/crew status, phone-place/wake records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log."]
+        var parts = ["Home glance — snapshot as of \(now.formatted(.iso8601)). \(freshness(world, now: now)). Desk, inbox, approvals, exchanges, helper/crew status, phone-place/wake records and reviews; no live calendar, reminders, mail, front app, full Doctor check or complete activity log."]
         if let seen, !changed.isEmpty {
             let shown = changed.prefix(3).map { clip($0, 44) }
             parts.append("Since you looked (\(age(now.timeIntervalSince1970 - seen.at))): " + shown.joined(separator: " · ")

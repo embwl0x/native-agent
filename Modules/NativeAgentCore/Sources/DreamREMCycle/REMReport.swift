@@ -32,6 +32,13 @@ public struct REMReport: Sendable, Codable, Equatable {
     /// Of the survivors, how many rest on entries with no provenance at all, so
     /// whether they recurred is not knowable. Said, not assumed.
     public var provenanceUnavailableKept: Int?
+    /// Transient delivery of committed causes, excluded from the counter-only run ledger.
+    public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
+
+    private enum CodingKeys: String, CodingKey {
+        case proposalsGenerated, evidenceDatesMin, tombstoneSkips, growthMDEvicted, archivedEntries
+        case personaTargetDrops, passageBoundDrops, skipReason, dweltOnKept, provenanceUnavailableKept
+    }
 
     public init(
         proposalsGenerated: Int,
@@ -156,3 +163,4 @@ extension REMRunReportPayload {
         return CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 }
+import CognitiveSubstrate

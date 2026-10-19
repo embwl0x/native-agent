@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import Speech
 import AVFoundation
+import NativeAgentShared
 
 /// Recognition events enter the capture lifecycle through the native driver.
 public enum VoiceInputRecognitionEvent: Equatable, Sendable {
@@ -74,9 +75,13 @@ public enum VoiceInputPermissionResult: Equatable, Sendable {
 }
 
 private func makeSpeechAudioTap(
-    request: SFSpeechAudioBufferRecognitionRequest
+    request: SFSpeechAudioBufferRecognitionRequest,
+    recording: SpeechUtterance.Recording,
+    onError: @escaping @Sendable (String) -> Void
 ) -> AVAudioNodeTapBlock {
     { buffer, _ in
+        do { try recording.append(buffer) }
+        catch { onError(error.localizedDescription); return }
         request.append(buffer)
     }
 }
@@ -88,12 +93,10 @@ private func makeSpeechRecognitionHandler(
 ) -> (SFSpeechRecognitionResult?, Error?) -> Void {
     { [weak controller] result, error in
         if let result {
-            let transcript = result.bestTranscription.formattedString
-            let isFinal = result.isFinal
+            let utterance = SpeechUtterance(result)
             Task { @MainActor [weak controller] in
                 controller?.receiveNativeRecognition(
-                    transcript: transcript,
-                    isFinal: isFinal,
+                    utterance: utterance,
                     generation: generation
                 )
             }
@@ -120,6 +123,7 @@ public final class VoiceInputCapture {
     public var transcript = ""
     public var isListening = false
     public var errorMessage: String?
+    public private(set) var attachment: MultimodalAttachment?
 
     public private(set) var permissionGranted = false
     private var recognizer: SFSpeechRecognizer?
@@ -127,6 +131,8 @@ public final class VoiceInputCapture {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var inputTapInstalled = false
+    private var recording: SpeechUtterance.Recording?
+    private var utterance: SpeechUtterance?
     private let recognitionContext: @MainActor () -> [String]
     private let requestSpeechAuthorization: @MainActor () async -> SFSpeechRecognizerAuthorizationStatus
     private let failureMessage: @Sendable (Error, String) -> String
@@ -170,6 +176,8 @@ public final class VoiceInputCapture {
 
     private func prepareForCapture() {
         latestStopResult = nil
+        attachment = nil
+        utterance = nil
     }
 
     private func beginCapture() -> UInt64 {
@@ -245,6 +253,16 @@ public final class VoiceInputCapture {
         recognitionGeneration &+= 1
         stopGeneration &+= 1
         cancelRecognition()
+        var result = result
+        if case .final? = result, let utterance, let recording {
+            do { attachment = try recording.finish(utterance: utterance) }
+            catch {
+                let message = "Couldn't retain voice audio: \(error.localizedDescription)"
+                errorMessage = message
+                result = .failed(message)
+            }
+        }
+        recording = nil
         isListening = false
         stopTimeoutTask?.cancel()
         stopTimeoutTask = nil
@@ -356,11 +374,23 @@ public final class VoiceInputCapture {
             return
         }
 
-        let tap = makeSpeechAudioTap(request: request)
+        let recording: SpeechUtterance.Recording
+        do { recording = try SpeechUtterance.Recording(format: recordingFormat) }
+        catch {
+            errorMessage = "Couldn't retain voice audio: \(error.localizedDescription)"
+            recognitionRequest = nil
+            return
+        }
+        self.recording = recording
+        let generation = beginCapture()
+        let tap = makeSpeechAudioTap(request: request, recording: recording) { [weak self] message in
+            Task { @MainActor [weak self] in
+                self?.receiveNativeRecognitionFailure(message: message, generation: generation)
+            }
+        }
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat, block: tap)
         inputTapInstalled = true
 
-        let generation = beginCapture()
         // A recognition callback can arrive while the engine begins. Install
         // the active state before registering it so a synchronous final stays
         // terminal rather than being overwritten after cleanup.
@@ -378,12 +408,13 @@ public final class VoiceInputCapture {
     }
 
     fileprivate func receiveNativeRecognition(
-        transcript: String,
-        isFinal: Bool,
+        utterance: SpeechUtterance,
         generation: UInt64
     ) {
+        guard recognitionGeneration == generation else { return }
+        self.utterance = utterance
         receive(
-            isFinal ? .final(transcript) : .partial(transcript),
+            utterance.isFinal ? .final(utterance.text) : .partial(utterance.text),
             generation: generation
         )
     }

@@ -152,7 +152,7 @@ extension SwiftNativeSecurityCenter {
     // is her own helper: it inherits her posture exactly (User 10-17).
     static let fullMacYoloLocalSurfaces: Set<String> = Set(
         [
-            "chat", "app", "bot", "desk", "codex-bridge", "claude-bridge",
+            "chat", "app", "bot", "desk",
             "connector_action", "nextgen_action", "native_actions", "mcp_ui",
         ]
             + WorkshopSurfaceVocabulary.gateSpellings

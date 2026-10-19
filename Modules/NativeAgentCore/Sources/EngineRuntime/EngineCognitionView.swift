@@ -373,7 +373,7 @@ extension CognitionViewFacade {
                 activeDeskCount: activeDeskCount,
                 blockedDeskCount: blockedDeskCount,
                 ownerWaiting: overview.needsYouCount,
-                pendingApprovals: approvalRows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }.count,
+                pendingApprovals: approvalRows.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }.count,
                 latestDream: latestDream,
                 agentDisplayName: agentDisplayName()
             ),

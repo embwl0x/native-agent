@@ -57,7 +57,7 @@ extension QuietInboxHost {
     }
 
     private func inboxGate(verb: String, input: [String: JSONValue]) async -> Result<QuietInboxTarget, QuietInboxRefusal> {
-        func refuse(_ json: JSONValue) -> Result<QuietInboxTarget, QuietInboxRefusal> { .failure(QuietInboxRefusal(json: json)) }
+        func refuse(_ json: JSONValue) -> Result<QuietInboxTarget, QuietInboxRefusal> { .failure(QuietInboxRefusal(json: ChatToolOutcome.refusedBeforeRunning(json))) }
         func text(_ key: String) -> String { Self.inboxText(input, key) }
         let items: [InboxItemRecord]
         do { items = try await self.readInbox() } catch {
@@ -150,14 +150,32 @@ extension QuietInboxHost {
                     extra: ["id": .string(item.id)]))
             }
             let fence = opensForUser ? nil : await inboxFloor(item, action: action, dataRoot: self.inboxDataRoot)
+            let peerSteered = CapabilityLifecycle.writeRefusal != nil
+                || (PeerTurnEffectPolicy.isPeerBridge(surface: TurnEnvelope.current(surface: "").surface) && !PeerDataTaint.trustedTurn)
+            if action == "approve", peerSteered, item.related_approval_id == nil {
+                return refuse(AppToolExecutor.failure("owners_call",
+                    "This inbox item has no owner-review approval record. A peer-steered turn cannot supply the person's consent.",
+                    extra: ["remedy": Repair.why(owner: "inbox item \(item.id)", tap: "Today > \(item.title) > Approve")]))
+            }
             // Two cards are a person's under Full Mac too: a skill script's Install
             // (approving admits the script as his) and a destructive call's (User,
             // 10-17: what cannot be undone on his side waits for a human's tap, one
             // card every time). Her own approve never stands in for his.
-            if action == "approve", let approvalID = item.related_approval_id,
-               let record = try? await SwiftNativeApprovalInbox(
-                   root: self.dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()).get(approvalID) {
+            if action == "approve", let approvalID = item.related_approval_id {
+                let record: ApprovalRecord
+                do { record = try await SwiftNativeApprovalInbox(root: self.inboxDataRoot).get(approvalID) }
+                catch {
+                    return refuse(AppToolExecutor.failure("approval_unavailable",
+                        "workflows/approvals/requests.json card \(approvalID) could not be read: \(error.localizedDescription). No consent was supplied."))
+                }
                 let install = record.action == SwiftNativeApprovalInbox.skillScriptInstallAction
+                if peerSteered,
+                   !SwiftNativeApprovalInbox.ownerReviewActions.contains(record.action) {
+                    return refuse(AppToolExecutor.failure("owners_call",
+                        "Approval \(record.id) is \(record.action), not a review of your own work. A peer-steered turn cannot supply the person's consent.",
+                        extra: ["remedy": Repair.why(owner: "workflows/approvals/requests.json card \(record.id)",
+                            tap: "Today > \(record.title) > Approve")]))
+                }
                 if install || PermissionLaw.humanDecides(action: record.action, payload: record.payload) {
                     return refuse(AppToolExecutor.failure("owners_call",
                         "That's the owner's even under Full Mac: " + (install
@@ -212,7 +230,7 @@ extension QuietInboxHost {
                     await self.refreshInboxSurfaces()
                     return AppToolExecutor.failure("write_failed",
                         "\(error.localizedDescription) Nothing after \(id) was touched; retry with the ids not in done.",
-                        extra: ["done": .array(done), "id": .string(id)])
+                        extra: ["done": .array(done), "id": .string(id), "effects": .string(done.isEmpty ? "unknown" : "partial")])
                 }
             }
             await self.refreshInboxSurfaces()
@@ -247,7 +265,7 @@ extension QuietInboxHost {
                 try await self.withdrawApproval(id: approvalID, decidedBy: "agent_withdraw")
             } catch {
                 return AppToolExecutor.failure("withdraw_failed",
-                    "\(error.localizedDescription) The approval is unchanged; read the note again, then retry.")
+                    "\(error.localizedDescription) The approval is unchanged; read the note again, then retry.", extra: ["effects": .string("unknown")])
             }
             await self.refreshInboxSurfaces()
             return .object(["status": .string("ok"), "verb": .string(verb), "id": .string(ids[0]),
@@ -259,7 +277,7 @@ extension QuietInboxHost {
                 try await self.performInboxAction(item.id, action: action, metadata: [:], quiet: true, dataRootOverride: self.dataRootOverride)
             } catch {
                 return AppToolExecutor.failure("act_failed", error.localizedDescription,
-                    extra: ["id": .string(item.id), "action": .string(action)])
+                    extra: ["id": .string(item.id), "action": .string(action), "effects": .string("unknown")])
             }
             await self.refreshInboxSurfaces()
             if target.decided {
@@ -274,8 +292,7 @@ extension QuietInboxHost {
 
     /// Needs you as Today and the Desk count it (`OwnerAttentionPolicy`).
     private func inboxNeedsYou(_ item: InboxItemRecord) -> Bool {
-        OwnerAttentionPolicy.inboxAsks(pending: item.isActivityPending, systemLane: item.isSystemLane,
-            severity: item.severity, linkedApproval: inboxPresentation(item).linkedApproval, actionIDs: item.actions.map(\.id))
+        item.requiresOwnerInput
     }
 
     private func inboxList(_ items: [InboxItemRecord], filter: String, limit: JSONValue?) -> JSONValue {

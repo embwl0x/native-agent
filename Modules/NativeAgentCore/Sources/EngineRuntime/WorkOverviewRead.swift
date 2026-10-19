@@ -5,6 +5,7 @@ import NativeAgentShared
 import NativeAgentCore
 import NotificationInbox
 import PersistenceCore
+import Privacy
 import WorkshopExecution
 
 /// One surface-neutral projection over the canonical owners. Only explicit
@@ -17,9 +18,9 @@ public enum WorkOverviewRead {
 
     /// Needs you is `OwnerAttentionPolicy`, applied once here.
     static func project(board: DeskBoardRead, approvals: [ApprovalRecord], inbox: [InboxItemRecord],
-                        unavailable: [String], now: Date) -> WorkOverview {
+                        experiences: [Experience] = [], unavailable: [String], now: Date) -> WorkOverview {
         let executions = board.executions.items.sorted { $0.updatedAt > $1.updatedAt }
-        let pending = approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status) }
+        let pending = approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }
         func approvalIDs(_ item: DeskItem) -> Set<String> {
             Set(item.refs.compactMap { ref in
                 if case .approval(let id, _) = ref.kind { return id }
@@ -49,7 +50,9 @@ public enum WorkOverviewRead {
                   updatedAt: updated, location: location, movementAt: movement)
         }
         var needs = pending.map {
-            row(.approval, $0.id, $0.title, $0.reason, "Decision needed",
+            // Redacted before it leaves for the phone: a lesson can quote anything.
+            row(.approval, $0.id, $0.title,
+                TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText($0.readableAsk)), "Decision needed",
                 $0.lastRequestedAt ?? $0.createdAt, detail: 1_000)
         }
         let approvalExecutions = executions.filter { $0.status == "blocked_on_approval" }
@@ -71,15 +74,10 @@ public enum WorkOverviewRead {
             needs.append(row(.desk, item.handle, item.title, item.blockedReason ?? item.summary ?? "",
                              "Needs you", item.updatedAt, location: item.project, detail: 1_000))
         }
-        for item in inbox where OwnerAttentionPolicy.inboxAsks(pending: item.isActivityPending, systemLane: item.isSystemLane,
-                severity: item.severity, linkedApproval: !(item.related_approval_id ?? "").isEmpty, actionIDs: item.actions.map(\.id)) {
-            let actions = Set(item.actions.map(\.id))
-            let mirrorsApproval = pending.contains {
-                item.related_approval_id == $0.id && item.id == $0.id
-                    && actions.contains("approve") && !actions.isDisjoint(with: ["reject", "deny"])
-                    && actions.isSubset(of: ["approve", "reject", "deny", "view", "read", "dismiss"])
-            }
-            if mirrorsApproval { continue }
+        for item in inbox where item.requiresOwnerInput {
+            // The approval owns both its wait and its settlement. Its old
+            // inbox face must not become a new ask once it leaves pending.
+            if item.id == item.related_approval_id { continue }
             // Contextual links do not establish that a note is the same ask.
             needs.append(row(.inbox, item.id, item.title, item.detail ?? item.summary,
                              "Needs you", item.created_at, detail: 1_000))
@@ -128,11 +126,14 @@ public enum WorkOverviewRead {
         }
         let captureFormatter = ISO8601DateFormatter()
         captureFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return .init(capturedAt: captureFormatter.string(from: now),
+        var overview = WorkOverview(capturedAt: captureFormatter.string(from: now),
                      now: Array(sorted(current).prefix(24)), needsYou: Array(sorted(needs).prefix(needsYouLimit)),
                      recentlyDone: Array(sorted(recent).prefix(12)), unavailable: unavailable,
                      omittedNow: max(0, current.count - 24), omittedNeedsYou: max(0, needs.count - needsYouLimit),
                      omittedRecentlyDone: max(0, recent.count - 12))
+        overview.experiences = experiences.map(\.mobile)
+        overview.needsYouCounts = Dictionary(grouping: needs, by: \.reference.kind).mapValues(\.count)
+        return overview
     }
 
     /// Progress and the next step while an execution runs, its full result and

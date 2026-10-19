@@ -6,6 +6,7 @@ import EngineRuntime
 import BackgroundLoops
 import BackgroundWork
 import DoctorChecks
+import DeviceSync
 import NativeAgentCore
 import NativeAgentShared
 
@@ -45,6 +46,11 @@ struct AppDoctorPort: EngineDoctorPlatformPort {
     func doctorRestartLoop(id: String) async -> LoopRestartOutcome {
         await NativeAgentEngine.restartBackgroundLoop(id: id, manager: backgroundLoopsManager)
     }
+
+    func doctorRepairPhoneSync() async -> DoctorRepairAttempt? {
+        .unverified(await NativeAgentEngine.liveDeviceSync.engine.repairPhoneSync())
+    }
+
     func doctorStartBridge(name: String) async {
         switch name {
         case "ClaudeBridge": await ClaudeBridgeRuntime.shared.startServer()

@@ -1,157 +1,153 @@
 import Foundation
+import NativeAgentCore
+import PersistenceCore
+import Transcripts
+import CognitiveSubstrate
+import Studio
 
-// MARK: - Dream provenance (item 4)
-//
-// A dream used to end at "_(woven from 3 conversations)_" — a COUNT. A count
-// cannot tell a week apart from a night: three dreams about one evening and
-// three evenings each dreamt once collapse to the same number, and REM, reading
-// only the dream dates, called both of them recurrence.
-//
-// The dream now retains WHAT it was woven from: the source message / encounter
-// ids it actually read, and the date each of those things HAPPENED — the lived
-// date, which is not the date of the dream. REM reads those lines back and
-// counts INDEPENDENT LIVED DATES separately from DREAM DATES.
-//
-// Nothing here reaches the dream prompt. It is written after the model has
-// spoken, exactly like the studio citation line beside the mood.
-
-/// One thing a dream was woven from: a transcript row or a studio encounter,
-/// with the date it HAPPENED (not the date it was dreamt about).
+/// An original row, its known exchange, or a consolidated stretch.
 public struct DreamSourceRef: Sendable, Equatable {
-    /// `message` for a transcript row, `recollection` for a consolidated
-    /// stretch, `studio_entry` for a filed journal encounter.
     public var kind: String
-    /// The row / entry id, verbatim, so the chain can be walked by hand.
     public var id: String
-    /// The conversation the row belongs to, when there is one.
     public var sessionID: String?
-    /// `YYYY-MM-DD` in the local calendar — when this actually happened.
     public var livedDate: String
+    public var messageID: String?
 
-    public init(kind: String, id: String, sessionID: String? = nil, livedDate: String) {
+    public init(kind: String, id: String, sessionID: String? = nil, livedDate: String, messageID: String? = nil) {
         self.kind = kind
         self.id = id
         self.sessionID = sessionID
         self.livedDate = livedDate
+        self.messageID = messageID
+    }
+
+    public var reference: String {
+        "\(kind):\(sessionID.map { $0 + "/" } ?? "")\(id)\(messageID.map { "#message:" + $0 } ?? "")@\(livedDate)"
     }
 }
 
-/// The provenance a dream entry carries, and the parse of it back out.
-///
-/// `nil` from `parse` means the entry carries NO provenance line at all (every
-/// diary entry written before this shape existed). That is reported as
-/// "provenance unavailable" — it is never silently treated as support.
-public struct DreamEntryProvenance: Sendable, Equatable {
-    /// Distinct `YYYY-MM-DD` dates the dream's material actually happened on,
-    /// ascending. Empty means the dream said so honestly: it had none to give.
-    public var livedDates: [String]
-    /// The source refs, as written (`<kind>:<id>` or `<kind>:<session>/<id>`).
+/// Each claim keeps only the experiences the dream named for that claim.
+/// Old diary-wide provenance cannot establish a claim's support.
+public struct DreamEntryProvenance: Sendable, Codable, Equatable {
+    public var quote: String
     public var sourceRefs: [String]
 
-    public init(livedDates: [String], sourceRefs: [String]) {
-        self.livedDates = livedDates
-        self.sourceRefs = sourceRefs
+    private enum CodingKeys: String, CodingKey {
+        case quote
+        case sourceRefs = "source_refs"
     }
 
-    /// TRUE when the entry named its sources but had none to name.
-    public var isEmpty: Bool { livedDates.isEmpty && sourceRefs.isEmpty }
+    private static let prefix = "<!-- claim-sources "
+    private static let peersPrefix = "<!-- dream-peers "
 
-    // MARK: Wire shape
-
-    static let livedPrefix = "_Lived on: "
-    static let sourcesPrefix = "_Sources: "
-    /// The honest label for a dream that could not resolve where its material
-    /// came from. Never omitted — an absent line is indistinguishable from a
-    /// line that was never written, and the difference is the whole point.
-    public static let unavailableLabel = "provenance unavailable"
-    /// Bound on what one entry writes, so a 300-row night can't bloat the diary.
-    static let sourceRefLimit = 24
-    private static let dateRegex: NSRegularExpression = {
-        // swiftlint:disable:next force_try
-        try! NSRegularExpression(pattern: #"\d{4}-\d{2}-\d{2}"#)
-    }()
-
-    /// The provenance block a dream entry carries, or the honest unavailable
-    /// line when there is nothing to bind. Always emits the `_Lived on:` line
-    /// so a reader (and REM) can tell "nothing to cite" from "written before
-    /// this existed".
-    public static func renderBlock(_ sources: [DreamSourceRef]) -> String {
-        var seenRefs = Set<String>()
-        var refs: [String] = []
-        var seenDates = Set<String>()
-        for source in sources {
-            let id = source.id.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !id.isEmpty else { continue }
-            let date = source.livedDate.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard isDateStem(date) else { continue }
-            seenDates.insert(date)
-            let session = source.sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let body = (session?.isEmpty == false) ? "\(session!)/\(id)" : id
-            let ref = "\(source.kind):\(body)@\(date)"
-            guard seenRefs.insert(ref).inserted else { continue }
-            if refs.count < sourceRefLimit { refs.append(ref) }
-        }
-        let dates = seenDates.sorted()
-        guard !dates.isEmpty else {
-            return "\(livedPrefix)\(unavailableLabel)_\n\n"
-        }
-        var out = "\(livedPrefix)\(dates.joined(separator: ", "))_\n\n"
-        if !refs.isEmpty {
-            out += "\(sourcesPrefix)\(refs.joined(separator: " · "))_\n\n"
-        }
-        return out
+    static func peerIds(in content: String) -> [String]? {
+        guard let line = content.components(separatedBy: "\n").last(where: { $0.hasPrefix(peersPrefix) }),
+              line.hasSuffix(" -->") else { return nil }
+        return try? JSONDecoder().decode([String].self, from: Data(line.dropFirst(peersPrefix.count).dropLast(4).utf8))
     }
 
-    /// Read the block back out of a diary entry. `nil` when the entry has no
-    /// `_Lived on:` line — a legacy entry, whose provenance is UNAVAILABLE and
-    /// must not be counted as lived recurrence.
-    public static func parse(_ content: String?) -> DreamEntryProvenance? {
-        guard let content else { return nil }
-        var livedLine: String?
-        var sourcesLine: String?
-        for raw in content.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(raw).trimmingCharacters(in: .whitespaces)
-            if livedLine == nil, line.hasPrefix(livedPrefix) { livedLine = line }
-            if sourcesLine == nil, line.hasPrefix(sourcesPrefix) { sourcesLine = line }
-        }
-        guard let livedLine else { return nil }
-        if livedLine.contains(unavailableLabel) {
-            return DreamEntryProvenance(livedDates: [], sourceRefs: [])
-        }
-        let dates = Set(matches(of: dateRegex, in: livedLine)).sorted()
-        var refs: [String] = []
-        if let sourcesLine {
-            var body = String(sourcesLine.dropFirst(sourcesPrefix.count))
-            if body.hasSuffix("_") { body.removeLast() }
-            refs = body.components(separatedBy: " · ")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-        }
-        return DreamEntryProvenance(livedDates: dates, sourceRefs: refs)
+    static func peerBlock(_ peers: [String]?) throws -> String {
+        "\(peersPrefix)\(String(decoding: try JSONEncoder().encode(peers), as: UTF8.self)) -->\n"
     }
 
-    static func isDateStem(_ s: String) -> Bool {
-        let range = NSRange(s.startIndex..., in: s)
-        guard let match = dateRegex.firstMatch(in: s, options: [], range: range) else { return false }
-        return match.range == range
-    }
-
-    private static func matches(of regex: NSRegularExpression, in s: String) -> [String] {
-        let range = NSRange(s.startIndex..., in: s)
-        return regex.matches(in: s, options: [], range: range).compactMap {
-            Range($0.range, in: s).map { r in String(s[r]) }
+    static func transcriptCause(_ row: [String: JSONValue], session: String) -> CognitiveReflectionCause? {
+        guard case .string(let role)? = row["role"] else { return nil }
+        var metadata: [String: JSONValue] = [:]
+        if case .object(let value)? = row["metadata"] { metadata = value }
+        metadata["sessionId"] = .string(session)
+        if let recollection = ChatSessionRecollections.recollection(fromTranscriptRow: .object(row), sessionId: session) {
+            // Continuity records the participant, not the consumed peer checkpoint.
+            return CognitiveReflectionCause(text: "\(DreamCycleRunner.recollectionRole):\n\(recollection.text)")
         }
+        guard ["user", "assistant"].contains(role), case .string(let content)? = row["content"] else { return nil }
+        let text = "\(role):\n\(content)"
+        var peers = CognitiveSubstrate.peerIdentity(metadata: metadata).map { [$0] } ?? []
+        let binding = ChatSessionRecollections.continuityBinding(role: role, metadata: metadata)
+        if case .object(let value)? = binding, case .string(let participant)? = value["participant"],
+           participant.hasPrefix("peer:") { peers.append(participant) }
+        var carried = [metadata["untrusted_sources"]]
+        if case .object(let origin)? = metadata["origin"] {
+            carried += [origin["peerSources"], origin["elevatedPeerSources"]]
+        }
+        for value in carried.compactMap({ $0 }) {
+            guard case .array(let sources) = value else { return CognitiveReflectionCause(text: text) }
+            for source in sources {
+                guard case .string(let peer) = source else { return CognitiveReflectionCause(text: text) }
+                peers.append(peer)
+            }
+        }
+        return CognitiveReflectionCause(text: text, sourcePeerIds: Array(Set(peers)).sorted())
     }
 
-    /// The local-calendar `YYYY-MM-DD` a timestamp belongs to — the unit the
-    /// diary is named in, so a lived date and a dream date are comparable.
+    /// Resolve exact cited rows; an exchange identity groups recurrence, not its material.
+    static func resolveSources(_ refs: Set<String>, dataRoot: URL,
+        messages: [String: (session: String, row: [String: JSONValue])]
+    ) async throws -> [String: CognitiveReflectionCause] {
+        var material: [String: CognitiveReflectionCause] = [:]
+        var journal: [StudioJournalEntry]?
+        for ref in refs.sorted() {
+            if let message = messages[ref] {
+                material[ref] = transcriptCause(message.row, session: message.session)
+                continue
+            }
+            let parts = ref.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let path = parts[1].split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                .split(separator: "/", maxSplits: 1).map(String.init)
+            switch parts[0] {
+            case "studio_entry":
+                guard path.count == 1 else { continue }
+                if journal == nil { journal = try await SwiftNativeStudioStore(dataRoot: dataRoot).journalEntriesIncludingArchive() }
+                if let entry = journal?.first(where: { $0.id == path[0] }) {
+                    material[ref] = CognitiveReflectionCause(text: String(decoding: try entry.toJSON().serializedData(pretty: true), as: UTF8.self))
+                }
+            default: break
+            }
+        }
+        return material
+    }
+
+    static func renderBlock(_ claims: [Self], content: String, sources: [DreamSourceRef]) throws -> String {
+        guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers") else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "dream prose contains reserved claim metadata"))
+        }
+        let allowed = Set(sources.map(\.reference))
+        var result = ""
+        for claim in claims {
+            guard !claim.quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  content.contains(claim.quote), Set(claim.sourceRefs).isSubset(of: allowed) else {
+                throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "dream claim has unbound source lineage"))
+            }
+            let data = try JSONEncoder().encode(claim)
+            result += "\(prefix)\(String(decoding: data, as: UTF8.self)) -->\n"
+        }
+        return result
+    }
+
+    static func sources(for quote: String? = nil, in content: String) -> [String] {
+        var refs = Set<String>()
+        for line in content.trimmingCharacters(in: .newlines).components(separatedBy: "\n").reversed() {
+            guard line.hasPrefix(prefix), line.hasSuffix(" -->") else { break }
+            let json = line.dropFirst(prefix.count).dropLast(4)
+            guard let claim = try? JSONDecoder().decode(Self.self, from: Data(json.utf8)),
+                  quote == nil || claim.quote.trimmingCharacters(in: .whitespacesAndNewlines)
+                    == quote?.trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
+            refs.formUnion(claim.sourceRefs)
+        }
+        // Historical diary-wide refs recover material, never support a quoted claim.
+        if quote == nil {
+            for line in content.components(separatedBy: "\n") where line.hasPrefix("_Sources: ") && line.hasSuffix("_") {
+                refs.formUnion(line.dropFirst(10).dropLast().components(separatedBy: " · ")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+            }
+        }
+        return refs.sorted()
+    }
+
     public static func dateStem(for date: Date) -> String {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .current
         let parts = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(
-            format: "%04d-%02d-%02d",
-            parts.year ?? 0, parts.month ?? 0, parts.day ?? 0
-        )
+        return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
     }
 }

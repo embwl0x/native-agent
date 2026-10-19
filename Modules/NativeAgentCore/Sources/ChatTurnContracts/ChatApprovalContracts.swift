@@ -77,7 +77,7 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
 }
 
 public enum AutonomyGateError: Error, LocalizedError, Equatable {
-    case toolDenied(reason: String)
+    case toolDenied(reason: String, remedy: JSONValue? = nil)
     case notRun(ToolNotRunStatus)
     case noApprovalInboxWired
     case approvalFilingFailed(String)
@@ -92,7 +92,7 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
     }
 
     public var errorDescription: String? {
-        if case .toolDenied(let reason) = self { return ToolNotRunStatus.blockedSentence(reason: reason) }
+        if case .toolDenied(let reason, _) = self { return ToolNotRunStatus.blockedSentence(reason: reason) }
         return notRunStatus.sentence()
     }
 }

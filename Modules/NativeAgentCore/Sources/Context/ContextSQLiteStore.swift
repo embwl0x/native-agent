@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import GRDB
+import PersistenceCore
 
 public struct ContextStoreHealthSnapshot: Sendable, Equatable {
     public let databaseURL: URL
@@ -31,6 +32,9 @@ public struct ContextStoreHealthSnapshot: Sendable, Equatable {
 /// project sources remain authoritative; this actor only publishes immutable
 /// derived generations.
 public actor ContextSQLiteStore {
+    public static let diskStorageOwner = DiskStorageOwner.retained(id: "context", roots: ["context"],
+        policy: "Kept to keep recall available; this active derived index cannot be safely dropped during cleanup.")
+
     public let databaseURL: URL
     private let dbPool: DatabasePool
 

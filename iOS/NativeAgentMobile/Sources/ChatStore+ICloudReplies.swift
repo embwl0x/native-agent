@@ -830,7 +830,8 @@ extension ChatStore {
                 type: $0.type,
                 mime: $0.mime,
                 base64: $0.base64,
-                byteSize: $0.byteSize
+                byteSize: $0.byteSize,
+                utterance: $0.utterance
             )
         }
     }

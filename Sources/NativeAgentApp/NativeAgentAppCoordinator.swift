@@ -242,7 +242,10 @@ final class NativeAgentAppCoordinator {
         }
         observe(.openApprovalsRequest) { _ in .activity(.approvals) }
         observe(.openTelegramRequest) { _ in .sidebar(.telegram) }
-        observe(.openTrustMultimodalRequest) { _ in .sidebar(.trust) }
+        observe(.openTrustMultimodalRequest) { _ in
+            Task { @MainActor in SettingsLink.open(.trust, tab: TrustTab.features.rawValue) }
+            return nil
+        }
         // Inbox act → chat draft: the coordinator only activates the window and
         // lands on Chat; ContentView's receiver does the draft injection.
         observe(.openChatDraftRequest) { _ in .sidebar(.chat) }

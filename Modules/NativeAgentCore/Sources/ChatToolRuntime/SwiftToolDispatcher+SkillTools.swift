@@ -33,14 +33,20 @@ extension SwiftToolDispatcher {
             throw AutonomyGateError.toolDenied(reason: "skill.save requires a JavaScript run(input) routine and the originating app door.")
         }
         raw["entry"] = .string("run")
+        // What it calls is read off its own code; a listed id adds one it reaches dynamically.
+        if case .string(let source)? = raw["source"] {
+            let listed: [JSONValue] = if case .array(let ids)? = raw["actions"] { ids } else { [] }
+            raw["actions"] = .array(SkillScript.calledActions(source).filter { host.dependencyShape($0) != nil }.map(JSONValue.string) + listed)
+        }
         let script = try SkillScript.normalized(.object(raw))
         let actions: [JSONValue] = if case .object(let fields) = script, case .array(let ids)? = fields["actions"] { ids } else { [] }
+        // Each dependency's whole contract, so an additive change to it still fits.
         var pins: [String: JSONValue] = [:]
         for case .string(let id) in actions {
-            guard let pin = host.dependencyPin(id) else {
+            guard let contract = host.dependencyShape(id) else {
                 throw AutonomyGateError.toolDenied(reason: "Declare an available app action; \(id) is unavailable.")
             }
-            pins[id] = .string(pin)
+            pins[id] = contract
         }
         let steer = PeerDataTaint.carried(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                           peerID: ChatToolSessionContext.envelope?.verifiedUserId)
@@ -56,10 +62,10 @@ extension SwiftToolDispatcher {
         // The road from here, each step handing back the next: validate with
         // input that fits its params, enable, run.
         let sample = ToolSignature.example(SkillScript.inputSchema(script), name: "input")
-        return .object(["status": .string("saved"), "skill": .string(name), "candidate_digest": row["candidateDigest"] ?? .null,
+        return .object(["status": .string("saved"), "skill": .string(name), "actions": .array(actions), "candidate_digest": row["candidateDigest"] ?? .null,
             "selected_version": row["codeFingerprint"] ?? .null, "skill_status": row["status"] ?? .null,
             "next_call": .object(["action": .string("skill.validate"), "args": .object(["name": .string(name), "input": sample])]),
-            "then": .string("skill.enable {name} turns the validated candidate on; skill.run {name, args} runs it."),
+            "then": .string("skill.enable {name} turns the rehearsed candidate on; skill.run {name, args} runs it. Rehearsal proves no live behavior."),
             "authority": .string("Every routine call takes the ordinary turn's dispatch chain; a skill grants no authority.")])
     }
 }

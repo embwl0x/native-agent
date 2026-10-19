@@ -216,7 +216,7 @@ public enum SenseDoor {
         }
         do { _ = try await source.material(for: corner, address: address) }
         catch {
-            return try await fallback((error as? SenseFailure) ?? SenseFailure(code: "source_unavailable", message: error.localizedDescription),
+            return try await fallback(SenseFailure(error, code: "source_unavailable"),
                 record: record, address: address, source: source)
         }
         guard let runner = SensesHub.shared.runner else {
@@ -383,7 +383,8 @@ public enum SenseDoor {
     private static func fallback(_ failure: SenseFailure, record: SenseRecord, address: String?, source: DoorSource) async throws -> JSONValue {
         let result = try await $readingRaw.withValue(true) { try await source.rawResult() }
         return signedRaw(.object(["ok": .bool(false), "status": .string("failed"),
-            "error_code": .string(failure.code), "error": .string(failure.message), "raw": result]),
+            "error_code": .string(failure.code), "error": .string(failure.message), "raw": result,
+            "remedy": failure.remedy ?? .null]),
             line: "raw view · sense \(record.id) v\(record.version) unavailable: \(failure.code); no sense page served")
     }
 }
@@ -566,7 +567,7 @@ public final class SenseDoorViews: @unchecked Sendable {
         }
         lock.withLock {
             views.removeAll { $0.page.address == page.address && $0.record.id == record.id && $0.scope == scope }
-            views.append(View(page: page, record: record, makeSource: makeSource, scope: scope, materialRef: materialRef, readInput: readInput, capturedMaterial: capturedMaterial, growthCheck: { turnCheck() ?? growthCheck?() }, fullPage: fullPage))
+            views.append(View(page: page, record: record, makeSource: makeSource, scope: scope, materialRef: materialRef, readInput: readInput, capturedMaterial: capturedMaterial, growthCheck: { turnCheck()?.message ?? growthCheck?() }, fullPage: fullPage))
             if views.count > 32 { views.removeFirst(views.count - 32) }
         }
     }

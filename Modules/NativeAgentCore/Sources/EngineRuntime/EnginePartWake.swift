@@ -6,6 +6,7 @@ import BackgroundLoops
 import BackgroundWork
 import ChatOrchestration
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 import Senses
@@ -79,6 +80,7 @@ actor EnginePartWake {
 
     private func deliver(_ signal: String, only: String? = nil, except: String? = nil,
                          _ payload: [String: JSONValue], dataRoot: URL) async {
+        reindex(dataRoot: dataRoot)
         let parts = (index[signal] ?? []).filter { (only == nil || $0.id == only) && $0.id != except }
         guard !parts.isEmpty else { return }
         guard await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot) else {
@@ -106,18 +108,29 @@ actor EnginePartWake {
     private func begin(_ key: String) { waiting.remove(key) }
 
     private static func run(_ file: AbilityStore.File, input: [String: JSONValue], dataRoot: URL) async {
+        let wake = "wake-" + UUID().uuidString.lowercased()
         let taint = PeerDataTaint()
         if case .string(let agent)? = input["agent"], !PeerTrust.ownerTrusts(agent, dataRoot: dataRoot) { taint.mark(peer: agent) }
         // A tainted signal reaches only a part that can do no harm with it: a
         // part that can write skips it, with a trace row and no card for the
         // person (User 10-15: a card is a decision, never weight).
         if taint.isTainted, !Self.readsOnly(file, dataRoot: dataRoot) {
+            let peer = taint.sourceDescription
+            // The peer's name comes from its authenticated contact binding,
+            // never from parsing the steer's own words.
+            // Several authenticated peers may have steered it; each is named, or none is.
+            let sources: [String] = if case .string(let agent)? = input["agent"] { agent.components(separatedBy: ", ") } else { [] }
+            let names = sources.map { PeerDataTaint.sourceName($0) }
+            let tap = !names.isEmpty && names.allSatisfy({ $0 != nil })
+                ? names.compactMap { $0 }.map { "Trust > Connected agents > " + $0 }.joined(separator: "; ") : nil
+            let failure = CapabilityLifecycle.peerRefusal(peer, tap: tap)
             nativeLog("[wake] %@ skipped a tainted %@ signal: it can write", file.id, String(describing: input["signal"]))
-            TurnTraceBus.fire(TurnTraceEvent(turnId: "wake-" + UUID().uuidString.lowercased(), kind: "part.wake",
+            let result: JSONValue = .object(["status": .string("skipped"), "reason": .string("tainted_signal"),
+                "detail": .string(failure.message), "remedy": Repair.why(owner: failure.owner ?? "peer \(peer) (not elevated)",
+                    tap: failure.tap ?? "Trust > Connected agents (steering peer unidentified)")])
+            TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake",
                 sessionId: ResidentWake.session, surface: "chat",
-                payload: .object(["part": .string(file.id), "input": .object(input),
-                                  "result": .object(["status": .string("skipped"), "reason": .string("tainted_signal"),
-                                                     "detail": .string("Another agent's words steered the turn that fired this signal, and this part can write; it did not run.")])])))
+                payload: .object(["part": .string(file.id), "input": .object(input), "result": result])))
             return
         }
         // Bound for the whole run, so a card it raises waits and names the part,
@@ -125,7 +138,7 @@ actor EnginePartWake {
         let wrote: @Sendable (URL) -> Void = { url in
             PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: echo(file.id, url))
         }
-        let result: JSONValue = await SkillRunContext.$partID.withValue(file.id) { await SkillRunContext.$wrote.withValue(wrote) {
+        let result: JSONValue = await TurnTraceContext.$turnId.withValue(wake) { await SkillRunContext.$partID.withValue(file.id) { await SkillRunContext.$wrote.withValue(wrote) {
             await ChatToolSessionContext.$envelope.withValue(TurnEnvelope(surface: "chat", agent: "self",
                 declaredRemote: false, workIdentity: "wake:" + file.id)) {
                 await PeerDataTaint.$current.withValue(taint) {
@@ -144,9 +157,9 @@ actor EnginePartWake {
                     } catch { return ChatToolOutcome.failure(error: error, tool: "app") }
                 }
             }
-        } }
+        } } }
         // Every run leaves a trace, on her resident session.
-        TurnTraceBus.fire(TurnTraceEvent(turnId: "wake-" + UUID().uuidString.lowercased(), kind: "part.wake",
+        TurnTraceBus.fire(TurnTraceEvent(turnId: wake, kind: "part.wake",
             sessionId: ResidentWake.session, surface: "chat",
             payload: .object(["part": .string(file.id), "input": .object(input), "result": Self.outcome(result)])))
     }
@@ -171,7 +184,7 @@ actor EnginePartWake {
     /// What the run came to, small enough that its trace row is never cut.
     private static func outcome(_ result: JSONValue) -> JSONValue {
         guard case .object(let fields) = result else { return result }
-        return .object(fields.filter { ["status", "reason", "detail", "effects", "log"].contains($0.key) })
+        return .object(fields.filter { ["status", "reason", "detail", "effects", "log", "remedy"].contains($0.key) })
     }
 
     /// A sense hears its wake through its resident owner, as an event.
@@ -193,9 +206,21 @@ actor EnginePartWake {
     private func reindex(dataRoot: URL) {
         let files: [AbilityStore.File]
         do { files = try AbilityStore(dataRoot: dataRoot).files(includeProposals: false) }
-        catch { return nativeLog("[wake] parts unchanged: abilities do not read (%@)", error.localizedDescription) }
+        catch {
+            index.removeAll()
+            for watch in watches.values { watch.cancel() }
+            watches.removeAll(); watched.removeAll()
+            let failure = error as? ToolFailureError ?? AbilityStore(dataRoot: dataRoot).repairFailure(
+                source: dataRoot.appendingPathComponent("abilities"), detail: error.localizedDescription)
+            RepairOwed.owe(dataRoot, id: "parts-index:" + UUID().uuidString.lowercased(), kind: .run,
+                operation: "parts.index", owner: failure.owner ?? dataRoot.appendingPathComponent("abilities").path,
+                words: "Part wakes stopped because the catalog did not read: \(error.localizedDescription). Preserve the named source before repairing it; old wake wiring is not current authority.",
+                nextCall: failure.nextCall)
+            return nativeLog("[wake] part wakes stopped: abilities do not read (%@)", error.localizedDescription)
+        }
         index = [:]
         for file in files { for signal in Set(file.wakes) { index[signal, default: []].append(file) } }
+        RepairOwed.settle(dataRoot, operation: "parts.index", evidence: .init(source: "abilities", id: "index-rebuilt:" + UUID().uuidString.lowercased()))
         for file in files {
             let paths = file.wakes.filter { $0.hasPrefix("file.changed:") }.map(Self.watchedURL)
             guard watched[file.id] != paths else { continue }

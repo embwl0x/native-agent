@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Synchronization
 
 // MARK: - Subsystem #8+9: MemoryV2
 //
@@ -330,6 +331,13 @@ public actor SwiftNativeMemoryV2 {
     internal var canonicalDataRoot: URL?
     internal var canonicalAttachmentReady: Task<Void, Never>?
     internal var userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
+    var actionIndexSource: (@Sendable () async throws -> [String])?
+    var actionIndexWatcher: FileChangeWatcher?
+    let actionIndexObservers = Mutex<[NSObjectProtocol]>([])
+    var actionIndexUpdate: Task<Void, Never>?
+    var actionIndexDirty = false
+    var actionIndexFailure: String?
+    var actionIndexWrite: Task<[String: [Float]], Error>?
     private struct EmbeddingRetryKey: Hashable {
         let epoch: String
         let kind: String
@@ -362,6 +370,11 @@ public actor SwiftNativeMemoryV2 {
     public init() {
         self.embedder = nil
         self.storage = nil
+    }
+
+    deinit {
+        actionIndexObservers.withLock { $0.forEach { NotificationCenter.default.removeObserver($0) } }
+        actionIndexWatcher?.cancel()
     }
 
     internal init(canonicalDataRoot: URL) {
@@ -498,6 +511,7 @@ public actor SwiftNativeMemoryV2 {
             throw MemoryV2Error.underlying("embedding runtime is not configurable")
         }
         try await managed.setBackend(enabled: enabled)
+        requestActionIndexUpdate()
     }
 
     /// 2026-06-07 task #88: force-load the embedder by issuing a trivial

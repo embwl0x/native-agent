@@ -53,7 +53,7 @@ extension SwiftToolDispatcher {
         "inner_state",
         "codex_message", "invoke_codex", "omp_message",
         "agent_swarm",
-        "market_status", "market_watchlists", "tradingview_watchlist", "market_quote",
+        "market_status", "market_configure", "market_watchlists", "tradingview_watchlist", "market_quote",
         // X (Twitter) read tools — the user's connected account. Posting/DM is
         // intentionally gated through the Activity-approval UI, not chat.
         "x_status", "x_me", "x_search", "x_timeline", "x_user_tweets",

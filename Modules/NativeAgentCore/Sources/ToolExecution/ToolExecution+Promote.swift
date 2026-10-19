@@ -31,7 +31,8 @@ extension SwiftNativeToolExecution {
             return ProposalValidationResult(valid: true,
                 autoPromotable: !candidate.program.permissions.isEmpty
                     && Set(candidate.program.permissions).isSubset(of: ["app_data_read", "app_data_write"]), errors: [],
-                candidateDigest: candidate.digest, capture: Self.string(Self.fields(proof), "capture"))
+                candidateDigest: candidate.digest, capture: Self.string(Self.fields(proof), "capture"),
+                evidence: AbilityStore.validationEvidence(proof, fixtures: candidate.fixtures))
         } catch {
             await broker.close()
             if (error as? SenseFailure)?.code == "stale_validation" { throw error }
@@ -85,6 +86,7 @@ struct ToolHost: OwnedProgramHostProfile {
     func secretLine(_ text: String) -> Bool { base.secretLine(text) }
     func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence { base.evidence(receipt) }
     func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? { base.receiptField(key, in: receipt) }
+    func answer(_ receipt: JSONValue) -> JSONValue { base.answer(receipt) }
     func validationPerform(_ call: [String: JSONValue], fixture: OwnedProgramFixtures) async -> JSONValue {
         guard case .string(let id)? = call["action"], action(id) != nil,
               dependencyMatches(id) else {
@@ -99,9 +101,6 @@ struct ToolHost: OwnedProgramHostProfile {
         }
         do {
             try Task.checkCancellation()
-            guard dependencyMatches(id) else {
-                throw SenseFailure(code: "stale_dependency", message: "The app action changed after validation.")
-            }
             try await admission()
             try Task.checkCancellation()
             let permissions = candidate.program.permissions
@@ -109,16 +108,25 @@ struct ToolHost: OwnedProgramHostProfile {
                 ? (root: dataRoot, write: permissions.contains("app_data_write")) : nil
             return await AbilityStore.$fileReach.withValue(reach) { await base.perform(call) }
         } catch {
-            return Self.failure((error as? SenseFailure)?.code ?? (error is CancellationError ? "cancelled" : "failed"),
-                                error.localizedDescription, effects: "none")
+            var fields = SwiftNativeToolExecution.fields(Self.failure((error as? SenseFailure)?.code ?? (error is CancellationError ? "cancelled" : "failed"),
+                                error.localizedDescription, effects: "none"))
+            fields["remedy"] = (error as? ToolFailureError).flatMap { error in
+                error.owner.map { owner in
+                    if error.personDecides, let tap = error.tap { return Repair.why(owner: owner, tap: tap) }
+                    return Repair.remedy(owner: owner, nextCall: error.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: error.tap)
+                }
+            }
+            return .object(fields)
         }
     }
 
     func primitiveAction(_ operation: String) -> OwnedProgramAction? {
         guard operation == "apps.call" || ToolPrimitiveBroker.operations.contains(operation) else { return nil }
         let read = ToolPrimitiveBroker.readOperations.contains(operation)
-        return OwnedProgramAction(id: operation, page: operation == "apps.call" ? "apps" : "network",
-                                  read: read, readOnly: { ToolPrimitiveBroker.readOnly(operation, .object($0)) })
+        let page = operation == "apps.call" ? "apps" : ["screen", "frame", "hand"].contains(operation.prefix { $0 != "." }) ? "screen" : "network"
+        return OwnedProgramAction(id: operation, page: page, read: read,
+                                  journaled: !ToolPrimitiveBroker.frameOperations.contains(operation),
+                                  readOnly: { ToolPrimitiveBroker.readOnly(operation, .object($0)) })
     }
 
     func checkPrimitive(_ operation: String, arguments: JSONValue) async -> JSONValue? {
@@ -144,6 +152,14 @@ struct ToolHost: OwnedProgramHostProfile {
     func primitive(_ operation: String, arguments: JSONValue, preview: Bool) async throws -> JSONValue {
         if let refused = await checkPrimitive(operation, arguments: arguments) { return refused }
         if operation == "model.call" { return try await performPrimitive(operation, arguments: arguments) }
+        // A watch's frames are reads inside its admitted watch, at frame speed.
+        if ToolPrimitiveBroker.frameOperations.contains(operation) {
+            do { return Self.receipt(try await broker.perform(operation, arguments: arguments), effects: "none") }
+            catch {
+                return Self.failure((error as? SenseFailure)?.code ?? (error is CancellationError ? "cancelled" : "world_error"),
+                                    error.localizedDescription, effects: "none")
+            }
+        }
         let effect = AuthoredToolEffects.primitiveEffect(operation, arguments: arguments)
         let args = SwiftNativeToolExecution.fields(arguments)
         return await AuthoredToolEffects.$call.withValue((effect.tool, {
@@ -183,6 +199,10 @@ struct ToolHost: OwnedProgramHostProfile {
             }
             return Self.receipt(result, effects: observed ?? (read ? "none" : "occurred"))
         } catch {
+            // Screen control's card, refused before anything ran.
+            if let refusal = error as? MacScreenWatch.Refusal {
+                return .object(SwiftNativeToolExecution.fields(refusal.receipt).merging(["effects": .string("none")]) { said, _ in said })
+            }
             let code = (error as? SenseFailure)?.code
             let reason = error is CancellationError ? "cancelled" : code ?? "world_error"
             return Self.failure(reason, error.localizedDescription,

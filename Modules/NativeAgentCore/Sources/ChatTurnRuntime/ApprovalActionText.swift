@@ -19,9 +19,7 @@ public enum ApprovalActionText {
     }
 
     public static func reason(_ reason: String?, tool: String) -> String {
-        guard let reason, !reason.isEmpty,
-              !reason.hasPrefix("autonomy="),
-              reason != "Your tool permission settings require approval." else {
+        guard let reason, !reason.isEmpty else {
             return sentence(tool: tool)
         }
         return reason

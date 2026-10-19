@@ -189,6 +189,7 @@ extension NativeCognitionRuntime {
         valence: Double? = nil,
         arousal: Double? = nil,
         metadata: [String: JSONValue] = [:],
+        reflectionMaterial: [String: CognitiveReflectionCause] = [:],
         persistSynchronously: Bool = true
     ) async {
         let signal = SomaticSignal(
@@ -203,6 +204,7 @@ extension NativeCognitionRuntime {
         )
         await ingestPreparedOrganismSignal(
             signal,
+            reflectionMaterial: reflectionMaterial,
             persistSynchronously: persistSynchronously
         )
     }
@@ -214,11 +216,13 @@ extension NativeCognitionRuntime {
     /// body signal.
     func ingestPreparedOrganismSignal(
         _ signal: SomaticSignal,
+        reflectionMaterial: [String: CognitiveReflectionCause] = [:],
         persistSynchronously: Bool = true
     ) async {
         await bootstrap()
         await ingestPreparedOrganismSignalAfterBootstrap(
             signal,
+            reflectionMaterial: reflectionMaterial,
             persistSynchronously: persistSynchronously
         )
     }
@@ -282,6 +286,7 @@ extension NativeCognitionRuntime {
 
     private func ingestPreparedOrganismSignalAfterBootstrap(
         _ signal: SomaticSignal,
+        reflectionMaterial: [String: CognitiveReflectionCause] = [:],
         persistSynchronously: Bool
     ) async {
         let kind = signal.kind
@@ -308,8 +313,8 @@ extension NativeCognitionRuntime {
             await reportLoopOutcome(loopId: "cognition_replay", outcome: outcome)
             // A4.6: reflection follows the same commit signal, AFTER the replay
             // await above so it reflects on post-replay substrate state. Fire-
-            // and-forget with its own single-flight; budget gates stay inside.
-            scheduleEventDrivenReflection(reason: "reflection_event:\(kind.rawValue)")
+            // and-forget after the previous flight; budget gates stay inside.
+            await scheduleEventDrivenReflection(reason: "reflection_event:\(kind.rawValue)", material: reflectionMaterial)
         }
     }
 

@@ -301,7 +301,10 @@ private struct SkillRow: View {
     let onRead: () -> Void
     let onReview: () -> Void
 
-    private var isDraft: Bool { info.registry.state == "drafted" || info.validationStatus == "valid" }
+    private var isDraft: Bool {
+        InstalledSkillInventory.reviewInstallRefusal(version: info.manifest.version, state: info.registry.state,
+            name: info.registry.name, hasCandidate: info.candidateDigest != nil, validationStatus: info.validationStatus) == nil
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {

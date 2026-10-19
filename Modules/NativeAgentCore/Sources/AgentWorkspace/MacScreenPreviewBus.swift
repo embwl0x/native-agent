@@ -15,7 +15,7 @@ import PersistenceCore
 /// publishes a caption with no new frame and the card keeps showing the last
 /// picture, while a capture with no caption keeps the words already there.
 public struct MacScreenPreviewUpdate: @unchecked Sendable {
-    /// Already downscaled and secret-masked by ``MacScreenPreviewFrame``.
+    /// Masked at capture, then downscaled by ``MacScreenPreviewFrame``.
     /// `nil` keeps whatever frame the card is showing.
     public let image: CGImage?
     /// One line of plain words. `nil` keeps the caption already shown.
@@ -32,7 +32,7 @@ public struct MacScreenPreviewUpdate: @unchecked Sendable {
 /// The one channel from a Mac verb to the chat's live computer pane.
 ///
 /// Dead-control-by-construction, exactly like ``ToolNoticeBus``: when no
-/// surface has bound `publish` the four-verb path decodes nothing, masks
+/// surface has bound `publish` the preview decodes nothing, resizes
 /// nothing, and hands nothing anywhere. A headless turn, a Telegram turn, and
 /// every test therefore pay zero for this feature.
 public enum MacScreenPreviewBus {
@@ -184,36 +184,16 @@ public enum MacScreenPreviewCaption {
     }
 }
 
-/// Turns the frame a verb already captured into the frame the card can show:
-/// small, and with every secure field painted out.
-///
-/// The perception path's redaction is text-only — it withholds a password
-/// field's VALUE and LABEL from the legend while the pixels of that field ride
-/// along inside the capture. A picture on screen is a second channel, so the
-/// same verdict (``MacScreenViewBuilder.isSecretField``) is applied to the
-/// pixels here: every secure field's rect is filled opaque before the image
-/// leaves this function. The downscale is the other half — a 72pt thumbnail
-/// and its sheet never need a retina desktop, and the cap bounds what one
-/// turn holds in memory.
+/// Sizes the source-masked observation for the card.
 public enum MacScreenPreviewFrame {
     /// Widest preview kept. Comfortably above the expand sheet's drawn size,
     /// far below a captured retina desktop.
     public static let maxWidth = 960
 
-    /// `marks` are the view's own control rows — role, subrole, label, value —
-    /// in the same global screen points `origin`/`logicalSize` describe, which
-    /// is what makes the mapping to pixels exact rather than approximate.
-    public static func previewImage(
-        from image: CGImage,
-        marks: [JSONValue],
-        origin: (x: Double, y: Double),
-        logicalSize: (w: Double, h: Double),
-        maximumWidth: Int = maxWidth
-    ) -> CGImage? {
-        guard image.width > 0, image.height > 0,
-              logicalSize.w > 0, logicalSize.h > 0 else { return nil }
+    public static func previewImage(from image: CGImage) -> CGImage? {
+        guard image.width > 0, image.height > 0 else { return nil }
 
-        let scale = min(1, Double(maximumWidth) / Double(image.width))
+        let scale = min(1, Double(maxWidth) / Double(image.width))
         let targetW = max(1, Int((Double(image.width) * scale).rounded()))
         let targetH = max(1, Int((Double(image.height) * scale).rounded()))
 
@@ -230,96 +210,6 @@ public enum MacScreenPreviewFrame {
         context.interpolationQuality = .medium
         context.draw(image, in: CGRect(x: 0, y: 0, width: targetW, height: targetH))
 
-        let secrets = secretRects(
-            marks: marks,
-            imagePixelSize: (w: image.width, h: image.height),
-            origin: origin,
-            logicalSize: logicalSize
-        )
-        if !secrets.isEmpty {
-            // Opaque, not blurred: a blur of a short code is still the code.
-            context.setFillColor(gray: 0.08, alpha: 1)
-            for rect in secrets {
-                // Image space is top-left origin; the context is bottom-left.
-                let x = rect.minX * scale
-                let w = rect.width * scale
-                let h = rect.height * scale
-                let y = Double(targetH) - (rect.minY * scale) - h
-                context.fill(CGRect(x: x, y: y, width: w, height: h))
-            }
-        }
         return context.makeImage()
-    }
-
-    /// Secure-field rects in the capture's PIXEL space, top-left origin.
-    /// Public so the masking verdict can be exercised directly by the review
-    /// fixture rather than re-implemented there — a security claim checked
-    /// against a copy of the logic is not checked at all.
-    public static func secretRects(
-        marks: [JSONValue],
-        imagePixelSize: (w: Int, h: Int),
-        origin: (x: Double, y: Double),
-        logicalSize: (w: Double, h: Double)
-    ) -> [CGRect] {
-        let scaleX = Double(imagePixelSize.w) / logicalSize.w
-        let scaleY = Double(imagePixelSize.h) / logicalSize.h
-        return marks.compactMap { value -> CGRect? in
-            guard case .object(let mark) = value,
-                  case .string(let role)? = mark["role"],
-                  let frame = frame(mark["frame"]),
-                  isSecret(mark: mark, role: role) else { return nil }
-            let x = (frame.x - origin.x) * scaleX
-            let y = (frame.y - origin.y) * scaleY
-            let w = frame.w * scaleX
-            let h = frame.h * scaleY
-            let rect = CGRect(x: x, y: y, width: w, height: h)
-                .intersection(CGRect(x: 0, y: 0, width: imagePixelSize.w, height: imagePixelSize.h))
-            guard !rect.isNull, rect.width >= 1, rect.height >= 1 else { return nil }
-            return rect
-        }
-    }
-
-    static func isSecret(mark: [String: JSONValue], role: String) -> Bool {
-        // The legend's own verdict, carried on the row it classified
-        // (MacScreenView.swift:304, MacPerceptionCompiler.swift:279). It is the
-        // canonical answer and it is checked FIRST: a field the compiler
-        // classified as secret but whose value came back empty or truncated
-        // would not trip the label test below, and would otherwise stay
-        // readable in the picture after being withheld from the words.
-        if mark["secret_field"] == .bool(true) { return true }
-        let subrole: String? = {
-            guard case .string(let value)? = mark["subrole"] else { return nil }
-            return value
-        }()
-        // A label or value the text redactor already WITHHELD arrives as an
-        // object rather than a string. That verdict is reused rather than
-        // re-derived: whatever made the words unprintable makes the pixels
-        // unshowable.
-        if case .object? = mark["label"] { return true }
-        if case .object? = mark["value"] { return true }
-        let label: String? = {
-            guard case .string(let value)? = mark["label"] else { return nil }
-            return value
-        }()
-        let value: String? = {
-            guard case .string(let value)? = mark["value"] else { return nil }
-            return value
-        }()
-        return MacScreenViewBuilder.isSecretField(role: role, subrole: subrole, label: label, value: value)
-    }
-
-    private static func frame(_ value: JSONValue?) -> MacAXFrame? {
-        guard case .object(let object)? = value else { return nil }
-        func number(_ value: JSONValue?) -> Double? {
-            switch value {
-            case .int(let value)?: return Double(value)
-            case .double(let value)? where value.isFinite: return value
-            default: return nil
-            }
-        }
-        guard let x = number(object["x"]), let y = number(object["y"]),
-              let w = number(object["w"]), let h = number(object["h"]),
-              w > 0, h > 0 else { return nil }
-        return MacAXFrame(x: x, y: y, w: w, h: h)
     }
 }

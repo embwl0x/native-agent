@@ -158,6 +158,7 @@ extension AppToolExecutor {
         )
     }
 
+    /// Refusals run nothing; a caller that already acted supplies its own effects in extra.
     public static func failure(_ reason: String, _ detail: String, extra: [String: JSONValue] = [:]) -> JSONValue {
         var body: [String: JSONValue] = [
             "status": .string("failed"),
@@ -166,13 +167,14 @@ extension AppToolExecutor {
         ]
         // The code, status and detail stand: extra never overwrites them.
         body.merge(extra) { own, _ in own }
-        return .object(body)
+        return ChatToolOutcome.refusedBeforeRunning(.object(body))
     }
 
     public static func unattachedFailure() -> JSONValue {
-        failure(
+        doorRefusal(
             "app_window_unavailable",
-            "The app's own pages are not available in this process — there is no live window to read."
+            "The app's own pages are not available in this process — there is no live window to read.",
+            remedy: "correct_arguments", "Call app from the installed app's chat tool chain; supplying a session id cannot attach a live window."
         )
     }
 
@@ -225,7 +227,7 @@ extension AppToolExecutor {
                                                dataRoot: host.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         let answer = await host.runChatSession(verb: verb, input: input, reachesUser: reachesUser)
         guard case .object(var body) = answer else {
-            return Self.failure("chat_session_failed", "The app gave no answer for that verb.")
+            return Self.failure("chat_session_failed", "The app gave no answer for that verb.", extra: ["effects": .string("unknown")])
         }
         body["verb"] = .string(verb)
         body["trust_mode"] = .string(posture.name)
@@ -432,6 +434,13 @@ extension AppToolExecutor {
                 extra: ["setting": .string(setting.id), "type": .string(setting.kind.rawValue)]
             ))
         }
+        if setting.id.hasPrefix("providers."), setting.id != "providers.routing_repair" {
+            do {
+                _ = try await SwiftNativeProviderRouting(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()).checkedRoutingSnapshot()
+            } catch {
+                return refuse(await Self.settingWriteFailure(error, setting, requestedValue, host: appModel, detail: ["effects": .string("none")]))
+            }
+        }
         return .success(GatedSetting(setting: setting, host: appModel, posture: posture, value: requestedValue, request: request, restoresPrevious: restoresPrevious, write: write))
     }
 
@@ -449,7 +458,7 @@ extension AppToolExecutor {
                     await gated.setting.check?(gated.host, gated.value)
                 }
             }) else { return nil }
-            return await Self.settingWriteFailure(refused, gated.setting, gated.value, host: gated.host)
+            return await Self.settingWriteFailure(refused, gated.setting, gated.value, host: gated.host, detail: ["effects": .string("none")])
         }
     }
 
@@ -466,7 +475,16 @@ extension AppToolExecutor {
             "requested_value": requestedValue,
             "current_value": await setting.read(host),
         ]
+        switch error {
+        case QuietSettingError.badValue, QuietSettingError.users: break
+        default: extra["effects"] = .string("unknown")
+        }
         for (key, value) in detail { extra[key] = value }
+        if let failure = error as? ToolFailureError, let owner = failure.owner {
+            extra["effects"] = .string(failure.effects.rawValue)
+            extra["remedy"] = Repair.remedy(owner: owner,
+                nextCall: failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: failure.tap)
+        }
         let code = if case QuietSettingError.users = error { "owners_call" } else { "write_refused" }
         return failure(code, error.localizedDescription, extra: extra)
     }

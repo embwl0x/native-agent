@@ -299,7 +299,7 @@ public actor SwiftNativeSecurityCenter {
         // security .ask routes to a real approval instead of a dead deny —
         // so flipping this to local-only is a one-line change if group
         // surfaces ever join the allowlist.
-        let (toolClass, law, autonomyLevel) = PermissionLaw.answer(
+        let (toolClass, law, autonomyLevel, autonomyReason, autonomyRemedy) = PermissionLaw.answer(
             tool: tool, input: input, policy: policy, saved: snapshot.userConfiguredAutonomyOverrides,
             dataRoot: dataRoot, roots: trustedRoots, capabilities: profile.capabilities)
         let promptInjectionKeys = Self.promptInjectionKeys(in: .object(input))
@@ -324,7 +324,8 @@ public actor SwiftNativeSecurityCenter {
 
         var decision = SecurityToolDecision.allow
         var reasons: [SecurityReason] = []
-        reasons.append(.init(.autonomy, "Your saved tool permissions were checked."))
+        reasons.append(.init(.autonomy, autonomyReason))
+        var remedy = autonomyRemedy
         if !originAssessment.trusted {
             reasons.append(.init(.origin, originAssessment.reason))
         }
@@ -348,27 +349,27 @@ public actor SwiftNativeSecurityCenter {
         if Self.bool(security["killSwitchEnabled"], default: false),
            !Self.catalogToolNames.contains(canonicalTool) {
             decision = .block
-            reasons.append(.init(.cause, "security kill switch is active"))
+            reasons.append(.init(.cause, "trust/policy.json securityPolicy.killSwitchEnabled=true stops this action."))
+            remedy = Repair.why(owner: "trust/policy.json securityPolicy.killSwitchEnabled", tap: "Trust > Access > Security Center > Pause everything")
         }
 
         // Safe changes nothing on User's side of the line (the law).
         if decision != .block, law == "blocked" {
             decision = .block
-            reasons.append(.init(.cause, "Safe keeps everything beyond your own data as it is, and only the person lifts it. "
-                + "Ask them to choose Work mode or above in Trust."))
+            reasons.append(.init(.cause, autonomyReason))
         }
 
         if enforceAutonomy, decision != .block {
             switch autonomyLevel {
             case "blocked":
                 decision = .block
-                reasons.append(.init(.cause, "Your tool permission settings block this action."))
+                reasons.append(.init(.cause, autonomyReason))
             case "send_approval", "confirm", "destructive_strong":
                 if !Self.notificationToolNames.contains(canonicalTool),
                    !Self.catalogToolNames.contains(canonicalTool),
                    !profile.capabilities.contains("approval_stage") {
                     decision = Self.maxDecision(decision, .ask)
-                    reasons.append(.init(.cause, "Your tool permission settings require approval."))
+                    reasons.append(.init(.cause, autonomyReason))
                 }
             default:
                 break
@@ -384,7 +385,15 @@ public actor SwiftNativeSecurityCenter {
                SwiftNativeTrustCenter.hasExplicitBlockOverride($0, overrides: snapshot.userConfiguredAutonomyOverrides)
            }) {
             decision = .block
-            reasons.append(.init(.cause, "tool is explicitly blocked by the user"))
+            let names = [canonicalTool, tool] + Array(profile.capabilities) + [GatedToolNameContext.rawSpelling(of: tool)].compactMap { $0 }
+            let entries = snapshot.userConfiguredAutonomyOverrides.keys.filter { key in
+                key != "default" && snapshot.userConfiguredAutonomyOverrides[key] == .string("blocked")
+                    && names.contains { SwiftNativeTrustCenter.fnmatch(name: $0, pattern: key) }
+            }.sorted()
+            let owner = "trust/policy.json " + entries.map { "toolAutonomy[\($0)]=blocked" }.joined(separator: ", ")
+            reasons.append(.init(.cause, owner + " stops this action."))
+            remedy = Repair.why(owner: owner,
+                tap: entries.map { "Trust > Access and policy > Saved tool permissions > \($0) > Use posture" }.joined(separator: "; "))
         }
 
         // Full Mac is authority selected by the trusted operator; it is not an
@@ -480,6 +489,8 @@ public actor SwiftNativeSecurityCenter {
            !yoloSatisfiesDevMode {
             decision = .block
             reasons.append(.init(.cause, "critical action requires Developer Mode"))
+            remedy = Repair.why(owner: "trust/policy.json securityPolicy.criticalRequiresDeveloperMode and developerMode",
+                tap: "Trust > Access and policy > Access > Full Mac > Enable Full Mac")
         }
 
         if decision != .block,
@@ -487,7 +498,7 @@ public actor SwiftNativeSecurityCenter {
            !fullMac {
             decision = Self.maxDecision(decision, .ask)
             // First, so the card names the cause rather than a recorded note.
-            reasons.insert(.init(.cause, "writing into another app's settings needs your go-ahead"), at: 0)
+            reasons.append(.init(.cause, "writing into another app's settings needs your go-ahead"))
         }
 
         // A reply turn from an authenticated contact gets the same answer as the
@@ -518,7 +529,8 @@ public actor SwiftNativeSecurityCenter {
             || profile.capabilities.contains("network_write")
             || profile.capabilities.contains("shell")) {
             decision = .block
-            reasons.append(.init(.cause, "The secret firewall prevents sending passwords or keys outside this Mac."))
+            reasons.append(.init(.cause, "trust/policy.json securityPolicy.secretFirewallEnabled blocks secret egress from input: \(secretKeys.sorted().joined(separator: ", ")). Remove the secret values from those fields before submitting this action."))
+            remedy = nil
         }
 
         if decision != .block,
@@ -552,6 +564,7 @@ public actor SwiftNativeSecurityCenter {
            Self.bool(security["toolSigningRequired"], default: false) {
             decision = .block
             reasons.append(.init(.cause, "unsigned high-risk tool is blocked"))
+            remedy = nil
         }
 
         if decision == .ask,
@@ -595,7 +608,9 @@ public actor SwiftNativeSecurityCenter {
             reasons: reasons,
             untrustedInputKeys: Array(Set(promptInjectionKeys)).sorted(),
             redactedInputPreview: redacted,
-            auditReceiptsEnabled: auditEnabled
+            auditReceiptsEnabled: auditEnabled,
+            autonomyReason: autonomyReason,
+            remedy: remedy
         )
     }
 
@@ -624,14 +639,16 @@ public actor SwiftNativeSecurityCenter {
             decision: .block,
             allowed: false,
             requiresApproval: false,
-            reasons: [.init(.cause, "saved trust policy is unavailable: \(error.localizedDescription)")],
+            reasons: [.init(.cause, "\(dataRoot.appendingPathComponent("trust/policy.json").path) could not authorize \(canonicalTool): \(error.localizedDescription)")],
             untrustedInputKeys: Array(
                 Set(Self.promptInjectionKeys(in: .object(input)))
             ).sorted(),
             redactedInputPreview: Self.redactValue(
                 .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
             ),
-            auditReceiptsEnabled: true
+            auditReceiptsEnabled: true,
+            remedy: Repair.remedy(owner: "trust/policy.json", nextCall: nil,
+                tap: "Trust > Access and policy > Preserve damaged policy and authorize Safe")
         )
     }
 

@@ -27,33 +27,6 @@ import UniformTypeIdentifiers
 import NativeAgentCore
 import PersistenceCore
 
-/// The resize lifecycle's decision boundary. The view owns geometry and the
-/// scroll proxy; this compact policy owns the user-position invariant so the
-/// debounced task cannot accidentally re-pin a history reader or a closed
-/// panel.
-enum DetachedChatResizeRepin {
-    static let settleDelayNanoseconds: UInt64 = 150_000_000
-
-    /// A resize burst snapshots the bottom sentinel only once. Later geometry
-    /// ticks may occur after reflow has displaced that sentinel, which must
-    /// not rewrite what the user was reading when the drag began.
-    static func shouldSnapshotBottom(hasPendingSettle: Bool) -> Bool {
-        !hasPendingSettle
-    }
-
-    /// Only the latest, live resize task for a bottom-pinned transcript may
-    /// scroll. In particular, cancellation is not a harmless early wake-up:
-    /// it means the panel disappeared or a newer geometry tick superseded it.
-    static func shouldRepin(
-        settledToken: Int,
-        currentToken: Int,
-        wasAtBottom: Bool,
-        isCancelled: Bool
-    ) -> Bool {
-        !isCancelled && settledToken == currentToken && wasAtBottom
-    }
-}
-
 struct DetachedChatPanelView: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
@@ -67,17 +40,6 @@ struct DetachedChatPanelView: View {
     @AppStorage("nativeagent.darkMode") private var preferDarkAppearance = true
 
     @State private var didInitialLoad = false
-    // True while the bottom anchor spacer is realized by the LazyVStack —
-    // a free "user is at/near the bottom" sentinel (same trick as ChatView's
-    // scroll coordinator; no geometry plumbing). Drives resize re-pinning.
-    @State private var bottomAnchorVisible = true
-    // Resize settle state (round 3): re-pinning on EVERY geometry tick made
-    // scrollTo fight the live reflow — the round-2 "scroll flies around"
-    // regression. One burst = snapshot was-at-bottom on the first tick, then
-    // a debounced single re-pin after the size stops changing.
-    @State private var resizeBurstToken = 0
-    @State private var resizeWasAtBottom = false
-    @State private var resizeSettleTask: Task<Void, Never>?
     // Render-cost audit F1 — streaming-delta scroll throttle.
     //
     // `.onChange(of: messages.last?.content)` fires on every coalesced delta
@@ -340,12 +302,6 @@ struct DetachedChatPanelView: View {
             // F1: invalidate any scroll scheduled against the now-dead proxy
             // (same contract as `ChatView.swift:1032`).
             scrollCoordinator.markViewDisappeared()
-            // Task.sleep wakes early on cancel, so invalidate before
-            // cancellation: a late resize settle must not target a panel that
-            // has already left the hierarchy.
-            resizeBurstToken += 1
-            resizeSettleTask?.cancel()
-            resizeSettleTask = nil
             // H5: hand the uncommitted draft back so closing the panel never
             // eats typed text (the main window adopts it on session switch).
             commitPanelDraft()
@@ -375,7 +331,7 @@ struct DetachedChatPanelView: View {
 
     private var messageScrollback: some View {
         ScrollViewReader { proxy in
-            ScrollView {
+            TranscriptScrollView(coordinator: scrollCoordinator) {
                 LazyVStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
                     if loadPresentation == .stale {
                         Label("History refresh failed; showing last known messages.", systemImage: "exclamationmark.triangle.fill")
@@ -416,17 +372,6 @@ struct DetachedChatPanelView: View {
                     // above the composer — so this window and the main window
                     // show the same one thing instead of stacking two.
                     Color.clear.frame(height: 1).id(detachedBottomAnchor)
-                        // Inside the LazyVStack this spacer is only realized
-                        // when the viewport is at/near the bottom, so its
-                        // appearance is the "pinned to bottom" signal.
-                        .onAppear {
-                            bottomAnchorVisible = true
-                            scrollCoordinator.setBottomSpacerVisible(true)
-                        }
-                        .onDisappear {
-                            bottomAnchorVisible = false
-                            scrollCoordinator.setBottomSpacerVisible(false)
-                        }
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
@@ -452,10 +397,7 @@ struct DetachedChatPanelView: View {
             // Empty/placeholder states anchor to the TOP: the anchor also
             // aligns content SHORTER than the viewport, and a lone empty-state
             // card shoved to the bottom of a 600pt panel reads as broken.
-            .modifier(DetachedScrollAnchorModifier(
-                isEmpty: messages.isEmpty || !sessionIsAvailable,
-                followsBottomOnGrowth: scrollCoordinator.autoFollow
-            ))
+            .modifier(DetachedScrollAnchorModifier(isEmpty: messages.isEmpty || !sessionIsAvailable))
             .safeAreaInset(edge: .top, spacing: 0) {
                 if showTranscriptSearch {
                     MacChatTranscriptSearchBar(
@@ -468,54 +410,6 @@ struct DetachedChatPanelView: View {
                     )
                 }
             }
-            // Messages-style resize: if the user was at the bottom when the
-            // resize STARTED, snap the latest message back to the composer
-            // once the size settles; if they'd scrolled up to read history,
-            // leave their place alone. Deliberately debounced — a per-tick
-            // scrollTo mid-drag fights the LazyVStack reflow and throws the
-            // scroll around (round-2 failure). The was-at-bottom snapshot is
-            // taken on the burst's FIRST tick because shrinking the viewport
-            // can push the sentinel spacer out of realization mid-drag.
-            .background(
-                GeometryReader { geo in
-                    Color.clear.onChange(of: geo.size) {
-                        if DetachedChatResizeRepin.shouldSnapshotBottom(
-                            hasPendingSettle: resizeSettleTask != nil
-                        ) {
-                            resizeWasAtBottom = bottomAnchorVisible
-                        }
-                        resizeBurstToken += 1
-                        let token = resizeBurstToken
-                        resizeSettleTask?.cancel()
-                        resizeSettleTask = Task { @MainActor in
-                            try? await Task.sleep(
-                                nanoseconds: DetachedChatResizeRepin.settleDelayNanoseconds
-                            )
-                            // A newer tick superseded this one (its own task
-                            // owns the settle), and a cancelled panel must
-                            // never get a late scroll after it has closed.
-                            // 2026-09-06: the settle handle is cleared on
-                            // EVERY exit of the live task, not just the one
-                            // that scrolled. Returning early left it non-nil
-                            // forever, so `shouldSnapshotBottom` read "a
-                            // settle is already pending" from then on and the
-                            // was-at-bottom snapshot was never taken again —
-                            // one resize while reading history disabled
-                            // re-pinning for the life of the panel. A task
-                            // superseded by a newer tick does not clear it:
-                            // that handle belongs to the newer task.
-                            defer { if token == resizeBurstToken { resizeSettleTask = nil } }
-                            guard DetachedChatResizeRepin.shouldRepin(
-                                settledToken: token,
-                                currentToken: resizeBurstToken,
-                                wasAtBottom: resizeWasAtBottom,
-                                isCancelled: Task.isCancelled
-                            ) else { return }
-                            proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
-                        }
-                    }
-                }
-            )
             .onChange(of: messages.count) {
                 if showTranscriptSearch {
                     refreshTranscriptSearchIfPresented()
@@ -575,40 +469,6 @@ struct DetachedChatPanelView: View {
                     )
                 }
             }
-            // 2026-09-06: the same two disarm sources the main window has.
-            // Without them nothing in this panel ever called `disarmFollow()`,
-            // so a reader could not get out of the way of a streaming reply.
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 4).onChanged { _ in
-                    scrollCoordinator.disarmFollow()
-                }
-            )
-            .background(
-                ScrollWheelCatcher { deltaY in
-                    switch ChatViewportPresentation.scrollFollowAction(
-                        deltaY: deltaY,
-                        bottomSpacerVisible: scrollCoordinator.bottomSpacerVisible,
-                        autoFollow: scrollCoordinator.autoFollow
-                    ) {
-                    case .disarm:
-                        scrollCoordinator.disarmFollow()
-                    case .rearm:
-                        // Scrolling back down to the bottom re-arms follow and
-                        // snaps flush, so the next delta continues from there.
-                        scrollCoordinator.forceFollow()
-                        scrollCoordinator.scrollToBottom(
-                            proxy,
-                            bottomAnchor: detachedBottomAnchor,
-                            animated: false,
-                            delay: 0,
-                            force: true
-                        )
-                    case .none:
-                        break
-                    }
-                }
-                .allowsHitTesting(false)
-            )
         }
     }
 
@@ -797,6 +657,10 @@ struct DetachedChatPanelView: View {
 
     private func send() {
         guard !isSubmittingSend else { return }
+        if voiceAcceptsTranscript {
+            Task { @MainActor in if await finishPanelDictation() { send() } }
+            return
+        }
         guard !appModel.isSavingChatBrain else { return }
         guard ensureSessionIsAvailable() else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -871,23 +735,7 @@ struct DetachedChatPanelView: View {
 
     private func toggleVoice() {
         if voiceInput.isListening {
-            let stoppedGeneration = voiceGeneration
-            voiceAcceptsTranscript = false
-            Task { @MainActor in
-                let result = await voiceInput.stopListeningResult()
-                // The stop suspends; a send or a close in the meantime already
-                // ended this dictation and owns the composer now.
-                guard stoppedGeneration == voiceGeneration else { return }
-                let final = result.transcriptForSubmission
-                if final.isEmpty {
-                    draft = voiceDraftBeforeListening
-                    showToast(result.userFacingFailureMessage ?? "No speech detected")
-                } else {
-                    draft = composeVoiceDraft(final)
-                }
-                voiceGeneration &+= 1
-                voiceDraftBeforeListening = ""
-            }
+            Task { @MainActor in _ = await finishPanelDictation() }
         } else {
             guard ensureSessionIsAvailable() else { return }
             voiceInput.errorMessage = nil
@@ -895,8 +743,13 @@ struct DetachedChatPanelView: View {
             // 2026-09-06: the permission prompt suspends. A panel closed while
             // it was up could not cancel the start — `onDisappear` had nothing
             // to stop, because listening had not begun.
-            let startGeneration = voiceGeneration
+            let requestedGeneration = voiceGeneration
             Task {
+                guard requestedGeneration == voiceGeneration else { return }
+                if voiceAcceptsTranscript {
+                    guard await finishPanelDictation() else { return }
+                }
+                let startGeneration = voiceGeneration
                 let granted = await voiceInput.requestPermission()
                 guard granted else {
                     showToast(voiceInput.errorMessage ?? "Microphone or speech permission denied.")
@@ -917,7 +770,25 @@ struct DetachedChatPanelView: View {
         }
     }
 
+    private func finishPanelDictation() async -> Bool {
+        let stoppedGeneration = voiceGeneration
+        let wasListening = voiceInput.isListening
+        let result = await voiceInput.stopListeningResult()
+        guard stoppedGeneration == voiceGeneration else { return false }
+        voiceAcceptsTranscript = false
+        let accepted = ChatComposerSupport.finishDictation(
+            result, wasListening: wasListening, base: &voiceDraftBeforeListening,
+            draft: &draft, attachments: &pendingAttachments,
+            attachment: voiceInput.attachment, showToast: showToast)
+        voiceGeneration &+= 1
+        return accepted
+    }
+
     private func captureScreen() {
+        if voiceAcceptsTranscript {
+            Task { @MainActor in if await finishPanelDictation() { captureScreen() } }
+            return
+        }
         guard ensureSessionIsAvailable() else { return }
         guard !isCapturing else { return }
         // 2026-09-06: a screenshot send is a send, so it takes the send latch
@@ -926,7 +797,7 @@ struct DetachedChatPanelView: View {
         // capture button live — the screenshot was admitted as a second turn.
         guard !isSubmittingSend else { return }
         guard screenCaptureAllowed else {
-            showToast("Enable screen capture in Trust -> Multimodal Capabilities")
+            showToast("Enable screen capture in Trust → Features → Multimodal")
             return
         }
         guard !isBusy else {
@@ -1116,36 +987,18 @@ enum DetachedChatLoadFailureCopy {
     }
 }
 
-// Scopes the scroll anchor to the initial offset on macOS 15+ so content-size
-// changes (hover timestamp, live resize reflow) never re-anchor the viewport.
-// The .alignment role keeps short conversations sitting by the composer.
-// macOS 14 lacks ScrollAnchorRole, so it falls back to the blanket anchor.
+// Scopes the scroll anchor to the initial offset so content-size changes
+// (hover timestamp, live resize reflow) never re-anchor the viewport; growth
+// is TranscriptScrollView's. The .alignment role keeps short conversations
+// sitting by the composer.
 private struct DetachedScrollAnchorModifier: ViewModifier {
     let isEmpty: Bool
-    /// True while the reader is parked at the bottom (auto-follow armed).
-    let followsBottomOnGrowth: Bool
 
     func body(content: Content) -> some View {
         let anchor: UnitPoint = isEmpty ? .top : .bottom
-        if #available(macOS 15.0, *) {
-            content
-                .defaultScrollAnchor(anchor, for: .initialOffset)
-                .defaultScrollAnchor(anchor, for: .alignment)
-                // User, 2026-09-13: growth-anchoring, gated on follow. This is
-                // the piece the 2026-07-25 revert threw out with the blanket
-                // anchor: pinning the bottom while the reader IS at the bottom
-                // is the whole auto-follow behaviour, and it costs no scroll
-                // command and no animation per streamed chunk. `.top` is the
-                // system default, so a reader who scrolled up keeps their
-                // offset through every size change.
-                .defaultScrollAnchor(
-                    followsBottomOnGrowth ? .bottom : .top,
-                    for: .sizeChanges
-                )
-        } else {
-            content
-                .defaultScrollAnchor(anchor)
-        }
+        content
+            .defaultScrollAnchor(anchor, for: .initialOffset)
+            .defaultScrollAnchor(anchor, for: .alignment)
     }
 }
 

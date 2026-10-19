@@ -1,10 +1,12 @@
 import Foundation
+import Experiences
 import NativeAgentCore
 import PersistenceCore
 
 public struct CognitiveSubstrateDependencies: Sendable {
     public var now: @Sendable () -> Date
     public var makeUUID: @Sendable () -> UUID
+    public var decisions: @Sendable () async -> [String: Experience]
     /// How the agent addresses the user, resolved from the configured persona
     /// (profile.json `userName`, set at onboarding). Never hardcode a name in
     /// the capsule/reflection cues — a public install's user is not "User".
@@ -71,10 +73,12 @@ public struct CognitiveSubstrateDependencies: Sendable {
         embedTexts: @escaping @Sendable ([String]) async -> [[Float]]? = { _ in nil },
         peerTrusted: @escaping @Sendable (String) -> Bool = { _ in false },
         sinceGap: @escaping @Sendable (Date, Date, String) async -> [String] = { _, _, _ in [] },
-        feltCause: @escaping @Sendable (Double, Double) async -> Void = { _, _ in }
+        feltCause: @escaping @Sendable (Double, Double) async -> Void = { _, _ in },
+        decisions: @escaping @Sendable () async -> [String: Experience] = { [:] }
     ) {
         self.now = now
         self.makeUUID = makeUUID
+        self.decisions = decisions
         self.userName = userName
         self.attentionProjectionSink = attentionProjectionSink
         self.dynamics = dynamics

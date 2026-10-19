@@ -130,8 +130,6 @@ private struct MCPHubConsentRow: View {
 // List, no Section chrome, no material of its own — the frame owns the room.
 struct MCPHubView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var drafts: [String: MCPHubToolDraft] = [:]
-    @State private var draftServer: String?
 
     var body: some View {
         ScrollView {
@@ -153,16 +151,16 @@ struct MCPHubView: View {
             .accessibilityLabel("Refresh MCP connections")
         }
         .onChange(of: appModel.mcpTools, initial: true) { _, _ in refreshDrafts() }
-        .onChange(of: appModel.selectedMCPServerId) { _, _ in refreshDrafts() }
     }
 
     private func refreshDrafts() {
-        if draftServer != appModel.selectedMCPServerId {
-            drafts = [:]
-            draftServer = appModel.selectedMCPServerId
-        }
-        for tool in appModel.mcpTools where drafts[tool.name]?.schema != tool.inputSchema || drafts[tool.name] == nil {
-            drafts[tool.name] = MCPHubToolDraft(schema: tool.inputSchema)
+        guard let server = appModel.selectedMCPServerId else { return }
+        for tool in appModel.mcpTools {
+            let key = MCPHubToolDraft.subject(server: server, tool: tool.name)
+            let held: MCPHubToolDraft? = appModel.editDraft(key, seed: Optional<MCPHubToolDraft>.none)
+            if inputSchemaContainsSecret(tool.inputSchema) || (held != nil && held?.schema != tool.inputSchema) {
+                appModel.clearEditDraft(key)
+            }
         }
     }
 
@@ -313,9 +311,12 @@ struct MCPHubView: View {
             if notice.showsTools, !appModel.mcpTools.isEmpty {
                 AliveGroupCard(lazy: true) {
                     ForEach(appModel.mcpTools) { tool in
-                        if let draft = drafts[tool.name] {
-                            MCPHubToolRow(tool: tool, form: draft)
-                                .id(ObjectIdentifier(draft))
+                        if let server = appModel.selectedMCPServerId {
+                            let subject = MCPHubToolDraft.subject(server: server, tool: tool.name)
+                            MCPHubToolRow(tool: tool, subject: subject, form: inputSchemaContainsSecret(tool.inputSchema)
+                                ? MCPHubToolDraft(schema: tool.inputSchema)
+                                : appModel.editDraft(subject, seed: MCPHubToolDraft(schema: tool.inputSchema)))
+                                .id(subject)
                         }
                     }
                 }
@@ -515,12 +516,14 @@ private enum MCPHubWords {
 
 @Observable
 private final class MCPHubToolDraft {
+    static func subject(server: String, tool: String) -> String { "mcp/\(server)/\(tool)" }
     let schema: JSONValue?
     var isExpanded = false
     var values: [String: JSONValue] = [:]
     var parseErrors: [String: String] = [:]
     var draft = MCPInputSchemaForm.Draft()
     var validationError: String?
+    var isRunning = false
 
     init(schema: JSONValue?) { self.schema = schema }
 }
@@ -529,7 +532,19 @@ private struct MCPHubToolRow: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let tool: MCPTool
-    @Bindable var form: MCPHubToolDraft
+    let subject: String
+    @State var form: MCPHubToolDraft
+
+    private var heldDraft: MCPHubToolDraft? {
+        inputSchemaContainsSecret(tool.inputSchema) ? nil : appModel.editDraft(subject, seed: Optional<MCPHubToolDraft>.none)
+    }
+
+    private var values: Binding<[String: JSONValue]> {
+        Binding(get: { form.values }, set: { input in
+            form.values = input
+            form.validationError = nil
+        })
+    }
 
     var body: some View {
         MCPCard {
@@ -562,13 +577,14 @@ private struct MCPHubToolRow: View {
                 let consentRisk = appModel.selectedMCPServer.map {
                     appModel.mcpConsentRisk(server: $0, toolName: tool.name)
                 }
-                MCPInputSchemaForm(schema: tool.inputSchema, values: Binding(
-                    get: { form.values },
-                    set: {
-                        form.values = $0
-                        form.validationError = nil
-                    }
-                ), jsonErrors: $form.parseErrors, draft: $form.draft)
+                MCPInputSchemaForm(schema: tool.inputSchema, values: values,
+                                   jsonErrors: $form.parseErrors, draft: $form.draft,
+                                   onEdit: {
+                                       if !inputSchemaContainsSecret(tool.inputSchema) {
+                                           appModel.setEditDraft(form, for: subject)
+                                       }
+                                   })
+                    .id(ObjectIdentifier(form))
                 if let consentRisk {
                     Text("Consent risk: \(consentRisk)")
                         .font(ShellType.caption)
@@ -582,7 +598,7 @@ private struct MCPHubToolRow: View {
                     Button("Run") {
                         guard form.parseErrors.isEmpty else { return }
                         guard let server = appModel.selectedMCPServer else { return }
-                        let input = form.values
+                        let input = values.wrappedValue
                         if let validation = MCPUIActions.validationMessage(
                             schema: tool.inputSchema,
                             values: input
@@ -591,7 +607,19 @@ private struct MCPHubToolRow: View {
                             return
                         }
                         form.validationError = nil
-                        Task { await appModel.callMCPToolWithInput(server: server, tool: tool, input: input) }
+                        form.isRunning = true
+                        let submitted = form
+                        Task {
+                            defer { submitted.isRunning = false }
+                            if await appModel.callMCPToolWithInput(server: server, tool: tool, input: input) {
+                                guard form === submitted else { return }
+                                let held: MCPHubToolDraft? = appModel.editDraft(subject, seed: Optional<MCPHubToolDraft>.none)
+                                if held === submitted {
+                                    appModel.clearEditDraft(subject)
+                                }
+                                form = MCPHubToolDraft(schema: tool.inputSchema)
+                            }
+                        }
                     }
                     .disabled(!form.parseErrors.isEmpty)
                     Spacer(minLength: 0)
@@ -607,7 +635,18 @@ private struct MCPHubToolRow: View {
                 }
             }
         }
+        .disabled(form.isRunning)
         .contentShape(Rectangle())
+        .onChange(of: tool.inputSchema) {
+            form = MCPHubToolDraft(schema: tool.inputSchema)
+        }
+        .onChange(of: heldDraft.map(ObjectIdentifier.init)) {
+            if let heldDraft {
+                form = heldDraft
+            } else {
+                form = MCPHubToolDraft(schema: tool.inputSchema)
+            }
+        }
     }
 }
 
@@ -908,19 +947,20 @@ extension AppModel {
     }
 
     @MainActor
-    func callMCPToolWithInput(server: MCPServer, tool: MCPTool, input: [String: JSONValue]) async {
+    func callMCPToolWithInput(server: MCPServer, tool: MCPTool, input: [String: JSONValue]) async -> Bool {
         if let validation = MCPUIActions.validationMessage(
             schema: tool.inputSchema,
             values: input
         ) {
             statusText = "MCP input refused: \(validation)"
-            return
+            return false
         }
         do {
-            latestMCPCall = try await MCPUIActions.callMCPTool(
+            let call = try await MCPUIActions.callMCPTool(
                 serverId: server.id, toolName: tool.name, input: input,
                 dataRoot: engine.dataRoot, authority: .runtime(dataRoot: engine.dataRoot)
             )
+            latestMCPCall = call
             if latestMCPCall?.evidenceStatus == "recorded" {
                 refreshMCPHubRecentCall()
             } else if let latestMCPCall {
@@ -928,9 +968,11 @@ extension AppModel {
             }
             statusText = "MCP \(tool.name): \(latestMCPCall?.status ?? "done")"
             await refreshAll()
+            return call.status == "ok" || call.status == "success"
         } catch {
             mcpRecentCallState = .latestAttemptFailed(UserFacingError.cause(error, action: "call that MCP tool"))
             setFailureStatus(error, action: "call that MCP tool")
+            return false
         }
     }
 

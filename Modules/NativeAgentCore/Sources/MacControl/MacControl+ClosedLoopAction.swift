@@ -919,24 +919,19 @@ var effect: [String: JSONValue] = [
         output["status"] = .string(classification.status)
         let observedReadout = MacActReceiptRendering.actedReadout(diff: diff, after: after)
         let editVerified = verb == .type && classification.status == "acted"
-        // A click, select, toggle or dismiss is certified by ITS effect: a
-        // state of the acted control read on both sides and different, its
-        // presence (under a comparable census), its window's title or modal,
-        // and — for a click only — the focus landing on it. A readout moving
-        // elsewhere, focus alone, or a read that failed is not that.
-        let acted = performed.actedHandle
+        // A press is certified by its CONSEQUENCE (`MacActClosedLoop.pressEvidence`),
+        // by the pointer or by AXPress alike. Its own state counts only for a
+        // verb that asks for that state.
+        let evidence = MacActClosedLoop.pressEvidence(diff, before: frame, pressed: entry, clicked: verb == .click)
         func moved(_ before: String?, _ after: String?) -> Bool { before != nil && after != nil && before != after }
-        let controlEffect = diff.windowTitleChanged || diff.modalAppeared || diff.modalDisappeared
-            || diff.changed.contains {
-                $0.handle == acted && (moved($0.beforeValue, $0.afterValue) || moved($0.beforeLabel, $0.afterLabel))
-            }
-            || (diff.diffComparable && diff.removed.contains { $0.handle == acted })
-            || (verb == .click && diff.focusChanged && diff.focusHandleAfter == acted)
-            || performed.postState.map {
-                moved(performed.target.value, $0.value) || moved(performed.target.title, $0.title)
-            } == true
-        let effectSeen = [MacActVerb.click, .select, .toggle, .dismiss].contains(verb) ? controlEffect
+        let ownState = evidence.own || performed.postState.map {
+            moved(performed.target.value, $0.value) || moved(performed.target.title, $0.title)
+        } == true
+        let consequence = evidence.consequence
+        let effectSeen = [MacActVerb.select, .toggle].contains(verb) ? consequence || ownState
+            : [MacActVerb.click, .dismiss].contains(verb) ? consequence
             : diff.windowChanged || editVerified
+        if verb == .click, ownState, !consequence { output["verification_note"] = .string("own_state_only") }
         if classification.status == "acted", effectSeen {
             output["verified"] = .bool(true)
             output["verification_scope"] = .string(editVerified ? "intended_field_edit" : "observed_screen_effect")

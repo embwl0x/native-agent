@@ -36,13 +36,4 @@ extension SwiftNativeTrustCenter {
             throw ChromeControlAuthorityError.disabled
         }
     }
-
-    public func chromeControlEnabledChecked(tool: String = "browser.chrome", origin: SecurityOriginContext? = nil) async -> Bool {
-        do {
-            try await authorizeChromeControlEffect(tool: tool, origin: origin)
-            return true
-        } catch {
-            return false
-        }
-    }
 }

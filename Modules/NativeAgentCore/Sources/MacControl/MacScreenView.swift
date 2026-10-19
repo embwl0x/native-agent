@@ -84,58 +84,43 @@ public struct MacScreenShot: @unchecked Sendable {
     #endif
 }
 
-#if canImport(CoreGraphics)
-extension MacScreenShot {
-    /// Crop in global AX points before image encoding. The returned bounds are
-    /// derived back from the integer pixel edges actually cropped, keeping the
-    /// image-to-screen transform exact even on fractional display scales.
-    public func cropped(to requested: MacAXFrame) -> MacScreenShot? {
-        guard bounds.w > 0, bounds.h > 0, pixelWidth > 0, pixelHeight > 0 else { return nil }
-        let x0 = max(bounds.x, requested.x)
-        let y0 = max(bounds.y, requested.y)
-        let x1 = min(bounds.x + bounds.w, requested.x + requested.w)
-        let y1 = min(bounds.y + bounds.h, requested.y + requested.h)
-        guard x1 > x0, y1 > y0 else { return nil }
-
-        let scaleX = Double(pixelWidth) / bounds.w
-        let scaleY = Double(pixelHeight) / bounds.h
-        let px0 = max(0, min(pixelWidth, Int(((x0 - bounds.x) * scaleX).rounded(.down))))
-        let py0 = max(0, min(pixelHeight, Int(((y0 - bounds.y) * scaleY).rounded(.down))))
-        let px1 = max(px0 + 1, min(pixelWidth, Int(((x1 - bounds.x) * scaleX).rounded(.up))))
-        let py1 = max(py0 + 1, min(pixelHeight, Int(((y1 - bounds.y) * scaleY).rounded(.up))))
-        let pixelRect = CGRect(x: px0, y: py0, width: px1 - px0, height: py1 - py0)
-        let croppedImage: CGImage?
-        if let cgImage {
-            guard let value = cgImage.cropping(to: pixelRect) else { return nil }
-            croppedImage = value
-        } else {
-            croppedImage = nil
-        }
-        return MacScreenShot(
-            bounds: MacAXFrame(
-                x: bounds.x + Double(px0) / scaleX,
-                y: bounds.y + Double(py0) / scaleY,
-                w: Double(px1 - px0) / scaleX,
-                h: Double(py1 - py0) / scaleY
-            ),
-            pixelWidth: px1 - px0,
-            pixelHeight: py1 - py0,
-            cgImage: croppedImage
-        )
-    }
-}
-#endif
-
 /// Why no image came back. Always REPORTED, never silently swallowed — "I need
 /// Screen Recording permission" is a true and actionable answer; a missing
 /// `image` key with no reason is not.
-public enum MacScreenCaptureFailure: String, Sendable, Equatable, Error {
-    case screenRecordingNotTrusted = "screen_recording_not_trusted"
-    case noDisplay = "no_display"
-    case captureFailed = "capture_failed"
-    case unavailableOnThisPlatform = "screen_capture_unavailable_on_this_platform"
-    case encodeFailed = "image_encode_failed"
-    case exceedsByteCap = "image_exceeds_byte_cap"
+public enum MacScreenCaptureFailure: Sendable, Equatable, Error, LocalizedError {
+    case screenRecordingNotTrusted, noDisplay, captureFailed, unavailableOnThisPlatform, encodeFailed, exceedsByteCap
+    case operationFailed(String, String)
+
+    public var rawValue: String {
+        switch self {
+        case .screenRecordingNotTrusted: "screen_recording_not_trusted"
+        case .noDisplay: "no_display"
+        case .captureFailed: "capture_failed"
+        case .unavailableOnThisPlatform: "screen_capture_unavailable_on_this_platform"
+        case .encodeFailed: "image_encode_failed"
+        case .exceedsByteCap: "image_exceeds_byte_cap"
+        case .operationFailed: "capture_failed"
+        }
+    }
+
+    public var errorDescription: String? {
+        if case .operationFailed(let operation, let cause) = self { return "\(operation): \(cause)" }
+        return rawValue
+    }
+
+    public func remedy(app: String? = nil, part: String? = nil) -> JSONValue {
+        var args: [String: JSONValue] = ["pixels": .bool(true)]
+        if let app { args["app"] = .string(app) }
+        if let part { args["part"] = .string(part) }
+        return MacFourVerbsReply.privacyRemedy(rawValue) ?? .object([
+            "kind": .string("inspect"),
+            "instruction": .string("\(errorDescription ?? rawValue). Inspect the requested pixels with next_call; no capture was verified."),
+            "next_call": .object([
+                "tool": .string("app"), "input": .object(["action": .string("mac.look"),
+                    "args": .object(args)]),
+            ]),
+        ])
+    }
 }
 
 /// The injectable capture seam. Production is `SystemMacScreenCaptureSource`
@@ -189,7 +174,7 @@ public struct MacScreenMarkerPlacement: Sendable, Equatable {
     }
 }
 
-/// Draws the numbered markers and encodes. Injectable so the byte-budget ladder
+/// Masks secret frames, draws the numbered markers and encodes. Injectable so the byte-budget ladder
 /// and the placement math are testable with no pixels involved.
 public protocol MacScreenImageRenderer: Sendable {
     /// - Parameter downscale: 1.0 = native pixels. The renderer applies it to
@@ -198,6 +183,7 @@ public protocol MacScreenImageRenderer: Sendable {
     func renderPNG(
         shot: MacScreenShot,
         placements: [MacScreenMarkerPlacement],
+        secretFrames: [MacAXFrame],
         downscale: Double
     ) -> Data?
 }
@@ -570,8 +556,7 @@ public enum MacImageFrames {
     private nonisolated(unsafe) static var held: [(id: String, session: String, geometry: MacScreenViewGeometry)] = []
 
     /// Keep a delivered image; its receipt fields and the sentence that reads them.
-    public static func remember(_ geometry: MacScreenViewGeometry) -> (fields: JSONValue, words: String) {
-        let id = "img-" + UUID().uuidString.prefix(8).lowercased()
+    public static func remember(_ geometry: MacScreenViewGeometry, id: String = "img-" + UUID().uuidString.prefix(8).lowercased()) -> (fields: JSONValue, words: String) {
         let session = PersonOnlyWindows.driver?.session ?? ""
         lock.withLock {
             held.append((id, session, geometry))

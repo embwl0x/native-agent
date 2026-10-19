@@ -1,18 +1,5 @@
 import Connectors
 import AttentionRouting
-// PATCH-2026-08-18: system-permission preflight.
-//
-// Root cause this file exists for: commit 130dc377 made SFSpeechRecognizer
-// load-bearing for a HEADLESS pipeline (inbound Telegram voice notes), but the
-// ONLY code path that can raise the macOS SpeechRecognition TCC prompt is
-// VoiceInputCapture.requestPermission(), reachable only when a human clicks
-// the in-app mic button. A Telegram-only user never traverses it, so
-// kTCCServiceSpeechRecognition stays notDetermined forever — and worse, the
-// headless transcriber's own SFSpeechRecognizer.requestAuthorization call runs
-// where macOS cannot render a prompt, so the system resolves it .denied.
-//
-// This type supplies the three things that were missing: a NON-PROMPTING status
-// read, a foreground acquisition path, and warning copy naming the Settings pane.
 import Foundation
 import AppKit
 import ApplicationServices
@@ -33,8 +20,22 @@ extension SystemPermissionPreflight {
     static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool {
         for id in ids {
             guard let gate = cardSettingsCapability(id), let url = settingsURL(for: gate) else { continue }
-            let opened = NSWorkspace.shared.open(url)
-            ModuleLog.app("[permission-card] \(opened ? "Opened" : "Could not open") \(url.absoluteString)")
+            if !NSApp.isActive {
+                let activation = AsyncStream<Void>(bufferingPolicy: .bufferingNewest(1)) { continuation in
+                    nonisolated(unsafe) let token = NotificationCenter.default.addObserver(
+                        forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+                    ) { _ in continuation.yield(()); continuation.finish() }
+                    continuation.onTermination = { _ in NotificationCenter.default.removeObserver(token) }
+                }
+                NSApp.activate(ignoringOtherApps: true)
+                for await _ in activation {}
+            }
+            guard NSApp.isActive, !Task.isCancelled else { return true }
+            // Settings must not take focus before macOS receives the request.
+            defer {
+                let opened = NSWorkspace.shared.open(url)
+                ModuleLog.app("[permission-card] \(opened ? "Opened" : "Could not open") \(url.absoluteString)")
+            }
             if let bundleID = SystemAppleScriptAdapter.automationTarget(id) {
                 _ = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID, ask: true)
                 continue
@@ -48,9 +49,7 @@ extension SystemPermissionPreflight {
             guard cardStatus(gate, mode: mode) != .granted else { continue }
             switch gate {
             case .calendars where mode == .write:
-                if cardStatus(gate, mode: mode) == .notDetermined {
-                    _ = try? await EKEventStore().requestWriteOnlyAccessToEvents()
-                }
+                _ = try? await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: EKEventStore())
             case .calendars: _ = await LocalPIMConnectorActions.requestCalendarAccess()
             case .reminders: _ = await LocalPIMConnectorActions.requestReminderAccess()
             case .contacts where status(gate) == .notDetermined:
@@ -65,9 +64,12 @@ extension SystemPermissionPreflight {
                 _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
             case .screenRecording: _ = CGRequestScreenCaptureAccess()
             case .inputMonitoring: _ = CGRequestListenEventAccess()
+            case .fullDiskAccess:
+                NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
             default: break
             }
         }
+        NotificationCenter.default.post(name: permissionDidChange, object: nil)
         return await cardBlockReason(ids, mode: mode) != nil
     }
 

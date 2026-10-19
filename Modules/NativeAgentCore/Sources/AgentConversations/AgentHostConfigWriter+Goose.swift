@@ -5,6 +5,11 @@ extension AgentHostConfigWriter {
     static func writeGooseEntry(path: String, name: String, entryJSON: String, backupRecordURL: URL) throws -> Outcome {
         try edit(path: path, backupRecordURL: backupRecordURL, initial: Data("extensions: {}\n".utf8)) {
             guard let result = try GooseEntrySplice.edit($0, name: name, entry: entryJSON) else { return nil }
+            guard !result.replaced else {
+                if result.data == $0 { return nil }
+                return result
+            }
+            if checking == true { throw Failure.unparsable("missing connector at \(path):extensions.\(name); connect this host") }
             // Validate the proposed document too: appending after a YAML end
             // marker must never turn one valid document into two.
             _ = try GooseEntrySplice.edit(result.data, name: name, entry: nil)
@@ -71,7 +76,10 @@ enum GooseEntrySplice {
             guard line.hasPrefix(prefix),
                   (try? JSONSerialization.jsonObject(with: Data(line.dropFirst(prefix.count).utf8))) is [String: Any]
             else { throw refused() }
-            if let entry { lines[index] = prefix + entry }
+            if let entry {
+                if try AgentHostConfigWriter.checkEntry(String(line.dropFirst(prefix.count)), expected: entry, json: true, at: "extensions." + name) { return nil }
+                lines[index] = prefix + entry
+            }
             else { lines.remove(at: index) }
             return (Data(lines.joined(separator: "\n").utf8), entry != nil, entry == nil)
         }

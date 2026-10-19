@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 
-/// Complete values and paragraphs for reading; the retained byte stream remains
+/// Complete values and lines for reading; the retained byte stream remains
 /// available separately for exact reconstruction, including unusually large atoms.
 package enum ToolResultSections {
     package static let pageBudget = 24_000
@@ -12,10 +12,9 @@ package enum ToolResultSections {
 
     static func projection(content: String, budget: Int) -> [(value: JSONValue, text: String, bytes: Int)] {
         var sections: [(value: JSONValue, text: String, bytes: Int)] = []
-        func append(_ value: JSONValue, path: [JSONValue], paragraph: Int? = nil, sentence: Int? = nil) {
+        func append(_ value: JSONValue, path: [JSONValue], line: Int? = nil) {
             var row: [String: JSONValue] = ["path": .array(path), "value": value]
-            if let paragraph { row["paragraph"] = .int(Int64(paragraph)) }
-            if let sentence { row["sentence"] = .int(Int64(sentence)) }
+            if let line { row["line"] = .int(Int64(line)) }
             let encoded = (try? value.serialize(pretty: false)) ?? ""
             if encoded.utf8.count > budget - 1_024 {
                 row.removeValue(forKey: "value")
@@ -48,40 +47,27 @@ package enum ToolResultSections {
             let section = JSONValue.object(row)
             sections.append((section, searchable, ((try? section.serialize(pretty: false))?.utf8.count ?? 0) + 1))
         }
-        func appendParagraph(_ text: String, path: [JSONValue], paragraph: Int) {
-            if ((try? JSONValue.string(text).serialize(pretty: false))?.utf8.count ?? 0) <= budget - 1_024 {
-                append(.string(text), path: path, paragraph: paragraph)
-                return
-            }
-            // Very long paragraphs can still be read as whole sentences.
-            var sentence = 0
-            text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: .bySentences) { _, _, range, _ in
-                append(.string(String(text[range])), path: path, paragraph: paragraph, sentence: sentence)
-                sentence += 1
-            }
-            if sentence == 0 { append(.string(text), path: path, paragraph: paragraph) }
-        }
         func visit(_ value: JSONValue, path: [JSONValue]) {
             switch value {
             case .string(let text):
-                // Preserve separators in their paragraph, so joining restores text.
+                // Keep record separators, so joining restores the source text.
                 var start = text.startIndex
-                var paragraph = 0
-                while let range = text.range(of: "\n\n", range: start..<text.endIndex) {
-                    appendParagraph(String(text[start..<range.upperBound]), path: path, paragraph: paragraph)
-                    paragraph += 1
-                    start = range.upperBound
+                var line = 1
+                while let range = text.rangeOfCharacter(from: .newlines, range: start..<text.endIndex) {
+                    let end = text[range] == "\r" && range.upperBound < text.endIndex && text[range.upperBound] == "\n"
+                        ? text.index(after: range.upperBound) : range.upperBound
+                    append(.string(String(text[start..<end])), path: path, line: line)
+                    line += 1
+                    start = end
                 }
-                if start < text.endIndex || paragraph == 0 {
-                    appendParagraph(String(text[start...]), path: path, paragraph: paragraph)
+                if start < text.endIndex || line == 1 {
+                    append(.string(String(text[start...])), path: path, line: line)
                 }
             case .array(let values):
                 if values.isEmpty { append(value, path: path) }
                 for (index, item) in values.enumerated() {
                     let itemPath = path + [.int(Int64(index))]
-                    if ((try? item.serialize(pretty: false))?.utf8.count ?? 0) <= budget - 1_024 {
-                        append(item, path: itemPath)
-                    } else { visit(item, path: itemPath) }
+                    append(item, path: itemPath)
                 }
             case .object(let fields):
                 if fields.isEmpty { append(value, path: path) }
@@ -102,15 +88,11 @@ package enum ToolResultSections {
 
     static func pages(sections projection: [(value: JSONValue, text: String, bytes: Int)], query: String, budget: Int) -> [[JSONValue]] {
         var sections = projection
-        let terms = query.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
         if !terms.isEmpty {
-            let scores: [Int] = sections.map { section in
-                terms.filter { section.text.localizedCaseInsensitiveContains($0) }.count
+            sections = sections.filter { section in
+                terms.allSatisfy { section.text.localizedCaseInsensitiveContains($0) }
             }
-            let order = sections.indices.sorted { left, right in
-                scores[left] == scores[right] ? left < right : scores[left] > scores[right]
-            }
-            sections = order.map { sections[$0] }
         }
         var pages: [[JSONValue]] = [[]]
         var bytes = 2

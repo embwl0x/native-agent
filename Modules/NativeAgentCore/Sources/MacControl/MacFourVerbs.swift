@@ -58,6 +58,8 @@ import PersistenceCore
 
 public struct MacFourVerbs: Sendable {
     let host: any MacControlClient
+    let flowRoot: URL?
+    let flowSession: String?
     let clock = SystemMacFourVerbsClock()
     let supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)?
     let namedLocationRoots: [URL]
@@ -77,9 +79,11 @@ public struct MacFourVerbs: Sendable {
         supplementalSource: (any MacFourVerbsSupplementalPerceptionSource)? = nil,
         namedLocationRoots: [URL]? = nil,
         effectObserverSource: any MacAXEffectObserverSource = defaultMacAXEffectObserverSource(),
-        appActivationSource: any MacAppActivationObserverSource = defaultMacAppActivationObserverSource()
+        appActivationSource: any MacAppActivationObserverSource = defaultMacAppActivationObserverSource(),
+        flowRoot: URL? = nil, flowSession: String? = nil
     ) {
         self.host = host
+        self.flowRoot = flowRoot; self.flowSession = flowSession
         self.supplementalSource = supplementalSource
         self.namedLocationRoots = namedLocationRoots ?? Self.commonHomeLocationRoots()
         self.effectObserverSource = effectObserverSource

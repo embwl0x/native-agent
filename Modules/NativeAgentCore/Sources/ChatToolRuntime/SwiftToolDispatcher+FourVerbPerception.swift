@@ -10,83 +10,6 @@ import PersistenceCore
 import VisionPerception
 import Senses
 
-struct MacVisualWindowRecord: Sendable, Equatable {
-    let ownerPID: Int32
-    let ownerName: String
-    let layer: Int
-    let frame: MacAXFrame
-    let alpha: Double
-}
-
-struct MacVisualObstruction: Sendable, Equatable {
-    let ownerPID: Int32
-    let ownerName: String
-    let coverage: Double
-    let frame: MacAXFrame
-
-    func covers(_ other: MacAXFrame) -> Bool {
-        min(frame.x + frame.w, other.x + other.w) > max(frame.x, other.x)
-            && min(frame.y + frame.h, other.y + other.h) > max(frame.y, other.y)
-    }
-}
-
-struct SystemMacVisualObstructionProbe: Sendable {
-    func obstructions(over frame: MacAXFrame, targetPID: Int32) -> [MacVisualObstruction] {
-        guard let raw = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly], kCGNullWindowID
-        ) as? [[String: Any]] else { return [] }
-        let windows = raw.compactMap { value -> MacVisualWindowRecord? in
-            // Her clicks pass through Shotgun, so it covers nothing of hers.
-            if let number = value[kCGWindowNumber as String] as? Int,
-               PersonOnlyWindows.contains(number: number) { return nil }
-            guard let pid = value[kCGWindowOwnerPID as String] as? Int,
-                  let layer = value[kCGWindowLayer as String] as? Int,
-                  let bounds = value[kCGWindowBounds as String] as? NSDictionary,
-                  let rect = CGRect(dictionaryRepresentation: bounds) else { return nil }
-            return MacVisualWindowRecord(
-                ownerPID: Int32(pid),
-                ownerName: value[kCGWindowOwnerName as String] as? String ?? "another app",
-                layer: layer,
-                frame: MacAXFrame(x: rect.minX, y: rect.minY, w: rect.width, h: rect.height),
-                alpha: value[kCGWindowAlpha as String] as? Double ?? 1
-            )
-        }
-        return Self.obstructions(in: windows, over: frame, targetPID: targetPID)
-    }
-
-    static func obstructions(
-        in windows: [MacVisualWindowRecord],
-        over frame: MacAXFrame,
-        targetPID: Int32
-    ) -> [MacVisualObstruction] {
-        let frameArea = frame.w * frame.h
-        guard frameArea > 0,
-              let targetIndex = windows.indices.first(where: { index in
-                  let window = windows[index]
-                  return window.ownerPID == targetPID
-                      && intersectionArea(window.frame, frame) / frameArea >= 0.5
-              }) else { return [] }
-        let ignoredOwners = Set(["Window Server", "Dock", "Control Center"])
-        return windows[..<targetIndex].compactMap { window -> MacVisualObstruction? in
-            guard window.alpha > 0.05,
-                  window.layer >= 0,
-                  !ignoredOwners.contains(window.ownerName) else { return nil }
-            let coverage = intersectionArea(window.frame, frame) / frameArea
-            // A small dialog can completely cover a small target. Screen-area
-            // thresholds hid real obstructions on large displays. Preserve
-            // exact overlap geometry, including same-app floating windows.
-            guard coverage > 0 else { return nil }
-            return MacVisualObstruction(ownerPID: window.ownerPID, ownerName: window.ownerName, coverage: coverage, frame: window.frame)
-        }
-    }
-
-    private static func intersectionArea(_ lhs: MacAXFrame, _ rhs: MacAXFrame) -> Double {
-        let width = max(0, min(lhs.x + lhs.w, rhs.x + rhs.w) - max(lhs.x, rhs.x))
-        let height = max(0, min(lhs.y + lhs.h, rhs.y + rhs.h) - max(lhs.y, rhs.y))
-        return width * height
-    }
-}
-
 /// The app-assembly bridge between MacControl's live fused capture and the pure
 /// VisionPerception compiler. MacControl stays independent of VisionPerception;
 /// the four-verb surface receives one additive, source-neutral supplement.
@@ -138,17 +61,19 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             return nil
         }
         let captureFinishedNs = DispatchTime.now().uptimeNanoseconds
-        guard result.ok, case .object(var output) = result.output else { return nil }
+        if !result.ok, case .object(let output) = result.output, var remedy = output["remedy"] {
+            if case .object(let fields) = remedy, fields["kind"] == .string("inspect") {
+                remedy = MacScreenCaptureFailure.operationFailed(result.error ?? "capture_failed",
+                    string(output["message"]) ?? "The requested screen capture failed.").remedy(app: requestedApp, part: pixels?.part)
+            }
+            return MacFourVerbsSupplement(diagnostics: ["error": .string(result.error ?? "capture_failed"),
+                "message": output["message"] ?? .string("The requested screen capture failed."), "remedy": remedy])
+        }
+        guard result.ok, case .object(let output) = result.output,
+              let frameID = string(output["frame_id"]) else { return nil }
 
         let viewId = string(output["view"])
         let marks = array(output["marks"])
-        if output["image"] != nil, output["image"] != .null {
-            // One masked capture feeds the preview, OCR and model attachment.
-            output["image"] = maskedCapture(output: output, marks: marks).map(JSONValue.string)
-            if output["image"] == nil {
-                output["image_unavailable_reason"] = .string("The capture could not be safely masked.")
-            }
-        }
         let app = object(output["app"])
         let appName = string(app["name"])
         let bundleIdentifier = string(app["bundle_id"])
@@ -192,16 +117,9 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         // its latency on this window, and a richly semantic window the agent
         // skips OCR on is exactly the window the user still wants to see.
         if let publish = MacScreenPreviewBus.publish {
-            await publishPreview(output: output, marks: marks, appName: appName, publish: publish)
+            await publishPreview(output: output, appName: appName, publish: publish)
         }
 
-        let dominantImageFrame: MacAXFrame? = frame(output["semantic_focus_frame"])
-            ?? marks.compactMap { value in
-                let mark = object(value)
-                guard let role = string(mark["role"]),
-                      role == "AXImage" || role == "AXCanvas" else { return nil }
-                return frame(mark["frame"])
-            }.max { lhs, rhs in lhs.w * lhs.h < rhs.w * rhs.h }
         // The view graded its own AX read (Chromium and incomplete reads are never thin).
         let thinReason = string(output["thin_accessibility_reason"])
         // Independent-window capture contains no covering app pixels to exclude.
@@ -210,6 +128,7 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             let title = displayText(output["window_title"]) ?? ""
             let windowFrame = visibleFrame.map { "\(Int($0.x)),\(Int($0.y)),\(Int($0.w))x\(Int($0.h))" } ?? ""
             pixels.record(
+                frameID: frameID,
                 reason: thinReason,
                 screenRecording: bool(output["screen_recording_trusted"]) ?? false,
                 png: string(output["image"]),
@@ -218,10 +137,12 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                          number(imageOriginObject["y"] ?? originObject["y"]) ?? 0),
                 logicalSize: (number(imageLogicalObject["w"] ?? logicalObject["w"]) ?? 0,
                               number(imageLogicalObject["h"] ?? logicalObject["h"]) ?? 0),
-                wholeWindow: output["semantic_focus_frame"] == nil || output["semantic_focus_frame"] == .null,
                 background: output["capture_isolated_window"] == .bool(true),
                 window: [bundleIdentifier ?? "", appName ?? "", title, windowFrame].joined(separator: "|")
             )
+            if let mainPicture = frame(output["semantic_focus_frame"]) {
+                pixels.focus(name: "the window's main picture area", frame: mainPicture)
+            }
         }
         // Pixel perception is the fallback for AX-sparse surfaces; the view
         // decided before its capture whether this window earns it.
@@ -242,22 +163,18 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             let visualCompileStartedNs = DispatchTime.now().uptimeNanoseconds
             let appName = string(object(output["app"])["name"])
             let title = displayText(output["window_title"])
-            let crop = VisionImageCropper.crop(
-                image,
-                to: dominantImageFrame,
-                origin: (originX, originY),
-                logicalSize: (logicalW, logicalH)
-            )
+            let origin = (x: originX, y: originY)
+            let logicalSize = (width: logicalW, height: logicalH)
             let excludedRegions = obstructions.map { obstruction in
                 VisionRect(
-                    x: (obstruction.frame.x - crop.origin.x) * Double(crop.image.width) / crop.logicalSize.width,
-                    y: (obstruction.frame.y - crop.origin.y) * Double(crop.image.height) / crop.logicalSize.height,
-                    w: obstruction.frame.w * Double(crop.image.width) / crop.logicalSize.width,
-                    h: obstruction.frame.h * Double(crop.image.height) / crop.logicalSize.height
+                    x: (obstruction.frame.x - origin.x) * Double(image.width) / logicalSize.width,
+                    y: (obstruction.frame.y - origin.y) * Double(image.height) / logicalSize.height,
+                    w: obstruction.frame.w * Double(image.width) / logicalSize.width,
+                    h: obstruction.frame.h * Double(image.height) / logicalSize.height
                 )
             }
             let percept = try VisionPerceptionCompiler().compile(
-                image: crop.image,
+                image: image,
                 excludedRegions: excludedRegions
             )
             let sceneKey = [bundleIdentifier, appName, title]
@@ -267,15 +184,16 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
             let sceneSnapshot = await liveScene.identify(
                 rows: percept.rows,
                 frameSize: percept.frameSize,
-                origin: crop.origin,
-                logicalSize: crop.logicalSize,
+                origin: origin,
+                logicalSize: logicalSize,
                 sceneKey: sceneKey,
                 capturedAt: capturedAt
             )
             let vision = percept.fourVerbSupplement(
-                origin: crop.origin,
-                logicalSize: crop.logicalSize,
+                origin: origin,
+                logicalSize: logicalSize,
                 viewId: viewId,
+                globalRegionOfInterest: frame(output["semantic_focus_frame"]),
                 liveRegionIdentities: sceneSnapshot.identities,
                 liveOccludedRegions: sceneSnapshot.temporarilyNotVisible
             )
@@ -349,8 +267,8 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
                 bundleIdentifier: bundleIdentifier,
                 visibleFrame: visibleFrame,
                 pointer: pointer,
-                pointerFrame: MacAXFrame(x: crop.origin.x, y: crop.origin.y,
-                    w: crop.logicalSize.width, h: crop.logicalSize.height),
+                pointerFrame: MacAXFrame(x: origin.x, y: origin.y,
+                    w: logicalSize.width, h: logicalSize.height),
                 contents: structural.contents + visionContents,
                 controls: structural.controls + vision.controls,
                 values: structural.values + visionValues,
@@ -517,27 +435,6 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
         )
     }
 
-    private func maskedCapture(output: [String: JSONValue], marks: [JSONValue]) -> String? {
-        let imageOrigin = object(output["image_origin"])
-        let imageLogical = object(output["image_logical_size"])
-        let origin = object(output["origin"])
-        let logical = object(output["logical_size"])
-        guard let encoded = string(output["image"]), let data = Data(base64Encoded: encoded),
-              let image = VisionImageDecoder.decode(data),
-              let x = number(imageOrigin["x"] ?? origin["x"]), let y = number(imageOrigin["y"] ?? origin["y"]),
-              let w = number(imageLogical["w"] ?? logical["w"]), let h = number(imageLogical["h"] ?? logical["h"]),
-              w > 0, h > 0 else { return nil }
-        guard !MacScreenPreviewFrame.secretRects(marks: marks,
-            imagePixelSize: (w: image.width, h: image.height), origin: (x: x, y: y), logicalSize: (w: w, h: h)).isEmpty else { return encoded }
-        guard let masked = MacScreenPreviewFrame.previewImage(from: image, marks: marks,
-                  origin: (x: x, y: y), logicalSize: (w: w, h: h), maximumWidth: image.width) else { return nil }
-        let png = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(png, UTType.png.identifier as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, masked, nil)
-        guard CGImageDestinationFinalize(destination) else { return nil }
-        return (png as Data).base64EncodedString()
-    }
-
     /// Hands the card the frame this observation already holds, masked and
     /// downscaled. A capture with no image (Screen Recording not granted, a
     /// locked screen, a refused capture) still publishes the words, so the
@@ -545,29 +442,14 @@ struct SwiftToolDispatcherFourVerbPerceptionSource: MacFourVerbsSupplementalPerc
     /// whatever picture it last had.
     private func publishPreview(
         output: [String: JSONValue],
-        marks: [JSONValue],
         appName: String?,
         publish: @Sendable (MacScreenPreviewUpdate) async -> Void
     ) async {
         let caption = previewCaption ?? MacScreenPreviewCaption.looking(at: appName)
-        let imageOrigin = object(output["image_origin"])
-        let imageLogical = object(output["image_logical_size"])
-        let origin = object(output["origin"])
-        let logical = object(output["logical_size"])
         guard let encoded = string(output["image"]),
               let data = Data(base64Encoded: encoded),
               let image = VisionImageDecoder.decode(data),
-              let originX = number(imageOrigin["x"] ?? origin["x"]),
-              let originY = number(imageOrigin["y"] ?? origin["y"]),
-              let logicalW = number(imageLogical["w"] ?? logical["w"]),
-              let logicalH = number(imageLogical["h"] ?? logical["h"]),
-              logicalW > 0, logicalH > 0,
-              let preview = MacScreenPreviewFrame.previewImage(
-                  from: image,
-                  marks: marks,
-                  origin: (x: originX, y: originY),
-                  logicalSize: (w: logicalW, h: logicalH)
-              ) else {
+              let preview = MacScreenPreviewFrame.previewImage(from: image) else {
             await publish(MacScreenPreviewUpdate(image: nil, caption: caption, at: Date()))
             return
         }
@@ -646,13 +528,13 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
     let forced: Bool
     private let lock = NSLock()
     private var recorded = false
+    private var frameID = ""
     private var reason: String?
     private var screenRecording = false
     private var png: String?
     private var unavailable: String?
     private var origin: (x: Double, y: Double) = (0, 0)
     private var logicalSize: (width: Double, height: Double) = (0, 0)
-    private var wholeWindow = true
     private var background = false
     private var window = ""
     private var region: (name: String, frame: MacAXFrame)?
@@ -662,11 +544,12 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         self.forced = forced
     }
 
-    func record(reason: String?, screenRecording: Bool, png: String?, unavailable: String?,
+    func record(frameID: String, reason: String?, screenRecording: Bool, png: String?, unavailable: String?,
                 origin: (x: Double, y: Double), logicalSize: (width: Double, height: Double),
-                wholeWindow: Bool, background: Bool, window: String) {
+                background: Bool, window: String) {
         lock.lock(); defer { lock.unlock() }
         recorded = true
+        self.frameID = frameID
         discarded = false
         self.reason = reason
         self.screenRecording = screenRecording
@@ -674,7 +557,6 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         self.unavailable = unavailable
         self.origin = origin
         self.logicalSize = logicalSize
-        self.wholeWindow = wholeWindow
         self.background = background
         self.window = window
         region = nil
@@ -738,15 +620,19 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard LocalToolImage.sink != nil else {
             return "Pixels (\(why)): this call cannot carry an image, so none was attached; the words above are all I have."
         }
-        var scope = wholeWindow ? "the window" : "the window's main picture area"
+        var scope = "the window"
         if let region { scope = "\(region.name), cropped at higher detail" }
         // Same window, same region, byte-identical source frame → the image
         // already in her context stands. Checked before any decode or encode.
         let key = window + "|" + (region?.name ?? "")
         let fingerprint = SHA256.hash(data: Data(png.utf8)).map { String(format: "%02x", $0) }.joined()
         let turn = forced ? nil : ChatTurnExecution.current
-        if turn?.pixelsAlreadyAttached(window: key, fingerprint: fingerprint) == true {
-            return "Pixels (\(why)): \(scope) is unchanged since its image was attached earlier this turn; not sent again."
+        if let previousID = turn?.attachedPixelFrame(window: key, fingerprint: fingerprint),
+           let previous = MacImageFrames.frame(previousID) {
+            let frame = MacImageFrames.remember(previous.geometry, id: frameID)
+            imageFrame = frame.fields
+            turn?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID)
+            return "Pixels (\(why)): \(scope) is unchanged since its image was attached earlier this turn; not sent again. " + frame.words
         }
         guard let data = Data(base64Encoded: png), let image = VisionImageDecoder.decode(data) else {
             return "Pixels (\(why)): the window capture could not be decoded; the words above are all I have."
@@ -770,15 +656,15 @@ final class FourVerbPixelAttachment: @unchecked Sendable {
         guard case .object(let result) = delivered, result["status"] == .string("ok") else {
             return "Pixels (\(why)): this result already carries its image limit; none was attached."
         }
-        ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint)
         let placement = background ? "captured where it sits, nothing raised" : "the front window as shown"
         let attached = "Pixels attached (\(why)): one \(jpeg.width)×\(jpeg.height) JPEG, \(max(1, jpeg.data.count / 1000)) KB, of \(scope) (\(placement)). It follows this result."
         // The final size and the screen rect it covers travel together, so a point in it is a place.
         guard source.logicalSize.width > 0, source.logicalSize.height > 0 else { return attached }
         let frame = MacImageFrames.remember(MacScreenViewGeometry(
             bounds: MacAXFrame(x: source.origin.x, y: source.origin.y, w: source.logicalSize.width, h: source.logicalSize.height),
-            pixelWidth: jpeg.width, pixelHeight: jpeg.height))
+            pixelWidth: jpeg.width, pixelHeight: jpeg.height), id: frameID)
         imageFrame = frame.fields
+        ChatTurnExecution.current?.notePixelsAttached(window: key, fingerprint: fingerprint, frameID: frameID)
         return attached + " " + frame.words
     }
 

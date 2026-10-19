@@ -1,4 +1,5 @@
 import Foundation
+@_exported import ChatToolParsing
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -118,8 +119,18 @@ package enum ChatTranscriptEvidenceRendering {
     }
 
     package static func contentIncludingAttachments(_ content: String, attachments: JSONValue?) -> String {
-        guard let marker = attachmentMarker(attachments) else { return content }
-        return content.isEmpty ? marker : "\(marker) \(content)"
+        let marker = attachmentMarker(attachments)
+        var parts = [marker.map { content.isEmpty ? $0 : "\($0) \(content)" } ?? content]
+        if case .array(let rows)? = attachments {
+            for row in rows {
+                guard case .object(let item) = row, let evidence = item["utterance"] else { continue }
+                do {
+                    let utterance = try JSONDecoder().decode(SpeechUtterance.self, from: evidence.serializedData(pretty: false))
+                    parts.append(ChatSecretRedactor.redactText(try utterance.evidence(audioReference: string(item["path"]) ?? string(item["id"]) ?? "unavailable")))
+                } catch { parts.append("[Voice recognition evidence unreadable: \(error.localizedDescription)]") }
+            }
+        }
+        return parts.filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
     /// Preserve attachment identity without claiming that document inputs were

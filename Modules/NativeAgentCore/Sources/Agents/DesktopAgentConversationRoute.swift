@@ -374,10 +374,10 @@ extension DesktopAgentConversationRoute: GrokBotConnectionPort {
         await GrokRoutineAccessibility.ensureRunning()
     }
 
-    public nonisolated func send(peer: AgentPeerContact, text: String, conversation: String,
+    public nonisolated func send(peer: AgentPeerContact, text: String, conversation: String, route: AgentBridgeCompletionRoute,
               messageID: String, dataRoot: URL, quiet: Bool) async throws -> JSONValue {
         try await GrokBotRoute.send(
-            peer: peer, text: text, conversation: conversation,
+            peer: peer, text: text, conversation: conversation, route: route,
             messageID: messageID, dataRoot: dataRoot,
             credential: GrokLinkCredential.read(peer: peer.id), quiet: quiet
         )

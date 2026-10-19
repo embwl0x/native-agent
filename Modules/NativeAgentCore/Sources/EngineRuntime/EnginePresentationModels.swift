@@ -1625,6 +1625,7 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
     public var kind: InlineCardKind
     /// What the interaction is about: "GitHub", "Desktop", "Work".
     public var target: String
+    public var systemPermissions: [SystemPermissionCapability]
     public var title: String
     /// One sentence. A writing constraint, not a line limit — it wraps.
     public var why: String
@@ -1672,6 +1673,7 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
         id: String,
         kind: InlineCardKind,
         target: String = "",
+        systemPermissions: [SystemPermissionCapability] = [],
         title: String,
         why: String,
         primaryLabel: String,
@@ -1698,6 +1700,7 @@ public struct InlineCardModel: Identifiable, Sendable, Equatable {
         self.id = id
         self.kind = kind
         self.target = target
+        self.systemPermissions = systemPermissions
         self.title = title
         self.why = why
         self.primaryLabel = primaryLabel
@@ -1788,6 +1791,8 @@ public enum InlineCardProjection {
             id: interaction.id,
             kind: kind(interaction.kind),
             target: descriptor.displayName,
+            systemPermissions: [.permission, .capability].contains(interaction.kind)
+                ? interaction.allTargets.compactMap(SystemPermissionPreflight.cardSettingsCapability) : [],
             title: interaction.title,
             why: interaction.why,
             primaryLabel: primaryLabel(interaction, descriptor),
@@ -2011,8 +2016,7 @@ public enum InlineCardProjection {
             return ("What happens", "Internet Accounts opens so you can add and enable a Mail account.")
         case .chromeSetup:
             return ("What happens",
-                    "Chrome control is switched on in Trust, the extension folder shows in Finder "
-                    + "and Chrome opens its extensions page. There, " + chromeSteps)
+                    "Chrome control is switched on in Trust. " + chromeSteps)
         case .pairDevice:
             return ("What happens",
                     "The pairing page opens. Open NativeAgent on your iPhone, then choose Pair "
@@ -2067,13 +2071,12 @@ public enum InlineCardProjection {
 
     /// The one thing to click, for a card that waits on the person
     /// somewhere else and settles by itself when the owner says done.
-    public static let chromeSteps = "turn on Developer mode, click Load unpacked and choose the "
-        + "\u{201C}\(ChromeExtensionFolder.visible.lastPathComponent)\u{201D} folder in your home folder."
+    public static let chromeSteps = "I'll load my extension in Chrome and check the connection. Allow Mac access if asked."
 
     private static func busyNote(_ control: InlineInteractionDescriptor.Control) -> String? {
         switch control {
         case .internetAccounts: return "Add and turn on a Mail account in Internet Accounts."
-        case .chromeSetup: return "In Chrome\u{2019}s extensions page, " + chromeSteps
+        case .chromeSetup: return chromeSteps
         case .pairDevice: return "Open NativeAgent on your iPhone, then choose Pair when the codes match."
         case .macPermissionGrant, .capabilityFlag:
             return "If System Settings opened, turn NativeAgent on there."

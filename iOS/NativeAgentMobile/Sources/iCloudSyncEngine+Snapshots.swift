@@ -507,11 +507,14 @@ extension iCloudSyncEngine {
         refreshInFlight = true
         defer { finishSnapshotRefresh(lifecycle: lifecycle) }
         await settleUnobservedActionResponses()
+        async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
         let bundle = await Self.loadLightweightSnapshots(snapshotDir: snapshotDir)
+        let overview = await latestOverview
         let workActivity: MobileWorkActivitySnapshot? = await Self.loadSnapshotObjectOnly(named: "work_activity.json", in: snapshotDir)
         let layout: SurfaceLayout? = await Self.loadSnapshotObjectOnly(named: "ui_layout.json", in: snapshotDir)
         guard generation == snapshotRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
+        applyWorkOverview(overview)
         if let v = bundle.trustPolicy { trustPolicy = v }
         if let workActivity { PhoneTurnActivity.shared.receive(workActivity) }
         if var layout { layout.addMissing(); surfaceLayout = layout }
@@ -578,9 +581,13 @@ extension iCloudSyncEngine {
         let lifecycle = lifecycleGeneration
         approvalsRefreshGeneration &+= 1
         let generation = approvalsRefreshGeneration
-        if let latest: [ApprovalRequest] = await Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir) {
-            guard generation == approvalsRefreshGeneration,
-                  lifecycle == lifecycleGeneration else { return }
+        async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
+        let latest: [ApprovalRequest]? = await Self.loadSnapshotArrayOnly(named: "approvals.json", in: snapshotDir)
+        let overview = await latestOverview
+        guard generation == approvalsRefreshGeneration,
+              lifecycle == lifecycleGeneration else { return }
+        applyWorkOverview(overview)
+        if let latest {
             approvalsSnapshotLoaded = true
             approvals = latest
             noteRefreshSucceeded()
@@ -596,9 +603,12 @@ extension iCloudSyncEngine {
         // after a newer read already landed, briefly reviving stale data.
         targetedRefreshGeneration &+= 1
         let generation = targetedRefreshGeneration
+        async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
         let bundle = await Self.loadActivitySnapshots(snapshotDir: snapshotDir)
+        let overview = await latestOverview
         guard generation == targetedRefreshGeneration,
               lifecycle == lifecycleGeneration else { return false }
+        applyWorkOverview(overview)
         if let v = bundle.workshopTasks { workshopTasks = v; WorkshopCompletionNotificationTracker.shared.apply(v) }
         if let v = bundle.memories, memories != v { memories = v }
         if let v = bundle.inboxItems {
@@ -937,16 +947,18 @@ extension iCloudSyncEngine {
         // write inboxItems, so they must invalidate each other's stale reads).
         targetedRefreshGeneration &+= 1
         let generation = targetedRefreshGeneration
-        if let latest: [InboxItemRecord] = await Self.loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir) {
-            guard generation == targetedRefreshGeneration,
-                  lifecycle == lifecycleGeneration else { return false }
+        async let latestOverview: WorkOverview? = Self.loadSnapshotObjectOnly(named: "work_overview.json", in: snapshotDir)
+        let latest: [InboxItemRecord]? = await Self.loadSnapshotArrayOnly(named: "inbox.json", in: snapshotDir)
+        let overview = await latestOverview
+        guard generation == targetedRefreshGeneration,
+              lifecycle == lifecycleGeneration else { return false }
+        applyWorkOverview(overview)
+        if let latest {
             inboxSnapshotLoaded = true
             inboxItems = latest
             noteRefreshSucceeded()
             return true
         } else {
-            guard generation == targetedRefreshGeneration,
-                  lifecycle == lifecycleGeneration else { return false }
             syncError = SnapshotHealthLog.damageSentence() ?? "Inbox snapshot is still downloading from iCloud. Try again in a moment."
             return false
         }

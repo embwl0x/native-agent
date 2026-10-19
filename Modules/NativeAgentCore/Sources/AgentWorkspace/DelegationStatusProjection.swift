@@ -300,10 +300,14 @@ public struct DelegationJobProjection: Sendable, Equatable {
     /// Newest-first ordering key: the most recent timestamp the record proves.
     var recencyKey: Date?
     /// Exact future crossing at which this open record's existing liveness
-    /// rule becomes stalled. Internal scheduling evidence only; the public
+    /// rule becomes stalled. Drawing and scheduling evidence only; the public
     /// JSON continues to expose the verdict and basis, not another workflow
     /// field.
     var stallDeadline: Date?
+
+    func stalled(at now: Date) -> Bool {
+        stallBasis == .recordedStall || (stallDeadline.map { now >= $0 } ?? stalled)
+    }
 
     public func toJSON(includeReplyText: Bool = false) -> JSONValue {
         var obj: [String: JSONValue] = [
@@ -435,6 +439,17 @@ public struct DelegationStatusProjector: Sendable {
     public static let defaultLimit = 20
     public static let maxLimit = 100
 
+    /// Every source read by the projection, including existing jobs updated in place.
+    package var watchedPaths: [URL] {
+        let directories = [claudeJobsDirectory, codexJobsDirectory, codexJobsDirectory.appendingPathComponent("undelivered"), ompJobsDirectory]
+            + CodexCompletionLifecycleProjection.directories(
+                configRoot: claudeJobsDirectory.deletingLastPathComponent().deletingLastPathComponent(), dataRoot: dataRoot)
+        return directories.flatMap { directory in
+            [directory] + ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []).sorted { $0.path < $1.path }
+        } + [codexDeliveriesFile, codexDeliveriesFile.deletingLastPathComponent().appendingPathComponent("codex-inbox.jsonl")]
+            + ["claude-inbox.jsonl", "claude-replies.jsonl"].map { claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent($0) }
+    }
+
     /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`: the
     /// stand-in for `~/.config`, which is what makes the tests hermetic.
     public init(configRoot: URL? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()) {
@@ -549,14 +564,15 @@ public struct DelegationStatusProjector: Sendable {
         if let messageID, agent == nil || agent == "claude",
            !rows.contains(where: { $0.acceptedMessageIDs.contains(messageID) }) {
             let replies = claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent("claude-replies.jsonl")
-            if let text = Self.requestTexts(inbox: replies, ids: [messageID], field: "replyTextHead")[messageID] {
-                let stamp = Self.requestTexts(inbox: replies, ids: [messageID], field: "createdAt")[messageID]
+            if let reply = liveReplies([messageID])[messageID] {
+                let stamp = Self.requestTexts(inbox: replies, ids: [messageID], field: "createdAt", window: .max)[messageID]
                 var row = DelegationJobProjection(id: messageID, acceptedMessageIDs: [messageID],
-                    agentReplyTextHead: text, source: "claude", agent: "claude", topicSlug: nil,
+                    source: "claude", agent: "claude", topicSlug: nil,
                     deskHandle: nil, state: "replied", status: "replied", runStatus: nil, createdAt: nil,
                     claimedAt: nil, startedAt: nil, lastLiveness: nil, completedAt: stamp, elapsedSeconds: nil,
                     stalled: false, stallBasis: .terminal, deliveryLost: nil, deliveryOutcome: nil,
                     completionTextHead: nil, recordKind: "linked_reply")
+                Self.retainReply(reply.text, truncated: reply.truncated, in: &row)
                 row.recencyKey = Self.date(stamp)
                 rows.append(row)
                 sources.append(DelegationSourceAvailability(source: "claude_replies", agent: "claude", readableRecords: 1))
@@ -716,12 +732,12 @@ public struct DelegationStatusProjector: Sendable {
                 .appendingPathComponent("claude-inbox.jsonl"), ids: claudeIDs, field: "conversationId")
             // 2026-09-22: a live Claude answers in a bridge chat, not the
             // job; the bridge records a reply that names her message here.
-            let replies = Self.requestTexts(inbox: claudeJobsDirectory.deletingLastPathComponent()
-                .appendingPathComponent("claude-replies.jsonl"), ids: claudeIDs, field: "replyTextHead")
+            let replies = liveReplies(claudeIDs)
             for index in page.indices where page[index].agent == "claude" {
                 page[index].conversationID = page[index].acceptedMessageIDs.sorted().lazy.compactMap { handles[$0] }.first
-                if page[index].agentReplyTextHead == nil {
-                    page[index].agentReplyTextHead = page[index].acceptedMessageIDs.sorted().lazy.compactMap { replies[$0] }.first.flatMap(Self.head)
+                if page[index].agentReplyTextHead == nil,
+                   let reply = page[index].acceptedMessageIDs.sorted().lazy.compactMap({ replies[$0] }).first {
+                    Self.retainReply(reply.text, truncated: reply.truncated, in: &page[index])
                 }
             }
         }
@@ -729,24 +745,37 @@ public struct DelegationStatusProjector: Sendable {
     }
 
     /// Inbox `field` for the given message ids, read from the file's last 512 KiB.
-    public static func requestTexts(inbox url: URL, ids: Set<String>, field: String = "text") -> [String: String] {
-        let key = url.standardizedFileURL.path
+    /// The live-session answers recorded for these messages. Rows written
+    /// before the bridge kept the answer whole carry only a 400-character head.
+    private func liveReplies(_ ids: Set<String>) -> [String: (text: String, truncated: Bool)] {
+        let url = claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent("claude-replies.jsonl")
+        // Read whole: the bridge's own retention (500 answers) bounds this file, and a
+        // tail window would drop older answers it still keeps.
+        let whole = Self.requestTexts(inbox: url, ids: ids, field: "replyText", window: .max)
+        let cut = Set(Self.requestTexts(inbox: url, ids: ids, field: "replyTruncated", window: .max).filter { $0.value == "true" }.keys)
+        return Self.requestTexts(inbox: url, ids: ids, field: "replyTextHead", window: .max)
+            .mapValues { ($0, $0.hasSuffix("…")) }
+            .merging(whole.map { ($0.key, ($0.value, cut.contains($0.key))) }) { _, whole in whole }
+    }
+
+    public static func requestTexts(inbox url: URL, ids: Set<String>, field: String = "text", window: Int = 524_288) -> [String: String] {
+        let key = url.standardizedFileURL.path + "#" + String(window)
         let stamp = DelegationFileCache.stamp(url)
         let all: [String: [String: String]]
         if let stamp, let cached = fileCache.tail(key, stamp: stamp) {
             all = cached
         } else {
-            all = tailTexts(inbox: url)
+            all = tailTexts(inbox: url, window: window)
             if let stamp { fileCache.putTail(key, stamp: stamp, all) }
         }
         return all.filter { ids.contains($0.key) }.compactMapValues { $0[field] }
     }
 
-    private static func tailTexts(inbox url: URL) -> [String: [String: String]] {
+    private static func tailTexts(inbox url: URL, window: Int) -> [String: [String: String]] {
         guard let file = try? FileHandle(forReadingFrom: url) else { return [:] }
         defer { try? file.close() }
         let size = (try? file.seekToEnd()) ?? 0
-        let start = size > 524_288 ? size - 524_288 : 0
+        let start = size > UInt64(window) ? size - UInt64(window) : 0
         guard (try? file.seek(toOffset: start)) != nil, let data = try? file.readToEnd() else { return [:] }
         var lines = data.split(separator: 0x0A)
         if start > 0, !lines.isEmpty { lines.removeFirst() }

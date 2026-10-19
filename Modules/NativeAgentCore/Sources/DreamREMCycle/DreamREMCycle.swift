@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import Darwin
 import NativeAgentCore
 import PersistenceCore
@@ -120,7 +121,11 @@ public struct DreamEntry: Sendable, Codable, Equatable, Identifiable {
 /// `_dream_cycle.run_now(force:)` returns; preserve verbatim.
 public struct DreamRunResult: Sendable, Codable, Equatable {
     public var rawResponse: JSONValue
-    public init(rawResponse: JSONValue) { self.rawResponse = rawResponse }
+    public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
+    public init(rawResponse: JSONValue, reflectionMaterial: [String: CognitiveReflectionCause] = [:]) {
+        self.rawResponse = rawResponse
+        self.reflectionMaterial = reflectionMaterial
+    }
 
     enum CodingKeys: String, CodingKey { case rawResponse = "raw_response" }
 }
@@ -129,7 +134,11 @@ public struct DreamRunResult: Sendable, Codable, Equatable {
 /// `_rem_cycle.run_now(force:)` returns; preserve verbatim.
 public struct REMRunResult: Sendable, Codable, Equatable {
     public var rawResponse: JSONValue
-    public init(rawResponse: JSONValue) { self.rawResponse = rawResponse }
+    public var reflectionMaterial: [String: CognitiveReflectionCause] = [:]
+    public init(rawResponse: JSONValue, reflectionMaterial: [String: CognitiveReflectionCause] = [:]) {
+        self.rawResponse = rawResponse
+        self.reflectionMaterial = reflectionMaterial
+    }
 
     enum CodingKeys: String, CodingKey { case rawResponse = "raw_response" }
 }
@@ -395,7 +404,8 @@ public struct FileBackedDreamDiary: Sendable {
         /// The diary (or an archive year) is there and could not be listed.
         public let storageUnreadable: Bool
         /// Files that were listed but could not be read or stat'ed this pass.
-        public let unreadableEntries: Int
+        public let failures: [String: String]
+        public var unreadableEntries: Int { failures.count }
 
         public var isComplete: Bool { !storageUnreadable && unreadableEntries == 0 }
     }
@@ -417,17 +427,15 @@ public struct FileBackedDreamDiary: Sendable {
         let isoOut = ISO8601DateFormatter()
         isoOut.formatOptions = [.withInternetDateTime]
         var out: [DreamEntry] = []
-        var skipped = 0
+        var failures: [String: String] = [:]
         for (name, url) in files {
-            // Daemon wraps the per-file read+stat in try/except and `continue`s
-            // on ANY failure — match that: a
-            // file we can't read OR can't stat is skipped entirely, not emitted
-            // with placeholder size:0/now (that would diverge from Python).
-            guard let text = try? String(contentsOf: url, encoding: .utf8),
-                  let attrs = try? fm.attributesOfItem(atPath: url.path),
-                  let size = (attrs[.size] as? NSNumber)?.intValue,
-                  let mtime = attrs[.modificationDate] as? Date
-            else { skipped += 1; continue }
+            do {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let attrs = try fm.attributesOfItem(atPath: url.path)
+            guard let size = (attrs[.size] as? NSNumber)?.intValue,
+                  let mtime = attrs[.modificationDate] as? Date else {
+                throw CocoaError(.fileReadUnknown)
+            }
             out.append(DreamEntry(
                 date: (name as NSString).deletingPathExtension,
                 filename: name,
@@ -435,10 +443,11 @@ public struct FileBackedDreamDiary: Sendable {
                 size: size,
                 modifiedAt: isoOut.string(from: mtime)
             ))
+            } catch { failures[url.path] = error.localizedDescription }
         }
         return DiaryListing(
             entries: out, totalEntries: scan.files.count,
-            storageUnreadable: scan.unreadableDirectory, unreadableEntries: skipped)
+            storageUnreadable: scan.unreadableDirectory, failures: failures)
     }
 
     /// Outcome of a by-date read so the caller can distinguish the daemon's
@@ -515,6 +524,7 @@ public struct FileBackedDreamDiary: Sendable {
 
 /// Native dream/REM runners with the same gate for prechecks and execution.
 public actor SwiftNativeDreamREMCycle {
+    private let dataRoot: URL
     private let dreamRunner: DreamCycleRunner
     private let remConsolidator: REMConsolidator
     private let gate: DreamREMGatePolicy
@@ -530,6 +540,7 @@ public actor SwiftNativeDreamREMCycle {
         remStageApproval: REMApprovalStager? = nil,
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) {
+        self.dataRoot = dataRoot
         let effectiveGate = gate ?? Self.loadGatePolicy(dataRoot: dataRoot)
         self.gate = effectiveGate
         let llm = Self.makeDefaultLLMClient(lifecycleObserver: lifecycleObserver)
@@ -572,7 +583,27 @@ public actor SwiftNativeDreamREMCycle {
                 detail: DreamREMGatePolicy.dreamDisabledDetail
             )
         }
-        let report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger)
+        let report: DreamReport
+        do {
+            report = try await dreamRunner.runNightlyDreamCycle(force: force, trigger: trigger)
+        } catch {
+            await RepairOwed.owe(dataRoot, id: "dream-repair:" + UUID().uuidString, kind: .run,
+                operation: "dream", owner: "dream cycle", words: error.localizedDescription,
+                nextCall: ToolFailureError.call("app", ["action": .string("mind.dream")])).value
+            throw error
+        }
+        if !report.errors.isEmpty {
+            let fields: [String: JSONValue] = if case .object(let fields)? = report.repair { fields } else { [:] }
+            let owner: String = if case .string(let owner)? = fields["owner"] { owner } else { "dream cycle" }
+            let tap: String? = if case .string(let tap)? = fields["tap"] { tap } else { nil }
+            await RepairOwed.owe(dataRoot, id: "dream-repair:" + UUID().uuidString, kind: .run,
+                operation: "dream", owner: owner, words: report.errors.joined(separator: "\n"),
+                nextCall: tap == nil ? ToolFailureError.call("app", ["action": .string("mind.dream")]) : nil,
+                tap: tap).value
+        } else if report.entriesWritten > 0 {
+            await RepairOwed.settle(dataRoot, operation: "dream",
+                evidence: .init(source: "dream_diary", id: NativeTimestampFormat.fractionalZulu(Date()))).value
+        }
         var response: [String: JSONValue] = [
             "ok": .bool(report.errors.isEmpty),
             "backend": .string("swift"),
@@ -586,7 +617,15 @@ public actor SwiftNativeDreamREMCycle {
         if let skipReason = report.skipReason {
             response["skipReason"] = .string(skipReason)
         }
-        return DreamRunResult(rawResponse: .object(response))
+        if !report.errors.isEmpty {
+            response["remedy"] = report.repair ?? Repair.remedy(owner: "dream cycle",
+                nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mind.dream")])]), tap: nil)
+        }
+        return DreamRunResult(rawResponse: .object(response), reflectionMaterial: report.reflectionMaterial)
+    }
+
+    public func repairREM() async throws -> Int {
+        try await remConsolidator.repairPendingWork()
     }
 
     public func runREM(force: Bool) async throws -> REMRunResult {
@@ -619,7 +658,7 @@ public actor SwiftNativeDreamREMCycle {
         if let skipReason = report.skipReason {
             response["skipReason"] = .string(skipReason)
         }
-        return REMRunResult(rawResponse: .object(response))
+        return REMRunResult(rawResponse: .object(response), reflectionMaterial: report.reflectionMaterial)
     }
 
     private nonisolated static func makeDefaultLLMClient(
@@ -667,3 +706,4 @@ public func makeDreamREMCycle(
         dreamMoodSink: dreamMoodSink, remStageApproval: remStageApproval,
         lifecycleObserver: lifecycleObserver)
 }
+import CognitiveSubstrate

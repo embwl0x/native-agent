@@ -4,6 +4,44 @@ import NativeAgentCore
 import PersistenceCore
 
 extension MemoryStorage {
+    /// Derived action vectors share memory's database and vector codec, never
+    /// its canonical corpus or recall generation.
+    public func actionEmbeddings(epoch: MemoryEmbeddingEpoch) async throws -> [String: [Float]] {
+        try await dbPool.read { db in
+            var vectors: [String: [Float]] = [:]
+            for row in try Row.fetchAll(db, sql: "SELECT text_hash, vector FROM action_embeddings WHERE epoch = ?",
+                                       arguments: [epoch.rawValue]) {
+                guard let vector = Self.decodeEmbedding(row["vector"]), !vector.isEmpty,
+                      vector.allSatisfy(\.isFinite), vector.contains(where: { $0 != 0 }) else {
+                    // Derived damage is a miss: the index writer replaces it
+                    // from the exact action text, never using a bad vector.
+                    continue
+                }
+                vectors[row["text_hash"]] = vector
+            }
+            return vectors
+        }
+    }
+
+    public func writeActionEmbeddings(_ vectors: [String: [Float]], epoch: MemoryEmbeddingEpoch,
+                                      retaining hashes: Set<String>? = nil) async throws {
+        try await dbPool.write { db in
+            for (hash, vector) in vectors {
+                try db.execute(sql: "INSERT OR REPLACE INTO action_embeddings (epoch, text_hash, vector) VALUES (?, ?, ?)",
+                               arguments: [epoch.rawValue, hash, Self.encodeEmbedding(vector)])
+            }
+            if let hashes {
+                for row in try Row.fetchAll(db, sql: "SELECT epoch, text_hash FROM action_embeddings") {
+                    let storedEpoch: String = row["epoch"], hash: String = row["text_hash"]
+                    if storedEpoch != epoch.rawValue || !hashes.contains(hash) {
+                        try db.execute(sql: "DELETE FROM action_embeddings WHERE epoch = ? AND text_hash = ?",
+                                       arguments: [storedEpoch, hash])
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - Embedding epoch activation
 
     /// Snapshot every canonical text-bearing row. Callers embed this immutable

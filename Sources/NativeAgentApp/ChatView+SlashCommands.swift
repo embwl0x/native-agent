@@ -12,6 +12,10 @@ import Dispatcher
 extension ChatView {
     func send() {
         guard !isSubmittingSend else { return }
+        if !voiceSessionId.isEmpty {
+            Task { @MainActor in if await finishDictation() { send() } }
+            return
+        }
         guard !appModel.isSavingChatBrain else { return }
         guard !isCapturing else {
             showToast("Screen capture is still in progress")

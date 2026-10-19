@@ -331,8 +331,10 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// every edge makes the existing ContextFlow coordinator reread the stores.
     private var residentWorkObservationTask: Task<Void, Never>?
     private var terminalResidentWorkRecordPaths: Set<String> = []
-    private var starting = false
-    private var startupWaiters: [CheckedContinuation<Void, Never>] = []
+    /// The startup in flight. Waiters await this task, so a turn or a quit
+    /// lends its priority to the launch's utility-priority startup instead of
+    /// parking behind it on a busy Mac (a continuation lends nothing).
+    private var startup: Task<Void, Never>?
     private var semanticQueryCache: [String: ContextQueryEmbeddingValue] = [:]
     private var semanticQueryCacheOrder: [String] = []
     static let maximumConcurrentSemanticQueries = 8
@@ -362,18 +364,24 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     }
 
     public func start() async {
-        if starting {
-            await waitForStartup()
-            return
-        }
+        if let startup { return await startup.value }
         guard coordinator == nil else { return }
-        starting = true
+        // Cleared by the task itself, so a stop-then-start after it finishes
+        // never mistakes the finished one for a startup in flight.
+        let startup = Task {
+            await performStartup()
+            self.startup = nil
+        }
+        self.startup = startup
+        await startup.value
+    }
+
+    private func performStartup() async {
         startupFailedClosed = false
         startupFailure = nil
         let configuration = resolvedConfiguration()
         guard configuration.mode != .off else {
             nativeLog("[context-flow] disabled until onboarding or explicit enablement")
-            finishStartup()
             return
         }
 
@@ -438,11 +446,10 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
             residentWorkObservationTask = nil
             nativeLog("[context-flow] start failed closed: %@", String(describing: error))
         }
-        finishStartup()
     }
 
     public func stop() async {
-        if starting { await waitForStartup() }
+        await startup?.value
         semanticQueryEpoch &+= 1
         semanticQueryTasks.values.forEach { $0.cancel() }
         semanticQueryTasks.removeAll()
@@ -530,8 +537,11 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         // or picker edge retries without a separate acknowledgment to undo.
     }
 
+    /// A read never waits on a start: during startup there is no started
+    /// coordinator to report, so it answers not-started (the bridge's state
+    /// read waited here ~95 s after a launch on a loaded Mac).
     public func health() async -> ContextFlowCoordinatorHealth? {
-        if starting { await waitForStartup() }
+        guard startup == nil else { return nil }
         return await coordinator?.health()
     }
 
@@ -539,7 +549,7 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
     /// from one whose health cannot be obtained. Both have no coordinator, but
     /// only the former is a healthy configuration state.
     public func observatoryHealthState() async -> ContextFlowObservatoryHealthState {
-        if starting { await waitForStartup() }
+        await startup?.value
         if let coordinator {
             return .health(await coordinator.health())
         }
@@ -547,9 +557,9 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
         return resolvedConfiguration().mode == .off ? .off : .unavailable
     }
 
+    /// During startup, the configured mode it is bringing up; never a wait.
     public func contextFlowMode() async -> ContextFlowMode {
-        if starting { await waitForStartup() }
-        if let coordinator { return await coordinator.mode }
+        if startup == nil, let coordinator { return await coordinator.mode }
         return resolvedConfiguration().mode
     }
 
@@ -884,20 +894,6 @@ public actor NativeContextFlowRuntime: ContextTurnPreparing {
 
     private func makeResidentWorkObservation() -> FileChangeEvents {
         FileChangeEvents(paths: residentWorkObservationPaths(), emitInitial: false)
-    }
-
-    private func waitForStartup() async {
-        guard starting else { return }
-        await withCheckedContinuation { continuation in
-            startupWaiters.append(continuation)
-        }
-    }
-
-    private func finishStartup() {
-        starting = false
-        let waiters = startupWaiters
-        startupWaiters.removeAll(keepingCapacity: true)
-        for waiter in waiters { waiter.resume() }
     }
 }
 

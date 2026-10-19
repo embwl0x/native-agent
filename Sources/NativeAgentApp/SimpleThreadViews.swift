@@ -34,6 +34,7 @@ struct SimpleContactThread: View {
     @State private var stopAsked = false
     /// Held messages being sent again.
     @State private var resending: Set<String> = []
+    @State private var reading = ChatScrollCoordinator()
 
     private var agentName: String { AgentVoice(name: appModel.agentDisplayName).name }
     private var root: URL { appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot() }
@@ -69,7 +70,7 @@ struct SimpleContactThread: View {
     var body: some View {
         let lines = store.lines[contact.id] ?? []
         let opened = openedChats
-        ScrollView {
+        TranscriptScrollView(coordinator: reading) {
             LazyVStack(alignment: .leading, spacing: 26) {
                 if let error = store.refreshError {
                     Text(error)
@@ -112,6 +113,7 @@ struct SimpleContactThread: View {
                                           + (line.door.map { " · " + $0 } ?? ""),
                                           text: line.text, at: line.at)
                         .equatable()
+                        .readingBlock("\(line.id)")
                 }
                 let flight = store.flight(for: contact.id)
                 if store.waiting.contains(contact.id) {
@@ -125,6 +127,7 @@ struct SimpleContactThread: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                    .readingBlock("live")
                 } else if sending > 0 {
                     Text("Sending…")
                         .font(ShellType.label)
@@ -156,10 +159,10 @@ struct SimpleContactThread: View {
             .padding(.top, 12)
             .padding(.bottom, 24)
         }
-        // From the top when it fits; opened at, and kept on, the newest.
+        // From the top when it fits; opened at the newest, and kept there
+        // while the reader is (TranscriptScrollView).
         .defaultScrollAnchor(.top, for: .alignment)
         .defaultScrollAnchor(.bottom, for: .initialOffset)
-        .defaultScrollAnchor(.bottom, for: .sizeChanges)
         // Lines dissolve before the header, as in the chat.
         .roomTopChrome {
             SimpleThreadHeader(title: contact.name, subtitle: contact.via) {
@@ -213,6 +216,7 @@ struct SimpleContactThread: View {
         note = nil
         failure = nil
         sending += 1
+        reading.followFromLiveEdge()
         let agent = contact.id
         defer { sending -= 1 }
         if let why = await NativeAgentEngine.live.sendContactMessage(agent: agent, text: text, session: session, root: root) {
@@ -608,6 +612,7 @@ struct SimpleClockTile: View {
 /// then the findings pulled together.
 struct SimpleCrewThread: View {
     let crew: SimpleCrew
+    @State private var reading = ChatScrollCoordinator(following: false)
 
     /// How a finished crew went, in words.
     static func outcome(_ crew: SimpleCrew) -> String {
@@ -623,7 +628,7 @@ struct SimpleCrewThread: View {
 
     var body: some View {
         let count = crew.workers.count == 1 ? "1 worker" : "\(crew.workers.count) workers"
-        ScrollView {
+        TranscriptScrollView(coordinator: reading) {
             VStack(alignment: .leading, spacing: 26) {
                 Text(crew.live ? "I sent \(count) on this. What each finds comes in here as they finish."
                                : "I sent \(count) on this.")
@@ -643,9 +648,11 @@ struct SimpleCrewThread: View {
                             .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
                     }
                     .accessibilityElement(children: .combine)
+                    .readingBlock("worker:\(worker.id)")
                 }
                 if let synthesis = crew.synthesis {
                     SimpleTranscriptEntry(speaker: "Together", text: synthesis, at: crew.at)
+                        .readingBlock("synthesis")
                 } else if crew.live, crew.settled {
                     Text("Pulling it together…")
                         .font(ShellType.label)

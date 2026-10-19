@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import Combine
 import DeviceSync
+import NativeAgentShared
 import TrustCenter
 
 /// Settings' observable projection of the engine's canonical device-sync owner.
@@ -13,6 +14,10 @@ public final class SyncFacade {
     public private(set) var status = "iCloud not checked"
     public private(set) var phones: [PairedPhoneStore.Phone] = []
     public private(set) var message: String?
+    /// Another Mac on this Apple Account holds the phone's pairing.
+    public private(set) var phonePairedElsewhere = false
+    /// The one assessment of the phone's connection, as the bridge holds it.
+    public private(set) var connection: NAPhoneConnection?
     public var secretBase64 = ""
     public var pairingError: String?
     @ObservationIgnored private var subscriptions: Set<AnyCancellable> = []
@@ -33,6 +38,18 @@ public final class SyncFacade {
             .store(in: &subscriptions)
         owner.pairedPhones.$message.sink { [weak self] in self?.message = $0 }
             .store(in: &subscriptions)
+        owner.bridge.$phonePairedElsewhere.sink { [weak self] in self?.phonePairedElsewhere = $0 }
+            .store(in: &subscriptions)
+        owner.bridge.$phoneConnection.sink { [weak self] in self?.connection = $0 }
+            .store(in: &subscriptions)
+    }
+
+    /// Move the phone to this Mac: the person's act, never a launch side effect.
+    public func usePhoneHere() async {
+        guard let owner else { return }
+        if !(await owner.bridge.usePhoneHere()) {
+            pairingError = "This Mac could not take the iPhone pairing. Check iCloud and try again."
+        }
     }
 
     public func setStatus(_ status: PairedPhoneStore.Phone.Status, id: String) async {
@@ -70,65 +87,26 @@ public final class SyncFacade {
         defer { isRotatingSecret = false }
         // Close admission before changing durable signing bytes, and reopen
         // with exactly the read-back key before either publication awaits.
+        owner.bridge.owePairingPublication(true)
         owner.engine.beginPairingSecretRotation()
         let result = await Task.detached(priority: .utility) { () -> (Data?, String?) in
             do { return (try PairingSecretManager.rotateSecret(), nil) }
             catch { return (nil, error.localizedDescription) }
         }.value
         guard let persistedSecret = result.0 else {
+            owner.bridge.owePairingPublication(false)
             await owner.engine.finishPairingSecretRotation(with: nil)
             let detail = result.1 ?? "The existing key was preserved."
             pairingError = "Pairing key regeneration failed. \(detail)"
             return
         }
         await owner.engine.finishPairingSecretRotation(with: persistedSecret)
+        // A publication that does not land stays owed and is the pairing fact
+        // of the one connection assessment until iCloud takes the key.
         async let kvsPublished = PairingSecretManager.publishMaterialToKVS(persistedSecret)
         async let cloudKitPublished = owner.bridge.publishPairingSecret(persistedSecret)
-        let published = await (kvsPublished, cloudKitPublished)
+        _ = await (kvsPublished, cloudKitPublished)
         pairingError = nil
-        _ = PairingPublicationHealth.record(kvsPublished: published.0, cloudKitPublished: published.1)
         secretBase64 = persistedSecret.base64EncodedString()
     }
-}
-
-public enum PairingPublicationPresentation {
-    public static func error(kvsPublished: Bool, cloudKitPublished: Bool) -> String? {
-        switch (kvsPublished, cloudKitPublished) {
-        case (true, true):
-            return nil
-        case (false, true):
-            return "The new key is saved and CloudKit updated, but KVS did not accept it. iPhones using KVS bootstrap may not receive the new pairing key until KVS recovers."
-        case (true, false):
-            return "The new key is saved and KVS updated, but CloudKit did not accept it. Paired iPhones may reject signed messages until CloudKit recovers."
-        case (false, false):
-            return "The new key is saved, but neither KVS nor CloudKit accepted it yet."
-        }
-    }
-}
-
-/// The pairing key is already rotated when either publication route fails, so
-/// this warning must survive the settings view's local state. Otherwise a user
-/// can navigate away and lose the only indication that every paired phone may
-/// still hold the old key.
-public enum PairingPublicationHealth {
-    public static let warningDefaultsKey = "NativeAgent.pairing.publicationWarning.v1"
-
-    @discardableResult
-    public static func record(
-        kvsPublished: Bool,
-        cloudKitPublished: Bool,
-        defaults: UserDefaults = .standard
-    ) -> String? {
-        let warning = PairingPublicationPresentation.error(
-            kvsPublished: kvsPublished,
-            cloudKitPublished: cloudKitPublished
-        )
-        if let warning {
-            defaults.set(warning, forKey: warningDefaultsKey)
-        } else {
-            defaults.removeObject(forKey: warningDefaultsKey)
-        }
-        return warning
-    }
-
 }

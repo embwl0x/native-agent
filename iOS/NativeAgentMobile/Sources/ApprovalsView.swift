@@ -162,11 +162,6 @@ final class ApprovalsStore: ObservableObject {
     private var notifiedPendingIDs = Set<String>()
     private var locallyFinalizedApprovals: [String: (decision: String, resolvedAt: String)] = [:]
 
-    // Pending count for the tab badge
-    var pendingCount: Int {
-        approvals.filter { $0.status.lowercased() == "pending" }.count
-    }
-
     // MARK: - Fetch
 
     func refresh(client: MacBridgeClient, pairingStore: PairingStore) async {
@@ -371,10 +366,13 @@ struct ApprovalsView: View {
     }
 
     private var headerLine: String {
-        switch pending.count {
+        guard let overview = iCloudSyncEngine.shared.workOverview, overview.unavailable.isEmpty,
+              let counts = overview.needsYouCounts else { return "Approval attention is unavailable." }
+        let count = counts[.approval] ?? 0
+        switch count {
         case 0: return resolved.isEmpty ? "Nothing to decide." : "You're all caught up."
         case 1: return "One thing is waiting on your yes."
-        default: return "\(AliveWords.spelled(pending.count)) things are waiting on your yes."
+        default: return "\(AliveWords.spelled(count)) things are waiting on your yes."
         }
     }
 
@@ -823,14 +821,5 @@ private struct BannerView: View {
 
     var body: some View {
         AliveStatusNote(systemImage: icon, text: message)
-    }
-}
-
-// MARK: - Badge helper (used by ContentView tab item)
-
-extension ApprovalsStore {
-    /// Returns a red badge label string for the tab item, or nil when count is 0.
-    var tabBadge: String? {
-        pendingCount > 0 ? "\(pendingCount)" : nil
     }
 }

@@ -128,13 +128,10 @@ extension SchedulerDueJobRunner {
                 }
             }
 
-            // Failed dream attempts settle this day's catch-up too. Only the
-            // retry policy may schedule another attempt after a failure.
+            // Failed attempts remain repair obligations, not automatic reruns.
             let dreamRanToday = Self.containsLastRunToday(rows: rows, kind: "dream", dateKey: runDateKey, includingFailed: true)
             let remRanToday = Self.containsLastRunToday(rows: rows, kind: "rem", dateKey: runDateKey)
-            // The daily retry cap also disarms catch-up until the day rolls over.
-            let dreamParkedToday = Self.containsRetryParkedToday(rows: rows, kind: "dream", dateKey: runDateKey)
-            let dreamCatchUp = scheduledDreamTimePassed && !dreamAlreadyHasEntry && !dreamRanToday && !dreamParkedToday
+            let dreamCatchUp = scheduledDreamTimePassed && !dreamAlreadyHasEntry && !dreamRanToday
             let remCatchUp = scheduledREMTimePassed && !remRanToday
 
             let dreamSchedule = NativeAgentDreamCycleSchedule.dreamSchedule

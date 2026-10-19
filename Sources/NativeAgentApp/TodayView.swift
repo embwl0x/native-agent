@@ -348,7 +348,7 @@ struct TodayView: View {
                             dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects())
                     }
                     if case .succeeded = outcome {
-                        await appModel.engine.inbox.publishAfterAction(actionID) {
+                        await appModel.engine.inbox.publishAfterAction {
                             _ = await appModel.refreshForSidebarItem(.activity)
                         }
                     }
@@ -453,6 +453,7 @@ struct TodayView: View {
 
     private var queuesLine: some View {
         let standing = cognitionSubscription.pending.count
+        let inboxCount = appModel.ownerWaitingKinds?[.inbox] ?? 0
         // An unreadable queue says so; it never passes for an empty one.
         let standingUnavailable: String? = {
             if case .unavailable(let detail) = cognitionSubscription.state { return detail }
@@ -461,7 +462,7 @@ struct TodayView: View {
         let entries: [(ActivitySection, String)] = [
             (.approvals, ActivitySection.approvals.sheetTitle),
             (.inbox, ActivitySection.inbox.sheetTitle
-                + (appModel.pendingInboxCount > 0 ? " (\(appModel.pendingInboxCount))" : "")),
+                + (inboxCount > 0 ? " (\(inboxCount) awaiting you)" : "")),
             (.selfImprovement, ActivitySection.selfImprovement.sheetTitle),
             (.cognitionProposals, ActivitySection.cognitionProposals.sheetTitle
                 + (standingUnavailable != nil ? " (couldn't check)" : standing > 0 ? " (\(standing))" : "")),

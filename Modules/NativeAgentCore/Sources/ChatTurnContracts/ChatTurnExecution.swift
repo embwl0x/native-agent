@@ -50,14 +50,15 @@ package final class ChatTurnExecution: @unchecked Sendable {
     /// Her-screen Phase 6 — the source-frame fingerprint of the last image
     /// `screen` attached per window this turn. A match means the window has
     /// not changed, so the picture already in her context stands.
-    private var attachedPixels: [String: String] = [:]
-    package func pixelsAlreadyAttached(window: String, fingerprint: String) -> Bool {
+    private var attachedPixels: [String: (fingerprint: String, frameID: String)] = [:]
+    package func attachedPixelFrame(window: String, fingerprint: String) -> String? {
         lock.lock(); defer { lock.unlock() }
-        return attachedPixels[window] == fingerprint
+        guard let attached = attachedPixels[window], attached.fingerprint == fingerprint else { return nil }
+        return attached.frameID
     }
-    package func notePixelsAttached(window: String, fingerprint: String) {
+    package func notePixelsAttached(window: String, fingerprint: String, frameID: String) {
         lock.lock(); defer { lock.unlock() }
-        attachedPixels[window] = fingerprint
+        attachedPixels[window] = (fingerprint, frameID)
     }
     private var records: [ToolDispatchRecord] = []
     package var toolRecords: [ToolDispatchRecord] { lock.lock(); defer { lock.unlock() }; return records }

@@ -181,10 +181,7 @@ public final class MoonshotAdapter: LLMAdapter {
                     // ledger.
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: "Moonshot")
                     var sawContent = false
-                    for try await event in SSEEventStream(bytes) {
-                        try Task.checkCancellation()
-                        let frame = try decoder.consume(payload: event.data)
-                        if frame.isDone { break }
+                    try await decoder.consume(SSEEventStream(bytes)) { frame in
                         if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
                             ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
                         }
@@ -198,7 +195,6 @@ public final class MoonshotAdapter: LLMAdapter {
                         for _ in 0..<frame.toolCallDeltaCount {
                             continuation.yield(.keepAlive)
                         }
-                        if decoder.toolBoundaryReason != nil { break }
                     }
                     // User, 2026-09-06: `[DONE]` with zero reply content AND zero
                     // tool calls was accepted as a successful turn, so an
@@ -216,7 +212,9 @@ public final class MoonshotAdapter: LLMAdapter {
                         requestBody: request.httpBody,
                         provider: providerID, model: model, streaming: true,
                         usage: decoder.usage, ttftMs: ttftMs, durationMs: duration,
-                        status: decoder.reachedLengthLimit ? "incomplete" : (try terminal.chatCompletionsTerminalStatus())
+                        status: decoder.toolBoundaryReason != nil ? "incomplete" : (try terminal.chatCompletionsTerminalStatus()),
+                        stopReason: decoder.toolBoundaryReason?.rawValue,
+                        errorDetail: decoder.errorDetail
                     )
                     let completed = try terminal.get()
                     for call in completed {

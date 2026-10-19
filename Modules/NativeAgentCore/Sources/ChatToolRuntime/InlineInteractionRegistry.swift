@@ -273,6 +273,7 @@ public enum InlineInteractionRegistry {
     /// Mac Integration ids own their display names; the five Mac Control
     /// approval categories carry Trust's own titles.
     public static func macCapabilityDisplayName(_ id: String) -> String {
+        if id.hasPrefix("privacy:"), let gate = SystemPermissionPreflight.cardSettingsCapability(id) { return gate.displayName }
         if MacIntegrationID.all.contains(id) {
             return MacIntegrationID.displayName(for: id)
         }
@@ -527,8 +528,8 @@ public enum InlineInteractionRegistry {
                 ?? "I'll leave \(grantPhrase) " + InlineInteraction.ConsequenceCopy.permissionLeaveAlone,
             // User's fence, said out loud on the card: a grant is not for one
             // turn, and the person should know that before they tap.
-            persistenceNote: capabilities.allSatisfy { !MacIntegrationID.all.contains($0) && SystemAppleScriptAdapter.automationTarget($0) != nil }
-                ? "macOS keeps your Automation decision until you change it in System Settings."
+            persistenceNote: capabilities.allSatisfy { !MacIntegrationID.all.contains($0) && !isMacControlCategory($0) && SystemPermissionPreflight.cardSettingsCapability($0) != nil }
+                ? "macOS keeps your decision until you change it in System Settings."
                 : "Stays on until you turn it off in Trust.",
             cardProse: "I need your go-ahead for \(grantPhrase) \u{2014} allow it below, "
                 + InlineInteraction.ConsequenceCopy.keepGoingSuffix

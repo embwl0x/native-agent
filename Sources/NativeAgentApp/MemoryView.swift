@@ -456,8 +456,8 @@ enum MemoryStatusPlainCopy {
         if pinned > 0 { parts.append("\(pinned) pinned") }
         if pendingProposals > 0 {
             parts.append(pendingProposals == 1
-                ? "1 waiting for your approval"
-                : "\(pendingProposals) waiting for your approval")
+                ? "1 proposal to review"
+                : "\(pendingProposals) proposals to review")
         }
         return parts.joined(separator: ". ") + "."
     }

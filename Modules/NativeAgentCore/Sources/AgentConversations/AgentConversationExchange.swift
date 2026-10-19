@@ -34,7 +34,7 @@ extension AgentConversationExchange {
             ?? Self.string(value["state"]) ?? "unknown")
         let answer: String?
         let ownerTruncated: Bool
-        if ["codex", "claude", "omp"].contains(row.agent), root["jobs"] != nil {
+        if root["jobs"] != nil {
             let original = AgentConversationView.codingReply(value)
             answer = original.text
             ownerTruncated = original.truncated

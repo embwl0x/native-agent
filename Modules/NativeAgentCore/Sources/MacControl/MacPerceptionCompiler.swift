@@ -935,7 +935,7 @@ public enum MacPerceptionCompiler {
         path.map(String.init).joined(separator: ",")
     }
 
-    /// Fields and popups that Cocoa names with a separate label.
+    /// Fields and popups an app names with a separate label (`MacAXAttributeRead.copyLabel`).
     static let captionedRoles: Set<String> = ["AXTextField", "AXComboBox", "AXPopUpButton"]
 
     /// "Save As:" → "Save As"; nil when there is no text.
@@ -944,37 +944,6 @@ public enum MacPerceptionCompiler {
         if text.hasSuffix(":") { text.removeLast() }
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text
-    }
-
-    /// Her-screen 09-24 — an unnamed field/popup whose previous sibling is a
-    /// static text ending in ":" takes that text as its name, so "Save As"
-    /// and "Where" address the save sheet's field and popup.
-    private static func captioned(_ snapshot: MacAXTreeSnapshot) -> MacAXTreeSnapshot {
-        var byPath: [String: MacAXNode] = [:]
-        for node in snapshot.nodes { byPath[key(node.path)] = node }
-        var changed = false
-        let nodes = snapshot.nodes.map { node -> MacAXNode in
-            let a = node.attributes
-            guard a.title == nil, captionedRoles.contains(a.role),
-                  let index = node.path.last, index > 0,
-                  let previous = byPath[key(Array(node.path.dropLast()) + [index - 1])],
-                  previous.attributes.role == "AXStaticText",
-                  let raw = previous.attributes.value ?? previous.attributes.title,
-                  raw.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(":"),
-                  let caption = captionText(raw) else { return node }
-            changed = true
-            return MacAXNode(attributes: MacAXAttributes(
-                role: a.role, subrole: a.subrole, title: caption, value: a.value, enabled: a.enabled,
-                selected: a.selected, frame: a.frame, actions: a.actions,
-                placeholder: a.placeholder, selectionRange: a.selectionRange, state: a.state,
-                liveRegion: a.liveRegion, valueIsHelp: a.valueIsHelp,
-                titleIsHelp: a.titleIsHelp, displayTitle: a.displayTitle
-            ), path: node.path, element: node.element)
-        }
-        guard changed else { return snapshot }
-        return MacAXTreeSnapshot(nodes: nodes, truncated: snapshot.truncated,
-                                 truncationReasons: snapshot.truncationReasons,
-                                 skippedAtLeast: snapshot.skippedAtLeast)
     }
 
     /// Compile ONE walk into ONE percept. Pure: same snapshot in ⇒ same percept
@@ -990,7 +959,6 @@ public enum MacPerceptionCompiler {
         uncapped: Bool = false
     ) -> MacLookPercept {
         let cap = uncapped ? Int.max : max(1, min(maxAffordances, MacPerceptionCompiler.maxAffordances))
-        let snapshot = captioned(snapshot)
         var byPath: [String: MacAXNode] = [:]
         for node in snapshot.nodes { byPath[key(node.path)] = node }
 

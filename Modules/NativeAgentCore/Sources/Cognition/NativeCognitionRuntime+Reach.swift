@@ -352,7 +352,8 @@ extension NativeCognitionRuntime {
             quietHours: host.inQuietHours(at: instant, dataRoot: dataRoot),
             liveTurn: liveTurnInFlight,
             lastUserTurn: UserTurnStamp.last(dataRoot: dataRoot),
-            lastClaude: withClaude ? Self.claudeLastActivity(Self.defaultClaudeWorklog()) : nil)
+            lastClaude: withClaude && AgentConversationDelivery.lane(for: "claude", dataRoot: dataRoot) != nil
+                ? Self.claudeLastActivity(Self.defaultClaudeWorklog()) : nil)
     }
 
     private func runReachPass() async {
@@ -542,24 +543,15 @@ extension NativeCognitionRuntime {
             }
         }
 
-        // What a builder he trusts shipped in his projects, that he likely has
-        // not seen: Codex works on its own; Claude works with him, so only
-        // what she logged during his quiet hours. Features only; the newest.
-        let quietWindow = TurnQuietHoursWindow.read(dataRoot: dataRoot)
-        let calendar = Calendar.current
-        let builders: [(name: String, lane: String, shipped: [(Date, String)], why: String)] = [
-            ("Claude", "claude",
-             Self.claudeShipped(Self.defaultClaudeWorklog(), kinds: ["feature"])
-                .filter { quietWindow?.contains(hour: calendar.component(.hour, from: $0.0)) == true },
-             "Claude shipped it during \(person)'s quiet hours, so he likely hasn't seen it; you could make it short and human"),
-            ("Codex", "codex", Self.codexShipped(Self.defaultCodexRecord()),
-             "Codex works on its own, so \(person) may not have seen it; you could make it short and human"),
-        ]
+        let builders = Self.builderNews(dataRoot: dataRoot, unseenOnly: true)
         for builder in builders where PeerTrust.ownerTrusts(builder.lane, dataRoot: dataRoot) {
             guard let newest = builder.shipped.filter({ $0.1.count >= 6 }).max(by: { $0.0 < $1.0 }) else { continue }
             out.append(ReachCandidate(
                 kind: .shipped, subject: "ship:\(builder.lane):\(Reach.digest(newest.1))", source: "\(builder.name)'s record of its work",
-                why: builder.why, text: "\(builder.name) shipped \"\(newest.1)\"", at: newest.0))
+                why: AgentConversationDelivery.door(for: builder.lane, dataRoot: dataRoot)?.liveReader == true
+                    ? "\(builder.name) shipped it during \(person)'s quiet hours, so he likely hasn't seen it; you could make it short and human"
+                    : "\(builder.name) works on its own, so \(person) may not have seen it; you could make it short and human",
+                text: "\(builder.name) shipped \"\(newest.1)\"", at: newest.0))
         }
 
         // A dream association, only about him and gentle, marked as a dream.

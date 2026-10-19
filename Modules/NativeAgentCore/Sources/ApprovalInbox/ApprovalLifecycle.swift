@@ -45,7 +45,8 @@ public actor ApprovalLifecycleBus {
 
     public func publish(_ event: ApprovalLifecycleEvent) {
         if event.phase == .resolved || event.phase == .executed {
-            if event.record.status == "resolved", let id = hostCallID(event.record) { continuations[id]?.reply.yield(event) }
+            if SwiftNativeApprovalInbox.terminalApprovalStatuses.contains(event.record.status),
+               let id = hostCallID(event.record) { continuations[id]?.reply.yield(event) }
             if event.phase == .executed { return }
         }
         for continuation in continuations.values where !continuation.host {

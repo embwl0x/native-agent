@@ -17,6 +17,21 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     public static let inputLimit = 16 * 1024
     public static let stepLimit = 50
 
+    /// The selection and dependency proof belong to the invocation. Concurrent
+    /// calls share its refresh; a failed refresh stays failed until an owner changes.
+    public actor Binding {
+        private var revision: [String]
+        private var checked: Task<Void, Error>?
+        public init(revision: [String]) { self.revision = revision }
+        public func check(_ revision: [String], refresh: @escaping @Sendable () async throws -> Void) async throws {
+            if self.revision != revision {
+                self.revision = revision
+                checked = Task { try await refresh() }
+            }
+            try await checked?.value
+        }
+    }
+
     public typealias SandboxProfile = @Sendable (URL) throws -> String
     private let helperURL: URL
     private let dataRoot: URL
@@ -108,7 +123,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         var receipt = await execute(program, input: input, preview: preview, replay: replay, host: host, held: held)
         // An ad hoc app script is not a part: it leaves no evidence on any ability.
         if !preview, program.kind != .script, !(host is OwnedProgramFixtures) {
-            do { try AbilityStore(dataRoot: dataRoot).recordRun(id: program.id, version: program.version, receipt: receipt) }
+            do { try AbilityStore(dataRoot: dataRoot).recordRun(id: program.id, version: program.version, receipt: receipt, input: replay == nil ? input : nil) }
             catch {
                 var fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { [:] }
                 fields["accounting_error"] = .string(error.localizedDescription); receipt = .object(fields)
@@ -295,7 +310,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
     // MARK: - Classifying one call's receipt
 
     /// `unclear`: a strict run's receipt that is not a clear success
-    /// (`strictFault`); a write's effects are then unknown.
+    /// (`strictFault`). The script still gets the receipt; the ledger keeps
+    /// the doubt, and a write's effects are then unknown.
     enum Outcome { case ok, preview, failed, stop, unclear }
 
     /// `strict` (a skill's run) is exact, by `strictFault`'s one rule.
@@ -555,6 +571,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         var reads = 0
         var stopped: [String: JSONValue]?
         var refusedAfterStop = 0
+        /// The call in flight leaves no ledger row (OwnedProgramAction.journaled).
+        var unjournaled = false
         var returned: JSONValue = .null
         var returnedNote: String?
         var error: [String: JSONValue]?
@@ -562,10 +580,11 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         /// A strict run's step labels and guidance, as `app.step` declared them.
         var steps: [(label: String, guidance: String)] = []
         /// The failure code the next call is declared to fail with
-        /// (`app.expect_fail`), and whether that call has run.
+        /// (`app.expect_fail`), whether that call has run, and how it failed.
         var expectFail: String?
         var expectFailSeen = false
         var expectFailMatched = false
+        var expectFailOther: String?
         /// The step count `app.step(label, guidance, {of: n})` declared.
         var stepTotal: Int?
         /// What `app.decide` handed back beside its question.
@@ -593,8 +612,11 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             self.host = host; self.actionsInFlight = actionsInFlight
             self.notebookRoot = notebookRoot; self.partID = partID
             self.ownWrites = (replay?.journal ?? []).enumerated().compactMap { at, entry in
+                // A write that landed, or may have: a failure caught after it changed something counts too.
                 guard let target = OwnedProgramRunner.target(entry, host: host), target.write, case .object(let fields) = entry,
-                      Self.status(fields["row"] ?? .null) == "ok" else { return nil }
+                      case .object(let row)? = fields["row"],
+                      ["ok", "unconfirmed"].contains(word(row["status"]) ?? "")
+                          || ["occurred", "partial", "unknown"].contains(word(row["effects"]) ?? "") else { return nil }
                 return (at, target.page, target.item)
             }
         }
@@ -743,6 +765,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 if expectFail != nil {
                     expectFailSeen = true
                     if fields["expected"] == .bool(true) { expectFailMatched = true }
+                    else if fields["status"] == .string("failed") { expectFailOther = word(fields["reason"]) }
                 }
             }
             replayContent.include(entry["read_projections"] ?? .null)
@@ -784,15 +807,17 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
         }
 
         func append(_ row: JSONValue) {
+            guard !unjournaled else { return }
             if tool { ledgerBytes += (try? row.serializedData(pretty: false).count) ?? 0 }
             ledger.append(row)
         }
 
-        /// One call, run: checks the latch and the limits, hands the call to
+        /// One call, run: checks the stop and the limits, hands the call to
         /// the caller's task, waits, and records it.
         func dispatch(kind: String, id: String, args: String, line: Int) async -> String {
             readContent = .null
             readProjections = .array([])
+            unjournaled = kind == "primitive" && host.primitiveAction(id)?.journaled == false
             if tool, ledgerBytes >= 4 * 1024 * 1024 {
                 stopped = ["reason": .string("output_limit"), "detail": .string("The tool's receipt ledger reached 4 MiB; no further call ran.")]
                 return encode(["ok": .bool(false), "reason": .string("output_limit"),
@@ -821,7 +846,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     return mark("expect_fail_async", "app.expect_fail(\"\(code)\") was given an async function; it takes one plain call.")
                 }
                 guard expectFailMatched else {
-                    return mark("expected_failure_not_seen", "app.expect_fail(\"\(code)\") saw no call fail with \(code).")
+                    return mark("expected_failure_not_seen", "app.expect_fail(\"\(code)\") saw no call fail with \(code)"
+                        + (expectFailOther.map { "; it failed with \($0)." } ?? "."))
                 }
                 return answer(["ok": .bool(true), "value": .null])
             }
@@ -833,13 +859,13 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             if kind == "state" {
                 guard case .array(let values)? = try? JSONValue.parse(Data(args.utf8)),
                       id == "get" && values.isEmpty || id == "set" && values.count == 1 else {
-                    return mark("bad_state", "Use host.state.get() or host.state.set(value).")
+                    return refuse("bad_state", "Use host.state.get() or host.state.set(value).", stop: false)
                 }
                 do {
                     let value = try await PartNotebooks.shared.access(dataRoot: notebookRoot, id: partID,
                         setting: id == "set", value: values.first ?? .null)
                     return answer(["ok": .bool(true), "value": value])
-                } catch { return mark("bad_state", error.localizedDescription) }
+                } catch { return refuse("bad_state", error.localizedDescription, stop: false) }
             }
             func halt(_ reason: String, _ detail: String, call name: String) -> String {
                 row["call"] = .string(name)
@@ -867,7 +893,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     guard expectFail == nil else {
                         return mark("expect_fail_nested", "app.expect_fail can't be nested; each one wraps one call.")
                     }
-                    expectFail = text(0); expectFailSeen = false; expectFailMatched = false
+                    expectFail = text(0); expectFailSeen = false; expectFailMatched = false; expectFailOther = nil
                 case "decide":
                     let data = given.count > 1 ? given[1] : .null
                     do {
@@ -886,19 +912,32 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 }
                 return answer(["ok": .bool(true), "value": .null])
             }
-            // The one call an expect_fail declared: its failure with that
-            // code, having changed nothing (effects none), does not stop a
-            // strict run; anything else does. A second call inside it does not run.
+            // An expect_fail wraps one call; a second call inside it does not run.
             if expectFail != nil, expectFailSeen {
                 return halt("expect_fail_one_call", "app.expect_fail wraps one app call; this second one did not run.",
                             call: kind == "action" ? id : kind)
             }
             let expected = expectFail
             if expected != nil { expectFailSeen = true }
-            /// Strict: a failure stops the run, unless it is the declared one.
-            func latch(_ reason: String, _ detail: String, call name: String, receipt: JSONValue? = nil) -> String? {
-                guard strict, reason != "declined", !(reason == expected && row["effects"] == .string("none")) else { return nil }
-                return stopCall(reason, detail, call: name, receipt: receipt)
+            /// A call's failure is the script's to read: it throws there as
+            /// an AppError the script may catch, and the run goes on. Only the
+            /// script's own throw, a stop of its own (expect, decide) or the
+            /// turn's cancel ends a run; the ledger keeps every call's effects.
+            func failed(_ reason: String) {
+                guard expected != nil else { return }
+                if reason == expected { row["expected"] = .bool(true); expectFailMatched = true } else { expectFailOther = reason }
+            }
+            /// Refused before it ran: nothing changed.
+            func refused(_ reason: String, _ detail: String, call name: String) -> String {
+                row["call"] = .string(name)
+                row["status"] = .string("failed")
+                row["reason"] = .string(reason)
+                row["detail"] = .string(detail)
+                row["effects"] = .string("none")
+                failed(reason)
+                append(.object(row))
+                return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail), "stopped": .bool(false),
+                               "effects": .string("none"), "call": .string(name)])
             }
             func stopCall(_ reason: String, _ detail: String, call name: String, receipt: JSONValue?) -> String {
                 stopped = ["n": .int(Int64(n)), "line": .int(Int64(line)), "source": sourceLine(line), "call": .string(name),
@@ -907,9 +946,14 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     for key in ["nearest", "remedy", "argument_path"] { stopped?[key] = fields[key] }
                 }
                 var fields: [String: JSONValue] = ["ok": .bool(false), "reason": .string(reason), "detail": .string(detail),
-                                                   "stopped": .bool(true)]
+                                                   "stopped": .bool(true), "call": .string(name), "effects": row["effects"] ?? .string("none")]
                 if let receipt { fields["receipt"] = receipt }
                 return answer(fields)
+            }
+            /// The call an expect_fail declared did not fail: her assertion stops the run.
+            func unexpected(_ code: String, _ receipt: JSONValue) -> String {
+                stopCall("expected_failure_succeeded", "This call was declared to fail with \(code) (app.expect_fail), "
+                    + "but it answered without failing; the run stopped.", call: row["call"].flatMap(word) ?? kind, receipt: receipt)
             }
 
             if isCancelled {
@@ -924,7 +968,7 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     // A refusal names the door: a part reaches the Mac through app.<page>.<action>({…}), never host.call.
                     let door = id.split(separator: ".").map(String.init)
                     let hint = door.count == 2 ? " Reach it through the door instead: app.\(door[0]).\(door[1])({…}), one named-argument object; app.read('\(door[0])') shows its arguments." : " Reach the Mac through the door: app.<page>.<action>({…}); app {} lists the pages."
-                    return halt("unsupported", "This host does not admit primitive \(id) with these arguments." + hint, call: name)
+                    return refused("unsupported", "This host does not admit primitive \(id) with these arguments." + hint, call: name)
                 }
                 guard tool || actions < OwnedProgramRunner.actionLimit else {
                     return halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
@@ -937,17 +981,11 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     return halt("action_limit", "A script does at most \(OwnedProgramRunner.actionLimit) actions.", call: name)
                 }
                 switch host.doorInput(id: id, given: given) {
-                case .success(let built): input = built
-                case .failure(let problem):
-                    row["call"] = .string(name)
-                    row["status"] = .string("failed")
-                    row["reason"] = .string(problem.reason)
-                    row["detail"] = .string(problem.detail)
-                    // Refused before it ran: nothing changed.
-                    if strict { row["effects"] = .string("none") }
-                    if problem.reason == expected { row["expected"] = .bool(true); expectFailMatched = true }
-                    append(.object(row))
-                    return latch(problem.reason, problem.detail, call: name) ?? refuse(problem.reason, problem.detail, stop: false)
+                case .success(let built):
+                    input = built
+                    // A program is calling, as on its reads.
+                    if !host.scriptKey.isEmpty { input[host.scriptKey] = .bool(true) }
+                case .failure(let problem): return refused(problem.reason, problem.detail, call: name)
                 }
                 actions += 1
                 if preview { input["preview"] = .bool(true) }
@@ -957,16 +995,9 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 let words = given.compactMap(word)
                 name = kind == "find" ? "find " + (words.first ?? "") : "read " + words.joined(separator: "/")
                 if kind == "read", given.count > 2 {
-                    let detail = "app.read takes page and optional item, not extra arguments. Use app.<action>({args}) to select a target. Nothing was read."
-                    row["call"] = .string(name)
-                    row["status"] = .string("failed")
-                    row["reason"] = .string("invalid_args")
-                    row["detail"] = .string(detail)
                     row["argument_path"] = .string("app.read.arguments[2]")
-                    row["effects"] = .string("none")
-                    if expected == "invalid_args" { row["expected"] = .bool(true); expectFailMatched = true }
-                    append(.object(row))
-                    return latch("invalid_args", detail, call: name) ?? refuse("invalid_args", detail, stop: false)
+                    return refused("invalid_args", "app.read takes page and optional item, not extra arguments. Use app.<action>({args}) "
+                        + "to select a target. Nothing was read.", call: name)
                 }
                 guard tool || reads < OwnedProgramRunner.readLimit else {
                     return halt("read_limit", "A script does at most \(OwnedProgramRunner.readLimit) reads.", call: name)
@@ -979,16 +1010,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 // items. The door's own reading decides, and checks the page again.
                 input[host.scriptKey] = .bool(true)
                 if host.opensHomeItem(input) {
-                    let detail = "A home item can send or change something, so a script never opens one. Read home with "
-                        + "app.read(\"home\") and open the item yourself."
-                    row["call"] = .string(name)
-                    row["status"] = .string("failed")
-                    row["reason"] = .string("action_required")
-                    row["detail"] = .string(detail)
-                    if strict { row["effects"] = .string("none") }
-                    if expected == "action_required" { row["expected"] = .bool(true); expectFailMatched = true }
-                    append(.object(row))
-                    return latch("action_required", detail, call: name) ?? refuse("action_required", detail, stop: false)
+                    return refused("action_required", "A home item can send or change something, so a script never opens one. "
+                        + "Read home with app.read(\"home\") and open the item yourself.", call: name)
                 }
             }
             row["call"] = .string(name)
@@ -1030,20 +1053,19 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 word(fields["status"]) != nil && ["none", "occurred", "partial", "unknown"].contains(text(fields["effects"]))
                     && (!host.evidence(envelope).successful || fields["result"] != nil)
             } else { false }
-            // A shell command that ran to its end has answered: its exit code
-            // is the program's data to read, not a failure of the call (Agent,
-            // 10-17: a false `[ -f x ]` stopped a whole skill run). A timeout,
-            // a cancel or a refusal before the process ran is still a failure.
-            let terminalShell: Bool = if kind == "action", ["shell.run", "shell.bash"].contains(id),
-                case .object(let fields) = envelope, fields["process_exit_code"] != nil, fields["timed_out"] != .bool(true),
-                ["completed", "failed"].contains(word(fields["status"]) ?? "") { true } else { false }
             let (outcome, reason, detail): (Outcome, String, String)
-            if terminalShell {
-                (outcome, reason, detail) = (.ok, "", "")
-            } else if kind == "primitive", !receipted {
+            if kind == "primitive", !receipted {
                 (outcome, reason, detail) = (.unclear, "not_a_receipt", "The primitive returned no terminal status, effects or result.")
             } else {
                 (outcome, reason, detail) = OwnedProgramRunner.classify(envelope, strict: strict || kind == "primitive", write: write, host: host)
+            }
+            /// What her code gets back from an action: the tool's own data, the
+            /// call it made (an id she can pass back) and what it changed.
+            func hand(_ receipt: JSONValue) -> JSONValue {
+                guard kind == "action" || kind == "primitive", case .object(var fields) = host.answer(receipt) else { return receipt }
+                fields["call"] = .string(name)
+                fields["effects"] = row["effects"] ?? .string(write ? "occurred" : "none")
+                return .object(fields)
             }
             if kind == "action" || kind == "primitive" { record(receipt, envelope: envelope, into: &row) } else if case .object(let read) = receipt {
                 if let version = read["version"] { row["version"] = version }
@@ -1052,12 +1074,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             case .ok, .preview:
                 row["status"] = .string(row["captured"] == .bool(true) ? "captured" : outcome == .ok ? "ok" : "preview")
                 append(.object(row))
-                if outcome == .ok, let code = expected {
-                    return stopCall("expected_failure_succeeded",
-                        "This call was declared to fail with \(code) (app.expect_fail), but it succeeded. It took effect; the run stopped.",
-                        call: name, receipt: receipt)
-                }
-                return answer(["ok": .bool(true), "value": receipt])
+                if outcome == .ok, let code = expected { return unexpected(code, receipt) }
+                return answer(["ok": .bool(true), "value": hand(receipt)])
             case .failed:
                 row["status"] = .string("failed")
                 row["reason"] = .string(reason)
@@ -1068,20 +1086,22 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                     let effects = OwnedProgramRunner.effects(fields) ?? (fields["status"] == .string("preview") ? .string("none") : nil)
                     if let effects { row["effects"] = effects }
                 }
-                if reason == expected, row["effects"] == .string("none") { row["expected"] = .bool(true); expectFailMatched = true }
+                failed(reason)
                 append(.object(row))
-                if let latched = latch(reason, detail.isEmpty ? reason : detail, call: name, receipt: receipt) { return latched }
-                return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail),
-                               "stopped": .bool(false), "receipt": receipt])
+                return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
+                               "stopped": .bool(false), "receipt": receipt, "effects": row["effects"] ?? .string("unknown"),
+                               "call": .string(name)])
             case .unclear:
-                // Not a clear success is never the failure an expect_fail
-                // declared; a write's effects are unknown.
-                row["status"] = .string("failed")
+                // It answered, but not a clear success (a press that ran
+                // unverified): the script reads the receipt and decides; the
+                // ledger keeps the doubt, and a write's effects are unknown.
+                row["status"] = .string("unconfirmed")
                 row["reason"] = .string(reason)
                 row["detail"] = .string(detail)
                 if write, row["effects"] == nil { row["effects"] = .string("unknown") }
                 append(.object(row))
-                return stopCall(reason, detail, call: name, receipt: receipt)
+                if let code = expected { return unexpected(code, receipt) }
+                return answer(["ok": .bool(true), "value": hand(receipt)])
             case .stop:
                 let previewed = if case .object(let fields) = receipt { fields["status"] == .string("preview") } else { false }
                 row["status"] = .string(reason == "cancelled" ? "not_run" : previewed ? "preview" : "refused")
@@ -1093,7 +1113,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 if case .object(let fields) = receipt {
                     for key in ["approvalId", "not_run_status", "remedy"] { stopped?[key] = fields[key] }
                 }
-                return refuse(reason, detail.isEmpty ? reason : detail, stop: true)
+                return answer(["ok": .bool(false), "reason": .string(reason), "detail": .string(detail.isEmpty ? reason : detail),
+                               "stopped": .bool(true), "call": .string(name), "effects": row["effects"] ?? .string("none")])
             }
         }
 
@@ -1139,6 +1160,15 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
                 }
                 let bytes = (try? shown.serializedData(pretty: false).count) ?? 0
                 if bytes <= 600 { row["result"] = shown } else { row["result_bytes"] = .int(Int64(bytes)) }
+                // Where a write landed rides its row however long its result:
+                // the file (a move's destination), or a shell call's directory.
+                if fields["read_only"] != .bool(true), case .object(let body) = result {
+                    let at = body.filter { key, value in
+                        guard ["path", "destination", "cwd"].contains(key), case .string(let place) = value else { return false }
+                        return place.hasPrefix("/")
+                    }
+                    if !at.isEmpty { row["at"] = .object(at) }
+                }
             }
             if case .object(let effects)? = fields["side_effects"] {
                 var seen: [String: JSONValue] = [:]
@@ -1413,6 +1443,22 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
               read: function (args) { return door("contacts.search", args); },
               create: function (args) { return door("contacts.save", args); },
               update: function (args) { return door("contacts.save", args); }})}), writable: false, configurable: false});
+          Object.defineProperty(globalThis, "screen", {value: Object.freeze({
+            watch: function (args) { return primitive("screen.watch", args); },
+            next: function (timeout) {
+              var f = primitive("screen.next", timeout === undefined ? {} : {timeout: timeout});
+              if (!f || f.captured) return null; // a recording has no frames: its watch ends at once
+              if (f.timedOut) return Object.freeze(f);
+              f.read = function (queries) { return primitive("frame.read", {watch: f.watch, seq: f.seq, queries: queries}); };
+              return Object.freeze(f);
+            }})});
+          function point(verb) { return function (x, y, toX, toY) {
+            return primitive("hand." + verb, verb === "drag" ? {x: x, y: y, to_x: toX, to_y: toY} : {x: x, y: y}); }; }
+          function keys(verb) { return function (keys, seconds) {
+            return primitive("hand." + verb, seconds === undefined ? {keys: keys} : {keys: keys, seconds: seconds}); }; }
+          Object.defineProperty(globalThis, "hand", {value: Object.freeze({click: point("click"),
+            double_click: point("double_click"), right_click: point("right_click"), move: point("move"), drag: point("drag"),
+            key: keys("key"), hold: keys("hold"), down: keys("down"), up: keys("up")})});
         """
         let reach = !turn ? "" : """
           Object.defineProperty(globalThis, "turn", {value: Object.freeze(["persona", "pins", "recall", "context"]
@@ -1433,6 +1479,8 @@ public struct OwnedProgramRunner: OwnedProgramRunning {
             var e = new Error(out.detail);
             e.name = "AppError"; e.reason = out.reason; e.action = id; e.stopped = out.stopped;
             e.scriptLine = out.line; e.callNumber = out.n; e.receipt = out.receipt;
+            // A reply that says nothing of effects is a refusal before anything ran.
+            e.effects = out.effects === undefined ? "none" : out.effects; e.call = out.call || id;
             throw e;
           }
           \(host)\(reach)

@@ -106,7 +106,7 @@ extension AppQuietToolHost {
                 let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
                 return AppToolExecutor.failure("\(verb)_failed",
                     "\(line) \(connector.name) may still be \(on ? "off" : "on"); read app {page:\"connectors\"}, then retry.",
-                    extra: ["id": .string(connector.id)])
+                    extra: ["id": .string(connector.id), "effects": .string("unknown")])
             }
         // User's four below Full Mac; the door refuses them there. Each posts
         // the decided row he sees it by.
@@ -124,7 +124,7 @@ extension AppQuietToolHost {
             do { _ = try await NativeAgentEngine.live.ports.deviceSyncHost.disconnectConnector(id: connector.id) } catch {
                 return AppToolExecutor.failure("connector_disconnect_failed",
                     "\(error.localizedDescription) Read app {page:\"connectors\"} for where \(connector.name) stands.",
-                    extra: ["id": .string(connector.id)])
+                    extra: ["id": .string(connector.id), "effects": .string("unknown")])
             }
             _ = await appModel.refreshForSidebarItem(.connectors)
             decided("connector.disconnect \(connector.id)")
@@ -159,11 +159,17 @@ extension AppQuietToolHost {
             }
             guard await store.setStatus(.removed, id: phone.id) else {
                 return AppToolExecutor.failure("pairing_remove_failed",
-                    (store.message ?? "The removal did not save.") + " The phone is as it was.", extra: ["id": .string(phone.id)])
+                    (store.message ?? "The removal did not save.") + " The phone is as it was.", extra: ["id": .string(phone.id), "effects": .string("unknown")])
             }
             decided("pairing.remove \(phone.id)")
             return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(phone.id),
                             "detail": .string("Removed the phone: it no longer decides approvals. Pairing it again is the owner's.")])
+        case "mcp_repair":
+            do {
+                return try await appModel.engine.tools.mcp.repairRegistry(records: input["records"] ?? .null, expectedSHA256: text("expected_sha256"))
+            } catch {
+                return ChatToolOutcome.failure(error: error, tool: "app")
+            }
         case "mcp_revoke_consent":
             // Connectors → MCP → Revoke, on a granted consent.
             appModel.mcpConsent = (try? await appModel.engine.tools.mcp.listConsents().map(MCPUIActions.mapConsent))
@@ -180,6 +186,12 @@ extension AppQuietToolHost {
             let result = outcome(appModel.statusForAgent, ["id": .string(consent.id)])
             if case .object(let body) = result, body["status"] == .string("ok") { decided("mcp.revoke_consent \(consent.id)") }
             return result
+        case "telegram_repair":
+            do {
+                return try await TelegramUpdateInbox.repair(dataRoot: appModel.engine.dataRoot, inbox: text("inbox"))
+            } catch {
+                return ChatToolOutcome.failure(error: error, tool: "app")
+            }
         case "telegram_test":
             await appModel.testTelegram()
             return outcome(appModel.statusForAgent)
@@ -191,7 +203,7 @@ extension AppQuietToolHost {
                                 "removed_rows": .int(Int64(receipt.removedRowCount))])
             case .failed(let detail)?:
                 let line = appModel.statusCause == nil ? detail : appModel.statusForAgent
-                return AppToolExecutor.failure("clear_logs_failed", line + " The logs are as they were; retry, or read \(AppToolExecutor.doorDoctor).")
+                return AppToolExecutor.failure("clear_logs_failed", line + " The logs are as they were; retry, or read \(AppToolExecutor.doorDoctor).", extra: ["effects": .string("unknown")])
             case nil:
                 return AppToolExecutor.failure("clear_logs_busy", "A clear is already running; read app {page:\"telegram\"} in a moment.")
             }

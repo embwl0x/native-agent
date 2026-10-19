@@ -168,7 +168,8 @@ extension iCloudSyncEngine {
             // of making them find it on their next poll tick.
             ActionResponseWaiters.shared.signal(actionID)
             if let action = response["action"], Self.isUnobservedAction(action) {
-                _ = await pollResponse(msgId: actionID, expectedAction: action)
+                _ = await pollResponse(msgId: actionID, expectedAction: action,
+                                       settlesAnswersFromPreviousPairing: true)
             }
             return true
         } catch {
@@ -202,7 +203,7 @@ extension iCloudSyncEngine {
         }.value
         for (msgId, action) in pending {
             guard generation == lifecycleGeneration, !Task.isCancelled else { return }
-            _ = await pollResponse(msgId: msgId, expectedAction: action)
+            _ = await pollResponse(msgId: msgId, expectedAction: action, settlesAnswersFromPreviousPairing: true)
         }
     }
 
@@ -267,6 +268,20 @@ extension iCloudSyncEngine {
             guard let data = try? Data(contentsOf: file) else { return nil }
             return try? JSONDecoder().decode(InboxAction.self, from: data)
         }.value
+    }
+
+    /// An action answered under a pairing this phone has replaced settles in
+    /// the ledger as orphaned, as connection repair settles the previous
+    /// pairing's actions. Its files stay for the ledger's own prune.
+    private func settleAnswerFromPreviousPairing(msgId: String, transactionId: String, action: String) async {
+        guard UUID(uuidString: msgId) != nil else { return }
+        try? await writeTransaction(
+            id: transactionId,
+            action: action,
+            state: "orphaned",
+            error: "Answered under a previous pairing key; this iPhone has paired again since.",
+            msgId: msgId
+        )
     }
 
     private func retirePendingCloudKitAction(msgId: String) async throws {
@@ -704,7 +719,10 @@ extension iCloudSyncEngine {
     }
 
     /// Poll responses directory for a reply to msgId. Returns nil if not yet available.
-    func pollResponse(msgId: String, expectedAction: String? = nil) async -> [String: String]? {
+    /// `settlesAnswersFromPreviousPairing`: the automatic sends' settle paths,
+    /// which have no one to warn.
+    func pollResponse(msgId: String, expectedAction: String? = nil,
+                      settlesAnswersFromPreviousPairing: Bool = false) async -> [String: String]? {
         let generation = lifecycleGeneration
         guard let responsesDir else { return nil }
         let fileURL = responsesDir.appendingPathComponent("\(msgId).json")
@@ -725,12 +743,23 @@ extension iCloudSyncEngine {
             if signature.lowercased() != expected {
                 if pairingStore?.applyKVSPairingMaterialIfNeeded() == true,
                    let refreshedSecret = pairingStore?.iCloudPairingSecret,
-                   refreshedSecret != secret {
-                    let refreshedExpected = try hmacHex(body: decoded, secret: refreshedSecret)
-                    guard signature.lowercased() == refreshedExpected else {
-                        syncError = "iCloud response signature mismatch. Re-pair iPhone with the current Mac app."
-                        return nil
-                    }
+                   refreshedSecret != secret,
+                   signature.lowercased() == (try hmacHex(body: decoded, secret: refreshedSecret)) {
+                    // The refreshed key authenticates it.
+                } else if settlesAnswersFromPreviousPairing, prefersCloudKitSnapshotCache {
+                    // The CloudKit mailbox holds only responses this phone
+                    // verified on arrival, with the key it held then. One that
+                    // no longer verifies was answered under a pairing this
+                    // phone has since replaced: the ledger settles it, never a
+                    // re-pair warning about an exchange that works. Nothing is
+                    // deleted, so a request still waiting on it reads exactly
+                    // what it read before, and its retry keeps its identity.
+                    await settleAnswerFromPreviousPairing(
+                        msgId: msgId,
+                        transactionId: decoded["transactionId"] ?? msgId,
+                        action: decoded["action"] ?? expectedAction ?? "unknown"
+                    )
+                    return nil
                 } else {
                     syncError = "iCloud response signature mismatch. Re-pair iPhone with the current Mac app."
                     return nil

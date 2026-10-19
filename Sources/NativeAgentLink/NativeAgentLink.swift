@@ -4,7 +4,7 @@ import Darwin
 import PersistenceCore
 
 private enum LinkFailure: Error {
-    case invalidArguments, descriptor, transport, response, http(Int)
+    case invalidArguments, descriptor(String, String), transport, response, http(Int)
     var label: String {
         switch self {
         case .invalidArguments: "invalid_arguments"
@@ -13,6 +13,25 @@ private enum LinkFailure: Error {
         case .response: "invalid_or_oversized_response"
         case .http(let status): "http_\(status)_outcome_unconfirmed"
         }
+    }
+
+    /// Local owner evidence goes to stderr; rejected HTTP callers still learn nothing.
+    func diagnose() {
+        let detail: String, remedy: JSONValue
+        switch self {
+        case .descriptor(let path, let failed):
+            detail = path + ": " + failed
+            remedy = .object(["kind": .string("inspect"), "instruction": .string(detail),
+                "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("files.info"), "args": .object(["path": .string(path)])])])])
+        case .http(401):
+            guard let peer = ProcessInfo.processInfo.environment["NATIVE_AGENT_PEER_ID"], UUID(uuidString: peer) != nil else { return }
+            detail = "The local connector's credential was rejected. Connect this same contact to repair its entry, then reconcile the retained request_id; do not resend an uncertain message."
+            remedy = Repair.remedy(owner: "Keychain peer:" + peer, nextCall: .object(["tool": .string("app"),
+                "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer)])])]), tap: nil)
+        default: return
+        }
+        let value = JSONValue.object(["detail": .string(detail), "remedy": remedy])
+        if let data = try? value.serializedData(pretty: false) { FileHandle.standardError.write(data + Data([10])) }
     }
 }
 
@@ -35,19 +54,20 @@ private struct BridgeDescriptor {
         let path = pathOverride ?? ProcessInfo.processInfo.environment["NATIVE_AGENT_BRIDGE_DESCRIPTOR"]
             ?? InstallPaths.current.bridgeConfigRoot.appendingPathComponent("claude-bridge/bridge.json").path
         let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-        guard fd >= 0 else { throw LinkFailure.descriptor }
+        guard fd >= 0 else { throw LinkFailure.descriptor(path, "Descriptor open failed (errno \(errno)); the file must exist and must not be a symlink.") }
         defer { Darwin.close(fd) }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_uid == getuid(),
-              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
-              info.st_mode & 0o077 == 0, info.st_size > 0, info.st_size <= 65_536
-        else { throw LinkFailure.descriptor }
+        guard fstat(fd, &info) == 0 else { throw LinkFailure.descriptor(path, "Descriptor fstat failed (errno \(errno)).") }
+        guard info.st_uid == getuid() else { throw LinkFailure.descriptor(path, "Descriptor owner must be the current uid.") }
+        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG) else { throw LinkFailure.descriptor(path, "Descriptor must be a regular file.") }
+        guard info.st_mode & 0o077 == 0 else { throw LinkFailure.descriptor(path, "Descriptor permissions must exclude group and other access (0600).") }
+        guard info.st_size > 0, info.st_size <= 65_536 else { throw LinkFailure.descriptor(path, "Descriptor size must be 1...65536 bytes.") }
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
         while true {
             let count = Darwin.read(fd, &buffer, buffer.count)
             if count == 0 { break }
-            guard count > 0, data.count + count <= 65_536 else { throw LinkFailure.descriptor }
+            guard count > 0, data.count + count <= 65_536 else { throw LinkFailure.descriptor(path, "Descriptor read failed or exceeded 65536 bytes.") }
             data.append(contentsOf: buffer.prefix(count))
         }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -57,10 +77,11 @@ private struct BridgeDescriptor {
               url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
               url.path.isEmpty || url.path == "/",
               let port = url.port, (1...65535).contains(port)
-        else { throw LinkFailure.descriptor }
+        else { throw LinkFailure.descriptor(path, "Descriptor JSON url must be an exact loopback HTTP origin with a valid port and no credentials, path, query or fragment.") }
         url.path = "/agent/mcp"
-        guard let endpoint = url.url else { throw LinkFailure.descriptor }
+        guard let endpoint = url.url else { throw LinkFailure.descriptor(path, "Descriptor url could not form the MCP endpoint.") }
         let environment = ProcessInfo.processInfo.environment
+        if let bearer { return Self(endpoint: endpoint, token: bearer, peerSecret: nil) }
         func identity(_ name: String) -> String? {
             guard let raw = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty, raw.utf8.count <= 8192,
@@ -72,17 +93,19 @@ private struct BridgeDescriptor {
         }
         let peerID = identity("NATIVE_AGENT_PEER_ID")
         let peerSecret = identity("NATIVE_AGENT_PEER_SECRET")
+        if (environment["NATIVE_AGENT_PEER_ID"] != nil || environment["NATIVE_AGENT_PEER_SECRET"] != nil),
+           peerID == nil || peerSecret == nil {
+            throw LinkFailure.descriptor(path, "Connector identity is incomplete or invalid. Repair NATIVE_AGENT_PEER_ID and NATIVE_AGENT_PEER_SECRET together with agent.connect; the shared bearer was not used.")
+        }
         // 2026-09-22: a connection with its own identity sends its SECRET as
         // the bearer and no identity headers; the bridge maps it on contact
-        // paths, so the main token is never read or sent. Half an identity is
-        // still no identity.
-        if let bearer { return Self(endpoint: endpoint, token: bearer, peerSecret: nil) }
+        // paths, so the main token is never read or sent.
         if peerID != nil, let peerSecret {
             return Self(endpoint: endpoint, token: peerSecret, peerSecret: peerSecret)
         }
         guard let token = object["token"] as? String, !token.isEmpty, token.utf8.count <= 8192,
               !token.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
-        else { throw LinkFailure.descriptor }
+        else { throw LinkFailure.descriptor(path, "Descriptor token is missing or invalid; regenerate it through the bridge owner. No credential value was logged.") }
         return Self(endpoint: endpoint, token: token, peerSecret: nil)
     }
 }
@@ -295,6 +318,7 @@ private struct NativeAgentLink {
             }
             output(result)
         } catch {
+            (error as? LinkFailure)?.diagnose()
             recovery["error"] = (error as? LinkFailure)?.label ?? "request_failed"
             recovery["automatically_resent"] = false
             output(recovery)
@@ -325,6 +349,7 @@ private struct NativeAgentLink {
             _ = try await BridgeHTTP.post(["message_id": reply.message_id, "text": reply.text], descriptor: descriptor)
             output(["status": "reply_received", "automatically_resent": false])
         } catch {
+            (error as? LinkFailure)?.diagnose()
             output(["error": "reply_refused_or_delivery_unconfirmed", "automatically_resent": false])
             Darwin.exit(1)
         }
@@ -377,6 +402,7 @@ private struct NativeAgentLink {
             }
             // Notifications (HTTP 202) never produce a JSON-RPC response.
         } catch {
+            (error as? LinkFailure)?.diagnose()
             if let id {
                 output(["jsonrpc": "2.0", "id": id,
                         "error": ["code": -32000, "message": (error as? LinkFailure)?.label ?? "request_failed"]])

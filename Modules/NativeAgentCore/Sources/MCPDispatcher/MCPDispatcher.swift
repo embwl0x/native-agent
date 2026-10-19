@@ -609,6 +609,7 @@ public actor SwiftNativeMCPDispatcher {
     private var _serversCacheRow: _ServersCacheRow?
     /// Concurrent cold callers share one refill task.
     private var _inflightListServers: Task<[MCPServer], Error>?
+    private var serversRevision = 0
     /// 60-second TTL by default — same as MCPLiveCache so a server-list
     /// add/remove naturally falls out of cache on the next minute boundary.
     private let listServersTTL: TimeInterval = 60
@@ -673,6 +674,7 @@ public actor SwiftNativeMCPDispatcher {
         if let inflight = _inflightListServers {
             return try await inflight.value
         }
+        let revision = serversRevision
         let task = Task<[MCPServer], Error> { [weak self] in
             guard let self = self else { return [] }
             return try await self._readServersUncached()
@@ -680,11 +682,13 @@ public actor SwiftNativeMCPDispatcher {
         _inflightListServers = task
         do {
             let result = try await task.value
-            _serversCacheRow = _ServersCacheRow(storedAt: Date(), value: result)
-            _inflightListServers = nil
+            if revision == serversRevision {
+                _serversCacheRow = _ServersCacheRow(storedAt: Date(), value: result)
+                _inflightListServers = nil
+            }
             return result
         } catch {
-            _inflightListServers = nil
+            if revision == serversRevision { _inflightListServers = nil }
             throw error
         }
     }
@@ -692,9 +696,12 @@ public actor SwiftNativeMCPDispatcher {
     /// Uncached read path — extracted so the cache wrapper above can call
     /// the real logic without inlining a 90-line method.
     func _readServersUncached() async throws -> [MCPServer] {
-        let raw = try await persistence.readJSON(serversPath, ifMissing: .array([]))
+        let raw: JSONValue
+        do { raw = try await persistence.readJSON(serversPath, ifMissing: .array([])) }
+        catch { throw Self.registryFailure("could not be read: \(error.localizedDescription)", at: serversPath) }
         let savedRecords: [JSONValue]
-        if case .array(let items) = raw { savedRecords = items } else { savedRecords = [] }
+        do { savedRecords = try Self.checkedRegistry(raw) }
+        catch { throw Self.registryFailure(error.localizedDescription, at: serversPath) }
 
         // Read searxng_base_url from the Swift-native research config.
         let configRaw = try await persistence.readJSON(configPath, ifMissing: .object([:]))
@@ -740,10 +747,7 @@ public actor SwiftNativeMCPDispatcher {
         // by_id index from saved.
         var byID: [String: [String: JSONValue]] = [:]
         for item in savedRecords {
-            guard case .object(let obj) = item else { continue }
-            if case .string(let id) = obj["id"] ?? .null {
-                byID[id] = obj
-            }
+            if case .object(let obj) = item, case .string(let id)? = obj["id"] { byID[id] = obj }
         }
 
         // Build merged defaults, overriding from saved EXCEPT for
@@ -772,7 +776,10 @@ public actor SwiftNativeMCPDispatcher {
             }
         }
 
-        let records = merged.compactMap(MCPServer.init(json:))
+        let records = try merged.map { item in
+            guard let server = MCPServer(json: item) else { throw Self.registryFailure("a merged server record is invalid", at: serversPath) }
+            return server
+        }
         await reconcileHTTPTransports(for: records)
         // Match list_mcp_servers: sorted by name (fallback id).
         return records.sorted { lhs, rhs in
@@ -780,6 +787,58 @@ public actor SwiftNativeMCPDispatcher {
             let rkey = rhs.name.isEmpty ? rhs.id : rhs.name
             return lkey < rkey
         }
+    }
+
+    static func registryFailure(_ reason: String, at serversPath: URL) -> ToolFailureError {
+        let bytes = try? Data(contentsOf: serversPath)
+        let records = bytes.flatMap { try? JSONValue.parse($0) } ?? bytes.map { .string(String(decoding: $0, as: UTF8.self)) } ?? .null
+        return ToolFailureError("MCP registry \(serversPath.path) \(reason). No inventory was substituted; the saved bytes are unchanged. Correct records in next_call using the saved configuration evidence; preserve every intended server. mcp.repair checks the original digest and keeps its bytes before replacement.",
+            effects: .none, owner: serversPath.path,
+            nextCall: ToolFailureError.call("app", ["action": .string("mcp.repair"), "args": .object([
+                "records": records, "expected_sha256": .string(bytes.map { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() } ?? ""),
+            ])]))
+    }
+
+    static func checkedRegistry(_ value: JSONValue) throws -> [JSONValue] {
+        func invalid(_ reason: String) -> ToolFailureError {
+            ToolFailureError(reason, argumentPath: "records", accepted: "An array of server objects with unique nonempty string ids and string configuration fields.", effects: .none)
+        }
+        guard case .array(let records) = value else { throw invalid("must be an array of server records") }
+        var ids: Set<String> = []
+        for (index, item) in records.enumerated() {
+            guard case .object(let fields) = item, let server = MCPServer(json: item),
+                  !server.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, ids.insert(server.id).inserted else {
+                throw invalid("row \(index) must be an object with a nonempty, unique string id")
+            }
+            for key in ["id", "name", "transport", "endpoint", "command", "status", "healthStatus", "riskClass", "createdAt", "updatedAt"] {
+                guard let field = fields[key] else { continue }
+                guard case .string = field else { throw invalid("row \(index).\(key) must be a string") }
+            }
+        }
+        return records
+    }
+
+    public func repairRegistry(records: JSONValue, expectedSHA256: String) throws -> JSONValue {
+        _ = try Self.checkedRegistry(records)
+        let replacementText = try records.serialize(pretty: true)
+        guard !replacementText.contains("[REDACTED") else {
+            throw ToolFailureError("Repair records contain redacted values. Restore their original values from the saved file before replacing the registry.",
+                argumentPath: "records", effects: .none)
+        }
+        let original = try Data(contentsOf: serversPath)
+        let digest = SHA256.hash(data: original).map { String(format: "%02x", $0) }.joined()
+        guard expectedSHA256 == digest else { throw Self.registryFailure("changed since the repair input was prepared", at: serversPath) }
+        let backup = serversPath.appendingPathExtension("damaged-" + digest)
+        let replacement = Data(replacementText.utf8)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(original, to: backup)
+        guard try Data(contentsOf: backup) == original else {
+            throw Self.registryFailure("could not preserve its original bytes at \(backup.path)", at: serversPath)
+        }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(replacement, to: serversPath)
+        serversRevision += 1
+        _serversCacheRow = nil
+        _inflightListServers = nil
+        return .object(["status": .string("ok"), "preserved": .string(backup.path), "records": records, "effects": .string("occurred")])
     }
 
     public func listTools(forServer serverId: String) async throws -> [MCPTool] {

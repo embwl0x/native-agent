@@ -174,7 +174,7 @@ public enum ToolNameAliases {
         "notion_status": "notion.status", "notion_search": "notion.search", "notion_read_page": "notion.read",
         "x_status": "x.status", "x_me": "x.me", "x_search": "x.search", "x_timeline": "x.timeline",
         "x_user_tweets": "x.user_tweets",
-        "market_status": "market.status", "market_watchlists": "market.watchlists", "market_quote": "market.quote",
+        "market_status": "market.status", "market_configure": "market.configure", "market_watchlists": "market.watchlists", "market_quote": "market.quote",
         "tradingview_watchlist": "market.tradingview",
         "mac_notify": "notify.mac", "mobile_notify": "notify.phone", "phone_request": "phone.request",
         "image_generate": "image.generate",
@@ -225,7 +225,8 @@ public enum ToolNameAliases {
     ]
 
     private static let argAliases: [String: [String: String]] = [
-        "*": ["max_rows": "max_nodes", "max_results": "limit"],
+        // A reader that searches takes `find`; `query` is what the others call it.
+        "*": ["max_rows": "max_nodes", "max_results": "limit", "query": "find"],
         "agent.swarm": ["prompt": "objective", "timeout_seconds": "timeoutSeconds"],
         "desk.close": ["outcome": "outcome_summary"],
         "memory.commit": ["content": "text"],
@@ -455,16 +456,33 @@ public enum ToolNameAliases {
             if case .string(let query)? = args["query"] { return ["find": .string(query)] }
             return [:]
         }
-        if name == "invoke_claude" || name == "claude_message" {
-            var call: [String: JSONValue] = ["item": .string("claude.say")]
-            let extra = args.filter { ["text", "conversation"].contains($0.key) && $0.value != .null }
-            if !extra.isEmpty { call["args"] = .object(extra) }
-            return call
+        if let handle = agentHandle(name) {
+            var extra = args
+            var options: [String: JSONValue] = if case .object(let options)? = args["options"] { options } else { [:] }
+            for key in ["working_directory", "topic", "model", "reasoning_effort", "fast", "pair_reviewer", "timeout_seconds", "priority", "desk_item", "completion_mode", "repository"] {
+                if let value = extra.removeValue(forKey: key) { options[key] = value }
+            }
+            if let cwd = extra.removeValue(forKey: "cwd") { options["working_directory"] = cwd }
+            if !options.isEmpty { extra["options"] = .object(options) }
+            if case .string(let context)? = extra.removeValue(forKey: "context"), case .string(let text)? = extra["text"] { extra["text"] = .string(context + "\n\n" + text) }
+            if extra["conversation_mode"] == .string("new") { extra.removeValue(forKey: "conversation_mode"); extra["new_conversation"] = .bool(true) }
+            if extra["conversation_mode"] == .string("resume"), extra["conversation_id"] != nil { extra.removeValue(forKey: "conversation_mode") }
+            extra["agent"] = .string(handle)
+            return ["action": .string("agent.message"), "args": .object(extra)]
         }
         // Its arguments were a hard-coded method's; a skill takes its own.
         if name == "craft_run" { return ["action": .string("skill.run")] }
         guard let id = appAction(name) else { return nil }
         return args.isEmpty ? ["action": .string(id)] : ["action": .string(id), "args": .object(doorArgs(name, args))]
+    }
+
+    /// Legacy send spellings supply a target, never an identity or a grant.
+    public static func agentHandle(_ name: String) -> String? {
+        let parts = name.replacingOccurrences(of: ".", with: "_").split(separator: "_").map(String.init)
+        guard parts.count == 2 else { return nil }
+        if ["message", "say"].contains(parts[1]), ["claude", "claude", "codex", "omp"].contains(parts[0]) { return parts[0] }
+        if parts[0] == "invoke", ["claude", "codex"].contains(parts[1]) { return parts[1] }
+        return nil
     }
 
     /// The answer to a call of a folded tool by its old name: the same call,

@@ -20,20 +20,28 @@ import MacIntegration
 import ToolRegistry
 
 /// One finished launch of an agent NativeAgent drives: SecurityCenter's
-/// decision for this turn's real origin and, under Full Mac, the exact program
+/// decision for this turn's real origin and the exact program
 /// approved for that agent, its receipt re-verified just now.
 struct DrivenAgentLaunch: Sendable {
     var permission: DrivenAgentLaunchPermission
-    /// Full Mac only: the approved file to run, never a PATH lookup.
+    /// The verified file to run; absent only when the launch is refused.
     var executable: String? = nil
-    /// Why a Full Mac request runs restricted, when it does.
+    var arguments: [String] = []
+    /// Why the requested launch cannot proceed.
     var note: String? = nil
+    var remedy: JSONValue? = nil
 
     /// The answer for a launch that must not happen at all.
     var deniedResult: JSONValue? {
-        guard case .denied(let reason) = permission else { return nil }
-        return .object(["status": .string("failed"), "reason": .string("launch_blocked"),
-                        "detail": .string("Nothing was launched: \(reason).")])
+        let reason: String
+        if let note { reason = note }
+        else if case .denied(let denied) = permission { reason = denied }
+        else { return nil }
+        var result: [String: JSONValue] = ["status": .string("failed"), "reason": .string("launch_blocked"),
+            "sent": .bool(false), "ran": .bool(false), "completed": .bool(false),
+            "detail": .string("Nothing was launched: \(reason).")]
+        if let remedy { result["remedy"] = remedy }
+        return .object(result)
     }
 
     var receipt: JSONValue {
@@ -53,24 +61,31 @@ extension SwiftToolDispatcher {
             verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)
         let permission = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .drivenAgentLaunchPermission(tool: tool, origin: origin)
-        guard permission == .fullMac else { return DrivenAgentLaunch(permission: permission) }
-        // Full Mac follows updates: the version installed now is approved
-        // here, so an update never needs a reconnect.
-        var contact = contact
-        if let current = contact, current.transport == .mcpHost,
-           let row = AgentPeerStore.hostRowID(current.endpoint).flatMap(AgentHostDirectory.row(named:)), let line = row.commandLine,
-           let installed = row.resolveExecutable(line.executable), installed != current.verifiedExecutablePath {
-            let store = AgentPeerStore(dataRoot: dataRoot)
-            if (try? store.approveExecutable(peerID: current.id, path: installed)) == true {
-                contact = (try? store.list())?.first { $0.id == current.id } ?? current
+        if case .denied = permission { return DrivenAgentLaunch(permission: permission) }
+        // Rebinding follows the installation without changing the launch's authority.
+        let store = AgentPeerStore(dataRoot: dataRoot)
+        var problem = "\(name)'s installed executable could not be bound to its contact"
+        do {
+            if let contact, let current = try store.list().first(where: { $0.id == contact.id }),
+               let row = AgentPeerStore.hostRowID(current.endpoint).flatMap(AgentHostDirectory.row(named:)),
+               let line = row.commandLine, let installed = row.resolveExecutable(line.executable) {
+                if installed != current.verifiedExecutablePath {
+                    guard try store.approveExecutable(peerID: current.id, path: installed) else {
+                        throw AgentCommunicationError.invalid("the contact was disconnected")
+                    }
+                }
+                if let path = try store.list().first(where: { $0.id == current.id })?.verifiedExecutablePath {
+                    return DrivenAgentLaunch(permission: permission, executable: path,
+                        arguments: line.permissionFlags.map(permission.arguments) ?? [])
+                }
             }
+        } catch {
+            problem = "\(name)'s executable binding could not be reconciled: \(error.localizedDescription)"
         }
-        guard let path = contact?.verifiedExecutablePath else {
-            return DrivenAgentLaunch(permission: .restricted, note: "Full Mac is on, but \(name) ran restricted: "
-                + "no program is approved for it, or the approved one has changed. "
-                + "Connect \(name) again to approve the one installed now.")
-        }
-        return DrivenAgentLaunch(permission: .fullMac, executable: path)
+        return DrivenAgentLaunch(permission: permission, note: problem,
+            remedy: Repair.remedy(owner: "agents/peers.json peer:" + (contact?.id ?? name),
+                nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("agent.connect"),
+                    "args": .object(["name": .string(contact.map { "peer:" + $0.id } ?? name)])])]), tap: nil))
     }
 
     /// The connected contact for a known command-line agent ("codex", "claude-code").
@@ -132,7 +147,7 @@ extension SwiftToolDispatcher {
     ) async throws -> (handle: String?, dropped: String?) {
         do {
             return (try await delegationDeskHandle(input), nil)
-        } catch AutonomyGateError.toolDenied(let reason) where reason.contains("is not a live Desk item") {
+        } catch AutonomyGateError.toolDenied(let reason, _) where reason.contains("is not a live Desk item") {
             guard case .string(let raw)? = input["desk_item"] else { return (nil, nil) }
             return (nil, raw)
         }

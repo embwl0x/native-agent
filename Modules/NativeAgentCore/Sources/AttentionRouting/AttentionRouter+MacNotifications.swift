@@ -8,6 +8,7 @@ import DeviceSync
 /// The identity a banner carries and what a click on it does. A click OPENS
 /// the item — it never approves, runs, or closes anything.
 public enum NativeAgentNotificationRoute {
+    public static let pageKey = "pageRoute"
     /// userInfo key: the Desk handle a reminder is about.
     public static let deskHandleKey = "deskHandle"
 
@@ -140,9 +141,9 @@ public enum NativeAgentNotifications: MacNotificationDelivery {
         )
     }
 
-    public static func post(title: String, body: String) {
+    public static func post(title: String, body: String, userInfo: [String: String] = [:]) {
         Task {
-            _ = await postAndReport(title: title, body: body)
+            _ = await postAndReport(title: title, body: body, userInfo: userInfo)
         }
     }
 

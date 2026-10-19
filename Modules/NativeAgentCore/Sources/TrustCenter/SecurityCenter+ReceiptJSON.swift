@@ -14,6 +14,8 @@ extension SecurityToolEnvelope {
             "capabilities": .array(capabilities.map { .string($0) }),
             "risk": .string(risk),
             "autonomy_level": .string(autonomyLevel),
+            "autonomy_reason": autonomyReason.map(JSONValue.string) ?? .null,
+            "remedy": remedy ?? .null,
             "signed_tool_known": .bool(signedToolKnown),
             "rollback_required": .bool(rollbackRequired),
             "decision": .string(decision.rawValue),

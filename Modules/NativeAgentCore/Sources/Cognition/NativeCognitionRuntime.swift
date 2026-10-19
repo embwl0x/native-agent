@@ -1,4 +1,5 @@
 import Foundation
+import ApprovalInbox
 import BackgroundLoops
 import ChatOrchestration
 import CognitiveSubstrate
@@ -9,6 +10,7 @@ import NativeAgentCore
 import PersonaEngine
 import PersistenceCore
 import Desk
+import Experiences
 import DreamREMCycle
 import ProviderRouting
 
@@ -151,6 +153,9 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     var pursuitRefreshInFlight = false  // internal for actor extensions (move-only Wave C)
     var pursuitRefreshQueued = false  // internal for actor extensions (move-only Wave C)
     var pursuitObservationTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
+    var carriedExperienceObservationTask: Task<Void, Never>?
+    var carriedReleaseRunning = false
+    var carriedReleaseAgain = false
     var pursuitRefreshTask: Task<Void, Never>?
     private static let bodyLineRefreshInterval: TimeInterval = 20 * 60
     var organismContinuityRestored = false  // internal for actor extensions (move-only Wave C)
@@ -350,6 +355,15 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 },
                 feltCause: { curiosity, coherence in
                     await kernel.admitHumanCause(curiosity: curiosity, coherence: coherence)
+                },
+                decisions: {
+                    do {
+                        return try await SwiftNativeApprovalInbox(root: root)
+                            .decisionsForREM()
+                    } catch {
+                        nativeLog("[cognition] decision unavailable: \(error)")
+                        return [:]
+                    }
                 }
             ),
             store: store
@@ -364,6 +378,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     deinit {
         approvalLifecycleObservationTask?.cancel()
         pursuitObservationTask?.cancel()
+        carriedExperienceObservationTask?.cancel()
         pursuitRefreshTask?.cancel()
         organismPersistenceDrainTask?.cancel()
     }
@@ -1191,6 +1206,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         pursuitRefreshQueued = false
         pursuitObservationTask?.cancel()
         pursuitObservationTask = nil
+        carriedExperienceObservationTask?.cancel()
+        carriedExperienceObservationTask = nil
         pursuitRefreshTask?.cancel()
         pursuitRefreshTask = nil
         residualDeadline.invalidate()
@@ -1284,6 +1301,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil, at: nil)
         }
         let receiptRead = await substrate.receiptReadSnapshot()
+        let schemas = await substrate.schemaProposalSnapshot()
+        let timeline = await substrate.developmentalTimelineSnapshot(proposals: schemas, limit: 240)
         return CognitiveObservatoryDetail(
             configuration: configuration,
             summary: await substrate.observatorySnapshot(from: read),
@@ -1293,10 +1312,10 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             thoughtSeeds: read.thoughtSeeds,
             thoughtSuggestions: await substrate.thoughtSuggestionSnapshot(surface: "observatory", workspace: read.workspace),
             episodes: await substrate.episodeSnapshot(),
-            schemaProposals: await substrate.schemaProposalSnapshot(),
+            schemaProposals: schemas,
             standingViews: await substrate.standingViewSnapshot(),
-            developmentalTimeline: await substrate.developmentalTimelineSnapshot(),
-            growthWeek: await substrate.growthWeek(),
+            developmentalTimeline: Array(timeline.prefix(40)),
+            growthWeek: await substrate.growthWeek(from: timeline),
             reflections: await substrate.reflectionReceiptSnapshot(),
             receiptRead: receiptRead,
             receipts: receiptRead.receipts,
@@ -1588,12 +1607,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         await substrate.recordReceipt(kind: "user.clear_transient_state")
         publishRuntimeChange(reason: "transient_clear:completed")
         return .cleared
-    }
-
-    func resolveSchemaProposal(id: UUID, accepted: Bool) async {
-        _ = await substrate.resolveSchemaProposal(id: id, accepted: accepted)
-        scheduleDirtyMicrocycle(reason: "schema_proposal_resolution")
-        publishRuntimeChange(reason: "proposal:schema_resolved")
     }
 
     /// Same seam, carrying the persistence outcome (2026-09-06) so the review

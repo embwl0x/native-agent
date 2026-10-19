@@ -58,10 +58,7 @@ extension SchedulerDueJobRunner {
         case .value(let result):
             return result
         case .failure(let message):
-            var output: [String: JSONValue] = ["error": .string(message)]
-            if job.kind == "dream", Self.dreamErrorsAreRetryable([message]) {
-                output["retryAfterSeconds"] = .int(15 * 60)
-            }
+            let output: [String: JSONValue] = ["error": .string(message)]
             return JobResult(
                 status: "error",
                 detail: message,

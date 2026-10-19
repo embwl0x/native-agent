@@ -184,9 +184,17 @@ struct ProviderConfigSheet: View {
     let onDone: () -> Void
 
     @Environment(AppModel.self) private var appModel
+    // Credentials deliberately die with the sheet; only nonsecret edits belong to the app.
     @State private var apiKey = ""
-    @State private var authMode: String
-    @State private var selectedModel = ""
+    private var authMode: String {
+        get { appModel.editDraft("provider:\(provider.provider_id):authMode", seed: authModePickerState.selectedMode) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "provider:\(provider.provider_id):authMode") }
+    }
+    private var selectedModel: String {
+        get { appModel.editDraft("provider:\(provider.provider_id):model", seed: savedModel) }
+        nonmutating set { appModel.setEditDraft(newValue, for: "provider:\(provider.provider_id):model") }
+    }
+    @State private var savedProvider: ProviderInfo
     @State private var availableModels: [NativeAgentShared.ProviderModelInfo]
     @State private var testResult: NativeAgentShared.ProviderTestResult? = nil
     @State private var isTesting = false
@@ -202,24 +210,27 @@ struct ProviderConfigSheet: View {
 
     private var authModePickerState: ProvidersFacade.AuthModePickerState {
         ProvidersFacade.authModePickerState(
-            advertisedModes: provider.auth_modes,
-            savedMode: provider.auth_mode,
-            providerIsReady: provider.auth_status.state == "ready"
+            advertisedModes: savedProvider.auth_modes,
+            savedMode: savedProvider.auth_mode,
+            providerIsReady: savedProvider.auth_status.state == "ready"
         )
     }
 
     init(provider: ProviderInfo, onDone: @escaping () -> Void) {
         self.provider = provider
         self.onDone = onDone
-        let authModeState = ProvidersFacade.authModePickerState(
-            advertisedModes: provider.auth_modes,
-            savedMode: provider.auth_mode,
-            providerIsReady: provider.auth_status.state == "ready"
-        )
-        _authMode = State(initialValue: authModeState.selectedMode)
-        let savedModel = provider.default_model?.trimmingCharacters(in: .whitespacesAndNewlines)
-        _selectedModel = State(initialValue: savedModel?.isEmpty == false ? savedModel! : (provider.models.first?.id ?? ""))
+        _savedProvider = State(initialValue: provider)
         _availableModels = State(initialValue: provider.models)
+    }
+
+    private var savedModel: String {
+        let model = savedProvider.default_model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return model.isEmpty ? (provider.models.first?.id ?? "") : model
+    }
+
+    private func clearDraft() {
+        appModel.clearEditDraft("provider:\(provider.provider_id):authMode")
+        appModel.clearEditDraft("provider:\(provider.provider_id):model")
     }
 
     private var modelPickerPresentation: ProviderConfigModelPickerPresentation {
@@ -355,7 +366,7 @@ struct ProviderConfigSheet: View {
                         AdvancedSection(title: "Model it falls back to", card: .bare) {
                             ProviderCard {
                                 VStack(alignment: .leading, spacing: 12) {
-                                    Picker("Model", selection: $selectedModel) {
+                                    Picker("Model", selection: appModel.editBinding("provider:\(provider.provider_id):model", seed: savedModel)) {
                                         ForEach(availableModels) { model in
                                             Text(model.name).tag(model.id)
                                         }
@@ -476,17 +487,19 @@ struct ProviderConfigSheet: View {
         invalidateTestFeedback()
         let savedInput = apiKey
         let savedAuthMode = authMode
+        let submittedModel = selectedModel
         do {
             try await appModel.engine.providers.saveConnection(
                 provider.provider_id,
                 apiKey: savedAuthMode == "api_key" ? savedInput : nil,
-                authMode: savedAuthMode, defaultModel: selectedModel,
+                authMode: savedAuthMode, defaultModel: submittedModel,
                 didSave: {
                     Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
                     if savedAuthMode == "api_key", apiKey == savedInput { apiKey = "" }
                 },
                 readback: { refreshed in
                     if let current = refreshed.first(where: { $0.provider_id == provider.provider_id }) {
+                        savedProvider = current
                         availableModels = current.models
                     }
                 },
@@ -496,6 +509,7 @@ struct ProviderConfigSheet: View {
             )
             // FIRSTRUN-2: the key is on disk, nothing more. Any earlier
             // "verified" claim is stale now that the credential changed.
+            if authMode == savedAuthMode, selectedModel == submittedModel { clearDraft() }
             verification = .afterSave()
             testResult = nil
             statusText = verification.statusText(providerNote: {
@@ -577,6 +591,7 @@ struct ProviderConfigSheet: View {
         let outcome = await appModel.disconnectProvider(provider.provider_id)
         if outcome.ok {
             apiKey = ""
+            clearDraft()
             verification = .afterClear()
             testResult = nil
         }

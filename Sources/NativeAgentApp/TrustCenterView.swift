@@ -4,6 +4,7 @@ import AppToolRuntime
 import Privacy
 import AgentConversations
 import SwiftUI
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import ChatOrchestration
@@ -334,9 +335,6 @@ struct TrustCenterView: View {
     /// The tab on show. Nil is every section in one column, for the hosts
     /// with no tab row (Simple view's Trust card, Settings).
     private let tab: TrustTab?
-    /// Mac control's unsaved edits, held by the tab row's page so a tab
-    /// switch does not throw them away.
-    private let macControlDraft: Binding<TrustMacControlPolicy?>?
     @Environment(AppModel.self) private var appModel
     @State private var agentAccessMode = "auto"
     @State private var permissionLevel = "balanced"
@@ -348,12 +346,13 @@ struct TrustCenterView: View {
     // PATCH-2026-05-06: dev-mode local binding mirrors trustPolicy.developerMode
     @State private var developerMode = false
     @State private var isApplyingPolicy = false
+    @State private var savedToolPermissions: [String: String] = [:]
+    @State private var savedToolPermissionsError: String?
     @State private var pendingRestore: BackupRecord?
     @State private var restoringBackupID: String?
 
-    init(tab: TrustTab? = nil, macControlDraft: Binding<TrustMacControlPolicy?>? = nil) {
+    init(tab: TrustTab? = nil) {
         self.tab = tab
-        self.macControlDraft = macControlDraft
     }
 
     private func shows(_ section: TrustTab) -> Bool { tab == nil || tab == section }
@@ -373,15 +372,14 @@ struct TrustCenterView: View {
                     accessAndPolicyPanel
                     TrustGuardrailSummaryPanel(accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) } ?? "auto")
                     NativeSecurityCenterPanel(
-                        statusReader: { limit in
-                            let root = PersistenceCore.defaultDataRoot()
-                            return try await SwiftNativeSecurityCenter(dataRoot: root).status(limit: limit)
+                        statusReader: { [root = appModel.firstRunDataRoot] limit in
+                            try await SwiftNativeSecurityCenter(dataRoot: root).status(limit: limit)
                         },
                         modeTitle: activePreset?.title)
                     // A remote agent is never the person: the grant it asks
                     // for is per-peer, and it is the only switch that can raise
                     // an inbound peer off the restricted agent-bridge surface.
-                    AgentPeerTrustView()
+                    AgentPeerTrustView(dataRoot: appModel.firstRunDataRoot)
                 }
 
                 if shows(.features) {
@@ -412,7 +410,7 @@ struct TrustCenterView: View {
                     AdvancedSection(title: "Chrome control") {
                         ChromeControlPermissionsView()
                     }
-                    MacControlPermissionsView(draft: macControlDraft)
+                    MacControlPermissionsView()
                 }
 
                 if shows(.advanced) {
@@ -457,6 +455,20 @@ struct TrustCenterView: View {
                 applyPolicy(newPolicy)
             }
         }
+        .task(id: appModel.engine.trust.policy) {
+            guard shows(.access) else { return }
+            do {
+                let snapshot = try await SwiftNativeTrustCenter().loadAuthorizationSnapshotChecked()
+                savedToolPermissions = snapshot.userConfiguredAutonomyOverrides.compactMapValues {
+                    if case .string(let value) = $0 { value } else { nil }
+                }
+                savedToolPermissionsError = nil
+            } catch {
+                let detail = UserFacingError.message(error, action: "read saved tool permissions")
+                savedToolPermissionsError = detail
+                appModel.recordTrustActionFailure(detail, cause: error)
+            }
+        }
         .alert(item: $pendingRestore) { backup in
             Alert(
                 title: Text("Restore backup?"),
@@ -498,6 +510,25 @@ struct TrustCenterView: View {
                 .pickerStyle(.radioGroup)
                 .labelsHidden()
                 .disabled(isApplyingPolicy || appModel.engine.trust.policy == nil)
+                if appModel.engine.trust.policy == nil || savedToolPermissionsError != nil || appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains("trust policy") == true {
+                    Button("Preserve damaged policy and authorize Safe") {
+                        isApplyingPolicy = true
+                        Task { @MainActor in
+                            defer { isApplyingPolicy = false }
+                            do {
+                                let policy = try await SwiftNativeTrustCenter().reauthorizeSafePolicy()
+                                savedToolPermissions = [:]
+                                savedToolPermissionsError = nil
+                                appModel.engine.trust.policy = policy
+                                applyPolicy(policy)
+                                appModel.statusText = "The damaged policy was preserved beside trust/policy.json. Safe is now authorized; choose any further access here."
+                            } catch {
+                                appModel.statusText = UserFacingError.message(error, action: "reauthorize Safe access")
+                            }
+                        }
+                    }
+                    .disabled(isApplyingPolicy)
+                }
                 HStack(spacing: 8) {
                     if isApplyingPolicy {
                         ProgressView().controlSize(.small)
@@ -508,6 +539,33 @@ struct TrustCenterView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(minHeight: 16, alignment: .leading)
+                if let savedToolPermissionsError {
+                    Text(savedToolPermissionsError).foregroundStyle(NativeAgentShell.trouble)
+                }
+                if !savedToolPermissions.isEmpty {
+                    Text("Saved tool permissions").font(ShellType.labelSemibold)
+                    ForEach(savedToolPermissions.keys.sorted(), id: \.self) { key in
+                        HStack {
+                            Text("\(key): \(savedToolPermissions[key] ?? "")")
+                            Button("Use posture") {
+                                guard let level = savedToolPermissions[key] else { return }
+                                isApplyingPolicy = true
+                                Task { @MainActor in
+                                    defer { isApplyingPolicy = false }
+                                    do {
+                                        let trust = SwiftNativeTrustCenter()
+                                        guard try await trust.compareAndSetToolAutonomy(tool: key, expectedCurrentTiers: [level], newTier: "auto") else {
+                                            throw TrustCenterError.underlying("The saved entry changed; reopen Trust to read it again.")
+                                        }
+                                        savedToolPermissions[key] = "auto"
+                                        appModel.applySavedTrustPolicy(try await trust.getTrust(), status: "\(key) now follows the Trust posture.")
+                                    } catch { appModel.statusText = UserFacingError.message(error, action: "change that saved tool permission") }
+                                }
+                            }
+                            .disabled(isApplyingPolicy || savedToolPermissionsError != nil)
+                        }
+                    }
+                }
                 // "Back up now" lives on the "If I get something wrong" row of
                 // What I can do right now, where it says what it copies.
             }
@@ -861,7 +919,7 @@ enum TrustPolicyPresetAction {
         let policy: TrustPolicy
         do {
             let outcome = try await preset.apply(
-                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                dataRoot: appModel.firstRunDataRoot,
                 fullMacConfirmed: fullMacConfirmed,
                 guardedByLockedPolicy: guardedByLockedPolicy
             )
@@ -999,47 +1057,61 @@ extension TrustFold where Trailing == EmptyView {
 /// it asks is not "is this peer configured" but "does this peer get to act as
 /// me", and that is the question Trust Center exists to answer.
 struct AgentPeerTrustView: View {
-    @State private var peers: [AgentPeerContact] = []
+    let dataRoot: URL
+    @State private var rows: [AgentContactRow] = []
+    @State private var readFailure: String?
     @State private var failure: String?
     /// Until the first read lands, "no agents" would be a guess.
     @State private var loaded = false
     /// Reads can finish out of order; only the newest one applies.
     @State private var reloadGeneration = 0
 
-    private var store: AgentPeerStore { AgentPeerStore(dataRoot: PersistenceCore.defaultDataRoot()) }
+    private var store: AgentPeerStore { AgentPeerStore(dataRoot: dataRoot) }
 
     var body: some View {
         // An eyebrow over one group card, a hairline per peer.
         AdvancedSection(title: "Connected agents") {
-            Text("Other agents can ask me for help. Anything that needs your permission comes to you as an approval request. Turning an agent on lets its requests use your existing permissions. Agents that connect over the network each need their own credential.")
+            Text("Other agents can ask me for help. Anything that needs your permission comes to you as an approval request. Your grant lets requests authenticated with this connection's own key use your existing permissions. You can always turn your grant off. Delivery is checked separately.")
                 .font(ShellType.rowDetail)
                 .foregroundStyle(NativeAgentShell.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if loaded && peers.isEmpty {
+            if loaded && rows.isEmpty && readFailure == nil {
                 Text("No agents are connected.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             } else {
-                ForEach(peers, id: \.id) { peer in
-                    HStack(alignment: .center, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(peer.name)
-                                .font(ShellType.rowTitle)
-                                .foregroundStyle(NativeAgentShell.text)
-                            Text("\(Self.via(peer)) · \(peer.elevationCanBeEnabled ? "has its own credential" : "no credential, so it can't be turned on")")
-                                .font(ShellType.rowDetail)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                ForEach(rows) { row in
+                    if let peer = row.contact {
+                        let eligible = row.elevationFailure == nil
+                        HStack(alignment: .center, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(row.displayName)
+                                    .font(ShellType.rowTitle)
+                                    .foregroundStyle(NativeAgentShell.text)
+                                Text("\(row.route)\nYour grant: \(peer.elevationAllowed ? "on" : "off") · Authority now: \(peer.elevationAllowed && eligible ? "on" : "off")\n\(row.pillWord) · \(row.status)")
+                                    .font(ShellType.rowDetail)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if let reason = row.elevationFailure {
+                                    Text("Its own key isn't available, so your grant can't take effect. " + (reason.tap.map { "Fix: " + $0 } ?? "Ask me to reconnect it."))
+                                        .font(ShellType.rowDetail)
+                                        .foregroundStyle(TrustTone.trouble.color)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            Spacer(minLength: 12)
+                            Toggle(peer.name, isOn: binding(for: peer))
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .hazeTinted()
+                                .disabled(readFailure != nil || (!peer.elevationAllowed && !eligible))
+                                .accessibilityIdentifier("trust.agent-peer.\(peer.id)")
                         }
-                        Spacer(minLength: 12)
-                        Toggle(peer.name, isOn: binding(for: peer))
-                            .labelsHidden()
-                            .toggleStyle(.switch)
-                            .hazeTinted()
-                            .disabled(!peer.elevationCanBeEnabled)
-                            .accessibilityIdentifier("trust.agent-peer.\(peer.id)")
                     }
                 }
+            }
+            if let readFailure {
+                AgentContactReadFailure(message: readFailure, dataRoot: dataRoot) { Task { await reload() } }
             }
             if let failure {
                 Text(failure)
@@ -1051,15 +1123,18 @@ struct AgentPeerTrustView: View {
         // The first file event is the appear read; Dot's readiness is asked
         // once, after it, when Dot is one of the peers.
         .task {
-            let events = FileChangeEvents(paths: [store.fileURL], emitInitial: true)
+            let events = FileChangeEvents(paths: [store.fileURL,
+                dataRoot.appendingPathComponent("agents/conversations.json"), AgentLocalHealth.url(dataRoot),
+                InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot).appendingPathComponent("claude-bridge/claude-live"),
+                dataRoot.appendingPathComponent("chat/sessions.json")], emitInitial: true)
             var askedDot = false
             await withTaskCancellationHandler {
                 for await _ in events.stream {
                     if Task.isCancelled { break }
                     await reload()
-                    if !askedDot, peers.contains(where: ChatGPTDotIPCTransport.owns) {
+                    if !askedDot, rows.contains(where: { $0.contact.map(ChatGPTDotIPCTransport.owns) == true }) {
                         askedDot = true
-                        let root = PersistenceCore.defaultDataRoot()
+                        let root = dataRoot
                         await Task.detached(priority: .userInitiated) {
                             _ = await SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false).chatGPTDotReadiness()
                         }.value
@@ -1070,22 +1145,6 @@ struct AgentPeerTrustView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: ChatGPTDotIPCTransport.didChange)) { _ in
             Task { await reload() }
-        }
-    }
-
-    /// How a peer reaches me, in words a person uses (the Simple view's words).
-    private static func via(_ peer: AgentPeerContact) -> String {
-        if peer.usesShellEnvironment {
-            return ChatGPTDotIPCTransport.detail
-        }
-        return switch peer.transport {
-        case .a2a: "Over the network (A2A)"
-        case .nativeAgent: "Another NativeAgent"
-        case .desktop: "Desktop app on this Mac"
-        case .desktopChat: "Desktop app, through its chat window"
-        case .mcpHost: "Through its settings on this Mac (MCP)"
-        case .acp: "Runs on this Mac"
-        case .grokBot: "Routine, replies come back here"
         }
     }
 
@@ -1106,19 +1165,19 @@ struct AgentPeerTrustView: View {
 
     /// peers.json is read under its lock: off the main actor.
     private func reload() async {
-        let store = store
+        let root = dataRoot
         reloadGeneration += 1
         let generation = reloadGeneration
         let read = await Task.detached(priority: .userInitiated) {
-            Result { try store.list().sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending } }
+            await AgentContactRow.read(dataRoot: root, everyDoor: true)
         }.value
         guard generation == reloadGeneration else { return }
         switch read {
         case .success(let list):
-            peers = list
+            rows = list.filter { $0.contact != nil }
+            readFailure = nil
         case .failure(let error):
-            peers = []
-            failure = UserFacingError.message(error, action: "read the connected agents")
+            readFailure = error.localizedDescription
         }
         loaded = true
     }

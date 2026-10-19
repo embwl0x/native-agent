@@ -276,7 +276,6 @@ enum ProviderToolResultProjection {
         sessionId: String? = nil,
         turnId: String? = nil,
         originalResultClass: ChatToolOutcome.ExactResultClass? = nil,
-        query: String? = nil,
         appDoor: Bool = false
     ) async -> String {
         let limit = maxUTF8Bytes(for: toolName)
@@ -293,12 +292,11 @@ enum ProviderToolResultProjection {
         let originalResultClass = recovery?.resultClass
             ?? originalResultClass ?? ProviderToolResultRecoveryStore.resultClass(content: content)
 
-        let query = query ?? ""
         let budget = min(ToolResultSections.pageBudget, limit - 3_000)
         var fields: [String: JSONValue]
         if let recovery, case .object(let page) = await ProviderToolResultRecoveryStore.shared.page(
             handle: recovery.handle, page: 0, sessionId: sessionId, turnId: turnId,
-            query: query
+            query: ""
         ) {
             fields = page
             // Through the door the page is app's result.page.
@@ -308,7 +306,7 @@ enum ProviderToolResultProjection {
             }
             fields["retained_bytes"] = .int(Int64(recovery.bytes))
         } else {
-            fields = ["sections": .array(ToolResultSections.pages(content: content, query: query, budget: budget)[0]),
+            fields = ["sections": .array(ToolResultSections.pages(content: content, budget: budget)[0]),
                 "detail": .string("Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing output does not establish failure.")]
         }
         fields["provider_projection"] = .string("bounded_tool_result")

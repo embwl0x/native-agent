@@ -405,7 +405,7 @@ extension AppModel {
 
     @MainActor
     @discardableResult
-    func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic) async -> DoctorFacade.RunOutcome {
+    func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic, checkID: String? = nil) async -> DoctorFacade.RunOutcome {
         // PATCH-2026-05-30: surface in-flight state to the UI so the user
         // sees a spinner + "Running…" text instead of an apparent freeze.
         // Block concurrent invocations — clicking Run while a run is in
@@ -427,18 +427,20 @@ extension AppModel {
         }
         do {
             var report = try await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
-                .runtime.runDoctor(repair: repair, repairScope: repairScope)
+                .runtime.runDoctor(repair: repair, repairScope: repairScope, checkID: checkID)
             let buttonRepair: Bool
             if case .button = repairScope {
-                buttonRepair = repair && doctor.report?.checks.contains {
-                    $0.id == "status.desk_attention" && $0.repair_available == true
-                } == true
+                buttonRepair = repair && (checkID == "status.desk_attention" || (checkID == nil && doctor.report?.checks.contains {
+                    $0.checkID == "status.desk_attention" && $0.repair_available == true
+                } == true))
             } else {
                 buttonRepair = false
             }
             let status = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: buttonRepair, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail)
             report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(report, liveChecks: status.checks)
             report.repaired = report.repaired || status.repaired
+            report.checks = await DoctorStatusProjection.repairProjection(report.checks, dataRoot: engine.dataRoot)
+            report.status = DoctorStatusProjection.doctorRollup(report.checks.map(\.status))
             doctor.report = report
             doctor.reportCompletedAt = Date()
             statusText = repair
@@ -466,7 +468,10 @@ extension AppModel {
         let statusChecks = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: false, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail).checks
         let withoutRetiredProbe = DoctorReport(status: current.status, repaired: current.repaired,
                                                checks: current.checks.filter { $0.id != "status.app_health" && $0.id != "status.living_sources" })
-        engine.doctor.report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
+        var refreshed = EngineDoctorRuntime<AppDoctorPort>.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
+        refreshed.checks = await DoctorStatusProjection.repairProjection(refreshed.checks, dataRoot: engine.dataRoot)
+        refreshed.status = DoctorStatusProjection.doctorRollup(refreshed.checks.map(\.status))
+        engine.doctor.report = refreshed
     }
 
     private func splitIDs(_ value: String) -> [String] {

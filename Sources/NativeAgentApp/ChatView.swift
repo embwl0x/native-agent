@@ -100,16 +100,11 @@ final class ChatTurnCardClearance {
 /// "window of nothing", back in a smaller form).
 struct ChatTranscriptBottomAnchor: View {
     let anchorID: String
-    let onVisibilityChange: (Bool) -> Void
 
     var body: some View {
         Color.clear
             .frame(height: NativeAgentShellLayout.composerClearanceMargin)
             .id(anchorID)
-            // Re-arm sentinel: the spacer is in the viewport only when the
-            // reader is at the bottom. In a plain VStack it always exists, so
-            // visibility comes from the scroll view, not from onAppear.
-            .onScrollVisibilityChange(threshold: 0.01, onVisibilityChange)
     }
 }
 
@@ -200,8 +195,11 @@ enum ChatViewportPresentation {
         return sane + NativeAgentShellLayout.composerClearanceMargin
     }
 
-    static func shouldShowLatestPill(autoFollow: Bool) -> Bool {
-        !autoFollow
+    /// Only when the live edge is out of view: a press at the bottom stops
+    /// following without anything being below the fold, and the bottom of an
+    /// earlier page is not the live edge.
+    static func shouldShowLatestPill(autoFollow: Bool, atBottom: Bool, pagedBack: Bool) -> Bool {
+        !autoFollow && (!atBottom || pagedBack)
     }
 
     enum ScrollFollowAction: Equatable {
@@ -212,11 +210,11 @@ enum ChatViewportPresentation {
 
     static func scrollFollowAction(
         deltaY: CGFloat,
-        bottomSpacerVisible: Bool,
+        atBottom: Bool,
         autoFollow: Bool
     ) -> ScrollFollowAction {
         if deltaY > 0.5 { return .disarm }
-        if deltaY < -0.5, bottomSpacerVisible, !autoFollow { return .rearm }
+        if deltaY < -0.5, atBottom, !autoFollow { return .rearm }
         return .none
     }
 }
@@ -930,9 +928,6 @@ struct ChatView: View {
             // view (and its @State) goes away on a tab change.
             commitDraft()
             endDictation()
-            // Re-arm sentinel cleanup — lazy children may skip their own
-            // onDisappear during window/tab teardown.
-            scrollCoordinator.setBottomSpacerVisible(false)
         }
         // 2026-09-13: leaving Chat no longer unmounts it, so `onDisappear`
         // above never runs on a page switch — the microphone kept recording
@@ -1141,7 +1136,15 @@ struct ChatView: View {
             // under her name and the system does the fade — no gradient, no
             // mask, no painted strip.
                 ScrollViewReader { proxy in
-                    ScrollView {
+                    TranscriptScrollView(
+                        coordinator: scrollCoordinator,
+                        isActive: chatPageIsVisible,
+                        // Paged back to an earlier page, its bottom is not the
+                        // live one: ask for the latest page, which clears the
+                        // anchor and scrolls there, or replies would stream in
+                        // off the page.
+                        onRearm: { if scrollCoordinator.transcriptPagedBack { transcriptLatestRequest &+= 1 } }
+                    ) {
                         // User, 2026-09-04: the transcript is a plain VStack.
                         // Every main-thread pin since 08-31 had the same
                         // shape: LazyVStack's prefetch re-armed itself at the
@@ -1221,9 +1224,7 @@ struct ChatView: View {
                             // target, which padding below the anchor would not
                             // be. Its height is the spacer's own business —
                             // see ChatTranscriptBottomAnchor.
-                            ChatTranscriptBottomAnchor(anchorID: bottomAnchor) { visible in
-                                scrollCoordinator.setBottomSpacerVisible(visible)
-                            }
+                            ChatTranscriptBottomAnchor(anchorID: bottomAnchor)
                         }
                         .padding(.horizontal, NativeAgentShellLayout.roomGutter)
                         .padding(.top, 18)
@@ -1264,59 +1265,6 @@ struct ChatView: View {
                     // new shell paints no band at either edge; that is the
                     // whole point of letting the system do it.
                     .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
-                    // User, 2026-09-13 ("still a little bumpy"): streaming no
-                    // longer issues a scroll command per chunk. While the
-                    // reader is at the bottom the SCROLL VIEW keeps the bottom
-                    // pinned itself — appended text moves the content's bottom
-                    // edge and the viewport rides it, with no animation to
-                    // overlap and no forced offset change per token. The role
-                    // is scoped to `.sizeChanges` on purpose: the 2026-07-25
-                    // blanket `.defaultScrollAnchor(.bottom)` also re-anchored
-                    // someone who had scrolled AWAY from the bottom, and
-                    // `autoFollow` is exactly the "away" bit. `.top` is the
-                    // system default — the offset is left alone.
-                    .defaultScrollAnchor(
-                        scrollCoordinator.autoFollow ? .bottom : .top,
-                        for: .sizeChanges
-                    )
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 4).onChanged { _ in
-                            scrollCoordinator.disarmFollow()
-                        }
-                    )
-                    .background(
-                        ScrollWheelCatcher(isActive: chatPageIsVisible) { deltaY in
-                            switch ChatViewportPresentation.scrollFollowAction(
-                                deltaY: deltaY,
-                                bottomSpacerVisible: scrollCoordinator.bottomSpacerVisible,
-                                autoFollow: scrollCoordinator.autoFollow
-                            ) {
-                            case .disarm:
-                                scrollCoordinator.disarmFollow()
-                            case .rearm:
-                                // Scrolling back DOWN to the bottom re-arms
-                                // follow (standard chat UX — the user's catch
-                                // 2026-06-12: once follow disarmed, streaming
-                                // grew below the fold and only the small
-                                // "Latest" pill could recover it). Fluid
-                                // glass: no snap. The reader is already at
-                                // the bottom and still scrolling; a forced
-                                // jump here moved the transcript under them
-                                // as the pill left. Paged back to an earlier
-                                // page, its bottom is not the live one: ask
-                                // for the latest page, which clears the anchor
-                                // and scrolls there, or replies would stream
-                                // in off the page.
-                                if scrollCoordinator.transcriptPagedBack {
-                                    transcriptLatestRequest &+= 1
-                                }
-                                scrollCoordinator.forceFollow()
-                            case .none:
-                                break
-                            }
-                        }
-                        .allowsHitTesting(false)
-                    )
                     // The room's pinned chrome. Everything in here floats
                     // over the transcript and the transcript scrolls under it,
                     // which is the only arrangement the scroll edge effect

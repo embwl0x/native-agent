@@ -56,7 +56,7 @@ register()
 let appToolNames = Set(appDescriptors.map(\.name))
 PeerDataTaint.ownerTrusts = { $0 == "peer:trusted-agent" }
 // The engine's own binding (PeerTrust.install): a turn's steer is asked of PeerDataTaint.
-CapabilityLifecycle.turnWriteCheck = { PeerDataTaint.abilityWriteCheck }
+CapabilityLifecycle.turnWriteCheck = { PeerDataTaint.abilityWriteFailure }
 
 enum Outcome: String { case act, ask, floor, refuse }
 

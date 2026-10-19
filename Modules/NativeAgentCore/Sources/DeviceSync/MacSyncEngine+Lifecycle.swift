@@ -17,6 +17,48 @@ import KnowledgeGraph
 import PersistenceCore
 
 extension MacSyncEngine {
+    /// A repair attempt uses the mounted writer and transport; its next health
+    /// reading, not admission to the writer, proves the failed postcondition.
+    public func repairPhoneSync() async -> String {
+        guard isActive, snapshotDir != nil else {
+            return "Phone sync is not active; no snapshot or presence was published."
+        }
+        let generation = snapshotLifecycleGeneration
+        let queued = snapshotWriteInFlight
+        await sync.bridge.repairReceive()
+        await writeSnapshots(forceHeavy: true, republish: true, includeChatTranscripts: true)
+        guard !queued else {
+            return "Phone snapshot rebuild was queued behind the active writer; recovery is not verified."
+        }
+        guard generation == snapshotLifecycleGeneration, isActive else {
+            return "Phone sync changed while rebuilding snapshots; recovery is not verified."
+        }
+        let presence = await sync.bridge.publishMacPresence()
+        guard generation == snapshotLifecycleGeneration, isActive else {
+            return "Phone snapshot transport is unavailable or changed during publication; recovery is not verified."
+        }
+        return ([presence ? "CloudKit accepted Mac presence." : "CloudKit has not accepted Mac presence."]
+            + (syncError.map { [$0] } ?? [])
+            + ["Snapshot publication was attempted; the phone's receipt is not confirmed. Doctor must verify the failed postcondition."])
+            .joined(separator: " ")
+    }
+
+    /// Every page and the presence beat as this Mac has them now, whatever
+    /// was last sent: another Mac may have written over them while it held
+    /// the phone, and unchanged files would otherwise never go out again.
+    func republishPhonePages() async {
+        guard isActive, let snapshotDir else { return }
+        let generation = snapshotLifecycleGeneration
+        _ = await sync.bridge.publishMobileSnapshotStatus(
+            groups: Set(NAMobileSnapshotGroup.allCases),
+            snapshotDirectory: snapshotDir,
+            shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
+        )
+        if await sync.bridge.publishMacPresence() {
+            OrganPulse.record("presence_beat", .worked, cadence: NAMacPresence.beat)
+        }
+    }
+
     // MARK: - Start
 
     /// Public Developer ID builds carry CloudKit but cannot carry the
@@ -198,6 +240,7 @@ extension MacSyncEngine {
         // The retiring pass owns admission until its physical write returns.
         snapshotWriteQueued = false
         snapshotWriteQueuedNeedsHeavy = false
+        snapshotWriteQueuedNeedsRepublish = false
         snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
         snapshotWriteQueuedNeedsStandardPass = false

@@ -1106,7 +1106,8 @@ public struct SwiftNativeDeskStore: Sendable {
     // MARK: - Sequencing edges (blocked-on / defer)
 
     /// setBlockedOn — REPLACE the whole blocker set for `handle`. Blockers are
-    /// stable handles of LIVE items (the chat lane resolves aliases first).
+    /// stable handles of LIVE items or exp:<id> (the chat lane resolves first).
+    /// A named wait replaces prose blocking and may carry her reason as a note.
     /// Validated UNDER THE OPS FLOCK against ops-derived live state so a refusal
     /// can't race a sibling close: unknown blocker, self-block, and any edge that
     /// would close a cycle are all refused.
@@ -1115,11 +1116,11 @@ public struct SwiftNativeDeskStore: Sendable {
     /// parameter would be evaluated at the call site BEFORE the lock and could
     /// commit behind a later-issued stamp (the trap this file documents).
     @discardableResult
-    public func setBlockedOn(_ handle: String, blockers: [String]) async throws -> DeskOp {
+    public func setBlockedOn(_ handle: String, blockers: [String], waiting: Bool = false, note: String? = nil) async throws -> DeskOp {
         try await persistence.withFileLock(opsPath) {
             let feed = try await readFeedUnlocked()
             let state = Self.compact(base: feed.base, feed.ops)
-            guard state.items.contains(where: { $0.handle == handle }) else {
+            guard let item = state.items.first(where: { $0.handle == handle }) else {
                 throw DeskError.unknownHandle(handle)
             }
             let proposed = Self.normalizeBlockers(blockers)
@@ -1129,7 +1130,17 @@ public struct SwiftNativeDeskStore: Sendable {
                 handle: handle,
                 body: .setBlockedOn(handles: proposed)
             )
-            _ = try await appendAndRecompactUnlocked(op, feed: feed)
+            var committed = try await appendAndRecompactUnlocked(op, feed: feed).feed
+            var bodies: [DeskOpBody] = []
+            if waiting {
+                bodies.append(.setStatus(status: item.status == .blocked ? .next : item.status,
+                    blockedReason: nil, waitingOn: nil, progress: item.progress, assignee: item.assignee, laneOf: item.laneOf))
+            }
+            if let note { bodies.append(.appendNote(text: note, author: "agent")) }
+            for body in bodies {
+                let next = DeskOp(ts: DeskClock.commitStamp(notBefore: committed.maxCommittedTs), handle: handle, body: body)
+                committed = try await appendAndRecompactUnlocked(next, feed: committed).feed
+            }
             return op
         }
     }
@@ -1174,27 +1185,44 @@ public struct SwiftNativeDeskStore: Sendable {
         return out
     }
 
-    /// Write-time gate for a proposed blocker set: every blocker must be a live
-    /// item, an item may not block itself, and the edge must not close a cycle in
+    /// Settled conditions come off the item as it is now, under the ops lock,
+    /// so a wait committed meanwhile is never overwritten; the note says why.
+    public func releaseBlockers(_ handle: String, removing settled: Set<String>, note: String, author: String) async throws {
+        try await persistence.withFileLock(opsPath) {
+            var feed = try await readFeedUnlocked()
+            let state = Self.compact(base: feed.base, feed.ops)
+            guard let item = state.items.first(where: { $0.handle == handle }),
+                  item.blockedOn.contains(where: settled.contains) else { return }
+            for body in [DeskOpBody.setBlockedOn(handles: item.blockedOn.filter { !settled.contains($0) }),
+                         .appendNote(text: note, author: author)] {
+                let op = DeskOp(ts: DeskClock.commitStamp(notBefore: feed.maxCommittedTs), handle: handle, body: body)
+                feed = try await appendAndRecompactUnlocked(op, feed: feed).feed
+            }
+        }
+    }
+
+    /// Write-time gate for a proposed blocker set: every Desk blocker must be a live
+    /// item; experience conditions are checked by their caller. Desk edges cannot close a cycle in
     /// the PROSPECTIVE graph (live edges with this item's edges replaced by the
     /// proposal). A cycle is unresolvable — nothing in it can ever become ready.
     static func validateBlockedOn(handle: String, proposed: [String], in state: DeskState) throws {
         let liveHandles = Set(state.items.map(\.handle))
         for blocker in proposed {
+            if blocker.hasPrefix("exp:"), blocker.count > 4 { continue }
             if blocker == handle { throw DeskError.blockedOnSelf(handle: handle) }
             guard liveHandles.contains(blocker) else {
                 throw DeskError.blockedOnUnknown(handle: handle, blocker: blocker)
             }
         }
         var edges: [String: [String]] = [:]
-        for item in state.items { edges[item.handle] = item.blockedOn }
-        edges[handle] = proposed
+        for item in state.items { edges[item.handle] = item.blockedOn.filter { !$0.hasPrefix("exp:") } }
+        edges[handle] = proposed.filter { !$0.hasPrefix("exp:") }
 
         // Is `handle` reachable FROM any proposed blocker? If so the proposal
         // closes a loop. DFS carries the path so the refusal can name it, and is
         // bounded by both a visited set (existing cycles elsewhere in the graph
         // can't hang it) and a depth cap.
-        for start in proposed {
+        for start in proposed where !start.hasPrefix("exp:") {
             var seen: Set<String> = []
             var path: [String] = []
             func reachesTarget(_ node: String, depth: Int) -> Bool {

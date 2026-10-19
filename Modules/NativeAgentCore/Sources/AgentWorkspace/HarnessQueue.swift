@@ -1,5 +1,6 @@
 import Foundation
 import Desk
+import NativeAgentCore
 
 /// One finding, with one Desk identity and the person who can tend it.
 public struct HarnessFinding: Sendable, Equatable {
@@ -25,31 +26,61 @@ extension ResidentWake {
     package static func carriedArrival(_ item: DeskItem, crossing: Date) -> Item {
         let key = "carry." + item.handle
         let step = item.step
+        let peers = (step?.peers ?? []).filter { !CapabilityLifecycle.ownerTrusts($0) }
+        let provenance = peers.isEmpty ? "" : " Peer steering retained: " + peers.joined(separator: ", ")
+            + ". A one-call approval does not elevate a peer."
+        // What released it since she last wrote on it (MyQueueReady.release's note).
+        let mine = item.notes.filter { $0.author == "agent" }.compactMap { DeskClock.parseISO($0.ts) }.max() ?? .distantPast
+        let released = item.notes.filter {
+            $0.author == "system" && $0.text.hasPrefix("Released: ") && (DeskClock.parseISO($0.ts) ?? .distantPast) > mine
+        }.map { $0.text + " " }.joined()
         return .init(id: key + "." + String(crossing.timeIntervalSince1970),
-            line: "Yours to carry: \(item.title) — \(item.summary ?? step?.words ?? item.title). Do what you judge right. Close it with desk.close only once it is actually done; otherwise leave it open and note why it waits.",
+            line: released + "Yours to carry: \(item.title) — \(item.summary ?? step?.words ?? item.title). Do what you judge right. Close it with desk.close only once it is actually done. If it can't move yet, say what it waits on with desk.wait {handle, on: <the card, message or debt id it needs>}: you are woken when that settles, not before." + provenance,
             key: key, thread: key,
             at: crossing, session: step?.session,
-            filedAt: step.map { $0.filedAt ?? item.openedAt })
+            filedAt: step.map { $0.filedAt ?? item.openedAt }, materialFingerprint: carriedFingerprint(item))
+    }
+
+    /// What an offer of carried work is measured from: the item's material state
+    /// and the step it queues (refiling it is a change), never notes or stamps.
+    static func carriedFingerprint(_ item: DeskItem) -> String {
+        let step = item.step.map { [$0.words, $0.when, $0.card ?? "", $0.action ?? "", $0.session ?? "", $0.filedAt ?? ""] } ?? []
+        return ([DeskObservationEvaluator.materialFingerprint(item)] + step).joined(separator: "\u{1F}")
     }
 
     /// The carry projection reads the wake owner's spacing and hop law here,
     /// without duplicating its ledger or importing its implementation details.
-    package static func carriedOpportunities(dataRoot: URL, handles: [String], at now: Date) -> [String: Date] {
-        let ledger = read(dataRoot)
-        guard !ledger.pending.contains(where: { $0.key?.hasPrefix("carry.") == true && $0.routeWait == nil }) else { return [:] }
-        return Dictionary(uniqueKeysWithValues: handles.filter { handle in
-            !ledger.pending.contains { $0.key == "carry." + handle && $0.routeWait != nil }
-        }.map { handle in
-            let key = "carry." + handle
-            var due = max(now, ledger.lastWake?.addingTimeInterval(spacing) ?? now)
-            if let offered = ledger.recent.filter({ $0.key == key }).map(\.at).max() {
-                due = max(due, offered.addingTimeInterval(spacing))
+    package static func carriedOpportunities(dataRoot: URL, items: [DeskItem], at now: Date) -> [String: Date] {
+        // An older offer had no fingerprint. Establish its baseline without
+        // inventing a change; subsequent material changes compare against it.
+        guard let saved = shared.kept(dataRoot, { ledger -> Ledger in
+            for index in ledger.recent.indices where ledger.recent[index].materialFingerprint == nil {
+                if let item = items.first(where: { "carry." + $0.handle == ledger.recent[index].key }) {
+                    ledger.recent[index].materialFingerprint = carriedFingerprint(item)
+                }
             }
+            return ledger
+        }), saved.saved else { return [:] }
+        let ledger = saved.result
+        guard !ledger.pending.contains(where: { $0.key?.hasPrefix("carry.") == true && $0.routeWait == nil }) else { return [:] }
+        return Dictionary(uniqueKeysWithValues: items.compactMap { item -> (String, Date)? in
+            let key = "carry." + item.handle
+            guard !ledger.pending.contains(where: { $0.key == key && $0.routeWait != nil }) else { return nil }
+            var changed = DeskClock.parseISO(item.openedAt) ?? .distantPast
+            for note in item.notes where note.author != "agent" {
+                if let at = DeskClock.parseISO(note.ts) { changed = max(changed, at) }
+            }
+            if let offered = ledger.recent.filter({ $0.key == key }).max(by: { $0.at < $1.at }) {
+                let materialChanged = offered.materialFingerprint != carriedFingerprint(item)
+                guard materialChanged || changed > offered.at else { return nil }
+                if materialChanged { changed = max(changed, now) }
+            }
+            var due = max(changed, ledger.lastWake?.addingTimeInterval(spacing) ?? .distantPast)
             if let hop = ledger.hops[key], hop.count >= maxHops {
                 let rested = hop.at.addingTimeInterval(rest)
                 due = max(due, Date(timeIntervalSinceReferenceDate: rested.timeIntervalSinceReferenceDate.nextUp))
             }
-            return (handle, due)
+            return (item.handle, due)
         })
     }
 }

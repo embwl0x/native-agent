@@ -41,49 +41,6 @@ extension AgentWorkspace {
 /// Reads use exact inbox identity, with the RFC identifier when available.
 /// Replies require that identifier; display text never selects a recipient.
 enum AgentWorkspaceMail {
-    /// Home reads are frequent; the notable-mail search is slow on a big
-    /// mailbox. One read per 10 minutes is fresh enough for a glance.
-    private actor NotableCache {
-        var value: (at: Date, text: String)?
-        func fresh() -> String? { value.flatMap { Date().timeIntervalSince($0.at) < 600 ? $0.text : nil } }
-        func store(_ text: String) { value = (Date(), text) }
-        func clear() { value = nil }
-    }
-    private static let notableCache = NotableCache()
-
-    static func notableToday(perform: AgentWorkspace.Perform) async -> String {
-        guard AgentWorkspaceReadiness.allows(tool: "mail_search"), AgentWorkspaceReadiness.ready(tool: "mail_search") else {
-            await notableCache.clear()
-            return "unavailable — Mail Read is off or not ready"
-        }
-        if let cached = await notableCache.fresh() { return cached }
-        let text = await readNotableToday(perform: perform)
-        if !text.hasPrefix("unavailable") { await notableCache.store(text) }
-        return text
-    }
-
-    private static func readNotableToday(perform: AgentWorkspace.Perform) async -> String {
-        let since = ISO8601DateFormatter().string(from: Calendar.current.startOfDay(for: Date()))
-        do {
-            let result = try await perform("mail_search", ["since": .string(since), "unread": .bool(true),
-                "category": .string("primary,transactions"), "limit": .int(4)])
-            guard case .object(let content) = result, content["status"] == .string("completed"),
-                  case .array(let rows)? = content["messages"] else {
-                return "unavailable — " + (ChatToolOutcome.explanation(result) ?? "Mail did not return a completed read.")
-            }
-            let previews = rows.compactMap { row -> String? in
-                guard case .object(let row) = row, case .string(let subject)? = row["subject"],
-                      case .string(let sender)? = row["sender"] else { return nil }
-                return HerScreen.clip(sender, 28) + " — " + HerScreen.clip(subject, 70)
-            }
-            let coverage = ChatToolOutcome.explanation(result).map { " · " + HerScreen.clip($0, 120) } ?? ""
-            return (previews.isEmpty ? "no unread Mail in Primary/Transactions today"
-                : previews.joined(separator: "; ") + " · open mail to read; up to 4 previews") + coverage
-        } catch {
-            return "unavailable — " + ChatToolOutcome.errorMessage(error)
-        }
-    }
-
     static func project(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
         let open = AgentWorkspaceButton(label: "Open Mail view", action: .perform(tool: "go", input: ["name": .string("Mail")], title: "Mail view", textField: nil, isEffect: true))
         var actions: [AgentWorkspaceButton] = [open,

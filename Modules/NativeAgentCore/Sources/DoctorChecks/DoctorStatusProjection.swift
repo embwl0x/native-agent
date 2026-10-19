@@ -1,8 +1,75 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
+import Experiences
 
 /// Cached health projection; host probes and display redaction arrive from the caller.
 public enum DoctorStatusProjection {
+    public static func repairProjection(_ rows: [CheckResult], dataRoot: URL) async -> [CheckResult] {
+        let rows = rows.filter { $0.repairExperience == nil }
+        do {
+            let open = try await ExperienceStore.at(dataRoot).projection()
+            let repairs = open.filter {
+                $0.owes["repair"]?.phase.isSettled == false
+                    && $0.claims.contains { $0.claim.hasPrefix("operation: doctor.check:") }
+            }
+            let owed = repairs.map { experience -> CheckResult in
+                let operation = experience.claims.first { $0.claim.hasPrefix("operation: doctor.check:") }!.claim
+                let checkID = String(operation.dropFirst("operation: doctor.check:".count))
+                let reading = rows.first { $0.id == checkID }
+                func claim(_ name: String) -> String? {
+                    experience.claims.first { $0.claim.hasPrefix(name + ": ") }.map { String($0.claim.dropFirst(name.count + 2)) }
+                }
+                let tap = claim("tap")
+                let nativeRepair = claim("next_call") == ToolFailureError.call("app", ["action": .string("doctor.repair"), "args": .object(["check_id": .string(checkID)])])
+                return CheckResult(id: experience.id, title: reading?.title ?? checkID, status: claim("check.status") ?? "warn",
+                    detail: experience.face?.words ?? checkID, harm: claim("check.harm"), receipt: claim("check.receipt"), human_action: tap,
+                    repair_available: reading?.repair_available ?? nativeRepair, ask: tap == nil ? nil : reading?.ask ?? .permission,
+                    repairExperience: experience)
+            }
+            // Measurements remain inspectable; their unresolved failures are
+            // rendered from the experience that owns them, including unknowns.
+            let owedIDs = Set(owed.map(\.checkID))
+            return rows.filter { !owedIDs.contains($0.id) || $0.ask != nil } + owed
+        } catch {
+            return rows + [CheckResult(source: "experiences/experiences.sqlite",
+                nextCall: ToolFailureError.fileRepairCall(dataRoot.appendingPathComponent("experiences/experiences.sqlite"), dataRoot: dataRoot,
+                    shape: "This SQLite experience store retains original experiences, claims, evidence and obligation phases. Preserve their identities and settlement history."),
+                id: "doctor.repair_store", title: "Repairs owed", status: "fail",
+                detail: "Repair obligations could not be read: \(error.localizedDescription)")]
+        }
+    }
+
+    /// Each measurement owns its repair. A report, restart, or unknown reading
+    /// cannot accept it; only this check's passing postcondition can.
+    public static func recordReadings(_ rows: [CheckResult], dataRoot: URL) async {
+        let measurement = UUID().uuidString
+        for row in rows where row.repairExperience == nil {
+            let operation = "doctor.check:" + row.id
+            let evidence = Experience.Ref(source: "doctor", id: measurement + ":" + row.id)
+            if DoctorSafeRepairPolicy.isAdverse(row.status), row.ask == nil,
+               let owner = row.repairOwner, row.repairCall != nil {
+                // One failing check is one owed repair: a later failing reading
+                // adds its evidence and current words to the open one.
+                await ExperienceStore.record(dataRoot, operation) { store in
+                    if let open = try await store.open().first(where: { $0.owes["repair"]?.phase.isSettled == false
+                        && $0.claims.contains { $0.claim == "operation: " + operation } }) {
+                        return try await store.append([.evidence(evidence), .face(.init(words: row.repairFace, artifacts: []))], to: open.id)
+                    }
+                    await RepairOwed.owe(dataRoot, id: evidence.id, kind: .act, evidence: [evidence],
+                        operation: operation, owner: owner, words: row.repairFace,
+                        nextCall: row.repairCall, tap: row.repairTap).value
+                    let fields: [(String, String?)] = [("check.status", row.status), ("check.harm", row.harm), ("check.receipt", row.receipt)]
+                    try await store.append(fields.compactMap { key, value in
+                        value.map { .claim(.init(claim: key + ": " + $0, evidence: [evidence])) }
+                    }, to: evidence.id)
+                }.value
+            } else if row.status == "ok" {
+                await RepairOwed.settle(dataRoot, operation: operation, evidence: evidence).value
+            }
+        }
+    }
+
     public static func makeHealthCard(
         now: String,
         cachePath: URL,
@@ -18,6 +85,7 @@ public enum DoctorStatusProjection {
             let raw = try await runCoreChecks()
             let executable = DoctorSafeRepairPolicy.executableCoreIDs(for: raw)
             let core = raw.map { $0.settled(liveAvailable: false, coreAvailable: executable.contains($0.id)) }
+            await recordReadings(core, dataRoot: cachePath.deletingLastPathComponent().deletingLastPathComponent())
             do {
                 try await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt, inPlace: true)
             } catch {
@@ -28,12 +96,15 @@ public enum DoctorStatusProjection {
                     id: c.id,
                     label: c.title,
                     status: c.status,
-                    detail: c.detail,
-                    fixAction: c.repair
+                    detail: c.repairFace,
+                    fixAction: c.repairCall ?? c.repairTap
                 )
             }
             return HealthCard(overall: doctorRollup(subs.map(\.status)), subsystems: subs, createdAt: now)
         } catch {
+            await recordReadings([CheckResult(source: "Doctor run", id: "doctor", title: "Doctor", status: "unmeasured",
+                detail: "Doctor run failed: \(safeDetail(error.localizedDescription))")],
+                dataRoot: cachePath.deletingLastPathComponent().deletingLastPathComponent())
             let err = HealthCardSubsystem(
                 id: "doctor",
                 label: "Doctor",
@@ -87,8 +158,8 @@ public enum DoctorStatusProjection {
                 id: $0.id,
                 label: $0.title,
                 status: $0.status,
-                detail: $0.detail,
-                fixAction: $0.repair
+                detail: $0.repairFace,
+                fixAction: $0.repairCall ?? $0.repairTap
             )
         }
         let rollup = Self.doctorRollup(subs.map(\.status))
@@ -101,8 +172,8 @@ public enum DoctorStatusProjection {
                 id: check.id,
                 label: check.title,
                 status: check.status,
-                detail: check.detail,
-                fixAction: check.repair
+                detail: check.repairFace,
+                fixAction: check.repairCall ?? check.repairTap
             )
         }
         let liveIDs = Set(live.map(\.id))
@@ -162,7 +233,7 @@ extension DoctorStatusProjection {
             "Provider", "Runtime", "Cognition", "Connectors", "Data", "Tools",
             "Autonomy", "Release",
         ]
-        let grouped = Dictionary(grouping: checks, by: { categoryID(for: $0.id) })
+        let grouped = Dictionary(grouping: checks, by: { categoryID(for: $0.checkID) })
         let statusOrder = ["failing", "warning", "healthy", "reading", "off", "not needed", "unclear"]
         return order.compactMap { key in
             guard let values = grouped[key], !values.isEmpty else { return nil }

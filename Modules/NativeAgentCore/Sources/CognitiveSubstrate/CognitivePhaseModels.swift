@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import PersistenceCore
 
 public protocol CognitiveEventObserving: Sendable {
@@ -226,6 +227,7 @@ public struct CognitiveCapsule: Sendable, Equatable {
     public var stableKernel: String
     public var dynamicContext: String
     public var provenanceNodeIds: [UUID]
+    public var sourcePeerIds: [String]?
     public var truncated: Bool
 
     public var combined: String {
@@ -241,13 +243,15 @@ public struct CognitiveCapsule: Sendable, Equatable {
         stableKernel: String,
         dynamicContext: String,
         provenanceNodeIds: [UUID],
-        truncated: Bool
+        truncated: Bool,
+        sourcePeerIds: [String]? = nil
     ) {
         self.generatedAt = generatedAt
         self.mode = mode
         self.stableKernel = stableKernel
         self.dynamicContext = dynamicContext
         self.provenanceNodeIds = provenanceNodeIds
+        self.sourcePeerIds = sourcePeerIds
         self.truncated = truncated
     }
 }
@@ -458,6 +462,7 @@ public enum CognitiveSchemaProposalStatus: String, Sendable, Equatable, CaseIter
     case proposed
     case accepted
     case rejected
+    case unavailable
 }
 
 public struct CognitiveSchemaProposal: Sendable, Equatable, Identifiable {
@@ -465,7 +470,16 @@ public struct CognitiveSchemaProposal: Sendable, Equatable, Identifiable {
     public var title: String
     public var body: String
     public var target: String
-    public var status: CognitiveSchemaProposalStatus
+    /// A read projection, never persisted as cognitive status.
+    public var decision: Experience? = nil
+    public var status: CognitiveSchemaProposalStatus {
+        guard let decision else { return .unavailable }
+        switch decision.outcome?.status {
+        case "approved": return decision.claims.contains { $0.claim == "applied" } ? .accepted : .unavailable
+        case "denied", "canceled": return .rejected
+        default: return decision.isOpen ? .proposed : .rejected
+        }
+    }
     public var confidence: Double
     public var createdAt: Date
     public var evidenceNodeIds: [UUID]
@@ -477,7 +491,6 @@ public struct CognitiveSchemaProposal: Sendable, Equatable, Identifiable {
         title: String,
         body: String,
         target: String,
-        status: CognitiveSchemaProposalStatus = .proposed,
         confidence: Double = 0,
         createdAt: Date,
         evidenceNodeIds: [UUID] = [],
@@ -488,7 +501,6 @@ public struct CognitiveSchemaProposal: Sendable, Equatable, Identifiable {
         self.title = title
         self.body = body
         self.target = target
-        self.status = status
         self.confidence = (confidence).clamped01()
         self.createdAt = createdAt
         self.evidenceNodeIds = evidenceNodeIds
@@ -739,7 +751,6 @@ public struct CognitiveREMProposalReference: Sendable, Equatable, Identifiable {
     public var target: String
     public var text: String
     public var evidenceDates: [String]
-    public var status: String
     public var confidence: Double
     public var createdAt: String
 
@@ -748,7 +759,6 @@ public struct CognitiveREMProposalReference: Sendable, Equatable, Identifiable {
         target: String,
         text: String,
         evidenceDates: [String],
-        status: String,
         confidence: Double,
         createdAt: String
     ) {
@@ -756,7 +766,6 @@ public struct CognitiveREMProposalReference: Sendable, Equatable, Identifiable {
         self.target = target
         self.text = text
         self.evidenceDates = evidenceDates
-        self.status = status
         self.confidence = (confidence).clamped01()
         self.createdAt = createdAt
     }
@@ -797,6 +806,52 @@ public struct CognitiveReplayIntegrationResult: Sendable, Equatable {
     }
 }
 
+/// Material and captured provenance travel together from a committed wake to reflection.
+public struct CognitiveReflectionCause: Codable, Sendable, Equatable {
+    public var text: String
+    public var sourcePeerIds: [String]?
+    public var sourceNodeIds: [UUID]
+    public var sourceRefs: [String]
+
+    public init(text: String, sourcePeerIds: [String]? = nil, sourceNodeIds: [UUID] = [], sourceRefs: [String] = []) {
+        self.text = text
+        self.sourcePeerIds = sourcePeerIds
+        self.sourceNodeIds = sourceNodeIds
+        self.sourceRefs = sourceRefs
+    }
+
+    public init(text: String, sources: [String], material: [String: Self]) {
+        self.init(text: text,
+            sourcePeerIds: sources.isEmpty ? nil : Self.unionPeerIds(sources.map { material[$0]?.sourcePeerIds }),
+            sourceRefs: Array(Set(sources + sources.flatMap { material[$0]?.sourceRefs ?? [] })).sorted())
+    }
+
+    /// Unknown input provenance stays unknown; selecting citations cannot lower the floor.
+    public static func unionPeerIds(_ inputs: [[String]?]) -> [String]? {
+        guard inputs.allSatisfy({ $0 != nil }) else { return nil }
+        return Array(Set(inputs.flatMap { $0! })).sorted()
+    }
+
+}
+
+/// One thinking call owns both the conclusion and its optional felt meaning.
+public struct CognitiveReflectionJudgment: Codable, Sendable, Equatable {
+    public var reflection: String
+    public var affect: Double?
+    public var takeaway: String?
+    public var sources: [String]
+
+    public func validate(material: [String: CognitiveReflectionCause]) throws {
+        guard affect.map({ $0.isFinite && (-1...1).contains($0) }) ?? true,
+              takeaway.map({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.count <= 240 }) ?? true,
+              Set(sources).isSubset(of: Set(material.keys)),
+              takeaway == nil || !sources.isEmpty else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [],
+                debugDescription: "Invalid reflection judgment: affect must be -1...1 or null; a takeaway must be complete, at most 240 characters, and cite supplied causes."))
+        }
+    }
+}
+
 public struct CognitiveReflectionRequest: Sendable, Equatable {
     public var reservationId: UUID?
     public var reason: String
@@ -811,19 +866,15 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
     /// whatever the workspace holds after the model returns (Astra audit
     /// 2026-09-11, finding 7).
     public var sourceNodeIds: [UUID]
-    /// Identity of the out-of-substrate material quoted in the prompt — today
-    /// the dream diary entry a `dreamCompleted` reflection is reflecting ON.
-    /// Carried so the takeaway keeps the dream's provenance.
+    /// Historical receipt provenance; new requests keep selected causes in `material`.
     public var materialProvenance: String?
-    /// THE TWO EXCERPT LINES THEMSELVES, exactly as they were quoted in the
-    /// prompt, each already carrying its own provenance stamp (2026-09-13).
-    /// `sourceNodeIds` names WHICH turns she read; this is WHAT SHE READ. A
-    /// standing view that outlives the workspace keeps the words that formed
-    /// it, not just ids pointing at nodes the field has since evicted.
+    /// Historical quoted lines, retained when decoding older receipts.
     public var sourceExcerpts: [String]
     /// Full peer identities captured with the sources; excerpt labels are presentation only.
     /// Nil means provenance is unknown, including receipts predating this field.
     public var sourcePeerIds: [String]?
+    /// Full source material keyed by its canonical reference, frozen for this call.
+    public var material: [String: CognitiveReflectionCause]
 
     public init(
         reservationId: UUID? = nil,
@@ -841,7 +892,8 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         sourceNodeIds: [UUID] = [],
         materialProvenance: String? = nil,
         sourceExcerpts: [String] = [],
-        sourcePeerIds: [String]? = nil
+        sourcePeerIds: [String]? = nil,
+        material: [String: CognitiveReflectionCause] = [:]
     ) {
         self.reservationId = reservationId
         self.reason = reason
@@ -855,6 +907,7 @@ public struct CognitiveReflectionRequest: Sendable, Equatable {
         self.materialProvenance = materialProvenance
         self.sourceExcerpts = sourceExcerpts
         self.sourcePeerIds = sourcePeerIds
+        self.material = material
     }
 }
 
@@ -870,6 +923,7 @@ public struct CognitiveReflectionReceipt: Sendable, Equatable, Identifiable {
     public var estimatedCostUnits: Double
     public var proposalYieldScore: Double
     public var proposalIds: [UUID]
+    public var judgment: CognitiveReflectionJudgment?
 
     public init(
         id: UUID,
@@ -882,7 +936,8 @@ public struct CognitiveReflectionReceipt: Sendable, Equatable, Identifiable {
         estimatedResultTokens: Int = 0,
         estimatedCostUnits: Double = 0,
         proposalYieldScore: Double = 0,
-        proposalIds: [UUID] = []
+        proposalIds: [UUID] = [],
+        judgment: CognitiveReflectionJudgment? = nil
     ) {
         self.id = id
         self.request = request
@@ -895,6 +950,7 @@ public struct CognitiveReflectionReceipt: Sendable, Equatable, Identifiable {
         self.estimatedCostUnits = max(0, estimatedCostUnits)
         self.proposalYieldScore = (proposalYieldScore).clamped01()
         self.proposalIds = proposalIds
+        self.judgment = judgment
     }
 }
 

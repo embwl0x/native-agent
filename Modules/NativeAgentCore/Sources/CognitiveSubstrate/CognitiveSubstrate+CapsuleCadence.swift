@@ -46,6 +46,7 @@ extension CognitiveSubstrate {
         /// and for her rejections. Never rendered.
         var source: String? = nil
         var score: Double? = nil
+        var seedId: UUID? = nil
     }
 
     nonisolated func selectInnerLine(

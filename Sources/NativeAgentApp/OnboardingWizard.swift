@@ -42,7 +42,16 @@ final class OnboardingWizardState {
     static let interactiveStepCount = 2
 
     var step: Step = .identity
-    var agentName: String
+    weak var draftOwner: AppModel?
+    private var savedAgentName: String
+    private var savedUserName = ""
+    var agentName: String {
+        get { draftOwner?.editDraft("persona/new/agentName", seed: savedAgentName) ?? savedAgentName }
+        set {
+            if let draftOwner { draftOwner.setEditDraft(newValue, for: "persona/new/agentName") }
+            else { savedAgentName = newValue }
+        }
+    }
     /// The public build ships a SINGLE AI persona — onboarding no longer offers
     /// a female/male/ai choice (User, 2026-07-04: "just give it a name and tell
     /// it your name"). Fixed to "ai"; the backend still accepts it.
@@ -99,7 +108,25 @@ final class OnboardingWizardState {
     // Blank by default — never pre-fill from the macOS account name
     // (NSFullUserName): a public user's Mac account isn't their answer to
     // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
-    var userName: String = ""
+    var userName: String {
+        get { draftOwner?.editDraft("persona/new/userName", seed: savedUserName) ?? savedUserName }
+        set {
+            if let draftOwner { draftOwner.setEditDraft(newValue, for: "persona/new/userName") }
+            else { savedUserName = newValue }
+        }
+    }
+
+    func prepareProfileRepair() {
+        savedAgentName = ""
+        savedUserName = ""
+    }
+
+    func releaseNames(agent: String, user: String) {
+        savedAgentName = agent
+        savedUserName = user
+        draftOwner?.clearEditDraft("persona/new/agentName")
+        draftOwner?.clearEditDraft("persona/new/userName")
+    }
     var abilities: [AbilityOverviewEntry] = SwiftNativeOnboardingClient.abilityOverview
     var showsAbilityOverview = false
     var errorMessage: String?
@@ -148,7 +175,7 @@ final class OnboardingWizardState {
     init() {
         let suggestion = Self.nameSuggestions[abs(Int(Date().timeIntervalSince1970) / 3) % Self.nameSuggestions.count]
         suggestedName = suggestion
-        agentName = suggestion
+        savedAgentName = suggestion
     }
 
     var trimmedAgentName: String { agentName.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -284,6 +311,7 @@ struct OnboardingWizard: View {
         .frame(minWidth: 600, idealWidth: 680, minHeight: 500, idealHeight: 640)
         .houseSheet()
         .task {
+            state.draftOwner = appModel
             await loadOnboardingState()
         }
     }
@@ -342,8 +370,7 @@ struct OnboardingWizard: View {
             // from inside the lane (the refusal recheck below) must not throw
             // away the names the person just typed.
             if !state.profileRepairOnly {
-                state.agentName = ""
-                state.userName = ""
+                state.prepareProfileRepair()
             }
             state.profileRepairOnly = true
             state.pendingRecoveryNeedsReset = false
@@ -391,8 +418,7 @@ struct OnboardingWizard: View {
             state.pendingRecoveryNeedsReset = false
             state.buildFailed = false
             state.errorMessage = nil
-            state.agentName = state.suggestedName
-            state.userName = ""
+            state.releaseNames(agent: state.suggestedName, user: "")
             state.step = .identity
         } catch {
             state.errorMessage = UserFacingError.message(error, action: "reset setup")
@@ -448,8 +474,7 @@ struct OnboardingWizard: View {
                 return
             }
             state.profileRepairRecheckOffered = false
-            state.agentName = state.trimmedAgentName
-            state.userName = state.trimmedUserName
+            state.releaseNames(agent: state.trimmedAgentName, user: state.trimmedUserName)
             // User, 2026-09-06: the repair lane ends here, on its own. It must
             // NOT borrow the shared `.building` step — that copy says the four
             // persona documents are being written, and a repair writes exactly
@@ -545,6 +570,7 @@ struct OnboardingWizard: View {
     /// reset (which would back out good identity docs over a scaffold problem);
     /// the actionable retry is the repair itself.
     private func finishSuccessfulOnboarding() async {
+        state.releaseNames(agent: state.agentName, user: state.userName)
         let outcome = await appModel.runDoctor(repair: true, repairScope: .onboarding)
         guard outcome.didRun, outcome.failingScaffoldChecks.isEmpty else {
             state.scaffoldRepairFailed = true

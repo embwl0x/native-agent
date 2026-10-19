@@ -59,9 +59,14 @@ public struct InstallPaths: Sendable {
     public var chromeManifest: URL {
         home.appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts/com.nativeagent.chrome.json")
     }
-    public var agentHostEntryName: String {
+    /// A secondary install names its own entry, like its ports, so two installs
+    /// on one Mac never collide in another app's settings.
+    public func agentHostEntryName(
+        secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")
+    ) -> String {
         // TOML bare keys cannot contain dots. Escape underscores first.
-        name("nativeagent").replacingOccurrences(of: "_", with: "__").replacingOccurrences(of: ".", with: "_d")
+        (secondary ? "nativeagent-" + bundleIdentifier : name("nativeagent"))
+            .replacingOccurrences(of: "_", with: "__").replacingOccurrences(of: ".", with: "_d")
     }
     public func bridgeConfigRoot(dataRoot: URL, defaultRoot: URL? = nil,
                                  secondary: Bool = UserDefaults.standard.bool(forKey: "NativeAgentSecondaryInstall")) -> URL {

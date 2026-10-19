@@ -286,9 +286,6 @@ async function handleNativeMessage(rawRequest, port) {
     request = validateRequest(rawRequest);
     requestValidated = true;
     if (reloadingExtension) throw new ProtocolError("extension_reloading", "The extension is reloading; wait for its accepted connection.");
-    if (request.action === "extension.reload" && nativeRequestsInFlight > 1) {
-      throw new ProtocolError("extension_busy", "A Chrome request is still progressing; reload was not started. Call chrome.reload_extension when it finishes.");
-    }
     await tabsReady;
     if (request.action.startsWith("page.") && request.action !== "page.snapshot.read") {
       const ownedTab = await workspace.requireForPageAction(request.payload);
@@ -303,9 +300,6 @@ async function handleNativeMessage(rawRequest, port) {
       if (request.action === "attach") {
         nativeReady = true;
         reconcileNativeReconnectAlarm();
-      } else if (request.action === "extension.reload") {
-        // The acknowledgement is queued first. Reload changes no tab/window.
-        chrome.runtime.reload();
       }
     } else if (request.action === "extension.reload") {
       reloadingExtension = false;
@@ -326,6 +320,8 @@ async function handleNativeMessage(rawRequest, port) {
     if (mutationTabId !== undefined) activePageActions.delete(request?.id);
     cancelledRequests.delete(request?.id);
     nativeRequestsInFlight -= 1;
+    // Finish accepted work and queue its replies before replacing the worker.
+    if (reloadingExtension && nativeRequestsInFlight === 0) chrome.runtime.reload();
   }
 }
 

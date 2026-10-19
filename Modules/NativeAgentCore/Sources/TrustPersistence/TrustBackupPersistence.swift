@@ -68,6 +68,125 @@ private struct NativeValidatedBackupSnapshot {
 }
 
 public enum TrustBackupPersistence {
+    public static func diskStorageOwner(dataRoot root: URL) -> DiskStorageOwner {
+        DiskStorageOwner(id: "backups", plan: {
+            try backupReclamationPlan(dataRoot: root)
+        }, reclaim: { saved in
+            guard await nativeBackupRestoreCoordinator.acquire(dataRoot: root) else {
+                throw backupError(code: 409, "A backup restore is in progress; backups were kept.")
+            }
+            do {
+                let persistence = SwiftNativePersistenceCore()
+                let backupRoot = root.appendingPathComponent("backups")
+                let index = backupRoot.appendingPathComponent("index.json")
+                let registry = backupRoot.appendingPathComponent("registry.json")
+                let outcomes = try await persistence.withFileLock(index) {
+                    try await persistence.withFileLock(registry) {
+                        let fresh = try backupReclamationPlan(dataRoot: root)
+                        let catalogs = try [index, registry].map { ($0, try readBackupCatalogChecked($0).rows) }
+                        var outcomes = saved.candidates.sorted(by: { $0.key < $1.key }).map { path, token in
+                            guard fresh.candidates[path] == token else {
+                                return DiskStorageOwner.Outcome(relativePath: path,
+                                    skippedReason: "retention or restore dependencies changed; kept")
+                            }
+                            return DiskStorageOwner.trash(path, candidate: token, dataRoot: root)
+                        }
+                        let moved = Set(outcomes.filter { $0.skippedReason == nil }.map {
+                            URL(fileURLWithPath: $0.relativePath).lastPathComponent
+                        })
+                        for (path, rows) in catalogs where !moved.isEmpty {
+                            do {
+                                try await persistence.writeJSON(.array(rows.filter {
+                                    !moved.contains(jsonObjectString($0, key: "id") ?? "")
+                                }), to: path)
+                            } catch {
+                                outcomes.append(DiskStorageOwner.Outcome(relativePath: "backups/\(path.lastPathComponent)",
+                                    skippedReason: "bytes reached Trash, but catalog update failed: \(error.localizedDescription)"))
+                            }
+                        }
+                        return outcomes
+                    }
+                }
+                await nativeBackupRestoreCoordinator.release(dataRoot: root)
+                return outcomes
+            } catch {
+                await nativeBackupRestoreCoordinator.release(dataRoot: root)
+                throw error
+            }
+        })
+    }
+
+    private static func backupReclamationPlan(dataRoot root: URL) throws -> DiskStorageOwner.Plan {
+        let keepCount = 2
+        var plan = DiskStorageOwner.Plan(owner: "backups", roots: ["backups"],
+            policy: "Keep the newest two verified restore points, catalog pins and staged restore dependencies. Older registered restore points and legacy exports move to Trash; failed verification and unregistered branches stay.",
+            candidates: [:])
+        let backupRoot = root.appendingPathComponent("backups")
+        guard pathEntryExists(backupRoot) else { return plan }
+        try requireRegularDirectory(backupRoot)
+        var records: [String: (record: BackupRecord, date: Date)] = [:]
+        var pinned: Set<String> = []
+        for name in ["index.json", "registry.json"] {
+            let catalog = try readBackupCatalogChecked(backupRoot.appendingPathComponent(name))
+            for row in catalog.rows {
+                guard let id = jsonObjectString(row, key: "id"), UUID(uuidString: id)?.uuidString.lowercased() == id,
+                      case .object(let object) = row else {
+                    throw backupError(code: 422, "Backup catalog has an invalid identity; backups were kept.")
+                }
+                if let pin = object["pinned"] {
+                    guard case .bool(let value) = pin else {
+                        throw backupError(code: 422, "Backup catalog pin is invalid; backups were kept.")
+                    }
+                    if value { pinned.insert(id) }
+                }
+            }
+            for record in catalog.records {
+                guard let date = NativeTimestampFormat.parseISO8601(record.createdAt) else {
+                    throw backupError(code: 422, "Backup catalog date is invalid; backups were kept.")
+                }
+                records[record.id] = (record, date)
+            }
+        }
+        let intentPath = backupRestoreIntentPath(dataRoot: root)
+        if pathEntryExists(intentPath) {
+            let intent = try readRestoreIntent(at: intentPath)
+            pinned.formUnion([intent.targetID, intent.safetyBackupID])
+        }
+        let ordered = records.values.sorted {
+            $0.date == $1.date ? $0.record.id < $1.record.id : $0.date > $1.date
+        }.map(\.record)
+        var verified: [String] = []
+        var invalid: Set<String> = []
+        for record in ordered {
+            let manifest = backupRoot.appendingPathComponent(record.id).appendingPathComponent("manifest.json")
+            guard pathEntryExists(manifest) else { continue }
+            do {
+                let snapshot = try validateBackupSnapshot(id: record.id, dataRoot: root)
+                guard snapshot.createdAt == record.createdAt else {
+                    throw backupError(code: 422, "Catalog and snapshot dates differ.")
+                }
+                verified.append(record.id)
+            } catch {
+                invalid.insert(record.id)
+                plan.notes.append("\(record.id) kept: restore verification failed (\(error.localizedDescription)).")
+            }
+        }
+        guard verified.count >= keepCount else {
+            plan.notes.append("No backup reclamation: \(verified.count) verified restore points; two are required before retiring older backups. Create verified backups using backup.now.")
+            return plan
+        }
+        pinned.formUnion(verified.prefix(keepCount))
+        for record in ordered where !pinned.contains(record.id) && !invalid.contains(record.id) {
+            guard let cutoff = records[verified[keepCount - 1]]?.date,
+                  let date = records[record.id]?.date, date < cutoff else { continue }
+            let path = "backups/\(record.id)"
+            guard pathEntryExists(root.appendingPathComponent(path)) else { continue }
+            try requireRegularDirectory(root.appendingPathComponent(path))
+            plan.candidates[path] = try DiskStorageOwner.candidate(path, dataRoot: root)
+        }
+        return plan
+    }
+
     public static func createBackup(reason: String, dataRoot root: URL, host: TrustBackupHost) async throws -> BackupRecord {
         let now = Self.nativeArtifactTimestamp()
         let id = UUID().uuidString.lowercased()
@@ -384,11 +503,11 @@ public enum TrustBackupPersistence {
     }
 
     /// Off-disk leaves these data-root-relative paths behind: the model that
-    /// ships in the DMG, local backups, regenerable diagnostics, old
+    /// ships in the DMG, local backups, the rebuildable history index, regenerable diagnostics, old
     /// pre-consolidation memory copies, and credential stores. Credential files
     /// anywhere else are `isCredentialFile`.
     private static let offDiskExcludedPaths: Set<String> = [
-        "extras", "backups",
+        "extras", "backups", "chat/index",
         "logs", "diagnostics", "crash_reports", "ui-frames", "mobile_snapshot_cache",
         "evals", "traces", "turn_traces", "harness", "builder_audit", "memory/backups",
         "security", "secrets", "oauth_tokens", "oauth_apps", "claude-bridge", "nextgen/remote",
@@ -968,6 +1087,19 @@ public enum TrustBackupPersistence {
                   filePaths.insert(path).inserted else {
                 throw Self.backupError(code: 422, "Backup manifest has an invalid file member.")
             }
+            // Older local snapshots sealed coordination sidecars. Only their absence is harmless;
+            // any listed sidecar still present must retain its sealed bytes and regular-file type.
+            if path.hasSuffix(".lock") {
+                let sidecar = dataDir.appendingNativeRelativePath(path)
+                do {
+                    try Self.requireRegularFile(sidecar, maximumBytes: nil)
+                } catch CocoaError.fileReadNoSuchFile { continue }
+                let digest = try Self.fileDigest(sidecar)
+                guard digest.sizeBytes == sizeBytes, digest.sha256 == sha256 else {
+                    throw Self.backupError(code: 422, "Backup file membership or SHA-256 integrity does not match its manifest.")
+                }
+                continue
+            }
             files.append(NativeBackupIntegrityFile(
                 path: path,
                 sizeBytes: sizeBytes,
@@ -1114,6 +1246,13 @@ public enum TrustBackupPersistence {
                     withIntermediateDirectories: true
                 )
                 try fm.copyItem(at: source, to: destination)
+                // Sidecars are not snapshot data; live writers create their own.
+                if let copies = fm.enumerator(at: destination, includingPropertiesForKeys: nil) {
+                    for case let copied as URL in copies where copied.lastPathComponent.hasSuffix(".lock")
+                        && (try? copied.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                        try fm.removeItem(at: copied)
+                    }
+                }
             }
             // The scope was just replaced by real directories, so a recreated
             // link never lands on (or writes through) an existing entry.
@@ -1448,6 +1587,8 @@ public enum TrustBackupPersistence {
             guard Self.isValidBackupFilePath(relative) else {
                 throw Self.backupError(code: 422, "Backup contains an invalid relative path.")
             }
+            // A regular sidecar coordinates writers; it is never snapshot data.
+            if item.lastPathComponent.hasSuffix(".lock") { continue }
             let digest = try Self.fileDigest(item)
             files.append(NativeBackupIntegrityFile(
                 path: relative,
@@ -1821,8 +1962,7 @@ public enum TrustBackupPersistence {
         // can prove every installed shape has been imported. Restore identity
         // never trusts either path; it derives the UUID directory beneath the
         // validated backup root, so retaining compatibility adds no authority.
-        // Snapshot directories have no automatic retention policy. Their
-        // discoverability must not expire independently of their bytes.
+        // Disk cleanup retires catalog rows only after their bytes reach Trash.
         try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("registry.json"), id: record.id, maxRows: nil, isBackupCatalog: true)
         try await appendRegistryRow(row, path: backupRoot.appendingPathComponent("index.json"), id: record.id, maxRows: nil, isBackupCatalog: true)
     }

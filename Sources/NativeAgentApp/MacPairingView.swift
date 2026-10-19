@@ -1,6 +1,7 @@
 // Mac-side automatic iCloud pairing with manual key transfer as a fallback.
 import SwiftUI
 import DeviceSync
+import NativeAgentShared
 
 struct MacPairingView: View {
     @Environment(AppModel.self) private var appModel
@@ -13,7 +14,6 @@ struct MacPairingView: View {
     @State private var manualPairingExpanded = false
     @State private var copied = false
     private var pairingError: String? { sync.pairingError }
-    @AppStorage(PairingPublicationHealth.warningDefaultsKey) private var pairingPublicationWarning = ""
     // S.3: confirmation before regenerate
     @State private var showRegenConfirm = false
     // S.4: reveal/hide key
@@ -37,19 +37,52 @@ struct MacPairingView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("pairing.mac-dependence")
 
-                // Alive glass (2026-09-23): eyebrow over one card.
+                // The connection is three facts, never one: pairing, iCloud and
+                // the last accepted exchange, each with who can fix it and how.
                 VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-                    PairingSectionLabel(text: "iCloud status")
+                    PairingSectionLabel(text: "Connection")
                     AliveGroupCard {
-                        Text(sync.status)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                        if let connection = sync.connection {
+                            ForEach(connection.facts, id: \.label) { item in
+                                PairingFactRow(label: item.label, fact: item.fact)
+                            }
+                            Text("Latest: \(sync.status)")
+                                .font(ShellType.caption)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                        } else {
+                            Text(sync.status)
+                                .font(ShellType.label)
+                                .foregroundStyle(NativeAgentShell.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
 
                 if let pairingError {
                     PairingNoticeCard(text: pairingError, systemImage: "exclamationmark.shield.fill")
+                }
+
+                // One phone follows one Mac. Another Mac on this Apple Account
+                // has it; moving it here is the person's act, not a launch's.
+                if sync.phonePairedElsewhere {
+                    VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
+                        PairingSectionLabel(text: "Your iPhone")
+                        AliveGroupCard {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Your iPhone is paired with another Mac (or an earlier install of NativeAgent) on this Apple Account. Moving it here disconnects it from that one.")
+                                    .font(ShellType.label)
+                                    .foregroundStyle(NativeAgentShell.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Button("Use my iPhone with this Mac") {
+                                    Task { await sync.usePhoneHere() }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .accessibilityIdentifier("pairing.use-phone-here")
+                            }
+                        }
+                    }
                 }
 
                 // One group card, a row per phone with its status pill.
@@ -91,13 +124,6 @@ struct MacPairingView: View {
                     if let message = sync.message {
                         Text(message).foregroundStyle(NativeAgentShell.trouble)
                     }
-                }
-
-                if !pairingPublicationWarning.isEmpty {
-                    PairingNoticeCard(
-                        text: "Pairing delivery needs attention: \(pairingPublicationWarning)",
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
                 }
 
                 DisclosureGroup("Pairing hasn't connected?", isExpanded: $manualPairingExpanded) {
@@ -259,6 +285,40 @@ private struct PairingCard<Content: View>: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .aliveCard()
             .accessibilityElement(children: .contain)
+    }
+}
+
+/// One fact of the connection: what is true, its state, and the way on when
+/// someone has to act.
+private struct PairingFactRow: View {
+    let label: String
+    let fact: NAPhoneConnection.Fact
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(NativeAgentShell.text)
+                Text(fact.line)
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                if let lever = fact.lever, fact.state != .holds {
+                    Text(lever)
+                        .font(ShellType.caption)
+                        .foregroundStyle(fact.state == .broken ? NativeAgentShell.trouble : NativeAgentShell.needsYou)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 8)
+            ConnectorsStatusPill(
+                text: fact.state == .holds ? "OK" : fact.state == .waiting ? "Waiting" : "Needs fixing",
+                tone: fact.state == .holds ? NativeAgentShell.calm
+                    : fact.state == .waiting ? NativeAgentShell.needsYou : NativeAgentShell.trouble)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 

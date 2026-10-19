@@ -8,6 +8,7 @@ import PersistenceCore
 import StandingBots
 import Transcripts
 import Darwin
+import Experiences
 
 /// A contact, keyed the way the agent's conversation records key it:
 /// `peer:<id>` for a saved contact, `codex` / `claude` / `omp` for a
@@ -180,15 +181,14 @@ public enum AgentContactThreads {
             return NSWorkspace.shared.urlForApplication(withBundleIdentifier: GrokBotRoute.bundleID) == nil
                 ? nil : GrokBotRoute.bundleID
         }
-        let host = row.builtIn ? String(row.id.dropFirst("builtin:".count))
-            : row.contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? row.id
+        let host = row.contact.flatMap { AgentPeerStore.hostRowID($0.endpoint) } ?? row.id
         let bundle = row.contact.flatMap { AgentPeerStore.desktopBundleID($0.endpoint) }
             ?? AgentHostDirectory.rows.first { $0.id == host }?.bundleIDs.first
         return bundle.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) == nil ? nil : $0 }
     }
 
     private static func isClaude(_ row: AgentContactRow) -> Bool {
-        row.id == "builtin:claude" || row.contact?.endpoint.absoluteString == "mcp://claude-desktop"
+        row.contact?.endpoint.absoluteString == "mcp://claude-desktop"
     }
 
     private static func sendRestriction(_ row: AgentContactRow) -> String? {
@@ -203,31 +203,32 @@ public enum AgentContactThreads {
 
     private static func contactList(root: URL, cached: ContactList?) throws -> ContactList {
         let peersFile = root.appendingPathComponent("agents/peers.json").path
-        let dispatcher = SwiftToolDispatcher(dataRoot: root, allowProcessGlobalTools: false)
-        let usable = Set(["codex", "claude", "omp"].filter { dispatcher.builtInAgentLaneUsable($0) })
-        let head = [stamp(peersFile), usable.sorted().joined(separator: ","), ChatGPTDotIPCTransport.detail]
+        let peers = try AgentPeerStore(dataRoot: root).list()
+        let inboxes = peers.flatMap { $0.handles ?? [] }.compactMap {
+            AgentConversationDelivery.inbox(agent: $0, bridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: root))
+        }
+        let head = [stamp(peersFile), ChatGPTDotIPCTransport.detail] + inboxes.map { stamp($0.path) }
         if let cached, cached.stamp == head + cached.programs.map(stamp) { return cached }
         // The same contact list the Agents page shows, minus apps that are
         // merely installed: saved contacts, then the usable built-in lanes.
-        let peers = try AgentPeerStore(dataRoot: root).list()
         let programs = peers.filter { $0.transport == .acp }.compactMap { $0.approvedACPExecutable?.path }
         // Stamped before the checks, so a change during them re-checks next time.
         let stamps = head + programs.map(stamp)
         let dates = ISO8601DateFormatter()
         let identity = AgentContactIdentity(dataRoot: root)
-        let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable)
-        func key(_ row: AgentContactRow) -> String { row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id }
+        let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: [])
         var seen: Set<String> = []
         // Once per row: the restriction reads Keychain and the program's file.
-        let restrictions = rows.map(sendRestriction)
+        let restrictions = rows.map { row in
+            AgentConversationDelivery.lane(for: row.key, dataRoot: root) != nil ? nil : sendRestriction(row)
+        }
         let grouped = rows.indices.sorted { a, b in
-            if rows[a].builtIn != rows[b].builtIn { return rows[a].builtIn }
             return restrictions[a] == nil && restrictions[b] != nil
-        }.filter { seen.insert(identity.canonical(key(rows[$0]))).inserted }
+        }.filter { seen.insert(identity.canonical(rows[$0].key)).inserted }
         let contacts = grouped.map { index in
             let row = rows[index]
-            return AgentContactPresentation(id: row.builtIn ? String(row.id.dropFirst("builtin:".count)) : row.id,
-                                 name: identity.canonical(key(row)) == "claude" ? "Claude" : identity.canonical(key(row)) == "codex" ? "Codex" : row.name,
+            return AgentContactPresentation(id: row.id,
+                                 name: row.name,
                                  builtIn: row.builtIn, via: via(row),
                                  sendRestriction: restrictions[index],
                                  lastActivityAt: [row.contact?.provenInboundAt, row.contact?.provenOutboundAt]
@@ -240,13 +241,22 @@ public enum AgentContactThreads {
         return ContactList(stamp: stamps, programs: programs, contacts: contacts)
     }
 
-    public static func mobileThreads(root: URL) throws -> [MobileAgentThread] {
+    public static func mobileThreads(root: URL) async throws -> [MobileAgentThread] {
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
         let snapshot = try read(root: root, cached: nil, includeHelpers: false).0
+        let experiences = try await ExperienceStore.at(root).projection()
+        let identity = AgentContactIdentity(dataRoot: root)
         return snapshot.contacts.map { contact in
             let lines = snapshot.lines[contact.id] ?? []
+            let owed = experiences.filter { experience in
+                experience.isOpen && experience.addressedTo.contains {
+                    $0.hasPrefix("agent:") && identity.canonical(String($0.dropFirst(6))) == identity.canonical(contact.id)
+                }
+            }.map(\.mobile)
             let status: String
-            if let problem = contact.health?.problem { status = problem }
+            if !owed.isEmpty {
+                status = "\(owed.count) \(owed.count == 1 ? "message" : "messages") still owed"
+            } else if let problem = contact.health?.problem { status = problem }
             else if snapshot.waiting.contains(contact.id) { status = "Waiting for reply" }
             else if contact.recoveredFailure, snapshot.status[contact.id] == nil { status = "Ready" }
             else {
@@ -261,9 +271,10 @@ public enum AgentContactThreads {
                 }
             }
             let last = lines.last { !contact.recoveredFailure || !AgentLocalHealth.authenticationFailure(.string($0.text)) }
-            let row = MobileAgentRow(id: contact.id, name: contact.name, via: contact.via,
+            var row = MobileAgentRow(id: contact.id, name: contact.name, via: contact.via,
                                      lastExchange: String((last?.text ?? "").prefix(240)), status: status,
                                      sendRestriction: contact.sendRestriction)
+            row.experiences = owed
             let tail = lines.suffix(32)
             return MobileAgentThread(agent: row, lines: tail.map {
                 MobileAgentLine(id: $0.id, speaker: $0.byPerson ? "You" : $0.fromAgent ? "Agent" : contact.name,
@@ -348,7 +359,6 @@ public enum AgentContactThreads {
         for index in contacts.indices {
             contacts[index].health = health[contacts[index].id]
         }
-        let bridges = InstallPaths.current.bridgeConfigRoot(dataRoot: root)
         for (id, record) in latest {
             if let index = contacts.firstIndex(where: { $0.id == id }),
                health[record.agent]?.resolves(record) == true {
@@ -363,14 +373,7 @@ public enum AgentContactThreads {
             }
             // A contact that has spoken since the send answered it, whatever its record says.
             if record.phase != "attention", !id.hasPrefix("bot:"), lines[id]?.last.map({ !$0.fromAgent }) == true { continue }
-            let message: String? = if case .string(let value)? = record.readInput?["message_id"] { value } else { nil }
-            // Read: the recipient's own inbox marked this message read.
-            let read = message.flatMap { message in
-                AgentConversationDelivery.inbox(agent: record.agent, bridgeConfigRoot: bridges).map {
-                    DelegationStatusProjector.requestTexts(inbox: $0, ids: [message], field: "read")[message] != nil
-                }
-            } ?? false
-            switch AgentConversationDelivery.of(record, read: read) {
+            switch AgentConversationDelivery.of(record, read: false) {
             case .sending, .waiting: waiting.insert(id)
             case .answered: break
             case let state: status[id] = state
@@ -429,7 +432,6 @@ public enum AgentContactThreads {
 
     /// How a contact is reached, in words a person uses.
     private static func via(_ row: AgentContactRow) -> String {
-        if row.builtIn { return "Built-in connection on this Mac" }
         guard let contact = row.contact else { return "On this Mac" }
         if ChatGPTDotIPCTransport.owns(contact) { return ChatGPTDotIPCTransport.detail }
         switch contact.transport {

@@ -301,6 +301,9 @@ extension AgentWorkspaceProjection {
         let strings: Set<String>
         let numbers: Set<String>
         switch tool {
+        case "read_file" where arguments["query"] != nil:
+            guard arguments["start_line"] != nil else { return nil }
+            required = ["path", "query", "version"]; strings = required; numbers = ["start_line", "max_lines"]
         case "read_file":
             required = ["path"]; strings = ["path", "version"]; numbers = ["offset", "max_bytes"]
         case "read_chat_message":
@@ -323,7 +326,7 @@ extension AgentWorkspaceProjection {
         if tool == "read_file", case .int(let offset)? = arguments["offset"], offset > 0,
            workspaceText(arguments["version"]) == nil { return nil }
         var input = arguments
-        if tool == "read_file", input["max_bytes"] == nil { input["max_bytes"] = .int(12_000) }
+        if tool == "read_file", input["query"] == nil, input["max_bytes"] == nil { input["max_bytes"] = .int(12_000) }
         return .init(label: label, action: .open(.record(tool: tool, input: input, title: title)))
     }
 

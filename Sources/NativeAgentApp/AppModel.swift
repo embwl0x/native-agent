@@ -130,6 +130,50 @@ extension AppModel {
 @MainActor
 @Observable
 final class AppModel: Sendable {
+    // Unfinished edits belong to their subject, across every presentation.
+    // Memory only. Never put credentials here; secure fields stay view-local.
+    private var editDrafts: [String: (value: Any, baseline: Any)] = [:]
+
+    func editDraft<Value>(_ subject: String, seed: @autoclosure () -> Value) -> Value {
+        (editDrafts[subject]?.value as? Value) ?? seed()
+    }
+
+    func setEditDraft<Value>(_ value: Value, for subject: String, baseline: Value? = nil) {
+        editDrafts[subject] = (value, editDrafts[subject]?.baseline ?? baseline ?? value)
+    }
+
+    /// An accepted save: the draft goes, or, edited again while it saved, it
+    /// now builds on what was saved, so its next merge cannot undo the edit.
+    func acceptEditDraft<Value: Equatable>(_ subject: String, submitted: Value, saved: Value) {
+        guard let held = editDrafts[subject] else { return }
+        if (held.value as? Value) == submitted { editDrafts[subject] = nil }
+        else { editDrafts[subject] = (held.value, saved) }
+    }
+
+    func mergingEditDraft<Value: Codable>(_ subject: String, edited: Value, into current: Value) throws -> Value {
+        guard let original = editDrafts[subject]?.baseline as? Value else { return current }
+        let encoder = JSONEncoder(), decoder = JSONDecoder()
+        func fields(_ value: Value) throws -> [String: JSONValue] {
+            try decoder.decode([String: JSONValue].self, from: encoder.encode(value))
+        }
+        let baseline = try fields(original)
+        let changes = try fields(edited)
+        var merged = try fields(current)
+        for key in Set(baseline.keys).union(changes.keys) where baseline[key] != changes[key] {
+            merged[key] = changes[key]
+        }
+        return try decoder.decode(Value.self, from: encoder.encode(merged))
+    }
+
+    func editBinding<Value>(_ subject: String, seed: @autoclosure @escaping () -> Value) -> Binding<Value> {
+        Binding(get: { self.editDraft(subject, seed: seed()) },
+                set: { self.setEditDraft($0, for: subject) })
+    }
+
+    func clearEditDraft(_ subject: String) {
+        editDrafts.removeValue(forKey: subject)
+    }
+
     /// Global toast/status surface. ContentView draws it in the one NoticeLane and
     /// any code path can call appModel.systemToasts.push(...).
     let systemToasts = SystemToastCenter()
@@ -641,37 +685,6 @@ final class AppModel: Sendable {
         chatDraftInjectionGeneration &+= 1
     }
 
-    var pendingApprovalsCount: Int {
-        engine.approvals.records.filter { $0.status.lowercased() == "pending" }.count
-    }
-
-    /// W6/G12: the badge counts the "For you" lane ONLY.
-    ///
-    /// The badge is an interrupt — it is the app claiming something needs User.
-    /// System-health notices (background_loop, disk_hygiene, heartbeat, the
-    /// self-referential proactive kinds) are readable in the System lane and
-    /// still surfaced by Doctor; none of them should light up a count that
-    /// means "you are needed". Lane membership is defined once on
-    /// `InboxItemRecord` (`InboxView.swift`) and read here and by the list.
-    var pendingInboxCount: Int {
-        engine.inbox.items.filter { $0.isActivityPending && $0.isForYouLane }.count
-    }
-
-    private(set) var pendingActivityCount: Int = 0
-
-    /// The authoritative sum. Kept as a separate computed property so tests
-    /// (and the `didSet` invariant) have one place to compare against.
-    var computedPendingActivityCount: Int {
-        pendingApprovalsCount + pendingInboxCount + pendingMemoryProposalsCount
-    }
-
-    /// Re-derive the badge scalar. Equality-gated so an unchanged badge after a
-    /// changed collection still performs zero observable writes on the root.
-    func recomputePendingActivityCount() {
-        let next = computedPendingActivityCount
-        if pendingActivityCount != next { pendingActivityCount = next }
-    }
-
     /// PATCH-2026-06-06: activity-flatten — when Cmd+Shift+A / Cmd+Shift+I
     /// fires from another page, Today is not yet mounted and its
     /// `.onReceive(.openActivitySectionRequest)` cannot observe the
@@ -705,7 +718,6 @@ final class AppModel: Sendable {
         self.activeChatSessionIDWriter = activeChatSessionIDWriter
         self.chatSnapshotPublisher = chatSnapshotPublisher
         engine.bindResidentPresentation(
-            activityCountChanged: { [weak self] in self?.recomputePendingActivityCount() },
             publishWorkStatus: { [weak self] in await self?.publishWorkStatus() },
             policyChanged: { [weak self] in
                 guard let self, let policy = engine.trust.policy else { return }
@@ -714,7 +726,6 @@ final class AppModel: Sendable {
             },
             memoryProposalsChanged: { [weak self] in
                 guard let self else { return }
-                recomputePendingActivityCount()
                 if let reminder = engine.memory.reviewReminder(pending: pendingMemoryProposalsCount, agentName: agentDisplayName) {
                     NativeAgentNotifications.post(title: reminder.title, body: reminder.body)
                 }
@@ -948,13 +959,15 @@ extension AppModel {
     }
 
     @MainActor
-    func createWorkshopTask(title: String, objective: String) async {
+    func createWorkshopTask(title: String, objective: String) async -> Bool {
         do {
             _ = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
             statusText = NewDeskTaskPresentation.successStatus
             await refreshAll()
+            return true
         } catch {
             setFailureStatus(NewDeskTaskPresentation.failureStatus(UserFacingError.cause(error, action: "create the Desk task")), cause: error)
+            return false
         }
     }
 
@@ -1105,7 +1118,7 @@ extension AppModel {
         var created: BackupRecord?
         do {
             let backup = try await TrustBackupPersistence.createBackup(
-                reason: reason, dataRoot: PersistenceCore.defaultDataRoot(), host: .app
+                reason: reason, dataRoot: firstRunDataRoot, host: .app
             )
             created = backup
             receipt = "Backup created at \(backup.createdAt): \(backup.reason)"
@@ -1123,7 +1136,7 @@ extension AppModel {
         var cause: String?
         do {
             let result = try await TrustBackupPersistence.restoreBackup(
-                id: backup.id, dataRoot: PersistenceCore.defaultDataRoot(), host: .app
+                id: backup.id, dataRoot: firstRunDataRoot, host: .app
             )
             if result.requiresRestart {
                 statusText = "Restore validated and staged with safety backup \(result.safetyBackupId ?? "created"). NativeAgent is restarting to restore before any live state owner opens."

@@ -1,6 +1,7 @@
 import ToolRegistry
 import Foundation
 import SwiftUI
+import PersistenceCore
 
 // PATCH-Phase7b: ToolInputForm — shown when a slash-command tool needs multiple
 // or non-string fields that can't be satisfied by free-text alone.
@@ -13,15 +14,31 @@ import SwiftUI
 // ---------------------------------------------------------------------------
 
 struct ToolInputForm: View {
+    @Environment(AppModel.self) private var appModel
     let plan: DispatchArgPlan
     /// Called on "Run" with a validated, JSON-shaped dispatch body.
     let onSubmit: (Data) -> Void
     let onCancel: () -> Void
 
-    // Per-field control values, validated and converted at the dispatch boundary.
-    @State private var stringValues: [String: String] = [:]
-    @State private var boolValues:   [String: Bool]   = [:]
-    @State private var intValues:    [String: Int]     = [:]
+    private struct Draft {
+        var strings: [String: String] = [:]
+        var bools: [String: Bool] = [:]
+        var ints: [String: Int] = [:]
+    }
+    private var draftSubject: String { "tool-input/\(plan.sessionId)/\(tool.name)" }
+    @State private var localDraft: Draft?
+    @State private var retainsDraft = false
+    private var draft: Binding<Draft> {
+        Binding(get: {
+            // A retained draft exists only after its schema was checked, so it
+            // shows (and an edit builds on it) before this presentation's check.
+            retainsDraft ? appModel.editDraft(draftSubject, seed: initialDraft())
+                : localDraft ?? appModel.editDraft(draftSubject, seed: initialDraft())
+        }, set: {
+            if retainsDraft { appModel.setEditDraft($0, for: draftSubject) }
+            else { localDraft = $0 }
+        })
+    }
     @State private var validationError: String? = nil
 
     private var tool: ToolCapability { plan.tool }
@@ -75,9 +92,9 @@ struct ToolInputForm: View {
                                     name: fieldName,
                                     prop: prop,
                                     required: requiredFields.contains(fieldName),
-                                    stringValues: $stringValues,
-                                    boolValues:   $boolValues,
-                                    intValues:    $intValues
+                                    stringValues: draft.strings,
+                                    boolValues: draft.bools,
+                                    intValues: draft.ints
                                 )
                             }
                         }
@@ -98,7 +115,7 @@ struct ToolInputForm: View {
             // Footer buttons
             HStack {
                 Spacer()
-                Button("Cancel") { onCancel() }
+                Button("Cancel") { appModel.clearEditDraft(draftSubject); onCancel() }
                     .keyboardShortcut(.escape, modifiers: [])
                     .accessibilityIdentifier("tool-input-form-cancel")
                 Button("Run") { attemptSubmit() }
@@ -111,18 +128,38 @@ struct ToolInputForm: View {
             .padding(.vertical, NativeAgentSpacing.md)
         }
         .frame(minWidth: 460, minHeight: 300)
-        .onAppear { seedPrefilled() }
+        .task {
+            do {
+                let manifest = try await appModel.engine.tools.loadManifest(detail: "full")
+                guard case .object(let envelope) = manifest, case .array(let tools) = envelope["tools"],
+                      let row = tools.compactMap({ value -> [String: JSONValue]? in
+                          if case .object(let row) = value, row["name"] == .string(tool.name) { return row }
+                          return nil
+                      }).first, let schema = row["parameters"] else {
+                    throw CocoaError(.coderValueNotFound)
+                }
+                guard !Task.isCancelled else { return }
+                if inputSchemaContainsSecret(schema) {
+                    appModel.clearEditDraft(draftSubject)
+                } else {
+                    if let localDraft { appModel.setEditDraft(localDraft, for: draftSubject) }
+                    retainsDraft = true
+                }
+            } catch {
+                validationError = "Couldn't check input schema: \(error.localizedDescription)"
+            }
+        }
     }
 
-    // Seed pre-filled values coming from the plan (e.g. single-arg shortcut that
-    // opened the form as a fallback after detecting formNeeded).
-    private func seedPrefilled() {
-        for (k, v) in plan.prefilled {
-            if let s = v as? String { stringValues[k] = s }
-            else if let b = v as? Bool { boolValues[k] = b }
-            else if let i = v as? Int { intValues[k] = i }
-            else { stringValues[k] = "\(v)" }
+    private func initialDraft() -> Draft {
+        var draft = Draft()
+        for (key, value) in plan.prefilled {
+            if let string = value as? String { draft.strings[key] = string }
+            else if let bool = value as? Bool { draft.bools[key] = bool }
+            else if let int = value as? Int { draft.ints[key] = int }
+            else { draft.strings[key] = "\(value)" }
         }
+        return draft
     }
 
     private func attemptSubmit() {
@@ -130,11 +167,12 @@ struct ToolInputForm: View {
         do {
             let inputData = try ChatToolCatalogSnapshot.serializedInput(
                 schema: schema,
-                stringValues: stringValues,
-                boolValues: boolValues,
-                intValues: intValues
+                stringValues: draft.wrappedValue.strings,
+                boolValues: draft.wrappedValue.bools,
+                intValues: draft.wrappedValue.ints
             )
             onSubmit(inputData)
+            appModel.clearEditDraft(draftSubject)
         } catch {
             validationError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         }

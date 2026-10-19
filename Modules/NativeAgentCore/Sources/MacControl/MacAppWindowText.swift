@@ -32,8 +32,14 @@ public enum MacAppWindowText {
         }
         let capture = await defaultMacScreenCaptureSource().capture(window: identity)
         try Task.checkCancellation()
-        guard case .success(let shot) = capture, let image = shot.cgImage else {
-            throw SenseFailure(code: "source_unavailable", message: "The app window could not be captured for on-device text recognition; Screen Recording permission and a visible window are required.")
+        let shot: MacScreenShot
+        switch capture {
+        case .success(let captured): shot = captured
+        case .failure(let failure):
+            throw SenseFailure(code: failure.rawValue, message: failure.localizedDescription, remedy: failure.remedy(app: bundleID))
+        }
+        guard let image = shot.cgImage else {
+            throw SenseFailure(code: "image_encode_failed", message: "The captured window has no image for text recognition.", remedy: MacScreenCaptureFailure.encodeFailed.remedy(app: bundleID))
         }
         let recognized = try await recognize(image: image, bounds: shot.bounds)
         guard source.runningApps().contains(where: { $0.processIdentifier == app.processIdentifier && $0.bundleIdentifier == bundleID }),

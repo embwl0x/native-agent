@@ -558,6 +558,7 @@ struct ChatMessageListView: View {
         // the bubble's named actions without altering visual layout.
         .accessibilityElement(children: .contain)
         .transcriptLayoutProbe(rowID: msg.id, kind: .bubble)
+        .readingBlock(msg.id)
         .modifier(MacChatTranscriptSearchHighlight(
             isHighlighted: msg.id == highlightedMessageID
         ))
@@ -630,15 +631,18 @@ struct ChatMessageListView: View {
                     if msg.metadata?.isPendingApproval == true {
                         InlineApprovalCard(message: msg)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
+                            .readingBlock(msg.id)
                     } else if let mirrored = msg.metadata?.interactionMirror {
                         // A card raised in another thread, answered here on the original.
                         InteractionInboxCard(mirrorOf: .init(sessionID: mirrored.sessionID,
                                                              interactionID: mirrored.interactionID))
                             .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
                             .transcriptLayoutProbe(rowID: msg.id, kind: .approval)
+                            .readingBlock(msg.id)
                     } else {
                         ToolCallGroup(messages: [msg])
                             .transcriptLayoutProbe(rowID: msg.id, kind: .toolRow)
+                            .readingBlock(msg.id)
                     }
                     // 0.4.12 cards round: an interaction that blocks this tool
                     // row appears HERE, under the row it belongs to, and never
@@ -647,11 +651,12 @@ struct ChatMessageListView: View {
                     // injected this renders nothing and the transcript is
                     // exactly as it was.
                     if !relocatedRows.contains(msg.id) {
-                        InlineCardsForRow(rowID: msg.id)
+                        ReadingCards(rowID: msg.id)
                     }
                 } else {
                     ToolCallGroup(messages: group.messages)
                     .transcriptLayoutProbe(rowID: group.id, kind: .toolGroup)
+                    .readingBlock(group.id)
                     // A card belongs to the ROW whose call raised it, not to
                     // the run that row happens to be collapsed into: the need
                     // is persisted on the blocked tool's own message, so the
@@ -659,7 +664,7 @@ struct ChatMessageListView: View {
                     // group in the order their calls were made.
                     ForEach(group.messages) { member in
                         if !relocatedRows.contains(member.id) {
-                            InlineCardsForRow(rowID: member.id)
+                            ReadingCards(rowID: member.id)
                         }
                     }
                 }
@@ -678,7 +683,7 @@ struct ChatMessageListView: View {
                         // leading edge, the transcript's one gap, nothing that
                         // reads as an interruption.
                         ForEach(hosted, id: \.self) { rowID in
-                            InlineCardsForRow(rowID: rowID)
+                            ReadingCards(rowID: rowID)
                         }
                     }
                 } else {
@@ -711,6 +716,20 @@ struct ChatMessageListView: View {
             .font(ShellType.label)
             .foregroundStyle(NativeAgentShell.secondary)
             .padding(.vertical, 8)
+        }
+    }
+}
+
+/// A row's cards as one reading block, only when it has any: an empty slot
+/// stays no view at all, or the stack would space it like a row.
+private struct ReadingCards: View {
+    let rowID: String
+    @Environment(\.inlineCardSource) private var source
+
+    var body: some View {
+        if !source(rowID).isEmpty {
+            InlineCardsForRow(rowID: rowID)
+                .readingBlock("cards:" + rowID)
         }
     }
 }
@@ -1085,6 +1104,7 @@ struct MessageBubble: View {
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
     @Environment(\.troubleCardOwnsRetry) private var troubleCardOwnsRetry
+    @Environment(\.readingPlace) private var readingPlace
     /// Set when a retry of this failed turn could repeat a real action.
     @State private var retryConfirmation: ChatTurnFailure?
     @State private var showJSONSheet = false
@@ -1545,6 +1565,10 @@ struct MessageBubble: View {
                 if now {
                     holdsLive = true
                 } else if holdsLive {
+                    // A fold never closes over what the reader is reading:
+                    // settled while their place is in this reply, its notes
+                    // start open and the words stay where they were.
+                    if readingPlace?.isReading(message.id) == true { commentaryExpanded = true }
                     withAnimation(NativeAgentMotion.arrive) { holdsLive = false }
                 }
             }

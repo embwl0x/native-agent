@@ -135,9 +135,11 @@ public func categoryPolicyKey(_ category: String) -> String {
 public struct MacControlGateDecision: Sendable, Equatable {
     public let allowed: Bool
     public let reason: String
-    public init(allowed: Bool, reason: String) {
+    public let remedy: JSONValue?
+    public init(allowed: Bool, reason: String, remedy: JSONValue? = nil) {
         self.allowed = allowed
         self.reason = reason
+        self.remedy = remedy
     }
     public static let allow = MacControlGateDecision(allowed: true, reason: "")
 }
@@ -183,27 +185,36 @@ public enum MacControlGate {
 
     // MARK: master / remote / per-category
 
-    /// Full port of `MacControl._gate`. Preserves
-    /// the EXACT order of checks and the EXACT refusal strings:
-    ///   1. master gate  → "mac_control_disabled: master gate off"
-    ///   2. remote ios   → "remote_ios_disabled: remote_from_ios_allowed is off"
-    ///   3. per-category → "category_disabled: <key> is off"
+    /// Master, remote and category gates retain their order and name the
+    /// saved field and the person's matching control.
     public static func gate(
         _ policy: MacControlPolicy,
         category: String,
         trigger: String = "user"
     ) -> MacControlGateDecision {
         if !policy.enabled {
-            return MacControlGateDecision(allowed: false, reason: "mac_control_disabled: master gate off")
+            return refusal("enabled", control: "Mac control > Mac control")
         }
         if trigger == "ios" && !policy.remoteFromIOSAllowed {
-            return MacControlGateDecision(allowed: false, reason: "remote_ios_disabled: remote_from_ios_allowed is off")
+            return refusal("remote_from_ios_allowed", control: "iPhone remote control > Allow iPhone remote control")
         }
         let key = categoryPolicyKey(category)
         if !(policy.categoryAllowed[key] ?? false) {
-            return MacControlGateDecision(allowed: false, reason: "category_disabled: \(key) is off")
+            let label = ["shell": "Shell commands > Shell commands", "file_ops": "Kinds of control > File operations",
+                "accessibility": "Kinds of control > Accessibility", "applescript": "Kinds of control > AppleScript",
+                "jxa": "Kinds of control > JavaScript for Automation (JXA)", "notifications": "Kinds of control > Notifications",
+                "spotlight": "Kinds of control > Spotlight search"][category]
+            return refusal(key, control: label)
         }
         return .allow
+    }
+
+    private static func refusal(_ key: String, control: String?) -> MacControlGateDecision {
+        let owner = "trust/policy.json macControlPolicy.\(key)"
+        let tap = control.map { "Trust > Mac > Advanced Mac control > \($0); then Mac control > Save" }
+        return MacControlGateDecision(allowed: false, reason: "\(owner)=false blocks this action."
+            + (tap.map { " The person's control: \($0)." } ?? " This category has no enabled implementation."),
+            remedy: tap.map { Repair.why(owner: owner, tap: $0) })
     }
 
     // MARK: full-mac trust state

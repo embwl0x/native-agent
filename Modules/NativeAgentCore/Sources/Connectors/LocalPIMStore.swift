@@ -22,16 +22,13 @@ final class LocalPIMStore {
 
     func requestCalendarAccess(_ intent: LocalPIMCalendarAccess) async throws -> Bool {
         switch intent {
-        case .read: return try await LocalPIMConnectorActions.requestCalendarReadAccess(store: store)
-        case .write: return try await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: store)
+        case .read: return LocalPIMConnectorActions.authorizationAllowsRead(EKEventStore.authorizationStatus(for: .event))
+        case .write: return LocalPIMConnectorActions.calendarAuthorizationAction(for: EKEventStore.authorizationStatus(for: .event), intent: .write) == .ready
         }
     }
 
     func requestReminderAccess() async throws -> Bool {
-        let status = EKEventStore.authorizationStatus(for: .reminder)
-        if LocalPIMConnectorActions.authorizationAllowsRead(status) { return true }
-        guard status == .notDetermined, !SkillRunContext.handsBack else { return false }
-        return try await store.requestFullAccessToReminders()
+        LocalPIMConnectorActions.authorizationAllowsRead(EKEventStore.authorizationStatus(for: .reminder))
     }
 
     func calendars(for entity: EKEntityType) -> [EKCalendar] {

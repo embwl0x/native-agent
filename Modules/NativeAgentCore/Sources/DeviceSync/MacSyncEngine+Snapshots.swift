@@ -421,6 +421,7 @@ extension MacSyncEngine {
 
     public func writeSnapshots(
         forceHeavy: Bool = false,
+        republish: Bool = false,
         includeMemories: Bool = false,
         includeChatTranscripts: Bool = false,
         scope: SnapshotWriteScope = .standard
@@ -430,6 +431,7 @@ extension MacSyncEngine {
         if snapshotWriteInFlight {
             snapshotWriteQueued = true
             snapshotWriteQueuedNeedsHeavy = snapshotWriteQueuedNeedsHeavy || forceHeavy
+            snapshotWriteQueuedNeedsRepublish = snapshotWriteQueuedNeedsRepublish || republish
             snapshotWriteQueuedNeedsMemories = snapshotWriteQueuedNeedsMemories || includeMemories
             snapshotWriteQueuedNeedsChatTranscripts =
                 snapshotWriteQueuedNeedsChatTranscripts || includeChatTranscripts
@@ -444,18 +446,21 @@ extension MacSyncEngine {
             if isActive, snapshotWriteQueued {
                 snapshotWriteQueued = false
                 let queuedForceHeavy = snapshotWriteQueuedNeedsHeavy
+                let queuedRepublish = snapshotWriteQueuedNeedsRepublish
                 let queuedIncludeMemories = snapshotWriteQueuedNeedsMemories
                 let queuedIncludeChatTranscripts = snapshotWriteQueuedNeedsChatTranscripts
                 let queuedScope: SnapshotWriteScope = snapshotWriteQueuedNeedsStandardPass
                     ? .standard
                     : .chatSessions
                 snapshotWriteQueuedNeedsHeavy = false
+                snapshotWriteQueuedNeedsRepublish = false
                 snapshotWriteQueuedNeedsMemories = false
                 snapshotWriteQueuedNeedsChatTranscripts = false
                 snapshotWriteQueuedNeedsStandardPass = false
                 Task { @MainActor in
                     await self.writeSnapshots(
                         forceHeavy: queuedForceHeavy,
+                        republish: queuedRepublish,
                         includeMemories: queuedIncludeMemories,
                         includeChatTranscripts: queuedIncludeChatTranscripts,
                         scope: queuedScope
@@ -470,12 +475,14 @@ extension MacSyncEngine {
         await Task.yield()
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive else { return }
         let heavy = forceHeavy || snapshotWriteQueuedNeedsHeavy
+        if republish || snapshotWriteQueuedNeedsRepublish { snapshotFileDigests.removeAll() }
         let memories = includeMemories || snapshotWriteQueuedNeedsMemories
         let transcripts = includeChatTranscripts || snapshotWriteQueuedNeedsChatTranscripts
         let mergedScope: SnapshotWriteScope = scope == .standard || snapshotWriteQueuedNeedsStandardPass
             ? .standard : .chatSessions
         snapshotWriteQueued = false
         snapshotWriteQueuedNeedsHeavy = false
+        snapshotWriteQueuedNeedsRepublish = false
         snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
         snapshotWriteQueuedNeedsStandardPass = false
@@ -1270,7 +1277,7 @@ extension MacSyncEngine {
                     sessionId: session.id,
                     messages: await MobileSnapshotBuilder.shared.build { Self.compactTranscriptMessages(messages) },
                     transcriptGeneration: session.transcriptGeneration,
-                    hasOlder: messages.count > Self.transcriptSnapshotRowLimit
+                    hasOlder: messages.lazy.filter(\.isPersonVisible).count > Self.transcriptSnapshotRowLimit
                 )
                 // An unencodable block is treated as unaffordable rather than
                 // free, so it can never be the one that breaches the contract.
@@ -1370,7 +1377,8 @@ extension MacSyncEngine {
     private nonisolated static func compactTranscriptMessages(
         _ messages: [any DeviceSyncTranscriptMessage & Sendable]
     ) -> [DeviceSyncTranscriptRow] {
-        messages.suffix(transcriptSnapshotRowLimit).map { message in
+        // Rows that are hers alone never reach the phone's transcript.
+        messages.filter(\.isPersonVisible).suffix(transcriptSnapshotRowLimit).map { message in
             var copy = message
             copy.content = Self.truncateTranscriptContent(copy.content)
             return DeviceSyncTranscriptRow(message: copy)

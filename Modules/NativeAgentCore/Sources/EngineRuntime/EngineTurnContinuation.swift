@@ -225,7 +225,8 @@ public struct TurnContinuationRuntime: Sendable {
         let envelope = TurnEnvelope(surface: saved.surface, agent: saved.agent,
             verifiedChatId: saved.verifiedChatId, verifiedUserId: saved.verifiedUserId,
             commandSignatureVerified: checkpoint.commandSignatureVerified,
-            deliveryRoute: saved.deliveryRoute, declaredRemote: checkpoint.declaredRemote)
+            deliveryRoute: saved.deliveryRoute, declaredRemote: checkpoint.declaredRemote,
+            answerExperienceID: saved.answerExperienceID)
         let request = followUpRequest(message: checkpoint.userMessage, sessionID: checkpoint.sessionId,
             fileAccess: checkpoint.fileAccess, surface: checkpoint.surface, envelope: envelope,
             replyRoute: route.chatToolReplyRoute, pinnedRunID: checkpoint.runId)
@@ -388,7 +389,8 @@ public struct TurnContinuationRuntime: Sendable {
         return TurnEnvelope(surface: saved.surface, agent: saved.agent,
             verifiedChatId: saved.verifiedChatId, verifiedUserId: saved.verifiedUserId,
             commandSignatureVerified: record.commandSignatureVerified,
-            deliveryRoute: saved.deliveryRoute, declaredRemote: record.declaredRemote)
+            deliveryRoute: saved.deliveryRoute, declaredRemote: record.declaredRemote,
+            answerExperienceID: saved.answerExperienceID)
     }
 
     private func text(_ object: [String: JSONValue], _ key: String) -> String? {

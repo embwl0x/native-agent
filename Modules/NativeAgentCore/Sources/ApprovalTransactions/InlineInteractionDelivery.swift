@@ -1,4 +1,5 @@
 import Foundation
+import Experiences
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -209,9 +210,23 @@ public enum InlineInteractionDelivery {
             return
         }
         var changed = false
+        let owed = Set(((try? await ExperienceStore.at(dataRoot).open()) ?? []).map(\.id))
         for pair in pairs {
             let card = pair.interaction
             let id = "interaction:\(card.id)"
+            // The card is a decision the person owes her, under the id she is
+            // shown: one experience, read by a wait like any other. A failed
+            // setup can be tried again on the same card, so it stays owed.
+            let open = card.state.isOpen || card.state.failureReason != nil
+            if !card.state.isUnknown, open || owed.contains(id) {
+                let phase: Owed.Phase = switch card.state {
+                case .pending, .running, .failed: .owed
+                case .superseded: .letGo(.cancelled)
+                default: .accepted
+                }
+                Owed.record(dataRoot, id: id, kind: .decision, key: "decide", to: "person", phase: phase,
+                            evidence: [.init(source: "chat/messages/" + sessionID, id: card.id)], born: open)
+            }
             do {
                 guard card.state.isOpen || card.state.failureReason != nil else {
                     guard activeIDs.contains(id) else { continue }

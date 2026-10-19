@@ -1,7 +1,10 @@
 import Foundation
 import PersistenceCore
 
-/// Presentation identity only. Routes, credentials and original sessions stay separate.
+/// Who each saved contact is (docs/agent-communication.md, "Every agent is
+/// itself"): its own who, or the who it is explicitly associated with
+/// (`who`). A who is known by its first handle, else by `peer:<id>`. Nothing
+/// else makes two contacts one: no product, vendor, host or lane name.
 public struct AgentContactIdentity: Sendable {
     public let aliases: [String: String]
     public let doors: [String: String]
@@ -10,26 +13,25 @@ public struct AgentContactIdentity: Sendable {
     public init(dataRoot: URL) {
         let peers = (try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")))
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [[String: Any]] } ?? []
-        self.init(peers: peers.map { $0.compactMapValues { $0 as? String } })
+        self.init(peers: peers.map { $0.compactMapValues { $0 as? String } },
+                  handles: Dictionary(peers.compactMap { peer in
+                      (peer["id"] as? String).map { ($0, (peer["handles"] as? [String]) ?? []) }
+                  }, uniquingKeysWith: { first, _ in first }))
     }
 
-    init(peers: [[String: String]]) {
+    init(peers: [[String: String]], handles: [String: [String]] = [:]) {
         self.peers = peers
-        var aliases = ["claude": "claude", "codex": "codex"]
-        var doors = ["claude": "Claude CLI", "codex": "Codex bridge"]
-        for peer in peers {
-            guard let id = peer["id"], let endpoint = peer["endpoint"],
-                  let url = URL(string: endpoint), ["mcp", "acp"].contains(url.scheme ?? "") else { continue }
-            let brain: String?
-            switch url.host {
-            case "claude-desktop", "claude-code": brain = "claude"
-            case "codex", "codex-cli": brain = "codex"
-            default: brain = nil
-            }
-            if let brain {
-                aliases["peer:" + id] = brain
-                doors["peer:" + id] = (peer["name"] ?? url.host ?? "") + (url.scheme == "acp" ? " (ACP)" : " (MCP)")
-            }
+        let byID = Dictionary(peers.compactMap { peer in peer["id"].map { ($0, peer) } }, uniquingKeysWith: { first, _ in first })
+        // An association to a contact that no longer exists is no association.
+        func who(_ id: String) -> String { byID[id]?["who"].flatMap { byID[$0] == nil ? nil : $0 } ?? id }
+        func key(_ who: String) -> String { handles[who]?.first?.lowercased() ?? "peer:" + who }
+        var aliases: [String: String] = [:], doors: [String: String] = [:]
+        for (id, peer) in byID {
+            let whoID = who(id), name = key(whoID)
+            if name != "peer:" + id { aliases["peer:" + id] = name }
+            if whoID == id { for handle in handles[id] ?? [] { aliases[handle.lowercased()] = name } }
+            guard name != "peer:" + id, let url = peer["endpoint"].flatMap(URL.init(string:)) else { continue }
+            doors["peer:" + id] = (peer["name"] ?? url.host ?? "") + (url.scheme == "acp" ? " (ACP)" : " (MCP)")
         }
         self.aliases = aliases; self.doors = doors
     }
@@ -50,8 +52,15 @@ public struct AgentContactIdentity: Sendable {
 public struct AgentLocalHealth: Codable, Sendable, Equatable {
     private var observedStatus: String?
     private var observedDetail: String
-    public private(set) var presenceStatus: String? = nil
-    public private(set) var presenceDetail: String? = nil
+    private var presence: String? = nil
+    private var presenceWords: String? = nil
+    private var presenceAt: Date? = nil
+    public var presenceStatus: String? {
+        presence == "recent_activity" && Date().timeIntervalSince(presenceAt ?? .distantPast) >= 600 ? "waiting" : presence
+    }
+    public var presenceDetail: String? {
+        presence == "recent_activity" && presenceStatus == "waiting" ? "No recent activity from Claude's bridge." : presenceWords
+    }
     private var installed: Bool? = nil
     private var authenticationRequired: Bool? = nil
     private var availability: String {
@@ -91,8 +100,9 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     }
 
     public mutating func present(_ presence: Self) {
-        presenceStatus = presence.status
-        presenceDetail = presence.detail
+        self.presence = presence.status
+        presenceWords = presence.detail
+        presenceAt = presence.checkedAt
     }
 
     public mutating func retainReplyEvidence() {
@@ -105,8 +115,13 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
 
     public static func url(_ root: URL) -> URL { root.appendingPathComponent("agents/local-health.json") }
     public static func read(_ root: URL) -> [String: Self] {
-        guard let data = try? Data(contentsOf: url(root)) else { return [:] }
-        return (try? JSONDecoder().decode([String: Self].self, from: data)) ?? [:]
+        do { return try checkedRead(root) }
+        catch { return ["local-health": Self(status: "unknown", detail: "agents/local-health.json is unreadable; saved observations are unavailable.", checkedAt: Date(), authenticated: false)] }
+    }
+    public static func checkedRead(_ root: URL) throws -> [String: Self] {
+        do {
+            return try JSONDecoder().decode([String: Self].self, from: Data(contentsOf: url(root)))
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
     }
     /// Said until a newer observation replaces it, not only while fresh.
     public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted", "no_reply_by_deadline"].contains(observedStatus ?? "") }
@@ -170,8 +185,8 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
 }
 
 /// An agent discovery found on this Mac and offered once (agents/discovery.json,
-/// by candidate id). A decline holds until its version changes; a connection
-/// ends the offer for good. AgentDiscoverySession is the one writer.
+/// by candidate id). Declines and disconnects hold across program updates.
+/// Discovery and disconnect share its file lock; a connection ends the offer.
 public struct AgentDiscoveryOffer: Codable, Sendable, Equatable {
     public var name: String
     public var version: String?
