@@ -81,7 +81,6 @@ public enum AgentConversationDelivery: String, Sendable {
 
     private static let inboxRecipes: [String: (path: String, tool: String, options: Set<String>, tap: String?)] = [
         "claude": ("claude-bridge/claude-inbox.jsonl", "claude_message", ["pair_reviewer"], "Claude Code → open a Claude Code session, which reads its inbox"),
-        "claude": ("claude-bridge/claude-inbox.jsonl", "claude_message", ["pair_reviewer"], "Claude Code → open a Claude Code session, which reads its inbox"),
         "codex": ("codex-nativeagent-bridge/codex-inbox.jsonl", "codex_message", ["model", "reasoning_effort", "fast", "pair_reviewer", "completion_mode", "repository"], nil),
         "omp": ("omp-bridge/omp-inbox.jsonl", "omp_message", ["timeout_seconds"], nil),
     ]

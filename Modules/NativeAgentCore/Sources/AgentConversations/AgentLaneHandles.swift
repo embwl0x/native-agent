@@ -10,12 +10,10 @@ import PersistenceCore
 /// Elsewhere the lane name stands for no one. Grants, keys and proofs are the
 /// store's to keep; this writes only `handles` and `who`.
 public enum AgentLaneHandles {
-    /// `named`: the name the person gave that who where the lane was his own
-    /// name for it; otherwise the who keeps its agent's own name.
-    static let lanes: [(lane: String, inbox: String, hosts: [String], named: String?)] = [
-        ("claude", "claude-bridge/claude-inbox.jsonl", ["claude-code", "claude-desktop"], "Claude"),
-        ("claude", "claude-bridge/claude-inbox.jsonl", ["claude-code", "claude-desktop"], nil),
-        ("codex", "codex-nativeagent-bridge/codex-inbox.jsonl", ["codex", "codex-cli"], nil),
+    /// The who keeps its agent's own name; the person renames it.
+    static let lanes: [(lane: String, inbox: String, hosts: [String])] = [
+        ("claude", "claude-bridge/claude-inbox.jsonl", ["claude-code", "claude-desktop"]),
+        ("codex", "codex-nativeagent-bridge/codex-inbox.jsonl", ["codex", "codex-cli"]),
     ]
 
     public static func migrate(dataRoot: URL, bridgeConfigRoot: URL? = nil) throws {
@@ -30,7 +28,6 @@ public enum AgentLaneHandles {
             guard !peers.contains(where: { $0.handles?.contains(lane.lane) == true }),
                   hadReader(root.appendingPathComponent(lane.inbox)), var first = doors.first(where: { $0.who == nil }) else { continue }
             first.handles = (first.handles ?? []) + [lane.lane]
-            if let named = lane.named { first.name = named }
             let head = try store.upsert(first)
             for var door in doors where door.id != head.id && door.who == nil && (door.handles ?? []).isEmpty {
                 door.who = head.id

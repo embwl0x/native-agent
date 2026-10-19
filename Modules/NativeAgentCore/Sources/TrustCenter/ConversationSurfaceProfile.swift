@@ -42,7 +42,6 @@ public struct ConversationSurfaceProfile: Sendable, Equatable, Hashable {
         "claude-bridge": agentBridgeID,
         "codex-bridge": agentBridgeID,
         "omp-bridge": agentBridgeID,
-        "claude-bridge": agentBridgeID,
         "bridge": agentBridgeID,
     ]
 }
