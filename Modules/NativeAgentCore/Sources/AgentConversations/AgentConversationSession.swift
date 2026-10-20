@@ -882,7 +882,10 @@ package enum AgentConversationSession {
         let latest = (try? store.records().first { $0.id == row.id }) ?? row
         // A send no process owns any more (a restart mid-send) still counts, so it can be released.
         let orphan = latest.phase == "sending" && ownerless(latest)
-        let flying = orphan || replyInFlight(latest, peer?.transport)
+        // A message waiting on the person's card is theirs to decide: a stop
+        // neither withdraws the card nor releases the conversation from it.
+        let awaitingCard: Bool = if case .object(let receipt)? = latest.receipt { receipt["status"] == .string("waiting_approval") } else { false }
+        let flying = !awaitingCard && (orphan || replyInFlight(latest, peer?.transport))
         // Admission first: the lane owner's stop runs through agent_cancel's own
         // gate, and nothing here (queue, stop state) changes unless it clears.
         // With nothing in flight it carries no lane target, so it stops nothing.
@@ -909,9 +912,11 @@ package enum AgentConversationSession {
             return .object(fields)
         }
         guard flying else {
+            let standing = awaitingCard
+                ? "Your earlier message to \(name) waits on the person's card; a stop does not withdraw a card, and this conversation still waits on it."
+                : "Nothing from \(name) is in flight on this conversation, so there was nothing to stop."
             return answer((try? store.records().first { $0.id == row.id }) ?? latest, ["stopped": .bool(false),
-                "detail": .string("Nothing from \(name) is in flight on this conversation, so there was nothing to stop."
-                + (cleared > 0 ? " The queued messages were withdrawn." : ""))])
+                "detail": .string(standing + (cleared > 0 ? " The queued messages were withdrawn." : ""))])
         }
         func write(_ asked: String, _ detail: String, receipt: JSONValue? = nil) -> JSONValue {
             var state = asked

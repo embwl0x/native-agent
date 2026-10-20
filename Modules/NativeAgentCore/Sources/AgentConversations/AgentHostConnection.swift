@@ -406,7 +406,7 @@ public enum AgentHostConnection {
                     _ = try ensureMessagingPermissions(contact: peer, store: store)
                 }
                 return .object(["status": .string("passed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
-                    "detail": .string("Checked \(proposal.row.installationCheck) host.configPath=\(proposal.row.expandedConfigPath), host.format=\(proposal.row.format.rawValue), helper=\(proposal.command). \(proposal.existing == nil ? "The Connect splice accepts these settings; agent.connect will mint its credential and save its peer." : "The settings match this contact's helper, descriptor, peer ID and credential.") No message crossed; restart: \(proposal.row.restartNote)")])
+                    "detail": .string("Checked \(proposal.row.installationCheck) host.configPath=\(proposal.row.expandedConfigPath), host.format=\(proposal.row.format.rawValue), helper=\(proposal.command). \(proposal.existing == nil ? "The Connect splice accepts these settings; agent.connect will mint its credential and save its peer." : "The settings match this contact's helper, descriptor, peer ID and credential.") No message crossed, so readiness stays as it was (unverified since the recipe changed until a message crosses on it; send one to prove the door). Restart: \(proposal.row.restartNote)")])
             }
         } catch AgentHostConfigWriter.Failure.staleEntry(let at, let helper, let gone) {
             // Not a recipe fault: the entry is another install's, and connect is the lever.
