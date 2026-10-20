@@ -43,9 +43,11 @@ public final class PeerDataTaint: @unchecked Sendable {
     /// Set once, before the box is shared.
     public private(set) var restored = false
 
-    /// A later turn under the steer an earlier one carried (`carried`).
+    /// A later turn under the steer an earlier one carried (`carried`): its
+    /// steering peers, and the peers the person's answer covered.
     public convenience init(restoring sources: [String], elevated: [String]) {
-        self.init(restoring: sources + elevated)
+        self.init(restoring: sources)
+        for peer in elevated { elevate(peer: peer) }
     }
 
     /// The steer this turn leaves on work it hands to a later one, a card or
@@ -166,8 +168,10 @@ public final class PeerDataTaint: @unchecked Sendable {
 
     public static var abilityWriteFailure: @Sendable () -> ToolFailureError? {
         let peers = abilitySources
+        // The person answered this run's card: its peers cap nothing more (one card per command, User 10-20).
+        let answered = Set(current?.elevatedSources ?? [])
         return {
-            let untrusted = peers.filter { !ownerTrusts($0) }.sorted()
+            let untrusted = peers.filter { !ownerTrusts($0) && !answered.contains($0) }.sorted()
             guard !untrusted.isEmpty else { return nil }
             let names = untrusted.map { sourceName($0) }
             let tap = names.allSatisfy { $0 != nil }

@@ -42,6 +42,7 @@ actor TurnCheckpointWriter {
         pendingCalls += startingCalls
         record.runningStep = pendingCalls > 0 ? 1 : nil
         record.peerSources = PeerDataTaint.current?.checkpointSources ?? record.peerSources
+        record.answeredPeers = PeerDataTaint.current?.elevatedSources ?? record.answeredPeers
         persist()
     }
 
@@ -49,6 +50,7 @@ actor TurnCheckpointWriter {
         pendingCalls = max(0, pendingCalls - 1)
         record.runningStep = pendingCalls > 0 ? 1 : nil
         record.peerSources = PeerDataTaint.current?.checkpointSources ?? record.peerSources
+        record.answeredPeers = PeerDataTaint.current?.elevatedSources ?? record.answeredPeers
         persist()
     }
 
@@ -293,13 +295,14 @@ extension SwiftNativeChatOrchestrationClient {
         }
         let taint = PeerDataTaint(restoring: (record.peerSources ?? []) + sources
             + (PeerDataTaint.current?.checkpointSources ?? []),
-            elevated: PeerDataTaint.current?.elevatedSources ?? [])
+            elevated: (record.answeredPeers ?? []) + (PeerDataTaint.current?.elevatedSources ?? []))
         try await DeskContinuationScope.current?.resume()
         return try await PeerDataTaint.$current.withValue(taint) {
         for row in rows {
             SwiftToolDispatcher.consumePersistedHistoryEvidence(row.extras ?? .null)
         }
         record.peerSources = taint.checkpointSources
+        record.answeredPeers = taint.elevatedSources
         return try await TurnTraceContext.$turnId.withValue(record.turnId) {
         try await TurnCheckpointScope.$resuming.withValue(record) {
         try await TurnCheckpointScope.$resumedRows.withValue(rows) {

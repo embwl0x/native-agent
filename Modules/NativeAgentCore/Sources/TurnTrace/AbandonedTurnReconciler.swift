@@ -17,6 +17,9 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
     public let fileAccess: String
     public let capabilityProfile: String?
     public var peerSources: [String]?
+    /// The steering peers the person's card answered in this run: a resume
+    /// continues under that one card, never a second.
+    public var answeredPeers: [String]?
     public let commandSignatureVerified: Bool?
     public let declaredRemote: Bool?
     public let helperDefinition: JSONValue?
