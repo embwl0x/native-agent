@@ -42,6 +42,10 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
     public func reporting(_ value: JSONValue, location: String = "Mac chat or on your phone", tool: String? = nil) -> JSONValue {
         guard case .object(var fields) = value else { return value }
         fields["not_run_status"] = .string(rawValue)
+        // Every result says where it stands; a held call is waiting, never blank.
+        if fields["status"] == nil {
+            fields["status"] = .string([.approvalFiled, .approvalDeliveryFailed].contains(self) ? "waiting_approval" : "not_run")
+        }
         if self == .blocked {
             func text(_ key: String) -> String? {
                 if case .string(let value)? = fields[key] { return value }

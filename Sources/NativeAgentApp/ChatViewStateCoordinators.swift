@@ -244,12 +244,22 @@ final class ChatScrollCoordinator {
         pickPlace()
     }
 
-    /// A press on the transcript: what was pressed is where the reader is, so
-    /// a disclosure opening there grows downward instead of pushing it away.
+    /// A press on the transcript: what was pressed is where the reader is.
+    /// A press alone never leaves the live edge; a scroll does, and so does
+    /// opening a disclosure (`opening`). 0.6.8: pressing Approve on a card
+    /// while her reply streamed stopped the follow, and the reply ran on
+    /// under the composer behind a "Latest" pill.
     func pressed(atY y: CGFloat) {
         guard y >= viewport.top, y <= viewport.top + viewport.visible else { return }
         pressedAt = y
-        if autoFollow { disarmFollow() } else { pickPlace() }
+        if !autoFollow { pickPlace() }
+    }
+
+    /// The reader opened a disclosure (working notes, a tool's detail): the
+    /// row they pressed holds its place and the detail grows downward, where
+    /// the bottom anchor would have pushed the heading above the viewport.
+    func opening() {
+        if autoFollow { disarmFollow() }
     }
 
     /// The block that holds the reading line, else the first one below it.

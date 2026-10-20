@@ -383,8 +383,10 @@ public enum AgentHostConnection {
     /// The same proposal and splice as Connect, stopping before any write or mint.
     package static func verifySetup(name: String, store: AgentPeerStore, dataRoot: URL, workspace: String? = nil) -> JSONValue {
         var checked = "agents/recipes/\(name).json host.id/displayName/aliases"
+        var host = name
         do {
             let proposal = try propose(name: name, store: store, dataRoot: dataRoot, workspace: workspace)
+            host = proposal.existing.map { "peer:" + $0.id } ?? proposal.row.id
             checked = "agents/recipes/\(proposal.row.id).json host.configPath=\(proposal.row.expandedConfigPath), host.format=\(proposal.row.format.rawValue)"
             return try CredentialFileLock.withLock(URL(fileURLWithPath: proposal.row.expandedConfigPath)) {
                 let secret: String
@@ -406,6 +408,13 @@ public enum AgentHostConnection {
                 return .object(["status": .string("passed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
                     "detail": .string("Checked \(proposal.row.installationCheck) host.configPath=\(proposal.row.expandedConfigPath), host.format=\(proposal.row.format.rawValue), helper=\(proposal.command). \(proposal.existing == nil ? "The Connect splice accepts these settings; agent.connect will mint its credential and save its peer." : "The settings match this contact's helper, descriptor, peer ID and credential.") No message crossed; restart: \(proposal.row.restartNote)")])
             }
+        } catch AgentHostConfigWriter.Failure.staleEntry(let at, let helper, let gone) {
+            // Not a recipe fault: the entry is another install's, and connect is the lever.
+            return .object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
+                "reason": .string("stale_entry"),
+                "detail": .string(AgentHostConfigWriter.Failure.staleEntry(at: at, helper: helper, gone: gone).localizedDescription),
+                "remedy": Repair.remedy(owner: checked, nextCall: .object(["tool": .string("app"), "input": .object([
+                    "action": .string("agent.connect"), "args": .object(["name": .string(host)])])]), tap: nil)])
         } catch let failure as ToolFailureError where failure.owner != nil {
             return .object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
                 "detail": .string(failure.localizedDescription),

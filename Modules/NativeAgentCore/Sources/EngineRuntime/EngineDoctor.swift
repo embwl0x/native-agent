@@ -81,6 +81,29 @@ public final class DoctorFacade {
         self.dataRoot = dataRoot
     }
 
+    /// Admission for every Doctor run on this root — Run, Repair, onboarding
+    /// and the automatic passes — so two never overlap and a click during a
+    /// pass is told so. The reuse stamp is cleared for the whole run: Support
+    /// Snapshot never reuses a report from before one.
+    public func admitRun() -> Bool {
+        guard !isRunning else { return false }
+        isRunning = true
+        runStartedAt = Date()
+        reportCompletedAt = nil
+        return true
+    }
+
+    /// Completion: the report a finished run produced lands with its stamp;
+    /// a run that threw leaves the last report standing.
+    public func finishRun(_ finished: DoctorReport?) {
+        if let finished {
+            report = finished
+            reportCompletedAt = Date()
+        }
+        isRunning = false
+        runStartedAt = nil
+    }
+
     public func toolStatusEnvelope() async throws -> JSONValue {
         guard let report else {
             return AppToolExecutor.failure("doctor_not_run", "No Doctor report yet. Run doctor.run, then read this page.")

@@ -430,9 +430,12 @@ extension BuiltInToolSchemaFactory {
                     required: []
                 )
             ),
+            // A request addressed to the person is a question, not an effect:
+            // the person's own answer on the card is the decision, so no
+            // posture or steer puts a card in front of the card.
             requestedSchema(
                 name: "request_interaction",
-                toolClass: .write,
+                toolClass: .read,
                 description: "Raise an inline setup card for a connector, provider sign-in, API key, Mac permission, capability, model or choice. Required: kind and why. Name the canonical target for setup; choose requires title, nonempty options and decline_consequence. Secrets belong in cards, never chat; never ask for a key/token. Connector cards contain token fields; ChatGPT/Claude/Grok api_key cards offer account sign-in plus key/setup-token fields. Connector cards require an explicit connect/add/set up/enable ask; ordinary read/status requests report the blocker without a card. Other kinds can also request a known missing prerequisite that would make a call fail. The person completes setup in the card, which settles to a one-line receipt; already-configured targets return that fact without a card. Use app agent.connect for Codex/Claude Code/Goose/peers and app bot.create for helpers. Give a one-sentence reason and the consequence of declining. Use canonical IDs: the app supplies controls and refuses IDs without one. Connector, permission and capability cards are nonblocking: the unavailable step is skipped, and you can continue other work. API key, model and choice cards stop the turn, which resumes after the person acts. Example: {\"kind\":\"connector\",\"target\":\"github\",\"why\":\"Connect GitHub as requested.\",\"decline_consequence\":\"I will continue without repository access.\"}.",
                 parametersJSON: params(
                     properties: [

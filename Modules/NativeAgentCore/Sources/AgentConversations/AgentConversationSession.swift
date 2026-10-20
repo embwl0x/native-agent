@@ -196,7 +196,7 @@ package enum AgentConversationSession {
                 if label != nil || pinned.record != nil, let row = previous, let conversation = row.conversationID {
                     let read = try await builtInThread(agent: agent, conversation: conversation, args: args,
                                                        scope: scope, dataRoot: dataRoot, perform: perform)
-                    if isRefusal(read) { return read }
+                    if readRefused(read) { return read }
                     if historyBefore != nil || historyExchange != nil {
                         return view(row, details: false, dataRoot: dataRoot,
                                     historyBefore: historyBefore, historyExchange: historyExchange)
@@ -464,7 +464,7 @@ package enum AgentConversationSession {
             // His reply lands through the listener, which marks the change.
             var seen = AgentConversationRunning.shared.seen
             var snapshot = try await read("agent_read", readInput)
-            if isRefusal(snapshot) { return snapshot }
+            if readRefused(snapshot) { return snapshot }
             var outcome = "nothing_in_flight"
             while case .object(let fields) = snapshot, case .array(let messages)? = fields["conversation"],
                   let sent = messages.lastIndex(where: {
@@ -481,7 +481,7 @@ package enum AgentConversationSession {
                 if Date() >= deadline { break }
                 seen = AgentConversationRunning.shared.seen
                 snapshot = try await read("agent_read", readInput)
-                if isRefusal(snapshot) { return snapshot }
+                if readRefused(snapshot) { return snapshot }
                 outcome = "settled"
             }
             guard case .object(var fields) = snapshot else { return snapshot }
@@ -491,7 +491,7 @@ package enum AgentConversationSession {
         }
         if admit {
             let first = try await $returnsHistory.withValue(false) { try await read("agent_read", readInput) }
-            if isRefusal(first) { return first }
+            if readRefused(first) { return first }
         }
         let store = AgentConversationStore(dataRoot: dataRoot)
         let transport = (try? AgentPeerStore(dataRoot: dataRoot).list())?.first { "peer:" + $0.id == agent }?.transport
@@ -676,7 +676,10 @@ package enum AgentConversationSession {
         if approvalWaits.contains(status), approvalDecided(string(value["approvalId"]) ?? string(root["approvalId"])) {
             return false
         }
-        return ["outcome_unknown", "delivery_unknown"].contains(status)
+        // An unknown outcome holds the thread while its reply may still come;
+        // a terminal one (its call ended, bounded by the route's own timeout)
+        // has nothing more coming, so the next message goes.
+        return ["outcome_unknown", "delivery_unknown"].contains(status) && value["terminal"] != .bool(true)
             || approvalWaits.contains(status)
     }
 
@@ -1020,14 +1023,16 @@ package enum AgentConversationSession {
         let receipt = try await perform("agent_read", read)
         // Synchronous command/ACP adapters do not expose a recovery endpoint.
         // Their gate still ran; show the clearly labelled retained last result.
-        // A desktop contact's read is send-only ("read": false, "sent": false):
-        // not an access refusal, just nothing to read there.
-        if case .object(let value) = receipt, value["status"] == .string("nothing_to_read")
-            || (value["operation"] == .string("read") && value["read"] == .bool(false) && value["error"] == nil) {
+        // A read that did not reach its owner cannot expose a cached reply.
+        if readRefused(receipt) {
+            let cause: String? = if case .object(let value) = receipt { string(value["detail"]) ?? string(value["error"]) } else { nil }
+            throw AgentConversationStore.Failure(message: "This conversation cannot be opened" + (cause.map { ": " + $0 } ?? " with the current access settings."))
+        }
+        // A contact with nothing to read on its side (a desktop or inbound-only
+        // door: "read": false) still has the conversation as it stands here.
+        if case .object(let value) = receipt, value["status"] == .string("nothing_to_read") || value["read"] == .bool(false) {
             return try store.update(id: row.id, operationID: row.operationID, touch: false) { $0.selected = true }
         }
-        // A read that did not reach its owner cannot expose a cached reply.
-        if isRefusal(receipt) { throw AgentConversationStore.Failure(message: "This conversation cannot be opened with the current access settings.") }
         if row.readInput == nil {
             return try store.update(id: row.id, operationID: row.operationID, touch: false) { $0.selected = true }
         }
@@ -1168,7 +1173,7 @@ package enum AgentConversationSession {
         guard case .object(var fields) = try await perform("agent_read", list) else {
             throw AgentConversationStore.Failure(message: "That conversation could not be read.")
         }
-        if isRefusal(.object(fields)) { return .object(fields) }
+        if readRefused(.object(fields)) { return .object(fields) }
         func inThread(_ value: JSONValue) -> Bool {
             guard case .object(let row) = value else { return false }
             if row["conversation_id"] == .string(conversation) { return true }
@@ -1225,7 +1230,11 @@ package enum AgentConversationSession {
             read["details"] = .bool(true); row.readInput = read
         }
         let state = GrokBotRoute.normalizedStatus(string(value["run_status"]) ?? string(value["status"]) ?? string(value["state"]) ?? "unknown")
-        if isRefusal(receipt) || ["failed", "interrupted", "waiting_approval", "waiting_for_approval", "waiting for approval", "waiting_on_you", "waiting_on_person", "waiting on you", "outcome_unknown", "unavailable", "cancelled", "canceled", "reconnect_required", "session_unavailable"].contains(state) {
+        // A contact that pulls (an MCP host with no command line) took nothing
+        // yet: the message is held and the thread is free (`takeHeld` drains it).
+        if state == "held" {
+            row.phase = "ready"
+        } else if isRefusal(receipt) || ["failed", "interrupted", "waiting_approval", "waiting_for_approval", "waiting for approval", "waiting_on_you", "waiting_on_person", "waiting on you", "outcome_unknown", "unavailable", "cancelled", "canceled", "reconnect_required", "session_unavailable"].contains(state) {
             row.phase = "attention"
         } else if row.agent.hasPrefix("peer:"), ["answered", "replied"].contains(state), value["reply"] == nil, value["answer"] == nil {
             // Evidence only (walk 2, 09-25): a contact's "answered" that carries no
@@ -1268,6 +1277,10 @@ package enum AgentConversationSession {
         }
         result = withLive(result, row: row, dataRoot: dataRoot)
         guard case .object(var shown) = result else { return result }
+        if shown["can_reply"] == .bool(true), let presence = peer.flatMap(AgentContactHealth.checkIn) {
+            shown["can_reply_detail"] = .string(presence.detail)
+            result = .object(shown)
+        }
         if let id = threadID(row.agent) {
             shown["thread_id"] = .string(id)
             result = .object(shown)
@@ -1379,7 +1392,7 @@ package enum AgentConversationSession {
                 }
             }
         } else if let text = reply(value) { result["reply"] = .string(text) }
-        for key in ["reply_state", "reply_deadline", "automatic_resend", "untrusted_remote_data", "source_availability", "read_error", "read", "completed", "terminal", "needs_input", "needs_authentication", "sent", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages", "healed", "repair", "remedy", "harness_item"] {
+        for key in ["reply_state", "reply_deadline", "automatic_resend", "untrusted_remote_data", "source_availability", "read_error", "read", "completed", "terminal", "needs_input", "needs_authentication", "sent", "effects", "argument_path", "accepted", "reason", "error", "execution_error", "reply_truncated", "artifacts", "parts", "has_more", "read_with", "attribution", "messages", "healed", "repair", "remedy", "harness_item", "delivered", "delivered_at"] {
             if let field = value[key] ?? root[key] { result[key] = field }
         }
         // delegation_status.detail is a format selector ("full"), not an
@@ -1439,10 +1452,19 @@ package enum AgentConversationSession {
         return ["reconnect_required", "unavailable", "needs_setup", "no_outbound_route",
                 "blocked", "denied", "blocked_by_trust", "busy", "invalid_arguments"].contains(string(receipt["status"]) ?? "")
     }
+    /// A send that did not reach its owner: refused, or `sent: false`.
     private static func isRefusal(_ receipt: JSONValue) -> Bool {
         guard case .object(let row) = receipt else { return true }
-        return row["error"] != nil || row["sent"] == .bool(false)
-            || ["blocked", "denied", "blocked_by_trust", "approval_required", "approval_filed", "needs_setup", "no_outbound_route"].contains(string(row["status"]) ?? "")
+        return readRefused(receipt) || row["sent"] == .bool(false)
+            || ["needs_setup", "no_outbound_route"].contains(string(row["status"]) ?? "")
+    }
+    /// A read is refused only by an error or an explicit gate. `sent: false`
+    /// is true of every read, and a contact with no outbound route still has
+    /// its conversation here to show (fresh install 10-19: Claude Desktop).
+    private static func readRefused(_ receipt: JSONValue) -> Bool {
+        guard case .object(let row) = receipt else { return true }
+        return row["error"] != nil
+            || ["blocked", "denied", "blocked_by_trust", "approval_required", "approval_filed"].contains(string(row["status"]) ?? "")
     }
     private static func string(_ value: JSONValue?) -> String? {
         guard case .string(let value)? = value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }; return value

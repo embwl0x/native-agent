@@ -7,7 +7,7 @@ extension SwiftNativeApprovalInbox {
     /// Presentation supplies the already-redacted envelope; the inbox owns IO.
     public func writeChatReceipt(
         approvalID: String, sessionID: String, toolName: String, surface: String,
-        summary: String, resultClass: String, ok: Bool?, resultPreview: String?,
+        summary: String, resultClass: String, resultStatus: String?, ok: Bool?, resultPreview: String?,
         returnedID: String? = nil, effects: String? = nil,
         recoveredAt: String? = nil
     ) async throws -> String? {
@@ -53,6 +53,8 @@ extension SwiftNativeApprovalInbox {
             }
             if let ok { metadata["ok"] = .bool(ok) }
             metadata["resultClass"] = .string(resultClass)
+            // The same exact word any tool row keeps beside its class.
+            if let resultStatus { metadata["resultStatus"] = .string(resultStatus) }
             if let returnedID { metadata["resultReturnedID"] = .string(returnedID) }
             if let effects { metadata["resultEffects"] = .string(effects) }
             // The envelope above is what the pill parses; its prose preamble

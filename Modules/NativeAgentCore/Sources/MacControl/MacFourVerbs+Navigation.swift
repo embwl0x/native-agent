@@ -119,9 +119,21 @@ extension MacFourVerbs {
                 moved += " The receiving app is \(receiver)."
             }
         }
+        // Launch Services opening a link, pane, file or folder is the whole act,
+        // and asked for front it activates the receiver itself: the landing
+        // read after it is sight, never the proof, so a blind read (no
+        // Accessibility) or a window titled otherwise never fails an open.
+        let opened = result.action == "open_target" && result.ok
+        func openedDetail(_ base: [String: JSONValue]) -> [String: JSONValue] {
+            var detail = base
+            detail["status"] = .string("opened")
+            if front { detail["front"] = .string("by Launch Services") }
+            return detail
+        }
         if !front, landingApp == nil {
             return MacFourVerbsReply(ok: result.ok, text: result.ok ? moved + " Nothing came to the front."
-                : "I couldn't complete the request to go to \(trimmed).", detail: Self.operationDetail(result))
+                : "I couldn't complete the request to go to \(trimmed).",
+                detail: opened ? openedDetail(Self.operationDetail(result)) : Self.operationDetail(result))
         }
         let windowless: JSONValue = .string(landingApp == nil ? "no_frontmost_window" : "no_window_in_app")
         var landing = await sight(part: nil, app: landingApp)
@@ -136,6 +148,11 @@ extension MacFourVerbs {
         }
         switch landing {
         case .blind(let reply):
+            if opened {
+                var detail = openedDetail(Self.operationDetail(result))
+                detail["landing_read"] = .string(reply.text)
+                return MacFourVerbsReply(ok: true, text: moved, detail: detail)
+            }
             var detail = reply.detail
             detail["navigation"] = .object(Self.operationDetail(result).merging(["ok": .bool(result.ok)]) { _, new in new })
             let ownWindow = reply.detail["status"] == .string("in_process_route")
@@ -161,16 +178,16 @@ extension MacFourVerbs {
                 return MacFourVerbsReply(
                     ok: true,
                     text: (result.ok ? receipt : "\(trimmed) is in front.") + " Now looking at " + hit.place + ".\n" + hit.render,
-                    detail: detail
+                    detail: opened ? openedDetail(detail) : detail
                 )
             }
-            if landed == nil, result.ok {
+            if opened || (landed == nil && result.ok) {
                 return MacFourVerbsReply(
                     ok: true,
                     text: receipt + " The fresh screen is " + hit.place
-                        + ", but it does not expose enough destination identity to prove the exact landing.\n"
+                        + (landed == nil ? ", but it does not expose enough destination identity to prove the exact landing.\n" : ".\n")
                         + hit.render,
-                    detail: detail
+                    detail: opened ? openedDetail(detail) : detail
                 )
             }
             return MacFourVerbsReply(

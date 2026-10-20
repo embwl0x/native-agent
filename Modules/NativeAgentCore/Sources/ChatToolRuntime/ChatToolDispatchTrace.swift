@@ -227,11 +227,14 @@ extension ChatToolOutcome {
         case unknown
     }
 
-    /// The algebra as one status word: ok only for a known success, unknown
-    /// for an outcome nobody established, failed for every failure shape.
+    /// The algebra as one status word: failed for every failure shape,
+    /// unknown only when the envelope itself says its outcome is still open
+    /// (`saysOutcomeOpen`), ok for every other call that returned without
+    /// error. A status word the algebra does not know (workspace's
+    /// "prepared", a read's "nothing_to_read") came back fine.
     package static func statusWord(_ output: JSONValue) -> String {
         guard outputLooksSuccessful(output) else { return "failed" }
-        return exactResultClass(output) == .succeeded ? "ok" : "unknown"
+        return saysOutcomeOpen(output) ? "unknown" : "ok"
     }
 
     /// Not failure-shaped, as the one outcome algebra (`exactResultClass`)

@@ -2133,7 +2133,7 @@ public struct DoctorAutoRunLoop: LoopRunner {
             // "no check has status fail", so an empty snapshot reads as a clean
             // bill of health for a body nobody examined.
             guard !results.isEmpty else {
-                return .skipped(reason: "doctor produced no check results")
+                return .skipped(reason: "no Doctor checks ran: none produced a result, or another Doctor run was in flight")
             }
             let dir = try await storage()
             // Two clocks, never one: `runAt` is when this file was written,

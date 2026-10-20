@@ -124,7 +124,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile { return [:] }
     }
     /// Said until a newer observation replaces it, not only while fresh.
-    public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted", "no_reply_by_deadline"].contains(observedStatus ?? "") }
+    public var sticky: Bool { brokenSince != nil || ["unverified", "interrupted", "stalled", "no_reply_by_deadline"].contains(observedStatus ?? "") }
     public var current: Bool { presenceStatus != nil || sticky || Date().timeIntervalSince(checkedAt) < 600 }
     public var word: String? {
         guard current else { return nil }
@@ -141,7 +141,7 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
     /// not: the next send proves it again.
     public var isBroken: Bool { problem != nil && ["broken", "signed_out", "unavailable"].contains(observedStatus ?? availability) }
     /// Presence words, overlaid live at every read: a state, never a problem.
-    public static let presenceStatuses: Set<String> = ["recent_activity", "waiting", "inbound_only"]
+    public static let presenceStatuses: Set<String> = ["recent_activity", "waiting", "inbound_only", "live"]
     public var problem: String? {
         current && !(["ready", "installed", "live", "unchecked"] + Self.presenceStatuses).contains(observedStatus ?? availability)
             ? observedDetail + (repairDetail.map { " " + $0 } ?? "") : nil

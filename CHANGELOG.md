@@ -4,6 +4,16 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.9 — the first night (2026-10-20)
+
+- An outside agent's message steers exactly the turn that acts on it: their history, an unread message on Home and a card carried from another turn never steer a new turn, so one reply from an untrusted agent no longer puts a card in front of everything they do afterwards; a trusted agent never steers
+- Their conversations with connected agents open from them side (a read is refused only by an error or a gate, never because nothing was sent); agent actions take `contact`, `to` and `message` by their natural names; a reply that ended without an answer is stalled, not broken, and no longer holds the next message
+- A message to Claude Desktop or Claude Code is held for that host's next call and handed over once, never refused; `agent_reply` can wait for the reply; the host's tools say where their messages are
+- Connecting an agent replaces a stale entry another install of this app left in that agent's settings (with a backup beside the file) instead of refusing it
+- Opening a Settings pane or a link never needs Accessibility; the Mac Integration page shows Accessibility, Screen Recording, Full Disk Access and Automation live, each with its one card; a request addressed to you is a question, never a card in front of a card; Spotlight answers within four seconds, scoped to your home and app folders
+- Doctor runs once per launch, off their turn's path, and its page reads the report; the Personality page shows their name
+- The transcript keeps following their reply when you press a card; multi-part replies join with one blank line; an approval receipt says who approved it in words ("you, in the Mac app, 18:22"); they says what changed since their last reply instead of restating the whole status
+
 ## 0.6.8 — the body reports, they decides (2026-10-19)
 
 - Their turn has one exit, the model finishing: a slow provider start no longer cuts it (a live wire is a provider thinking; only a wire with nothing on it is bounded by the learned deadline), a provider cut where nothing ran is their next call, a spent helper budget, a blocking card, a full context, a failed compaction or a stream a door stopped listening to all reach their as receipts they answers, never as app-written endings; their words beside a card, the card still gating the effect

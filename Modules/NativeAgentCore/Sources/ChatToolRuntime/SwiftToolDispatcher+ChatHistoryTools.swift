@@ -869,15 +869,6 @@ extension SwiftToolDispatcher {
         return envelope?.verifiedUserId ?? "unknown"
     }
 
-    /// Latch only selected, returned excerpts, never rows scanned for ranking.
-    package static func consumeRenderedToolReceipt(_ text: String) {
-        let receipt = text.range(of: " [context.expand history:", options: .backwards)
-            .map { String(text[..<$0.lowerBound]) } ?? text
-        if let evidence = try? JSONValue.parse(Data(receipt.utf8)) {
-            consumePersistedHistoryEvidence(evidence)
-        }
-    }
-
     package static func consumePersistedHistoryEvidence(_ value: JSONValue) {
         switch value {
         case .object(let fields):

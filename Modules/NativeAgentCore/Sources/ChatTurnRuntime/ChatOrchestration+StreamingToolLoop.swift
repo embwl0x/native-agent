@@ -289,7 +289,8 @@ extension SwiftNativeTurnEngine {
             let replay = SessionHistoryMessageProjection.project(messages: [user] + receipts,
                 historyLimit: max(1, receipts.count + 1), windowTokens: turnWindowTokens)
             visibleText = restarted.keptProse
-            turnInterstitialProse = String(restarted.keptProse.prefix(restarted.workingCommentaryCharacters))
+            // Held in joined shape, as a live one is, so its count is the offset.
+            turnInterstitialProse = Self.joinedProse(String(restarted.keptProse.prefix(restarted.workingCommentaryCharacters)), "")
             retainedAnswerProse = String(restarted.keptProse.dropFirst(restarted.workingCommentaryCharacters))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !restarted.workingNotes.isEmpty { conversation.append(.assistantText(restarted.workingNotes)) }
@@ -790,10 +791,15 @@ extension SwiftNativeTurnEngine {
     }
 
     /// 2026-09-22: each round's narration and the answer were concatenated
-    /// bare ("worth it.Exactly."). A blank line keeps them apart; the
-    /// commentary offset lands before the separator, which the fold trims.
+    /// bare ("worth it.Exactly."). A blank line keeps them apart, and exactly
+    /// one: parts that already ended or began with newlines were stored with
+    /// runs of five (0.6.8). The seam's whitespace and the end's are dropped,
+    /// so a joined head never ends in whitespace and the commentary offset
+    /// (`turnInterstitialProse.count`) lands on the separator, which the fold
+    /// trims.
     nonisolated static func joinedProse(_ head: String, _ tail: String) -> String {
-        let blank = { (text: String) in text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        return blank(head) || blank(tail) ? head + tail : head + "\n\n" + tail
+        let head = String(head[..<(head.lastIndex { !$0.isWhitespace }.map(head.index(after:)) ?? head.startIndex)])
+        let tail = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+        return head.isEmpty || tail.isEmpty ? head + tail : head + "\n\n" + tail
     }
 }

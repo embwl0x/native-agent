@@ -44,7 +44,6 @@ package enum AgentWorkspaceArrivals {
         var from: String? = nil
         var status: String? = nil
         var peer: String? = nil
-        var dataRoot: URL? = nil
     }
     struct Notice: Sendable {
         let id: String
@@ -57,15 +56,11 @@ package enum AgentWorkspaceArrivals {
         var from: String? = nil
         var status: String? = nil
         var peer: String? = nil
-        var dataRoot: URL? = nil
         var announced = false
         var value: JSONValue {
-            // Baseline collection never consumes peer content. Actual display
-            // does, using the current owner's elevation rather than cached trust.
-            if preview != nil, let peer, let dataRoot,
-               (try? AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot).first { "peer:" + $0.id == peer }?.elevationAllowed) != true {
-                AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
-            }
+            // An arrival's preview in her world is context, labelled untrusted
+            // with its source; it steers nothing. Opening the message is the
+            // read, and that read latches (the conversation session does it).
             var result: [String: JSONValue] = ["title": .string(String(title.prefix(120))),
                 "kind": .string(kind.rawValue), "attention_needed": .bool(kind.priority == 0),
                 "detail": .string(kind.detail), "open": .object(["tool": .string("app"), "input": .object(["item": .string(id)])])]
@@ -117,7 +112,7 @@ package enum AgentWorkspaceArrivals {
                 pending.removeAll { $0.source == item.source && ($0.kind == kind || $0.kind.priority > 0) }
                 pending.append(.init(id: "wa-" + UUID().uuidString.lowercased(), source: item.source,
                     revision: item.revision, title: item.title, kind: kind, location: item.location,
-                    preview: item.preview, from: item.from, status: item.status, peer: item.peer, dataRoot: item.dataRoot))
+                    preview: item.preview, from: item.from, status: item.status, peer: item.peer))
             }
             if baselines.count > 768 {
                 let current = Set(candidates.map(\.source)).union(pending.map(\.source))
@@ -199,7 +194,7 @@ package enum AgentWorkspaceArrivals {
                 eventID: row.agent.hasPrefix("bot:") ? helperEvent(
                     bot: String(row.agent.dropFirst(4)), entry: text(receipt["entry_id"] ?? receipt["message_id"])) : nil,
                 preview: receiptPreview(receipt, kind: kind), from: row.name, status: status,
-                peer: row.agent.hasPrefix("peer:") ? row.agent : nil, dataRoot: dataRoot)
+                peer: row.agent.hasPrefix("peer:") ? row.agent : nil)
         }
     }
 

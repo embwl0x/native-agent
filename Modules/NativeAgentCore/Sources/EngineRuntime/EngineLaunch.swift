@@ -58,7 +58,7 @@ public protocol EngineBackgroundWorkHost: Sendable {
     var backupHost: TrustBackupHost { get }
     func postMacNotification(title: String, body: String, userInfo: [String: String], soundName: String?) async -> NativeAgentNotificationPostResult
     func notifyIfAttentionWorthy(dataRoot: URL, itemId: String, title: String, summary: String, source: String, severity: String) async
-    func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult]
+    func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> DoctorReport
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String)
     func makeCompletionSender(dataRoot: URL, silentTelegram: Bool, requestedResultDeliveryID: String?, authorizeTelegramReply: @escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending
     var speechPermission: SpeechPermissionSnapshot { get }
@@ -589,8 +589,9 @@ extension NativeAgentEngine {
         // Prime GitHub before refresh can publish, then start reply journal
         // owners before the checkpoint sweep hands resumed answers to them.
         await github.replayResidentStateAtLaunch()
-        let loops = await makeLoops()
-        await BackgroundLoopsManager.shared.start(loops: loops)
+        // The one start path: failure notices wired, and the startup Doctor
+        // pass that gives a relaunch its report.
+        await startBackgroundLoops(loops: await makeLoops())
         await AbandonedTurnReconciliationHook.arm(completedTurnNotification: .chatTurnCompleted,
             inFlight: { Set(ChatCancelFlag.inFlightTurns(dataRoot: dataRoot).map(\.turnId)) },
             resume: resume)
@@ -1283,7 +1284,25 @@ extension EngineBackgroundWorkPort: MaintenanceBackgroundWorkPort {
     }
 
     func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult] {
-        try await NativeAgentEngine.live.ports.backgroundWork.runAutoDoctor(checks: checks, dataRoot: dataRoot)
+        // An automatic run (launch, first turn, the weekly sweep) takes the
+        // same lifecycle as Run: admitted only when no run is in flight, and
+        // its report is the one the Doctor page and the pill read, so a
+        // relaunch is never left at "no report" while one ran.
+        let doctor = NativeAgentEngine.live.doctor
+        let owned = doctor.dataRoot == dataRoot
+        if owned, !(await doctor.admitRun()) { return [] }
+        do {
+            let report = try await NativeAgentEngine.live.ports.backgroundWork.runAutoDoctor(checks: checks, dataRoot: dataRoot)
+            if owned {
+                let rows = await DoctorStatusProjection.repairProjection(report.checks, dataRoot: dataRoot)
+                await doctor.finishRun(DoctorReport(status: DoctorStatusProjection.doctorRollup(rows.map(\.status)),
+                                                    repaired: report.repaired, checks: rows))
+            }
+            return report.checks
+        } catch {
+            if owned { await doctor.finishRun(nil) }
+            throw error
+        }
     }
 
     func routeDoctorAsk(eventID: String, title: String, detail: String) async throws {

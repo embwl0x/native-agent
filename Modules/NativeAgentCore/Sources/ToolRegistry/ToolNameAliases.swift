@@ -224,6 +224,7 @@ public enum ToolNameAliases {
         "slack_search_messages": ["count": "limit"],
     ]
 
+    private static let whom = ["contact": "agent", "to": "agent"]
     private static let argAliases: [String: [String: String]] = [
         // A reader that searches takes `find`; `query` is what the others call it.
         "*": ["max_rows": "max_nodes", "max_results": "limit", "query": "find"],
@@ -233,7 +234,11 @@ public enum ToolNameAliases {
         "skill.save": ["code": "script.source"],
         "skill.validate": ["fixtures": "input"],
         "skill.enable": ["digest": "version"],
-        "agent.read": ["id": "message_id"],
+        // Fresh install 10-19: message for text ×4, contact for agent ×2, each a
+        // refused round. Who and what run by their natural names.
+        "agent.message": whom.merging(["message": "text"]) { $1 },
+        "agent.read": whom.merging(["id": "message_id"]) { $1 }, "agent.cancel": whom, "agent.verify": whom,
+        "agent.rename": whom, "agent.connect": whom, "agent.jobs": whom,
         // 10-17, Agent: "mac.go wants name, not app; shell.bash wants cmd, not command".
         "mac.go": ["app": "name"], "shell.run": ["command": "cmd"], "shell.bash": ["command": "cmd"],
         "x.search": ["max_results": "limit"], "x.timeline": ["max_results": "limit"], "x.user_tweets": ["max_results": "limit"],

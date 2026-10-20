@@ -400,20 +400,10 @@ extension AppModel {
         // Block concurrent invocations — clicking Run while a run is in
         // flight should be a no-op, not a queued duplicate.
         let doctor = engine.doctor
-        guard !doctor.isRunning else {
+        guard doctor.admitRun() else {
             return .unavailable("Health checks are already running.")
         }
-        doctor.isRunning = true
-        doctor.runStartedAt = Date()
-        // gpt-5.5 review (B2 wave): invalidate the snapshot-reuse freshness
-        // stamp for the whole run — Support Snapshot must never reuse a report
-        // from BEFORE an in-flight run (the stamp re-lands on success only).
-        doctor.reportCompletedAt = nil
         statusText = repair ? "Running repair…" : "Running health checks…"
-        defer {
-            doctor.isRunning = false
-            doctor.runStartedAt = nil
-        }
         do {
             var report = try await AppDoctorPort(dataRoot: engine.dataRoot, backgroundLoopsManager: backgroundLoopsManager)
                 .runtime.runDoctor(repair: repair, repairScope: repairScope, checkID: checkID)
@@ -430,8 +420,7 @@ extension AppModel {
             report.repaired = report.repaired || status.repaired
             report.checks = await DoctorStatusProjection.repairProjection(report.checks, dataRoot: engine.dataRoot)
             report.status = DoctorStatusProjection.doctorRollup(report.checks.map(\.status))
-            doctor.report = report
-            doctor.reportCompletedAt = Date()
+            doctor.finishRun(report)
             statusText = repair
                 ? DoctorFacade.repairCompletionMessage(report: report)
                 : "Health checks finished"
@@ -441,6 +430,7 @@ extension AppModel {
             }
             return .completed(status: report.status, failingChecks: failing)
         } catch {
+            doctor.finishRun(nil)
             setFailureStatus(error, action: "run the health checks")
             return .unavailable(statusText)
         }

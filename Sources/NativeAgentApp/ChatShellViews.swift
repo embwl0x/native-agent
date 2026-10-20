@@ -202,6 +202,7 @@ struct ChatActivityRow<Leading: View, Detail: View>: View {
     @ViewBuilder var leading: () -> Leading
     @ViewBuilder var detail: () -> Detail
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.readingPlace) private var readingPlace
 
     /// Where opened detail starts: past the chevron and its gap.
     static var indent: CGFloat { 18 }
@@ -209,6 +210,7 @@ struct ChatActivityRow<Leading: View, Detail: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
+                if !isExpanded { readingPlace?.opening() }
                 withAnimation(NativeAgentMotion.respecting(
                     NativeAgentMotion.arrive, reduceMotion: reduceMotion
                 )) { isExpanded.toggle() }

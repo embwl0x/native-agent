@@ -276,10 +276,11 @@ extension SwiftNativeChatOrchestrationClient {
                 personTurn: ChatPersistenceContext.originPrincipal == "person", at: admittedAt)
                 .filter { ChatToolSessionContext.envelope?.workIdentity != "carry." + $0.item.handle } } ?? []
         } else { carried = [] }
-        let taint = carried.isEmpty ? PeerDataTaint.current : PeerDataTaint(
-            restoring: (PeerDataTaint.current?.checkpointSources ?? []) + carried.flatMap { $0.step.peers },
-            elevated: (PeerDataTaint.current?.elevatedSources ?? []) + carried.flatMap { $0.step.elevated })
-        taint?.keep(line: carried.filter(\.peerBorn).map { $0.step.words }.joined(separator: "\n"))
+        // Carried queue items are context for this turn, not a read of their
+        // agents' words: an item's steer stays on the item and applies when the
+        // person's decision resumes that work (`ApprovalTransactionCoordinator`),
+        // never to the whole of an unrelated turn (User 10-19).
+        let taint = PeerDataTaint.current
         func executeCarriedTurn() async throws -> StructuredChatExecution {
         let outputMilestoneGate = TurnLifecycleFirstOutputGate()
         // #19 + B7: derive the per-session cancel flag AT TURN ACCEPT, keyed by

@@ -82,8 +82,7 @@ public enum SessionHistoryPromptRenderer {
         middleCandidates: [Renderable],
         userMessage: String,
         historyLimit: Int,
-        windowTokens: Int?,
-        consumeToolReceipt: ((String) -> Void)? = nil
+        windowTokens: Int?
     ) -> String? {
         let cappedLimit = max(0, historyLimit)
         guard cappedLimit > 0 else { return nil }
@@ -98,8 +97,7 @@ public enum SessionHistoryPromptRenderer {
             promptRenderables: renderables,
             candidates: middleCandidates,
             historyLimit: cappedLimit,
-            windowTokens: windowTokens,
-            consumeToolReceipt: consumeToolReceipt
+            windowTokens: windowTokens
         )
         if let middle = middleSnippet {
             sections.append(middle)
@@ -171,16 +169,14 @@ public enum SessionHistoryPromptRenderer {
         promptRenderables: [Renderable],
         candidates: [Renderable],
         historyLimit: Int,
-        windowTokens: Int?,
-        consumeToolReceipt: ((String) -> Void)?
+        windowTokens: Int?
     ) -> String? {
         relevantEarlierSessionSnippets(
             userMessage: userMessage,
             promptRenderables: promptRenderables,
             candidates: candidates,
             historyLimit: historyLimit,
-            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens),
-            consumeToolReceipt: consumeToolReceipt
+            budget: ContextBudgetPolicy.resolve(windowTokens: windowTokens)
         )
     }
 
@@ -267,8 +263,7 @@ public enum SessionHistoryPromptRenderer {
         promptRenderables: [Renderable],
         candidates: [Renderable],
         historyLimit: Int,
-        budget: Budget,
-        consumeToolReceipt: ((String) -> Void)?
+        budget: Budget
     ) -> String? {
         guard budget.relevantChars > 0, !candidates.isEmpty else { return nil }
         let query = middleSearchQuery(userMessage: userMessage, renderables: promptRenderables)
@@ -333,7 +328,6 @@ public enum SessionHistoryPromptRenderer {
             let line = "[\(hit.message.role)] \(cap(hit.message.displayContent, capValue))"
             let projected = used + line.count + 1
             if added > 0 && projected > budget.relevantChars { break }
-            if hit.message.isTool { consumeToolReceipt?(hit.message.content) }
             lines.append(line)
             used = projected
             added += 1

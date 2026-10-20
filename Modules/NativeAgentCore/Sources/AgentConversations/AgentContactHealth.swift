@@ -32,12 +32,32 @@ public actor AgentContactHealth {
             if health[key] == nil { health[key] = AgentLocalHealth(status: "unchecked", detail: "", checkedAt: .distantPast, authenticated: false) }
             health[key]?.present(bridge)
         }
-        for peer in peers where ChatGPTDotIPCTransport.owns(peer) {
+        for peer in peers {
+            guard let presence = ChatGPTDotIPCTransport.owns(peer) ? dotPresence() : checkIn(peer) else { continue }
             let key = "peer:" + peer.id
             if health[key] == nil { health[key] = AgentLocalHealth(status: "unchecked", detail: "", checkedAt: .distantPast, authenticated: false) }
-            health[key]?.present(dotPresence())
+            health[key]?.present(presence)
         }
         return health
+    }
+
+    /// A door its host pulls from (an MCP host with no command line): her
+    /// messages wait in the conversation and go out in the result of the host's
+    /// next call through its entry. Live while it called in within 30 minutes.
+    /// Nil for every other contact.
+    public nonisolated static func checkIn(_ peer: AgentPeerContact) -> AgentLocalHealth? {
+        guard peer.transport == .mcpHost, !ChatGPTDotIPCTransport.owns(peer),
+              AgentPeerStore.hostRowID(peer.endpoint).flatMap(AgentHostDirectory.row(named:))?.commandLine == nil else { return nil }
+        let at = peer.provenInboundAt.flatMap { ISO8601DateFormatter().date(from: $0) }
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        guard let at, Date().timeIntervalSince(at) < 1800 else {
+            return AgentLocalHealth(status: "waiting", detail: "Messages wait for \(peer.name)'s next check-in"
+                + (at.map { " (last call \(ISO8601DateFormatter().string(from: $0)))" } ?? " (it has not called in yet)")
+                + "; they go out in the result of its next call.", checkedAt: at ?? .distantPast, authenticated: false)
+        }
+        return AgentLocalHealth(status: "live", detail: "Live: \(peer.name) called in at \(clock.string(from: at)); a message goes out in the result of its next call.",
+                                checkedAt: at, authenticated: false)
     }
 
     private nonisolated static func claudePresence(inbox: URL) -> AgentLocalHealth {
@@ -229,15 +249,24 @@ public actor AgentContactHealth {
                 guard row.stop == nil, case .object(var receipt)? = row.receipt else { return nil }
                 guard row.phase == "attention", !AgentConversationSession.awaitingApproval(row) else { return nil }
                 if case .array(let jobs)? = receipt["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { receipt = job }
-                return receipt["error"] != nil || receipt["execution_error"] != nil
-                    || ["failed", "unavailable", "outcome_unknown"].contains(
-                        receipt["status"].flatMap { if case .string(let s) = $0 { s } else { nil } } ?? "") ? (row, row.updatedAt) : nil
+                let status = receipt["status"].flatMap { if case .string(let s) = $0 { s } else { nil } } ?? ""
+                return receipt["error"] != nil || receipt["execution_error"] != nil || ["failed", "unavailable"].contains(status)
+                    || status == "outcome_unknown" && receipt["sent"] == .bool(false) ? (row, row.updatedAt) : nil
             }.filter { (good ?? .distantPast) < $0.1 }.min { $0.1 < $1.1 }
             // Our own relaunch cut the last send off: not broken, nothing to repair.
             let interrupted = newest.flatMap { row -> Date? in
                 guard row.stop == nil, row.phase == "attention", case .object(let receipt)? = row.receipt,
                       receipt["status"] == .string("interrupted"), (good ?? .distantPast) < row.updatedAt else { return nil }
                 return row.updatedAt
+            }
+            // A message that went and whose reply ended with its outcome unknown
+            // stalled; the send path did not fail (Hermes 10-19: called broken,
+            // its next message went fine).
+            let stalled = newest.flatMap { row -> Date? in
+                guard row.stop == nil, row.phase == "attention", case .object(let receipt)? = row.receipt,
+                      receipt["status"] == .string("outcome_unknown"), receipt["sent"] != .bool(false) else { return nil }
+                let at = row.exchanges?.last { $0.id == row.operationID }?.settledAt ?? row.updatedAt
+                return (good ?? .distantPast) < at ? at : nil
             }
             let operation = failure?.0.operationID ?? (expired == nil ? nil : newest?.operationID)
             let fractional = ISO8601DateFormatter()
@@ -273,9 +302,10 @@ public actor AgentContactHealth {
                 || (peer?.transport == .desktopChat && proof != nil && (proof?.appVersion == nil || appVersion == nil))
                 || (peer?.appBundleIDs.isEmpty == false && proof?.appVersion.map { $0 != appVersion } == true)
             // An inbound-only contact has no outbound path: no broken, expired, interrupted or unverified send.
-            if !inboundOnly, broken != nil || expired != nil || interrupted != nil || unverified {
+            if !inboundOnly, broken != nil || expired != nil || interrupted != nil || stalled != nil || unverified {
                 var observed = previous[agent] ?? AgentLocalHealth(status: "broken", detail: "", checkedAt: Date(), authenticated: false)
-                observed.status = broken != nil ? "broken" : expired != nil ? "no_reply_by_deadline" : interrupted != nil ? "interrupted" : "unverified"
+                observed.status = broken != nil ? "broken" : expired != nil ? "no_reply_by_deadline" : interrupted != nil ? "interrupted"
+                    : stalled != nil ? "stalled" : "unverified"
                 observed.brokenSince = broken
                 observed.lastGoodAt = good
                 observed.failureOperation = operation
@@ -289,14 +319,16 @@ public actor AgentContactHealth {
                     "Reply path broken since \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Open Connect for \(peer?.name ?? agent) and verify its reply path; do not resend the message."
                 } ?? expired.map {
                     "No reply by the deadline \(iso.string(from: $0)); last good \(good.map(iso.string) ?? "never"). Open Connect for \(peer?.name ?? agent) and verify its reply path; do not resend the message."
-                } ?? interrupted.map { at in
+                } ?? (interrupted ?? stalled).map { at in
                     let clock = DateFormatter()
                     clock.dateFormat = "HH:mm"
-                    return "Last send to \(peer?.name ?? agent) was interrupted by a relaunch at \(clock.string(from: at)); the next message proves the path."
+                    return interrupted != nil
+                        ? "Last send to \(peer?.name ?? agent) was interrupted by a relaunch at \(clock.string(from: at)); the next message proves the path."
+                        : "A reply stalled at \(clock.string(from: at)) with its outcome unknown; the next message to \(peer?.name ?? agent) proves the path."
                 } ?? "Unverified since " + (recipeChanged ? "the recipe changed"
                     : programChanged ? "\(peer?.name ?? agent) updated to \(programShown ?? "")"
                     : appVersion.map { "\(peer?.name ?? agent) updated to \($0)" } ?? "\(peer?.name ?? agent)'s app could not be found")
-                if ["interrupted", "unverified"].contains(observed.status) {
+                if ["interrupted", "stalled", "unverified"].contains(observed.status) {
                     observed.repairFor = nil
                     observed.repairDetail = nil
                 } else if let reason = operation ?? broken.map(iso.string), observed.repairFor != reason,

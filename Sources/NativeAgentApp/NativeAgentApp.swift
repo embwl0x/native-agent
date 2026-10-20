@@ -199,9 +199,9 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
             source: source, severity: severity)
     }
 
-    func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult] {
+    func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> DoctorReport {
         try await AppDoctorPort(dataRoot: dataRoot).runtime.runDoctor(
-            repair: true, repairScope: .automatic, checks: checks).checks
+            repair: true, repairScope: .automatic, checks: checks)
     }
 
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String) {

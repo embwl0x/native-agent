@@ -657,12 +657,34 @@ extension SwiftNativeMacControl {
         }
         let limit = max(1, min(Self.intValue(body, "limit") ?? 10, 200))
         let started = now()
-        let result = try await processAdapter.run(
-            executable: "/usr/bin/mdfind",
-            arguments: [query],
-            timeoutSeconds: 10
-        )
-        let lines = result.stdout
+        // Her files and the Mac's apps, never the whole disk: unscoped, one
+        // query took 10 s and timed out, then 15 s (fresh install, 10-19).
+        let roots = [NSHomeDirectory(), "/Applications", "/System/Applications"]
+        let scopes = roots.flatMap { ["-onlyin", $0] }
+        // Words with no Spotlight syntax are almost always a name: asked as a
+        // filename first, and as free words only when no name matches.
+        let nameLike = query.rangeOfCharacter(from: CharacterSet(charactersIn: "=<>*\"&|()")) == nil && !query.contains("kMD")
+        // What arrived within the budget is the answer, marked partial, with
+        // the lever that narrows it; a slow index never turns into an error.
+        let budget: TimeInterval = 4
+        func search(_ arguments: [String]) async throws -> ProcessRunResult {
+            try await processAdapter.run(executable: "/usr/bin/mdfind", arguments: scopes + arguments, currentDirectory: nil,
+                                         environment: nil, standardInput: nil,
+                                         timeoutSeconds: budget - now().timeIntervalSince(started))
+        }
+        var result = try await search(nameLike ? ["-name", query] : [query])
+        var matched = nameLike ? "name" : "query"
+        if nameLike, !result.timedOut, result.exitCode == 0,
+           result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           now().timeIntervalSince(started) < budget {
+            result = try await search([query])
+            matched = "query"
+        }
+        let partial = result.timedOut
+        // A stopped search can end mid-line: only whole lines are paths.
+        let whole = partial && !result.stdout.hasSuffix("\n")
+            ? String(result.stdout[..<(result.stdout.lastIndex(of: "\n") ?? result.stdout.startIndex)]) : result.stdout
+        let lines = whole
             .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
             .map(String.init)
             .filter { !$0.isEmpty }
@@ -678,21 +700,26 @@ extension SwiftNativeMacControl {
                 "modified_at": dates?.contentModificationDate.map { .string(iso.string(from: $0)) } ?? .null,
                 "added_at": dates?.addedToDirectoryDate.map { .string(iso.string(from: $0)) } ?? .null])
         }
+        var output: [String: JSONValue] = [
+            "query": .string(query),
+            "matched_by": .string(matched),
+            "searched": .array(roots.map(JSONValue.string)),
+            "results": .array(lines.map { .string($0) }),
+            "files": .array(files),
+            "count": .int(Int64(lines.count)),
+            "partial": .bool(partial),
+            "stdout_truncated": .bool(result.stdoutTruncated),
+            "stderr_truncated": .bool(result.stderrTruncated),
+        ]
+        if partial {
+            output["lever"] = .string("Spotlight was still searching at \(Int(budget)) s; these are the matches so far. "
+                + "Ask again with more of the name, or list the folder it lives in with files.list {path}.")
+        }
         return MacControlResult(
-            ok: result.exitCode == 0 && !result.timedOut,
+            ok: partial || result.exitCode == 0,
             action: "spotlight",
-            output: .object([
-                "query": .string(query),
-                "results": .array(lines.map { .string($0) }),
-                "files": .array(files),
-                "count": .int(Int64(lines.count)),
-                "timed_out": .bool(result.timedOut),
-                "stdout_truncated": .bool(result.stdoutTruncated),
-                "stderr_truncated": .bool(result.stderrTruncated),
-            ]),
-            error: result.timedOut
-                ? "spotlight timed out"
-                : (result.exitCode == 0 ? nil : "mdfind exit \(result.exitCode) stderr=\(result.stderr.prefix(200))"),
+            output: .object(output),
+            error: partial || result.exitCode == 0 ? nil : "mdfind exit \(result.exitCode) stderr=\(result.stderr.prefix(200))",
             durationMs: durationMs
         )
     }

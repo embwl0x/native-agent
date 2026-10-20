@@ -1319,6 +1319,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
         // than as a failure. These status strings round-trip: each one classifies
         // back to the same ExactResultClass it came from.
         var envelope: [String: JSONValue] = ["detail": .string(prose)]
+        if let approvedBy = rec.approvedBy { envelope["approved_by"] = .string(approvedBy) }
         if case .object(let execution) = executedAction,
            let notRun = execution["not_run_status"] {
             envelope["not_run_status"] = notRun
@@ -1364,7 +1365,7 @@ public struct ApprovalTransactionCoordinator: Sendable {
             let legacyStartedAt = try await inbox.writeChatReceipt(
                 approvalID: rec.id, sessionID: safeSessionID, toolName: replay.toolName,
                 surface: replay.surface, summary: summary, resultClass: resultClass.rawValue,
-                ok: ok, resultPreview: resultPreview,
+                resultStatus: Self.jsonString(executedAction, "resultStatus"), ok: ok, resultPreview: resultPreview,
                 returnedID: Self.jsonString(executedAction, "returned_id"),
                 effects: Self.jsonString(executedAction, "effects"),
                 recoveredAt: continueConversation ? nil : (rec.resolvedAt ?? rec.createdAt))
@@ -1465,6 +1466,10 @@ public struct ApprovalTransactionCoordinator: Sendable {
             "resultClass": .string(resultClass.rawValue),
             "resultPreview": .string(preview),
         ]
+        // The word the result itself recorded, never one made up here: the
+        // replayed row keeps it as any tool row does, and omits it when the
+        // result had none (a nested "queued" stays visible in the body).
+        if let recorded = Self.jsonString(result, "status") { action["resultStatus"] = .string(recorded) }
         if let returnedID { action["returned_id"] = .string(returnedID) }
         if let resultEffects { action["effects"] = .string(resultEffects) }
         if toolName == "agent_connect" || toolName == "agent_message" {

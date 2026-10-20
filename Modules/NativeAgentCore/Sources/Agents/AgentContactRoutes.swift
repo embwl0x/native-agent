@@ -154,7 +154,29 @@ public struct AgentContactRoutes: Sendable {
                 BridgeCore.writeJSON(conn, status: rejection, obj: ["error": "unsupported_mcp_transport_headers"])
                 return
             }
-            switch NativeAgentMCPWire.parse(body, defaultSession: principal.conversationID(protocolName: "mcp")) {
+            // Her messages held for this host (it has no command line): a tool
+            // call takes a bounded batch in one step, and its response settles
+            // them: delivered once written, held again if it was not.
+            let conversations = AgentConversationStore(dataRoot: dataRoot)
+            let request = try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+            let tool = request?["method"] as? String == "tools/call" ? (request?["params"] as? [String: Any])?["name"] as? String : nil
+            let session = principal.conversationID(protocolName: "mcp") ?? ""
+            let stamp = ISO8601DateFormatter()
+            func wire(_ item: AgentConversationStore.Held) -> [String: String] {
+                ["at": stamp.string(from: item.at), "text": item.text, "conversation_id": item.conversation ?? session]
+            }
+            let held: (taken: [AgentConversationStore.Held], remaining: Int) = tool.flatMap { _ in principal.peerID.flatMap { peer in
+                try? conversations.takeHeld(agent: "peer:" + peer) { NativeAgentMCPWire.heldFits($0.map(wire)) }
+            } } ?? ([], 0)
+            let taken = held.taken
+            let settle: @Sendable (Bool) -> Void = { written in
+                guard !taken.isEmpty else { return }
+                let name = (try? AgentPeerStore(dataRoot: dataRoot).list())?.first { $0.id == principal.peerID }?.name ?? "the host"
+                do { try conversations.settleHeld(taken, written: written, to: name, via: tool ?? "MCP") }
+                catch { nativeLog("AgentContactRoutes: held messages were not settled (they stay delivering until the next launch): %@", error.localizedDescription) }
+            }
+            switch NativeAgentMCPWire.parse(body, defaultSession: principal.conversationID(protocolName: "mcp"),
+                                            held: (taken.map(wire), held.remaining)) {
             case .message(let message, let project):
                 // SSE only to a relay that says it reads it: relays spawned before
                 // this change advertise text/event-stream but accept only JSON.
@@ -167,16 +189,21 @@ public struct AgentContactRoutes: Sendable {
                                                     // The message, not the JSON-RPC envelope: a retry under
                                                     // the same request_id carries a new JSON-RPC id.
                                                     requestBody: message),
-                              responseProjection: project, mcpWait: mcpWait)
-            case .reply(let request, let session, let offset, let project):
+                              responseProjection: project, mcpWait: mcpWait, settle: settle)
+            case .reply(let request, let session, let offset, let waitSeconds, let project):
                 Task {
                     let tasks = self.tasks()
                     let receipt = await peerReplyReceipt(requestID: request, sessionID: session,
-                        offset: offset, principal: principal, tasks: tasks)
-                    BridgeCore.writeJSON(conn, status: 200, obj: project(receipt), onSent: Self.fetched(receipt, principal: principal, tasks: tasks))
+                        offset: offset, waitSeconds: waitSeconds, principal: principal, tasks: tasks)
+                    let fetched = Self.fetched(receipt, principal: principal, tasks: tasks)
+                    BridgeCore.writeJSON(conn, status: 200, obj: project(receipt), onSent: { fetched?(); settle(true) },
+                                         onFailed: { settle(false) })
                 }
-            case .immediate(let status, let response): BridgeCore.writeJSON(conn, status: status, obj: response)
+            case .immediate(let status, let response):
+                settle(false)
+                BridgeCore.writeJSON(conn, status: status, obj: response)
             case .acceptedNotification:
+                settle(false)
                 conn.send(content: Data("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
                           completion: .contentProcessed { _ in conn.cancel() })
             }
@@ -281,20 +308,36 @@ public struct AgentContactRoutes: Sendable {
          "authorship": "agent", "surface": "agent-bridge"]
     }
 
-    private func peerReplyReceipt(requestID: String, sessionID: String, offset: Int = 0,
-                                  maxChars: Int = 8000, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> [String: Any] {
+    private func peerReplyReceipt(requestID: String, sessionID: String, offset: Int = 0, maxChars: Int = 8000,
+                                  waitSeconds: Int = 0, principal: AgentBridgePrincipal, tasks: AgentContactTasks) async -> [String: Any] {
         let protocolSession = NativeAgentMCPWire.validSession(sessionID) || NativeAgentA2AWire.validContext(sessionID)
         let storedSession = protocolSession ? principal.storedConversation(sessionID) : sessionID
         guard storedSession.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)) else {
             return ["status": "invalid_request"]
         }
         let context = String(storedSession.dropFirst(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id).count))
-        if let task = try? await tasks.get("na3.\(context).\(requestID)", owner: principal.id) {
-            return Self.contactReply(task, requestID: requestID, sessionID: sessionID, offset: offset, maxChars: maxChars)
+        let taskID = "na3.\(context).\(requestID)"
+        // agent_reply's wait: back the moment the reply settles (its stream
+        // ends with it), or when the caller's bound passes, as agent_message waits.
+        // A wait that cannot watch the reply says why, never a silent immediate read.
+        var waitIgnored: String?
+        if waitSeconds > 0 {
+            do {
+                let events = try await tasks.subscribe(taskID, owner: principal.id)
+                await Self.untilSettled(seconds: waitSeconds) {
+                    for await event in events { if case .status(_, final: true) = event { return } }
+                }
+            } catch { waitIgnored = ((error as? AgentContactFailure)?.message ?? error.localizedDescription) + "; read as it is now." }
         }
-        var receipt = ClaudeBridgeMessageRuntime.agentReplyReceipt(requestID: requestID, sessionID: storedSession,
-            offset: offset, maxChars: maxChars, logURL: ClaudeBridgeMessageRuntime.messageReplyURL())
-        if receipt["session_id"] as? String == storedSession { receipt["session_id"] = sessionID }
+        var receipt: [String: Any]
+        if let task = try? await tasks.get(taskID, owner: principal.id) {
+            receipt = Self.contactReply(task, requestID: requestID, sessionID: sessionID, offset: offset, maxChars: maxChars)
+        } else {
+            receipt = ClaudeBridgeMessageRuntime.agentReplyReceipt(requestID: requestID, sessionID: storedSession,
+                offset: offset, maxChars: maxChars, logURL: ClaudeBridgeMessageRuntime.messageReplyURL())
+            if receipt["session_id"] as? String == storedSession { receipt["session_id"] = sessionID }
+        }
+        if let waitIgnored { receipt["wait_ignored"] = waitIgnored }
         return receipt
     }
 
@@ -312,10 +355,12 @@ public struct AgentContactRoutes: Sendable {
     private func handleContactMessage(conn: NWConnection, body: Data,
                                       tasks: AgentContactTasks, peer: PeerTurnContext,
                                       responseProjection: (@Sendable (Int, [String: Any]) -> [String: Any])? = nil,
-                                      mcpWait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?)? = nil) {
+                                      mcpWait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?)? = nil,
+                                      settle: (@Sendable (Bool) -> Void)? = nil) {
         func reply(_ status: Int, _ object: [String: Any]) {
             BridgeCore.writeJSON(conn, status: responseProjection == nil ? status : 200,
-                      obj: responseProjection?(status, object) ?? object)
+                      obj: responseProjection?(status, object) ?? object,
+                      onSent: { settle?(true) }, onFailed: { settle?(false) })
         }
         guard let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
               ClaudeBridgeMessageRuntime.validGenericAgentMessage(json), let text = json["text"] as? String else {
@@ -341,7 +386,7 @@ public struct AgentContactRoutes: Sendable {
                     "sessionId": session, "task_id": task.id]
                 guard let mcpWait, mcpWait.seconds > 0, let responseProjection else { reply(200, ack); return }
                 await Self.writeWaitedReply(conn: conn, ack: ack, taskID: task.id, requestID: request, sessionID: session,
-                    owner: principal.id, tasks: tasks, wait: mcpWait, project: responseProjection)
+                    owner: principal.id, tasks: tasks, wait: mcpWait, project: responseProjection, settle: settle)
             } catch {
                 reply(409, ["status": "rejected", "requestId": request, "sessionId": session,
                     "detail": (error as? AgentContactFailure)?.message ?? "The message could not be accepted. Work: outcome unknown."])
@@ -359,12 +404,15 @@ public struct AgentContactRoutes: Sendable {
     private static func writeWaitedReply(conn: NWConnection, ack: [String: Any], taskID: String, requestID: String,
                                          sessionID: String, owner: String, tasks: AgentContactTasks,
                                          wait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?),
-                                         project: @escaping @Sendable (Int, [String: Any]) -> [String: Any]) async {
+                                         project: @escaping @Sendable (Int, [String: Any]) -> [String: Any],
+                                         settle: (@Sendable (Bool) -> Void)?) async {
+        // Whatever ended the wait, held messages it carried that were not written stay held.
+        defer { settle?(false) }
         guard let ackData = try? JSONSerialization.data(withJSONObject: ack) else { conn.cancel(); return }
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
                 await writeWaitedReplyBody(conn: conn, ackData: ackData, taskID: taskID, requestID: requestID,
-                    sessionID: sessionID, owner: owner, tasks: tasks, wait: wait, project: project)
+                    sessionID: sessionID, owner: owner, tasks: tasks, wait: wait, project: project, settle: settle)
             }
             group.addTask {
                 // Bound all writes, with one second to send the result after the wait expires.
@@ -379,7 +427,8 @@ public struct AgentContactRoutes: Sendable {
     private static func writeWaitedReplyBody(conn: NWConnection, ackData: Data, taskID: String, requestID: String,
                                              sessionID: String, owner: String, tasks: AgentContactTasks,
                                              wait: (seconds: Int, progressToken: NativeAgentMCPWire.ID?),
-                                             project: @escaping @Sendable (Int, [String: Any]) -> [String: Any]) async {
+                                             project: @escaping @Sendable (Int, [String: Any]) -> [String: Any],
+                                             settle: (@Sendable (Bool) -> Void)?) async {
         guard let ack = try? JSONSerialization.jsonObject(with: ackData) as? [String: Any] else { return }
         @Sendable func send(_ data: Data) async -> Bool {
             let write = ContactStreamWrite()
@@ -405,27 +454,22 @@ public struct AgentContactRoutes: Sendable {
         }
         if let events = try? await tasks.subscribe(taskID, owner: owner) {
             let agent = PeerFacingIdentity.agentName
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    var step = 0, last = Date.distantPast
-                    for await event in events {
-                        let task: AgentContactTask
-                        switch event {
-                        case .status(let current, let final):
-                            if final { return }
-                            task = current
-                        case .snapshot(let current), .artifact(let current, _, _, _, _): task = current
-                        }
-                        guard let token, Date().timeIntervalSince(last) >= 0.5 else { continue }
-                        let message = task.state == .inputRequired ? (task.detail ?? "Waiting for the person")
-                            : task.text.isEmpty ? "\(agent) is working" : String(task.text.suffix(2000))
-                        last = Date(); step += 1
-                        guard await send(frame(NativeAgentMCPWire.progress(token, step: step, message: message))) else { return }
+            await untilSettled(seconds: wait.seconds) {
+                var step = 0, last = Date.distantPast
+                for await event in events {
+                    let task: AgentContactTask
+                    switch event {
+                    case .status(let current, let final):
+                        if final { return }
+                        task = current
+                    case .snapshot(let current), .artifact(let current, _, _, _, _): task = current
                     }
+                    guard let token, Date().timeIntervalSince(last) >= 0.5 else { continue }
+                    let message = task.state == .inputRequired ? (task.detail ?? "Waiting for the person")
+                        : task.text.isEmpty ? "\(agent) is working" : String(task.text.suffix(2000))
+                    last = Date(); step += 1
+                    guard await send(frame(NativeAgentMCPWire.progress(token, step: step, message: message))) else { return }
                 }
-                group.addTask { try? await Task.sleep(for: .seconds(wait.seconds)) }
-                await group.next()
-                group.cancelAll()
             }
         }
         var receipt = ack
@@ -444,7 +488,19 @@ public struct AgentContactRoutes: Sendable {
             data.append(body)
             sent = await send(data)
         }
+        settle?(sent)
         if sent, let fetchedTask { await tasks.recordReplyFetch(fetchedTask) }
+    }
+
+    /// The caller's wait on a reply (agent_message's, agent_reply's): `watch`
+    /// returns when the reply settles, or the caller's bound passes first.
+    private static func untilSettled(seconds: Int, _ watch: @escaping @Sendable () async -> Void) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await watch() }
+            group.addTask { try? await Task.sleep(for: .seconds(seconds)) }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     public static func contactReply(_ task: AgentContactTask, requestID: String, sessionID: String,

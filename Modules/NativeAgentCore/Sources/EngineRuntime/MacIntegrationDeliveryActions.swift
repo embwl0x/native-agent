@@ -279,8 +279,9 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
             auditAppendPath: auditPath
         )
         let result = try await impl.dispatch(action: "spotlight", body: input)
+        let partial = if case .object(let output) = result.output, output["partial"] == .bool(true) { true } else { false }
         var obj: [String: JSONValue] = [
-            "status": .string(result.ok ? "completed" : "failed"),
+            "status": .string(!result.ok ? "failed" : partial ? "partial" : "completed"),
             "action": .string(result.action),
             "ok": .bool(result.ok),
             "durationMs": .int(Int64(result.durationMs)),

@@ -209,8 +209,7 @@ extension SwiftNativeTurnEngine {
                 middleCandidates: preparedMiddle,
                 userMessage: queryMessage,
                 historyLimit: historyLimit,
-                windowTokens: historyWindowTokens,
-                consumeToolReceipt: SwiftToolDispatcher.consumeRenderedToolReceipt
+                windowTokens: historyWindowTokens
             )
         }
         var historyMessages: [LLMMessage] = []
@@ -291,11 +290,6 @@ extension SwiftNativeTurnEngine {
             }
             replayedRunIds = projected.replayedRunIds
             historyMessages = projected.messages
-            for message in historyMessages {
-                for case .text(let text) in message.content {
-                    SwiftToolDispatcher.consumeRenderedToolReceipt(text)
-                }
-            }
             historyMessageChars = projected.messages.reduce(0) { total, message in
                 total + message.content.reduce(0) {
                     if case .text(let text) = $1 { return $0 + text.count }
@@ -320,10 +314,11 @@ extension SwiftNativeTurnEngine {
         trace.setCount("budget.historyChars", historyBudget.historyChars)
         trace.setCount("budget.memoryBlockChars", historyBudget.memoryBlockChars)
         trace.setCount("budget.recallRowLimit", historyBudget.recallRowLimit)
+        // History is context, not a read this turn: an agent's words kept here are
+        // labelled untrusted for the model, and never steer the person's new turn.
+        // A steer lives for exactly the turn that read the words; a resumed turn
+        // restores its own (`ChatOrchestration+Continuation`).
         let receiptStrip = SessionHistoryPromptRenderer.recentReceiptStrip(from: prior)
-        if let receiptStrip, let evidence = try? JSONValue.parse(Data(receiptStrip.utf8)) {
-            SwiftToolDispatcher.consumePersistedHistoryEvidence(evidence)
-        }
         let historyParts = [renderedHistory, SessionHistoryPromptRenderer.worldRecord(from: prior), receiptStrip].compactMap { $0 }
         let historyBlock = historyParts.isEmpty ? nil : historyParts.joined(separator: "\n\n")
         trace.setCount("history.prompt.sourceBytes", priorStats.sourceBytes)

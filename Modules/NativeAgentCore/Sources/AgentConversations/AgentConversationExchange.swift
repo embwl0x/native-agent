@@ -3,7 +3,7 @@ import Foundation
 import PersistenceCore
 
 extension AgentConversationExchange {
-    static let textLimit = 8 * 1024
+    package static let textLimit = 8 * 1024
     static let byteLimit = 64 * 1024
     static let countLimit = 32
 
@@ -81,16 +81,19 @@ extension AgentConversationExchange {
     }
 
     static func bounded(_ history: [Self]) throws -> [Self] {
-        var result = Array(history.suffix(countLimit))
+        var result = history
         let encoder = JSONEncoder()
-        let sizes = try result.map { try encoder.encode($0).count }
+        var sizes = try result.map { try encoder.encode($0).count }
         var size = 2 + sizes.reduce(0, +) + max(0, sizes.count - 1)
-        var removed = 0
-        while size > byteLimit, result.count - removed > 1 {
-            size -= sizes[removed] + 1
-            removed += 1
+        // Oldest first, never a held message (or one being handed over): it is
+        // the only copy of what her contact has not yet taken (`takeHeld`).
+        while result.count > 1, result.count > countLimit || size > byteLimit {
+            guard let oldest = result.indices.dropLast().first(where: { !["held", "delivering"].contains(result[$0].status) }) else {
+                throw AgentConversationStore.Failure(message: "This conversation already keeps as many messages as it can hold for its contact's next check-in; nothing more was added. They go out when it next calls.")
+            }
+            size -= sizes.remove(at: oldest) + 1
+            result.remove(at: oldest)
         }
-        result.removeFirst(removed)
         // JSON escaping can exceed raw UTF-8 size. Preserve the newest exchange
         // with explicit clipping even for heavily escaped source text.
         while size > byteLimit, !result.isEmpty {

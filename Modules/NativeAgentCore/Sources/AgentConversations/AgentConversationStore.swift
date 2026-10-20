@@ -6,6 +6,7 @@ import PersistenceCore
 import ApprovalInbox
 import ChatTurnContracts
 import Experiences
+import TurnTrace
 
 
 
@@ -469,6 +470,105 @@ public struct AgentConversationStore: Sendable {
             ResidentWake.shared.request(dataRoot: root, reason: "what resolved", items: [.init(
                 id: "reply:" + exchange.id, line: row.name + " replied in \"" + String(row.label.prefix(60)) + "\"", thread: row.id,
                 session: row.scopeSessionID)])
+        }
+    }
+
+    /// One message of hers held for a contact that pulls (an MCP host with no
+    /// command line): it goes out in the result of that host's next call.
+    public struct Held: Sendable {
+        public let row: String
+        public let exchange: String
+        public let at: Date
+        public let text: String
+        public let conversation: String?
+    }
+
+    /// THE DRAIN, one serialized step: the held messages for `agent`, oldest
+    /// first, as many as `fits` allows, each marked delivering in the same
+    /// write, so no other call sees what this one took. `remaining` is how many
+    /// still wait. A claim from before this process (it quit mid-response) is
+    /// held again: its response was never written.
+    public func takeHeld(agent: String, fits: ([Held]) -> Bool) throws -> (taken: [Held], remaining: Int) {
+        try locked {
+            var rows = try load()
+            func waiting(_ exchange: AgentConversationExchange) -> Bool {
+                exchange.status == "held"
+                    || exchange.status == "delivering" && (exchange.settledAt ?? .distantPast) < AbandonedTurnReconciler.processEpoch
+            }
+            let all = rows.filter { $0.agent == agent }.flatMap { row in
+                (row.exchanges ?? []).filter(waiting).compactMap { exchange in
+                    exchange.prompt.map { Held(row: row.id, exchange: exchange.id, at: exchange.sentAt, text: $0, conversation: row.conversationID) }
+                }
+            }.sorted { $0.at < $1.at }
+            var taken: [Held] = []
+            for item in all {
+                guard fits(taken + [item]) else { break }
+                taken.append(item)
+            }
+            guard !taken.isEmpty else { return ([], all.count) }
+            Self.mark(taken, in: &rows, from: waiting) { exchange, receipt in
+                exchange.status = "delivering"
+                exchange.settledAt = Date()
+                receipt?["status"] = .string("delivering")
+            }
+            try save(rows)
+            return (taken, all.count - taken.count)
+        }
+    }
+
+    /// Settles what `takeHeld` handed out, once: delivered when the response
+    /// carrying them was written, held again when it was not. Anything already
+    /// settled is left as it is, so a late second word changes nothing.
+    public func settleHeld(_ taken: [Held], written: Bool, to name: String, via tool: String) throws {
+        guard !taken.isEmpty else { return }
+        let now = Date()
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        try locked {
+            var rows = try load()
+            Self.mark(taken, in: &rows, from: { $0.status == "delivering" }) { exchange, receipt in
+                exchange.status = written ? "delivered" : "held"
+                exchange.settledAt = written ? now : nil
+                receipt?["status"] = .string(exchange.status)
+                guard written else { return }
+                receipt?["delivered"] = .bool(true)
+                receipt?["accepted"] = .bool(true)
+                receipt?["delivered_at"] = .string(ISO8601DateFormatter().string(from: now))
+                receipt?["detail"] = .string("Delivered to \(name) at \(clock.string(from: now)), in the result of its \(tool) call. Its answer comes as a message of its own.")
+            }
+            if written {
+                for item in taken {
+                    guard let i = rows.firstIndex(where: { $0.id == item.row }),
+                          rows[i].exchanges?.contains(where: { $0.id == item.exchange && $0.status == "delivered" }) == true else { continue }
+                    // Taken by the host: that message's "accept" is kept (its answer comes as its own message).
+                    var accepted = Experience.Obligation(to: "agent:" + rows[i].agent)
+                    accepted.phase = .accepted
+                    accepted.evidence = .init(source: "agents/conversations", id: rows[i].id)
+                    rows[i].settledObligations = rows[i].settledObligations ?? [:]
+                    rows[i].settledObligations?[item.exchange, default: [:]]["accept"] = accepted
+                }
+            }
+            try save(rows)
+        }
+    }
+
+    /// One edit to each named exchange still in the state `from` accepts, and to
+    /// the conversation's receipt when it is the current send (whose exchange
+    /// mirrors that receipt).
+    private static func mark(_ items: [Held], in rows: inout [AgentConversationRecord],
+                             from: (AgentConversationExchange) -> Bool,
+                             _ edit: (inout AgentConversationExchange, inout [String: JSONValue]?) -> Void) {
+        for item in items {
+            guard let i = rows.firstIndex(where: { $0.id == item.row }),
+                  let j = rows[i].exchanges?.firstIndex(where: { $0.id == item.exchange }),
+                  let exchange = rows[i].exchanges?[j], from(exchange) else { continue }
+            var changed = exchange
+            var receipt: [String: JSONValue]? = nil
+            if rows[i].operationID == item.exchange, case .object(let fields)? = rows[i].receipt { receipt = fields }
+            edit(&changed, &receipt)
+            rows[i].exchanges?[j] = changed
+            if let receipt { rows[i].receipt = .object(receipt) }
+            rows[i].updatedAt = Date()
         }
     }
 

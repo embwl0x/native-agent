@@ -96,6 +96,9 @@ public actor AgentACPClient {
     private var requiredMode: String?
     private var deniedPermission = false
     private var prompting = false
+    /// The last run wrote its prompt. What happened after is the agent's turn,
+    /// not a failed send path; kept after the run so its caller can tell.
+    package private(set) var delivered = false
     private var active = false
     private var restoredHistory = false
     private var initialized: JSONValue?
@@ -125,7 +128,7 @@ public actor AgentACPClient {
         if started { guard conversationID == sessionID else { throw Failure.sessionUnavailable } }
         active = true
         defer { active = false; prompting = false; self.permission = nil; self.update = nil; self.peerCredential = nil }
-        text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false; requiredMode = nil
+        text = ""; receivedBytes = 0; deniedPermission = false; restoredHistory = false; requiredMode = nil; delivered = false
         startupTimeout = .initializationTimedOut
         self.permission = permission
         self.update = update
@@ -284,7 +287,7 @@ public actor AgentACPClient {
                 return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued, detail: nil)
             }
             // Conservative boundary: any attempted prompt write makes delivery uncertain.
-            prompting = true
+            prompting = true; delivered = true
             let response = try await request("session/prompt", ["sessionId": .string(id),
                 "prompt": .array([.object(["type": .string("text"), "text": .string(message)])])])
             guard case .string(let reason)? = response.objectValue?["stopReason"],

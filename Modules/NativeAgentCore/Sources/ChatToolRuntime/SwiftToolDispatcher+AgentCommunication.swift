@@ -350,9 +350,10 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 AgentHostDirectory.rows.first { $0.id == id }
             }
             // ONE VERB. A host whose row carries a command line is messaged by
-            // running it; a host without one has no outbound route at all.
+            // running it; a host without one pulls: the message is held for its next call.
             guard let row, row.commandLine != nil else {
-                return Self.hostNoCommandLine(row: row, contact: peer, peers: (try? store.list()) ?? [])
+                return try Self.hostPull(row: row, contact: peer, text: sending ? Self.peerString(args, "text", max: 64000) : nil,
+                                         peers: (try? store.list()) ?? [])
             }
             // Nothing to page through: the reply came back in the same call as
             // the message that asked for it, and there is no second copy here.
@@ -757,6 +758,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 value["detail"] = .string(state == .connected ? state.detail : Self.probeReason(probe, row: proposal.row))
                 Self.includeConnectionProbe(probe, in: &value)
             }
+            Self.sayReplaced(setup.outcome, in: &value)
             return .object(value)
         }
         if proposal.row.acp != nil {
@@ -806,7 +808,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         var value: [String: JSONValue] = [
             "status": .string(state == .connected ? "connected" : "configured"),
             "contact": Self.peerProjection(settled, peers: (try? store.list()) ?? []),
-            "state": .string(state.rawValue), "state_detail": .string(state == .unavailable ? state.detail : row.commandLine == nil ? "tools connected; cannot initiate yet" : state.detail),
+            "state": .string(state.rawValue), "state_detail": .string(state == .unavailable ? state.detail : AgentContactHealth.checkIn(settled)?.detail ?? state.detail),
             "config_path": .string(result.outcome.path),
             "entry": .string(AgentHostDirectory.entryName),
             "restart_required": .bool(row.restartRequired),
@@ -827,6 +829,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             value["detail"] = .string(Self.directCommandSetupDetail)
         }
         if let backup = result.outcome.backupPath { value["backup_path"] = .string(backup) }
+        Self.sayReplaced(result.outcome, in: &value)
         return .object(value)
     }
 
@@ -1073,11 +1076,11 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 return .object(result)
             }
             store.recordProof(peerID: contact.id, inbound: reply.completed && !reply.text.isEmpty, outbound: true)
+            // A prompt that went and ended without an answer is the agent's turn,
+            // not a failed send path: only a send that never went marks it unavailable.
             if reply.completed && !reply.text.isEmpty {
                 store.recordRoundTrip(peerID: contact.id, executable: approved.path,
                     version: approved.version, workspace: directory.path, recipe: recipe)
-            } else if reply.stopReason != "cancelled" {
-                store.recordUnavailable(peerID: contact.id)
             }
             var result: [String: JSONValue] = ["status": .string(reply.completed ? "replied" : reply.stopReason),
                 "agent": .string("peer:" + contact.id), "transport": .string("acp"),
@@ -1094,6 +1097,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         } catch {
             // The session it already has, so an uncertain turn can be resumed, not orphaned.
             let opened = await lease?.client.currentSessionID
+            let delivered = await lease?.client.delivered == true
             let reported = await lease?.client.learned(line).protocolVersion
             let session = conversationID ?? opened
             if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
@@ -1119,7 +1123,9 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             // Our own quit (closeAll) cut it off when the error says so; a peer's own EOF stays unknown.
             let quit = (error as? AgentACPClient.Failure) == .appQuit && !Task.isCancelled
             let cutOff = (error as? AgentACPClient.Failure) == .interrupted || quit || error is CancellationError || Task.isCancelled
-            if !cutOff { store.recordUnavailable(peerID: contact.id) }
+            // After the prompt went (a post-delivery timeout, an unreadable answer)
+            // the send path did not fail: the reply stalled, and health says so.
+            if !cutOff, !delivered { store.recordUnavailable(peerID: contact.id) }
             if var result = AgentACPClient.startupTimeoutReceipt(error) {
                 result["agent"] = .string("peer:" + contact.id)
                 result["transport"] = .string("acp")
@@ -1139,8 +1145,10 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 if let session { result["conversation_id"] = .string(session) }
                 return Self.peerRedact(.object(result), token: secret)
             }
+            // Terminal: the call is over, bounded by the client's own timeout, and
+            // nothing more arrives on it, so the thread does not wait on it.
             var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : quit ? "interrupted" : "outcome_unknown"),
-                "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false),
+                "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false), "terminal": .bool(true),
                 "detail": .string(Task.isCancelled ? "The conversation was stopped." : quit ? AgentConversationSession.restartDetail(contact.name) :
                     (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")]
             if let session { result["conversation_id"] = .string(session) }
@@ -1321,7 +1329,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         row: AgentHostRow, contact: AgentPeerContact, message: String, session: String?,
         resuming: Bool = false, store: AgentPeerStore, surface: String, probe: Bool = false
     ) async throws -> JSONValue {
-        guard let line = row.commandLine else { return Self.hostNoCommandLine(row: row, contact: contact, peers: (try? store.list()) ?? []) }
+        guard let line = row.commandLine else { throw AgentCommunicationError.invalid("\(row.displayName) has no command line to run") }
         if let failure = row.installation.failure { throw failure }
         // The recipe this send runs on, kept for its proof.
         let recipe = AgentRecipeStore.recipe(row.id)
@@ -1509,6 +1517,8 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             "reply": .string(reply), "reply_truncated": .bool(truncated),
             "untrusted_remote_data": .bool(!reply.isEmpty),
             "exit_code": envelope["exit_code"] ?? .null, "timed_out": envelope["timed_out"] ?? .bool(false),
+            // The process has exited (or hit the recipe's timeout): nothing more arrives on this call.
+            "terminal": .bool(true),
         ]
         if line.capturesThreadID {
             let stdout: String
@@ -1580,9 +1590,11 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let arrived = probe && probeNonce.map {
             store.finishConnectionProbe(peerID: contact.id, nonce: $0, ran: ran, workspace: workspace, recipe: recipe)
         } == true
+        // A command that ran and printed no answer delivered its message; only
+        // one that did not run (sent: false on its receipt) marks the path unavailable.
         if ran && replied && !probe {
             store.recordRoundTrip(peerID: contact.id, executable: executable, workspace: workspace, recipe: recipe)
-        } else if !probe {
+        } else if !probe, !ran {
             store.recordUnavailable(peerID: contact.id)
         }
         return arrived
@@ -1600,6 +1612,14 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         return "The probe ran and nothing arrived through the entry." + check
     }
 
+    /// Connect owns its entry name: another install's entry there was replaced, and the receipt says so first.
+    static func sayReplaced(_ outcome: AgentHostConfigWriter.Outcome, in value: inout [String: JSONValue]) {
+        guard let helper = outcome.replacedInstall else { return }
+        let note = "Replaced an entry from another install of this app at \(helper); backup at \(outcome.backupPath ?? "none")."
+        value["replaced_entry"] = .string(note)
+        value["detail"] = .string(note + (value["detail"].flatMap { if case .string(let text) = $0 { " " + text } else { nil } } ?? ""))
+    }
+
     static func includeConnectionProbe(_ probe: JSONValue, in value: inout [String: JSONValue]) {
         value["probe"] = probe
         guard case .object(let fields) = probe,
@@ -1611,20 +1631,49 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         value["restart_required"] = nil
     }
 
-    /// A HOST WITH NO COMMAND LINE. Honest, and it never reaches for a window.
-    static func hostNoCommandLine(row: AgentHostRow?, contact: AgentPeerContact, peers: [AgentPeerContact] = []) -> JSONValue {
-        let state = currentPeerState(contact, peers: peers)
-        return .object(["status": .string("no_outbound_route"), "agent": .string("peer:" + contact.id),
-                 "transport": .string("mcpHost"), "host": .string(row?.id ?? ""),
-                 "state": .string(state.rawValue), "state_detail": .string(state == .unavailable ? state.detail : row?.format == .shellEnvironment ? row!.description : "tools connected; cannot initiate yet"),
-                 "outbound_route": .string(row?.outboundRoute ?? "none"),
-                 "sent": .bool(false), "read": .bool(false), "completed": .bool(false),
-                 "remedy": row?.id == "claude-code"
-                    ? Repair.why(owner: "Claude Code's inbox is read by an open session; its MCP connection cannot start one",
-                        tap: "Claude Code → open a Claude Code session, which reads its inbox")
-                    : .object(["kind": .string("inspect"), "owner": .string("\(row?.displayName ?? contact.name)'s recipe/vendor has no supported outbound receiver"),
-                        "instruction": .string("Inspect the host's supported receiving interface before changing its recipe; reading agent.recipe does not add an outbound route.")]),
-                 "detail": .string(row?.format == .shellEnvironment ? row!.description : hostInboundOnlyDetail)])
+    /// A HOST THAT PULLS (no command line). Her message is held in this
+    /// conversation and goes out in the result of the host's next call through
+    /// its entry (`held_messages`, AgentConversationStore.held); held is not
+    /// sent, and the receipt says which. It never reaches for a window.
+    static func hostPull(row: AgentHostRow?, contact: AgentPeerContact, text: String?, peers: [AgentPeerContact] = []) -> JSONValue {
+        let name = row?.displayName ?? contact.name
+        var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("mcpHost"),
+            "host": .string(row?.id ?? ""), "completed": .bool(false)]
+        let presence = AgentContactHealth.checkIn(contact)?.detail ?? ""
+        guard let text else {
+            result["status"] = .string("nothing_to_read"); result["read"] = .bool(false)
+            result["detail"] = .string("\(name)'s answers arrive as its own messages; this conversation's exchanges say which of yours are held and which were delivered, and when. " + presence)
+            return .object(result)
+        }
+        if currentPeerState(contact, peers: peers) == .unavailable {
+            result["status"] = .string("unavailable"); result["sent"] = .bool(false)
+            result["detail"] = .string(AgentPeerCredentials.unavailableDetail + " Nothing was held: \(name) cannot call in without its key.")
+            result["remedy"] = Repair.remedy(owner: "Keychain peer:" + contact.id, nextCall: .object([
+                "tool": .string("app"), "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + contact.id)])])]), tap: nil)
+            return .object(result)
+        }
+        // The held copy is the exchange's own prompt; one longer would be clipped.
+        guard text.utf8.count <= AgentConversationExchange.textLimit else {
+            result["status"] = .string("invalid_arguments"); result["sent"] = .bool(false); result["argument_path"] = .string("text")
+            result["detail"] = .string("Nothing was held: a message held for \(name) keeps at most \(AgentConversationExchange.textLimit / 1024) KiB. Send it in parts.")
+            return .object(result)
+        }
+        if AgentRecipeStore.dryRun {
+            result["status"] = .string("passed"); result["dry_run"] = .bool(true); result["sent"] = .bool(false)
+            result["detail"] = .string("Dry run: a message to \(name) would be held for its next check-in. Nothing was held.")
+            return .object(result)
+        }
+        // Held means kept in a conversation of hers; a send outside one has nowhere to wait.
+        guard AgentConversationLiveContext.target != nil else {
+            result["status"] = .string("invalid_arguments"); result["sent"] = .bool(false); result["argument_path"] = .string("conversation_id")
+            result["detail"] = .string("Nothing was held: a message to \(name) waits in one of your conversations with it. Send it from a chat, naming a conversation rather than protocol ids.")
+            return .object(result)
+        }
+        result["status"] = .string("held"); result["delivered"] = .bool(false)
+        // The host's own session for this conversation: the session_id it answers in.
+        result["conversation_id"] = .string("mcp-" + contact.id)
+        result["detail"] = .string("Held, not sent: it waits for \(name)'s next check-in and goes out in the result of that call; nothing is lost. Do not resend. " + presence)
+        return .object(result)
     }
 
     /// One sentence of truth about a closed desktop app: this app can type into
@@ -1633,10 +1682,9 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
     static let desktopSendOnlyDetail = "Desktop contacts are send-only. Nothing was opened, focused or read. " + desktopSetupNote
 
     static let hostInboundOnlyDetail =
-        "Tools connected; cannot initiate yet. There is no way to push a message into that application from here: it has no command line this "
-        + "build knows, and its window is not a transport — nothing of it is opened or read. It can "
-        + "message this agent any time, because its own settings carry this app's entry and its "
-        + "agent_message tool reaches straight in; its messages arrive as ordinary inbound turns."
+        "This contact pulls: it has no command line this build knows, and its window is not a transport, so nothing of it is opened or read. "
+        + "A message to it is held in the conversation and goes out in the result of its next call through this app's entry "
+        + "(any agent_message or agent_reply call); its own messages arrive as ordinary inbound turns."
 
     static func agentLaneContacts(peers: [AgentPeerContact], selectedPeers: [AgentPeerContact],
                                   readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> [JSONValue] {
@@ -1762,10 +1810,10 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             value["host"] = .string(row?.id ?? "")
             value["route"] = .string(row?.route.rawValue ?? "mcp-settings-only")
             value["outbound_route"] = .string(row?.outboundRoute ?? "none")
-            if line == nil { value["state_detail"] = .string("tools connected; cannot initiate yet") }
+            if let presence = AgentContactHealth.checkIn(peer) { value["state_detail"] = .string(presence.detail) }
             value["credential_configured"] = .bool(peer.credentialKey != nil)
             value["readiness"] = .string("not_checked")
-            value["capabilities"] = .array(line == nil ? [] : [.string("message")])
+            value["capabilities"] = .array([.string("message")])
             value["read_inputs"] = .array(line?.continuesConversations == true ? [.string("conversation_id")] : [])
             value["setup"] = .string(line == nil
                 ? hostInboundOnlyDetail

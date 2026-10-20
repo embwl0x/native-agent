@@ -29,9 +29,14 @@ public enum AgentHostConfigWriter {
         case rollbackFailed(String)
         case changedUnderneath
         case entryExists(String)
+        /// This app's entry name, written by another install of it (a copy since
+        /// moved, deleted or run from elsewhere): connect owns it and replaces it.
+        case staleEntry(at: String, helper: String, gone: Bool)
 
         public var errorDescription: String? {
             switch self {
+            case .staleEntry(let at, let helper, let gone):
+                return "The entry at \(at) was written by another install of this app (its helper is \(helper)\(gone ? ", which no longer exists" : "")). agent.connect replaces it with this app's entry and keeps a backup beside the file; nothing was changed."
             case .entryExists(let at):
                 return "Connector collision at \(at). The existing entry belongs to another contact or has no peer ID. Review its ownership or change the recipe's configPath/format; it was left unchanged."
             case .changedUnderneath:
@@ -52,6 +57,9 @@ public enum AgentHostConfigWriter {
     /// nil writes; false checks an unconnected host; true requires its saved entry.
     @TaskLocal static var checking: Bool? = nil
     @TaskLocal static var repairingPeer: String? = nil
+    /// The helper of a stale entry a write is replacing, for its receipt.
+    final class Replaced: @unchecked Sendable { var helper: String? }
+    @TaskLocal static var replaced: Replaced? = nil
 
     static func checkEntry(_ existing: String?, expected: String, json: Bool, at: String) throws -> Bool {
         guard let existing else {
@@ -67,14 +75,27 @@ public enum AgentHostConfigWriter {
         }
         else { same = existing.trimmingCharacters(in: .whitespacesAndNewlines) == expected.trimmingCharacters(in: .whitespacesAndNewlines) }
         if same { return true }
-        func peerID(_ text: String) throws -> String? {
+        func identity(_ text: String) throws -> (command: String?, peerID: String?) {
             if json {
-                guard let value = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return nil }
-                return ((value["envs"] ?? value["env"]) as? [String: Any])?[AgentHostDirectory.peerIDVariable] as? String
+                guard let value = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return (nil, nil) }
+                return ((value["command"] ?? value["cmd"]) as? String,
+                        ((value["envs"] ?? value["env"]) as? [String: Any])?[AgentHostDirectory.peerIDVariable] as? String)
             }
-            return try TOMLEntrySplice.identity(Data(text.utf8), name: AgentHostDirectory.entryName)?.peerID
+            return try TOMLEntrySplice.fields(Data(text.utf8), name: AgentHostDirectory.entryName)
         }
-        guard let peer = try peerID(expected), !peer.isEmpty, try peerID(existing) == peer,
+        // STALE: this app's helper, but another install's copy of it (moved,
+        // deleted, or an old build run from elsewhere). The name is this app's,
+        // so connect replaces it; a helper that is not this app's is never touched.
+        if let helper = try identity(existing).command, let ours = try identity(expected).command,
+           URL(fileURLWithPath: helper).lastPathComponent == URL(fileURLWithPath: ours).lastPathComponent,
+           URL(fileURLWithPath: helper).resolvingSymlinksInPath() != URL(fileURLWithPath: ours).resolvingSymlinksInPath() {
+            guard checking == nil else {
+                throw Failure.staleEntry(at: at, helper: helper, gone: !FileManager.default.isExecutableFile(atPath: helper))
+            }
+            replaced?.helper = helper
+            return false
+        }
+        guard let peer = try identity(expected).peerID, !peer.isEmpty, try identity(existing).peerID == peer,
               repairingPeer == nil || repairingPeer == peer else { throw Failure.entryExists(at) }
         if checking != nil {
             throw ToolFailureError("This contact's connector at \(at) needs reconciliation. Connect it again to update its owned entry.",
@@ -90,6 +111,8 @@ public enum AgentHostConfigWriter {
         public let backupPath: String?
         public let replacedExistingEntry: Bool
         public let removed: Bool
+        /// The helper of another install's entry this write replaced.
+        public var replacedInstall: String? = nil
     }
 
     // MARK: - The two formats
@@ -333,7 +356,8 @@ public enum AgentHostConfigWriter {
         let identity: FileIdentity?
         if missing, let initial { existing = initial; identity = nil }
         else { (existing, identity) = try read(path: path) }
-        guard var result = try splice(existing) else {
+        let replacing = Replaced()
+        guard var result = try $replaced.withValue(replacing, operation: { try splice(existing) }) else {
             // Nothing to do — an absent entry a disconnect was asked to remove.
             if removing && cleanupBackups { try removeBackups(path: path, recordURL: backupRecordURL) }
             return Outcome(path: path, backupPath: nil, replacedExistingEntry: false, removed: false)
@@ -401,7 +425,7 @@ public enum AgentHostConfigWriter {
         }
         if removing && cleanupBackups { try removeBackups(path: path, recordURL: backupRecordURL) }
         return Outcome(path: path, backupPath: removing ? nil : backup,
-                       replacedExistingEntry: result.replaced, removed: result.removed)
+                       replacedExistingEntry: result.replaced, removed: result.removed, replacedInstall: replacing.helper)
     }
 
     /// Which exact file, with which exact contents, we read. Compared again
@@ -1033,8 +1057,15 @@ enum TOMLEntrySplice {
         return try range(of: name, in: text).map { String(text[$0]) }
     }
 
+    /// Ownership needs both fields; staleness needs only the command.
     static func identity(_ data: Data, name: String) throws -> (command: String, peerID: String)? {
-        guard let block = try entry(data, name: name) else { return nil }
+        let found = try fields(data, name: name)
+        guard let command = found.command, let peerID = found.peerID else { return nil }
+        return (command, peerID)
+    }
+
+    static func fields(_ data: Data, name: String) throws -> (command: String?, peerID: String?) {
+        guard let block = try entry(data, name: name) else { return (nil, nil) }
         var section = ""
         var values: [String: String] = [:]
         for raw in block.components(separatedBy: .newlines) {
@@ -1060,8 +1091,7 @@ enum TOMLEntrySplice {
                 values[key] = try JSONEntrySplice.string(bytes, &index)
             }
         }
-        guard let command = values["command"], let peerID = values[AgentHostDirectory.peerIDVariable] else { return nil }
-        return (command, peerID)
+        return (values["command"], values[AgentHostDirectory.peerIDVariable])
     }
 
     static func disconnect(_ data: Data, owner: AgentHostConfigWriter.JSONOwnership) throws

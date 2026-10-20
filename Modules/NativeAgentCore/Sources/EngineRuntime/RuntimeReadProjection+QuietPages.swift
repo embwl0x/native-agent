@@ -8,6 +8,7 @@ import Connectors
 import DeviceSync
 import Desk
 import Foundation
+import MacControl
 import MacIntegration
 import MemoryV2
 import PersonaEngine
@@ -189,9 +190,18 @@ extension RuntimeReadProjection {
             access["stored_permission"] = .object(["read": .bool(stored.read), "write": .bool(stored.write)])
             access["full_mac_admitted"] = .bool(admitted)
             access["permission_state"] = .string(read || write ? "allowed" : "off")
-            access["permission_blockers"] = .array([MacIntegrationPermissionMode.read, .write].compactMap {
-                readiness.refusal(integration: mac, mode: $0).map(JSONValue.string)
-            })
+            let blockers = [MacIntegrationPermissionMode.read, .write].compactMap { readiness.refusal(integration: mac, mode: $0) }
+            access["permission_blockers"] = .array(blockers.map(JSONValue.string))
+            // What is in effect leads, with why; the saved setting is named as
+            // what it is (the one used outside Full Mac), never as the truth.
+            func words(_ read: Bool, _ write: Bool) -> String {
+                read && write ? "read and write" : read ? "read-only" : write ? "write-only" : "off"
+            }
+            let now = words(read, write), saved = words(stored.read, stored.write)
+            access["in_effect"] = .string((now == saved ? now + (admitted ? " under Full Mac" : ", your saved setting")
+                : admitted ? "\(now) under Full Mac; your saved setting is \(saved) and applies when Full Mac is off"
+                : "\(now); your saved setting is \(saved)")
+                + (blockers.isEmpty ? "" : "; held back by: " + blockers.joined(separator: "; ")))
         } catch {
             access["permission_state"] = .string("unavailable")
             access["blocker"] = .string(error.localizedDescription)
@@ -311,9 +321,33 @@ extension RuntimeReadProjection {
                 permissions: permissions, statusText: statusText, osAccess: osAccess))
         }
         var overview: [JSONValue] = [.object(["heading": .string("Mac Integration"), "capabilities": .array(capabilities),
-            "note": .string("Supported routes, effective permission, connection readiness and OS access are separate facts. OS access uses live nonprompting status where available; unverified is unknown, not denied. No app or content was probed; no permission was requested.")])]
+            "note": .string("Supported routes, effective permission, connection readiness and OS access are separate facts. OS access uses live nonprompting status where available; unverified is unknown, not denied. No app or content was probed; no permission was requested.")]),
+            .object(["heading": .string("macOS grants"), "grants": .array(await quietMacOSGrants()),
+                "note": .string("Read live from macOS at this page read, without prompting. A grant that is not granted names the one card that asks for it.")])]
         overview += quietConnectors(connectors, workspaceCount: workspaceCount, telegramConfigured: telegramConfigured, statusText: statusText)
         return overview
+    }
+
+    /// The macOS grants her Mac work rides on, as macOS holds them now, never a
+    /// saved copy: Accessibility, Screen Recording, Full Disk Access, and
+    /// Automation per app she scripts.
+    static func quietMacOSGrants() async -> [JSONValue] {
+        func grant(_ name: String, _ state: String, card capability: String) -> JSONValue {
+            var row: [String: JSONValue] = ["grant": .string(name), "state": .string(state)]
+            if state != SystemPermissionStatus.granted.rawValue {
+                row["card"] = .string("permissions.request {capability: \"\(capability)\"}")
+            }
+            return .object(row)
+        }
+        var grants = [SystemPermissionCapability.accessibility, .screenRecording, .fullDiskAccess].map {
+            grant($0.displayName, SystemPermissionPreflight.status($0).rawValue, card: $0.rawValue)
+        }
+        for app in SystemAppleScriptAdapter.automationTargetApps {
+            guard let bundleID = SystemAppleScriptAdapter.automationTargetBundleIDs[app] else { continue }
+            grants.append(grant("Automation for \(app)", await SystemAppleScriptAdapter.automationStatus(app: app, ask: false),
+                                card: "applescript:" + bundleID))
+        }
+        return grants
     }
 
     public static func quietMemories(_ memory: MemoryFacade, keptLine: String, graphEntityCount: Int) -> [JSONValue] {
@@ -340,12 +374,20 @@ extension RuntimeReadProjection {
     public static func quietPersonality(name: String?, currentPersona: String, documents: [PersonaDocSpec], dataRootOverride: URL?) async -> [JSONValue] {
         var head: [String] = []
         if let name { head.append("Name: \(name)") }
-        head.append("Current persona name: \(currentPersona).")
+        let persona = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
+        let root = await persona.personaRoot
+        // The picker's word names a persona only when its directory holds one;
+        // otherwise the root SOUL.md is her, under the name the person chose.
+        do {
+            let id = try PersonaCompiler.selectedPersonaID(root: root, personaOverride: currentPersona)
+            if id != "canonical" { head.append("Current persona name: \(id).") }
+            else if let name { head.append("Current persona name: \(name) (the root persona).") }
+            else { head.append("Current persona: the root persona.") }
+        } catch { head.append("Current persona: unavailable: \(error.localizedDescription)") }
         head.append(quietCountLine(documents.count, "document", "documents"))
         var sections = [quietPageSection("Personality", head)]
         do {
-            let persona = dataRootOverride.map(SwiftNativePersonaEngine.isolated(dataRoot:)) ?? SwiftNativePersonaEngine()
-            let names = try PersonaCompiler.customPersonaNames(root: await persona.personaRoot)
+            let names = try PersonaCompiler.customPersonaNames(root: root)
             sections.append(quietPageSection("Custom names for persona.set", names.isEmpty ? ["None."] : names))
         } catch { sections.append(quietPageSection("Custom personas", ["Unavailable: \(error.localizedDescription)"])) }
         do {

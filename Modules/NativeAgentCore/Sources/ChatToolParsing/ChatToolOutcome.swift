@@ -210,6 +210,8 @@ public enum ChatToolOutcome {
 
     package static let failureStatuses: Set<String> = [
         "denied", "error", "failed", "failure", "rejected", "refused", "blocked", "unavailable", "needs_permission", "not_found",
+        // A setup this build cannot do, and a send with no route out: nothing ran.
+        "not_supported", "no_outbound_route",
     ]
 
     /// Statuses that are not final: nothing is known to have finished.
@@ -221,7 +223,25 @@ public enum ChatToolOutcome {
         "needs_input",
         "pending", "pending_approval", "partial", "queued", "scheduled", "ready",
         "running", "started", "waiting", "waiting_approval", "skipped", "submitted", "unknown", "warning",
+        // Work whose result is not confirmed: an interrupted hand-off, an
+        // effect nobody could read back, a setup waiting on the person.
+        "interrupted", "outcome_unknown", "needs_attention",
     ]
+
+    /// Finality, read once: the envelope's own words that nothing is known to
+    /// have finished — a non-final status, a dry run, or an operation record
+    /// still running or unconfirmed. `exactResultClass` and the trace's status
+    /// word both ask this, so the two can never disagree about an open call.
+    package static func saysOutcomeOpen(_ output: JSONValue) -> Bool {
+        guard case .object(let object) = output else { return output == .null }
+        if case .string(let raw)? = object["status"],
+           pendingStatuses.contains(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) { return true }
+        if case .bool(true)? = object["dryRun"] ?? object["dry_run"] { return true }
+        switch MacControlReceiptOutcome.projecting(envelope: output) {
+        case .running?, .effectUnconfirmed?: return true
+        default: return false
+        }
+    }
 
     /// The persistence writer's classification for a bounded historical receipt.
     /// Only transcript readers consult this; live results use their own evidence.
@@ -277,20 +297,15 @@ public enum ChatToolOutcome {
         if let status, failureStatuses.contains(status) { return .failed }
         if let status, ["timeout", "timed_out"].contains(status) { return .timeout }
         if !completed, let exitCode = numericExitCode(object["exit_code"]), exitCode != 0 { return .failed }
-        if case .bool(true)? = object["dryRun"] ?? object["dry_run"] { return .unknown }
         // Consult the operation record only after explicit failures are ruled out.
-        if let projected = MacControlReceiptOutcome.projecting(envelope: output) {
-            switch projected {
-            case .succeeded: break // Explicit failure markers still veto success.
-            case .failed: return .failed
-            case .refused: return .refused
-            case .cancelled: return .cancelled
-            case .timedOut: return .timeout
-            case .running, .effectUnconfirmed: return .unknown
-            }
+        switch MacControlReceiptOutcome.projecting(envelope: output) {
+        case .failed?: return .failed
+        case .refused?: return .refused
+        case .cancelled?: return .cancelled
+        case .timedOut?: return .timeout
+        default: break // Running/unconfirmed is finality's; success still faces the vetoes.
         }
-
-        if let status, pendingStatuses.contains(status) { return .unknown }
+        if saysOutcomeOpen(output) { return .unknown }
         if let status, ["cancelled", "canceled"].contains(status) { return .cancelled }
         if let status, successStatuses.contains(status) { return .succeeded }
         if MacControlReceiptOutcome.projecting(envelope: output) == .succeeded { return .succeeded }

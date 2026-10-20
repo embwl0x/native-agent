@@ -195,9 +195,9 @@ enum ChatViewportPresentation {
         return sane + NativeAgentShellLayout.composerClearanceMargin
     }
 
-    /// Only when the live edge is out of view: a press at the bottom stops
-    /// following without anything being below the fold, and the bottom of an
-    /// earlier page is not the live edge.
+    /// Only for a reader who left, and only when the live edge is out of
+    /// view: one who scrolled up a hair has nothing below the fold, and the
+    /// bottom of an earlier page is not the live edge.
     static func shouldShowLatestPill(autoFollow: Bool, atBottom: Bool, pagedBack: Bool) -> Bool {
         !autoFollow && (!atBottom || pagedBack)
     }

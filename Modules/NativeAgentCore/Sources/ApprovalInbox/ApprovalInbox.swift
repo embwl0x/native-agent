@@ -104,8 +104,12 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
             }
             if let preview = execution["resultPreview"] { fields["detail"] = preview }
             let preview = ChatToolOutcome.explanation(.object(fields)).map { " Result: \($0)" } ?? ""
-            words = (decision == "approved" ? "\(action): \(outcome) after approval."
-                : "\(action): \(decision ?? status). The tool did not run.") + preview
+            // A result's own `decided_by` names who carried the action out;
+            // read beside the approval, "agent" was taken for "the app
+            // approved it on its own" (0.6.8, five times).
+            let ranBy = preview.contains("decided_by") ? " Its decided_by names who carried it out, not who approved it." : ""
+            words = (decision == "approved" ? "\(action): \(outcome) after approval by \(approvedBy ?? "an unrecorded decider")."
+                : "\(action): \(decision ?? status). The tool did not run.") + preview + ranBy
         } else if executedAction != nil {
             let value = JSONValue.object(fields)
             words = [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
@@ -124,6 +128,23 @@ public struct ApprovalRecord: Sendable, Equatable, Identifiable {
                           face: .init(words: words, artifacts: []), addressedTo: ["person"],
                           owes: ["decide": obligation],
                           claims: applied ? [.init(claim: "applied", evidence: [ref])] : [])
+    }
+    /// Who approved, in words, with the time: "you, in the Mac app, 18:22".
+    /// A person's channel says "you" (her receipts address the person); any
+    /// other decider is named by its own label.
+    public var approvedBy: String? {
+        guard decision == "approved",
+              let provenance = resolutionProvenance ?? decidedBy.map(ApprovalResolutionProvenance.local) else { return nil }
+        let who = switch provenance {
+        case .telegram: "you, in Telegram"
+        case .signedIOS: "you, on your iPhone"
+        case .local(decidedBy: "mac_ui"), .local(decidedBy: "local_desk_click"): "you, in the Mac app"
+        case .local(let label): label
+        }
+        guard let at = resolvedAt.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) else { return who }
+        let clock = DateFormatter()
+        clock.dateFormat = Calendar.current.isDateInToday(at) ? "HH:mm" : "MMM d, HH:mm"
+        return "\(who), \(clock.string(from: at))"
     }
     public var chatContinuation: JSONValue? = nil
     /// User, 10-03: the one inline card this approval posted into his

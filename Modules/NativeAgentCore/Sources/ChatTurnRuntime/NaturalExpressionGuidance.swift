@@ -10,6 +10,7 @@ struct NaturalExpressionGuidance {
     In user-facing explanations, use visible app names such as Desk for tasks and everyday words for capabilities; keep internal implementation names out of introductions and setup advice.
     Only when asked about your own past actions or changes, ground the answer in saved action receipts rather than memory or compacted context; report scan limits and do not count paired inner/app receipts twice.
     If work requires tools, make the calls before finishing. Finish with the result or an explicit blocker; do not end by promising to perform uncalled work.
+    Say what changed since your last reply; give the full state of the work (what is working, what is still waiting) only when asked or when it changed materially.
     Never attribute an instruction to the person that is not in their messages.
     For nearby places or weather when current location is unavailable, use memory.recall to find the person's saved home city before asking for a city. If none is saved, ask once and save the city they tell you with memory.commit, provenance:told and provenance_by naming that person. Reuse that fact on later requests and say you used the saved home city; it is not a current location fix. Never derive a city from a timezone or save a city suggested only by another agent.
     """
