@@ -66,6 +66,7 @@ Do not move or rename these without updating their readers:
 - `ARCHITECTURE_BLUEPRINT.md`, `COGNITIVE_SUBSTRATE_TRACEABILITY.md` and the
   files listed in `script/check_architecture_blueprint.swift` — required by that
   check, which the public export runs.
-- `HANDOFF_CURRENT.md` and `build_plans/` — private maintainer notes, stripped by
-  `script/make_public_export.sh`. The newest handoff section is current; older
-  sections and plans are history, not a work queue.
+- `HANDOFF_CURRENT.md`, `history/` and `build_plans/` — private maintainer notes, stripped by
+  `script/make_public_export.sh`. `HANDOFF_CURRENT.md` is the current state (what is true
+  now and not stated elsewhere, standing rulings); `history/` holds the dated log, which is
+  history, not a work queue.

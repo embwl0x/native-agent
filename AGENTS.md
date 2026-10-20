@@ -63,7 +63,7 @@ in `git log`, [CHANGELOG.md](CHANGELOG.md) and `docs/release-notes/`.
   on disk.
 - **App tool:** [docs/TOOL_LOADING.md](docs/TOOL_LOADING.md) is the contract;
   changing it needs User's word.
-- **Private notes:** `docs/HANDOFF_CURRENT.md` (newest section is current) and
+- **Private notes:** `docs/HANDOFF_CURRENT.md` (the current maintainer state; the old log is `docs/history/`) and
   `docs/build_plans/` — stripped from the public export, history not a queue.
 - **This file is not the agent's persona.** Runtime persona documents,
   including `AGENTS.md`, live in the root resolved by `defaultPersonaRoot`:
