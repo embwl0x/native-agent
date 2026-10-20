@@ -34,9 +34,11 @@ public enum DoctorStatusProjection {
                 // verdict as this one's (0.6.9: Prompt Prefix Cache "fail, since
                 // this build launched at 00:13:44Z" three launches later).
                 let current = reading.flatMap { DoctorSafeRepairPolicy.isAdverse($0.status) ? nil : $0 }
-                let words = experience.face?.words ?? checkID
+                // One sentence of the debt's own words: a face can carry its
+                // whole remedy and next_call, which belong to their fields.
+                let words = (experience.face?.words ?? checkID).split(separator: ".", maxSplits: 1, omittingEmptySubsequences: true).first.map { String($0).trimmingCharacters(in: .whitespaces) + "." } ?? checkID
                 return CheckResult(id: experience.id, title: reading?.title ?? checkID, status: current?.status ?? claim("check.status") ?? "warn",
-                    detail: current.map { $0.detail + " Repair still owed since \(experience.at): " + words } ?? words,
+                    detail: current.map { $0.detail + " Repair owed since \(experience.at): " + words } ?? words,
                     harm: claim("check.harm"), receipt: claim("check.receipt"), human_action: tap,
                     repair_available: reading?.repair_available ?? nativeRepair, ask: tap == nil ? nil : reading?.ask ?? .permission,
                     repairExperience: experience)

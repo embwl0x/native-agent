@@ -788,7 +788,9 @@ extension SwiftToolDispatcher {
 
     private static func persistedHistoryPrincipals(role: String, row: [String: JSONValue]) -> [String] {
         let metadata = persistedHistoryMetadata(row: row)
-        // Every row carries the steering its writer stamped, whoever spoke.
+        // Who spoke. The steering a row's turn recorded is provenance to show,
+        // never a speaker: her own words and her tools' receipts do not carry
+        // last turn's steer into this one (User 10-20).
         let stamp = ContactThread.stamp(id: HumanConversationReader.string(row["id"]) ?? "", metadata: metadata)
         let spoke: [String]
         switch role.lowercased() {
@@ -801,7 +803,7 @@ extension SwiftToolDispatcher {
             spoke = bridged ? [stamp.source ?? "another agent"] : []
         default: spoke = []
         }
-        return Array(NSOrderedSet(array: spoke + stamp.steeredBy)) as? [String] ?? []
+        return Array(NSOrderedSet(array: spoke)) as? [String] ?? []
     }
 
     /// The sources a tool receipt's own result labels, or its routed contact.

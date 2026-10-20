@@ -1292,10 +1292,15 @@ package enum AgentConversationSession {
         // A read is not the send before it: the last send's failure stays on
         // record as last_send_status, and the read itself reads (0.6.9 night:
         // an old no_outbound_route made every later read "fail").
-        if !details, let last = string(shown["status"]),
-           ["no_outbound_route", "unavailable", "needs_setup", "reconnect_required", "not_supported",
-            "outcome_unknown", "delivery_unknown", "failed", "interrupted"].contains(last) {
+        // The read's own outcomes are read, nothing_to_read and (with no
+        // history) unavailable; any other status, execution or detail here is
+        // the last send's (0.6.10: a send waiting on a card made the read say
+        // "waiting_approval, not run, I filed a card" over the history it read).
+        let readOwn: Set<String> = shown["session_history"] == nil ? ["read", "nothing_to_read", "unavailable"] : ["read"]
+        if !details, let last = string(shown["status"]), !readOwn.contains(last) {
             shown["last_send_status"] = .string(last)
+            if let detail = shown["detail"] { shown["last_send_detail"] = detail; shown["detail"] = nil }
+            shown["execution"] = nil
             shown["status"] = .string("read")
             result = .object(shown)
         }

@@ -234,10 +234,12 @@ public enum ContactThread {
     public static func prefix(owner: String) -> String { ChatSessionRetention.contactSessionPrefix(owner: owner) }
 
     /// Reading a line she is shown: for a contact's line the principal its own
-    /// row attests (another agent when it attests none), and every peer that
-    /// steered the turn that wrote it, each marked read under its own current
-    /// grant. Every presentation of thread lines consumes what it shows here,
-    /// never under the thread's owner. Returns those principals, speaker first.
+    /// row attests (another agent when it attests none), marked read under its
+    /// own current grant. Her own lines are hers and latch nothing, whatever
+    /// steered the turn that wrote them (User 10-20: only the message from an
+    /// outside agent steers, and only the turn that reads it; the steering a
+    /// row records is provenance to show, never a speaker). Every presentation
+    /// of thread lines consumes what it shows here, never under the owner.
     @discardableResult
     public static func consume(_ line: Line, mark: (_ principal: String, _ words: String) -> Void) -> [String] {
         consume(mine: line.mine, source: line.source, steeredBy: line.steeredBy, text: line.text, mark: mark)
@@ -247,10 +249,10 @@ public enum ContactThread {
     @discardableResult
     public static func consume(mine: Bool, source: String?, steeredBy: [String], text: String,
                                mark: (_ principal: String, _ words: String) -> Void) -> [String] {
-        // One ordered list, each principal once: the speaker, then who steered it.
-        var seen: Set<String> = []
-        let speakers = ((mine ? [] : [source ?? "another agent"]) + steeredBy).filter { seen.insert($0).inserted }
-        for speaker in speakers { mark(speaker, mine ? "" : text) }
+        // The speaker, once; what steered the row's turn is shown, not latched.
+        _ = steeredBy
+        let speakers = mine ? [] : [source ?? "another agent"]
+        for speaker in speakers { mark(speaker, text) }
         return speakers
     }
 

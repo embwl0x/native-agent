@@ -117,7 +117,15 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 }
             }
             let found = savedMatch ? [] : await AgentDiscoverySession.shared.candidates(refresh: refresh, launch: launch, dataRoot: dataRoot)
+            // A program that answers as an agent already among her contacts is
+            // another door to that contact, not a second contact (hermes-acp → Hermes).
+            let twins = found.compactMap { candidate -> (AgentDiscoveryCandidate, AgentPeerContact)? in
+                guard candidate.hostID == nil, candidate.detail.hasPrefix("Speaks ACP"),
+                      let contact = peers.first(where: { Self.sameAgent($0.name, candidate.name) }) else { return nil }
+                return (candidate, contact)
+            }
             contacts += found.filter { candidate in
+                if twins.contains(where: { $0.0 == candidate }) { return false }
                 if let host = candidate.hostID {
                     return AgentHostDirectory.rows.first { $0.id == host }?.requiresWorkspace == true || !connected.contains(host)
                 }
@@ -139,6 +147,18 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                                 .map { .string($0.rawValue + " — " + $0.detail) }),
                             "detail": .string("Configuration is not evidence of availability or permission to send. Connected means a real message arrived through the connection, or a message and reply crossed it. Each route shows its own proof.")]
             if let note { listed["note"] = .string(note) }
+            if !savedMatch {
+                // What this listing read and what it ran, in words.
+                let ran: String = switch launch {
+                case nil: refresh
+                    ? "Found programs were read (signature bytes, settings files, agent cards), not run; agent.contacts {discover: true} runs each one's --help and initialize."
+                    : "Listed from the last discovery; nothing was read or run now."
+                case .refused(let why)?: "Found programs were read, not run: \(why)."
+                case .run?: "Each found program's --help and initialize ran under the rule a send to it uses: Full Mac as is, otherwise the builder sandbox (scrubbed environment, a temporary folder, stdin closed)."
+                }
+                let doors = twins.map { "\($0.0.name) is another door for \($0.1.name), already a contact" }
+                listed["discovery"] = .string(ran + (doors.isEmpty ? "" : " " + doors.joined(separator: "; ") + "."))
+            }
             return .object(listed)
         }
         if tool == "agent_connect" {
@@ -1746,12 +1766,26 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         AgentPeerCredentials.isAvailable(peer, peers: peers) ? peer.state : .unavailable
     }
 
+    /// "hermes-agent", "hermes-acp" and "Hermes" name one agent: letters and
+    /// digits only, without a trailing agent / acp / cli / bot.
+    static func sameAgent(_ a: String, _ b: String) -> Bool {
+        func bare(_ name: String) -> String {
+            var core = name.lowercased().filter { $0.isLetter || $0.isNumber }
+            for suffix in ["agent", "acp", "cli", "bot"] where core.hasSuffix(suffix) && core.count > suffix.count {
+                core = String(core.dropLast(suffix.count)); break
+            }
+            return core
+        }
+        let x = bare(a), y = bare(b)
+        return !x.isEmpty && x == y
+    }
+
     private static func compactContact(_ value: JSONValue) -> JSONValue {
         guard case .object(let row) = value else { return value }
         let keys: Set<String> = ["agent", "name", "description", "kind", "state", "state_detail", "readiness", "paused",
             "endpoint", "card_url", "untrusted_remote_data", "presence", "remedy", "handles", "doors",
             "can_start_turn", "can_answer_back", "capabilities", "read_inputs", "workspace",
-            "last_reply_in", "last_message_out", "last_exchange", "retained_exchanges", "unavailable_now_checked_at", "reply_path"]
+            "last_reply_in", "last_message_out", "last_exchange", "retained_exchanges", "unavailable_now_checked_at", "reply_path", "found_by"]
         var compact = row.filter { keys.contains($0.key) }
         if let contact = row["agent"] ?? row["name"] {
             compact["detail_read"] = .object(["action": .string("agent.contacts"), "args": .object(["discover": contact])])
