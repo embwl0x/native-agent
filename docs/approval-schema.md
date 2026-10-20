@@ -103,8 +103,10 @@ The device signature is separate: Ed25519 over sorted JSON excluding both
 `Modules/NativeAgentShared/Sources/NativeAgentShared/DeviceApprovalSignature.swift`.
 The outer HMAC covers the device signature too.
 
-`PairingSecretManager` owns the Mac's regular, 0600, 32-byte
-`icloud_pairing_secret.bin` under `PersistenceCore.defaultDataRoot()`.
+`PairingSecretManager` owns the Mac's 32-byte pairing secret in device-only
+Keychain storage; a legacy 0600 `icloud_pairing_secret.bin` under
+`PersistenceCore.defaultDataRoot()` is migrated into the Keychain and removed
+once verified.
 Pairing material is published through the configured private iCloud pairing
 transport. On iOS, `PairingStore` stores the shared secret in Keychain with
 `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`.

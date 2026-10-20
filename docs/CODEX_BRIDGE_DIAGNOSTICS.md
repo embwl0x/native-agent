@@ -36,8 +36,8 @@ New allocation can retire up to three checkouts idle for seven days. Reuse
 refreshes the pointer's mtime; all pointers to a checkout participate in the
 idle decision. Dirty work, untracked files, unique commits and uncertain
 ownership prevent retirement. Removal uses `git worktree remove` and preserves
-the branch. Removal outcomes are recorded in
-`nativeagent-builder-worktrees/retirements.jsonl` under the config root.
+the branch. Removal outcomes are recorded as `builder.worktree_retirement` events in the
+turn trace (`turn_traces/<yyyy-MM-dd>.jsonl`).
 
 ## desk_item is optional
 

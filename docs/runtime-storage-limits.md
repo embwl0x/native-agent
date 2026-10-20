@@ -18,7 +18,8 @@ cross the ceiling are refused.
 
 `TurnTraceRetention.swift` removes date-named turn ledgers older than its
 14-day window. Each persisted turn-trace row is bounded to 12 KiB by
-`TurnTrace.swift`.
+`TurnTrace.swift`, except `llm.call` rows, which keep the 8 MiB allowance
+`FeedPolicy` grants a model exchange.
 
 `Browser/BrowserCaptureCache.swift` owns temporary page text, links and
 screenshots. Captures share 128 MiB, 256 groups and seven days, enforced on

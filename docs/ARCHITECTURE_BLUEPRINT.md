@@ -90,8 +90,9 @@ authority remains separate. Every run records ok/error/refused/cut/network;
 a failed live part operation owes repair through Experiences even after a clean run.
 The retained source supplies its authoring call; successful operation or keeping
 its repair settles it, while reads and restarts do not.
-There is no automatic swap-back or notification-only healing. Explicit rollback
-keeps its existing authority checks. Sense lifecycle saves retain store-owned
+Tools, skills and senses have no automatic swap-back or notification-only healing;
+only their turn heals itself (`TurnPart`: `turn.js` → `turn.prev.js` → the shipped seed,
+the same turn replayed). Explicit rollback keeps its existing authority checks. Sense lifecycle saves retain store-owned
 evidence; only clean reads count as sense uses. A successful sense act
 keeps its receipt and effects when accounting fails, with `accounting_error` beside them.
 Its authoring mutations use the engine's task-local

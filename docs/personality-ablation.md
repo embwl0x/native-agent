@@ -6,7 +6,7 @@ changes a choice, and is never missed when it is off gets retired.
 
 Traces: `data/turn_traces/<date>.jsonl`. The `mind.why` rows carry `payload.lane`,
 one of `cue`, `memory` or `outreach`. Settings are set with
-`app {"action":"setting.set","args":{"id":…,"value":…}}`.
+`app {"action":"setting.set","args":{"setting":…,"value":…,"because":…}}`.
 
 | Layer | Shows it changed a turn | Off for a test |
 |---|---|---|

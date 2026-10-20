@@ -220,8 +220,15 @@ struct AppBackgroundWorkHost: EngineBackgroundWorkHost {
     }
 
     var speechPermission: SpeechPermissionSnapshot {
-        let status = SystemPermissionPreflight.status(.speechRecognition)
-        return SpeechPermissionSnapshot(rawValue: status.rawValue, isGranted: status == .granted,
+        Self.speechSnapshot(SystemPermissionPreflight.status(.speechRecognition))
+    }
+
+    func requestSpeechPermissionIfNotDetermined() async -> SpeechPermissionSnapshot {
+        Self.speechSnapshot(await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined())
+    }
+
+    private static func speechSnapshot(_ status: SystemPermissionStatus) -> SpeechPermissionSnapshot {
+        SpeechPermissionSnapshot(rawValue: status.rawValue, isGranted: status == .granted,
             warningSummary: SystemPermissionPreflight.warningSummary(for:
                 SystemPermissionSnapshot(capability: .speechRecognition, status: status)),
             settingsLink: SystemPermissionPreflight.settingsURL(for: .speechRecognition)?.absoluteString)

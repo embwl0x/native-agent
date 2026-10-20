@@ -884,7 +884,7 @@ public struct TelegramPollLoop: LoopRunner {
                         await recordError(context: "voice_transcription", error: String(describing: error), update: update, message: msg, text: nil)
                         await onCapabilityDenied?("speechRecognition")
                         do {
-                            try await sendMessage(token, msg.destination, "The voice note is saved. On the Mac, open Telegram settings → Set up Telegram voice to allow speech recognition. Transcription will retry automatically after access is granted.")
+                            try await sendMessage(token, msg.destination, "The voice note is saved. I've asked the Mac for Speech Recognition: allow it there and I'll transcribe this note and the next ones by myself. If the Mac refused it before, the card in NativeAgent opens the exact pane.")
                             await voicePermissionNotice.setSent(true)
                         } catch {
                             await recordError(context: "send_voice_permission_notice", error: String(describing: error), update: update, message: msg, text: nil)

@@ -59,7 +59,9 @@ unknown or modified download.
    pair the phone).
 3. Keep both devices signed into the intended Apple account with iCloud enabled.
 4. Launch NativeAgent on iPhone or iPad.
-5. Choose **Connect via iCloud** after the signed pairing material arrives.
+5. Tap **Connect** once the pairing key has arrived. Match **This phone's code**
+   to the waiting device on the Mac and choose **Pair** there, then tap
+   **Connect** on the phone again. Keep both apps open until the Mac confirms.
 6. If waiting, tap **Check for Mac** on the phone. Keep the Mac app open and
    allow the pairing details to arrive. Manual paste cannot bypass this wait.
 7. If the saved key needs correction, expand **Pairing hasn't connected?** on

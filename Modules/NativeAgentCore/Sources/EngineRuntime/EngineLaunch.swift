@@ -62,6 +62,8 @@ public protocol EngineBackgroundWorkHost: Sendable {
     func runConnectorAction(id: String, dryRun: Bool, input: [String: JSONValue], externalSendIdempotencyKey: String) async throws -> (id: String, status: String)
     func makeCompletionSender(dataRoot: URL, silentTelegram: Bool, requestedResultDeliveryID: String?, authorizeTelegramReply: @escaping @Sendable (TelegramConfig, Int) -> Bool) -> any AgentBridgeCompletionSending
     var speechPermission: SpeechPermissionSnapshot { get }
+    /// Asks macOS once when the grant was never decided (the system's own prompt); otherwise the live status.
+    func requestSpeechPermissionIfNotDetermined() async -> SpeechPermissionSnapshot
     var voiceName: String { get }
     var agentSubject: String { get }
     func githubRuntime(dataRoot: URL, shared: Bool) -> GitHubCommandRuntime
@@ -951,6 +953,14 @@ extension NativeAgentEngine {
     }
 
     public static func fileSystemPermissionNotice(capability: String, dataRoot: URL) async {
+        // A grant macOS has never been asked for is asked for now, by her (the
+        // one card she raises herself, 0.6.7): the system's own prompt, and the
+        // voice note transcribes on the grant. Only a refusal needs the pane.
+        if capability == "speechRecognition",
+           await NativeAgentEngine.live.ports.backgroundWork.requestSpeechPermissionIfNotDetermined().isGranted {
+            await retireSystemPermissionCardIfGranted(dataRoot: dataRoot)
+            return
+        }
         await ChatSurfaceBackgroundWork.fileSystemPermissionNotice(
             capability: capability, dataRoot: dataRoot,
             permissionStatus: { NativeAgentEngine.live.ports.backgroundWork.speechPermission },
