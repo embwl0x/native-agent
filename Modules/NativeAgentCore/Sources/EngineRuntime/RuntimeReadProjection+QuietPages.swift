@@ -151,6 +151,13 @@ extension RuntimeReadProjection {
             "supported_routes": .array(routes), "supported": .bool(!routes.isEmpty),
             "verified_os_access": .string("unverified"), "setting": .string("trust.mac_integration_\(mac)")]
         access["verified_os_access"] = .string(osAccess(mac))
+        // An Automation-backed app's access is its live grant, the same probe
+        // the macOS grants section reads (0.6.9 night: Mail and Notes said
+        // "unverified" while Automation for both was granted).
+        let appName = MacIntegrationID.displayName(for: mac)
+        if SystemAppleScriptAdapter.automationTargetApps.contains(appName) {
+            access["verified_os_access"] = .string(await SystemAppleScriptAdapter.automationStatus(app: appName, ask: false))
+        }
         if mac == MacIntegrationID.notifyMobile {
             do {
                 let phone = try await SwiftNativeAPNSSender().notificationReadiness(dataRoot: dataRoot)

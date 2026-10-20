@@ -1285,6 +1285,16 @@ package enum AgentConversationSession {
             shown["thread_id"] = .string(id)
             result = .object(shown)
         }
+        // A read is not the send before it: the last send's failure stays on
+        // record as last_send_status, and the read itself reads (0.6.9 night:
+        // an old no_outbound_route made every later read "fail").
+        if !details, let last = string(shown["status"]),
+           ["no_outbound_route", "unavailable", "needs_setup", "reconnect_required", "not_supported",
+            "outcome_unknown", "delivery_unknown", "failed", "interrupted"].contains(last) {
+            shown["last_send_status"] = .string(last)
+            shown["status"] = .string("read")
+            result = .object(shown)
+        }
         // Cached reads retain peer provenance instead of laundering it through
         // this presentation layer. Elevation still comes from the current owner.
         // Compact send/wait/stop results do not present retained history.

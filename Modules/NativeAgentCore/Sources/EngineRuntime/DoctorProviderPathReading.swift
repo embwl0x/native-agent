@@ -16,10 +16,13 @@ public enum DoctorProviderPathReading {
         guard let providers = try? await ProvidersFacade(dataRoot: dataRoot).list() else {
             return .unavailable
         }
-        let needsSignIn = routing.activeProviders.values.filter { id in
+        // The facade's saved state can lag a sign-in the turn already uses; a
+        // provider the turn's own credential check finds signed in needs nothing.
+        let needsSignIn = Set(routing.activeProviders.values.filter { id in
             let state = providers.first { $0.provider_id == id }?.auth_status.state.lowercased()
-            return ["needs_oauth", "needs_key", "needs_credentials", "rejected"].contains(state ?? "")
-        }.sorted()
+            guard ["needs_oauth", "needs_key", "needs_credentials", "rejected"].contains(state ?? "") else { return false }
+            return !(state == "needs_oauth" && NativeOAuthFlow.signInStatus(providerID: id, dataRoot: dataRoot).isSignedIn)
+        }).sorted()
         if !needsSignIn.isEmpty {
             let controls = providers.filter { needsSignIn.contains($0.provider_id) }.map {
                 "Providers → \($0.display_name) → " + ($0.auth_modes.contains("api_key") ? "API key" : "Sign in")

@@ -297,8 +297,8 @@ extension SwiftNativeTurnEngine {
         var seen = Set<String>()
         let names = others.filter { seen.insert($0).inserted }.joined(separator: ", ")
         return .object([
-            "status": .string("held"),
-            "error": .string("held: run this send in its own step"),
+            "status": .string("not_sent"),
+            "error": .string("not sent: run this send in its own step"),
             "held_for_results": .bool(true),
             "sent": .bool(false),
             "detail": .string("Not sent: written in the same step as \(names), before their results existed. "
