@@ -756,10 +756,30 @@ public struct AgentConversationStore: Sendable {
             return receipt["approvalId"] != nil && ["waiting_approval", "waiting_for_approval", "waiting for approval",
                 "approval_filed", "approval_required"].contains(receipt["status"].flatMap { if case .string(let s) = $0 { s } else { nil } } ?? "")
         }
-        guard !held.isEmpty,
+        let waiting: Set<String> = ["waiting_approval", "waiting_for_approval", "waiting for approval", "approval_filed", "approval_required"]
+        // Older sends in the ledger wait on their own cards; a decision made
+        // after the record moved on settles them too.
+        let ledgerHeld = rows.indices.filter { rows[$0].exchanges?.contains { $0.approvalId != nil && waiting.contains($0.status) } == true }
+        guard !held.isEmpty || !ledgerHeld.isEmpty,
               let decisions = try? SwiftNativeApprovalInbox.loadApprovalRowsChecked(
                 at: fileURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("workflows/approvals/requests.json")) else { return false }
         var changed = false
+        func decided(_ card: String) -> String? {
+            guard let decision = decisions.first(where: { if case .object(let value) = $0 { value["id"] == .string(card) } else { false } }),
+                  case .object(let approval) = decision, approval["status"] == .string("resolved"),
+                  case .string(let status)? = approval["decision"], ["denied", "canceled"].contains(status) else { return nil }
+            return status
+        }
+        for i in ledgerHeld {
+            guard var history = rows[i].exchanges else { continue }
+            for index in history.indices where history[index].approvalId != nil && waiting.contains(history[index].status) && history[index].id != rows[i].operationID {
+                guard let status = decided(history[index].approvalId!) else { continue }
+                history[index].status = status; history[index].phase = "ready"
+                if history[index].settledAt == nil { history[index].settledAt = Date() }
+                changed = true
+            }
+            rows[i].exchanges = try AgentConversationExchange.bounded(history)
+        }
         for i in held {
             guard case .object(let receipt)? = rows[i].receipt,
                   let decision = decisions.first(where: { if case .object(let value) = $0 { value["id"] == receipt["approvalId"] } else { false } }),

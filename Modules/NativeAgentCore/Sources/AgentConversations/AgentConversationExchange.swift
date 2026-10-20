@@ -32,6 +32,7 @@ extension AgentConversationExchange {
         if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
         status = Self.state(Self.string(value["run_status"]) ?? Self.string(value["status"])
             ?? Self.string(value["state"]) ?? "unknown")
+        if let card = Self.string(root["approvalId"]) { approvalId = card }
         let answer: String?
         let ownerTruncated: Bool
         if root["jobs"] != nil {

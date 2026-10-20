@@ -199,6 +199,9 @@ public struct AgentConversationExchange: Codable, Sendable {
     public var settledAt: Date?
     /// The agent's first sign of work on this send (text, a tool, bytes), if any.
     public var firstActivityAt: Date?
+    /// The card this send waits on, kept so a decision made after the record
+    /// moved on to a newer send still settles this one.
+    public var approvalId: String?
 
     package init(id: String,
                  sentAt: Date,
