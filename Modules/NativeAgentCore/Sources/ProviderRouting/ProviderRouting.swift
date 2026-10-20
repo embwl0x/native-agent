@@ -1152,9 +1152,13 @@ public actor SwiftNativeProviderRouting: ProviderRoutingProtocol {
         /// A sign-in the validator judged usable keeps its own words unless its check says otherwise.
         func signInReadiness(_ judged: (Bool, String, String?)) -> (ready: Bool, state: String, detail: String) {
             guard judged.0, let token = judged.2 else { return (judged.0, "needs_oauth", judged.1) }
+            // A sign-in with no check receipt yet is present and unproven, the
+            // same word a saved key gets; needs_oauth is for a sign-in that is
+            // absent (judged unusable above). 0.6.9 night: Doctor and the
+            // Providers page told User to sign in to the account every turn ran on.
             return receiptReadiness(token, holding: "Signed in",
                                     rejected: "This sign-in was rejected at its last check; sign in again in Providers.") { _ in
-                (true, "needs_oauth", judged.1)
+                (true, "saved", judged.1)
             }
         }
         switch id {

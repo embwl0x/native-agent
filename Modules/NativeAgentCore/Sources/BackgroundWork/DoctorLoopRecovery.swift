@@ -51,8 +51,13 @@ public enum DoctorLoopRecovery {
             let status = byID[id]
             let verdict = verdictByID[id]
             let level = verdict?.level ?? .fail
+            // Off by config or not needed is a state, not a missing registration
+            // and not an owed repair (0.6.9 night: Slack, never connected, read
+            // "fail, repair owed" on a fresh install).
+            let off = level == .off || level == .notNeeded
+            let waiting = pending.contains(id) && !off
             let state = (verdict?.detail ?? "The app-owned loop is absent from the live manager.")
-                + (pending.contains(id) ? " Repair remains owed until this loop completes successful work." : "")
+                + (waiting ? " Repair remains owed until this loop completes successful work." : "")
             let lastFailure = status?.lastError.map {
                 " Last failure: \(NativeAppSecretRedactor.redactText(String($0.prefix(500))))."
             } ?? ""
@@ -61,12 +66,11 @@ public enum DoctorLoopRecovery {
                 + NativeAppSecretRedactor.redactText(String(state.prefix(700))) + lastFailure
             let failure = [status?.lastError, status?.lastResult].compactMap { $0 }.joined(separator: " ")
             let action = MaintenanceBackgroundWork.loopSettingFix(loopId: id, error: failure)
-            let missingRegistration = managerRunning && configured[id] != nil && status?.running != true
+            let missingRegistration = !off && managerRunning && configured[id] != nil && status?.running != true
             // Being offline is no owner's fault however often it recurs; any other
             // persistent failure no setting explains is the loop's code to fix.
             let offline = ["network", "offline", "timed out", "not connected to the internet"].contains { failure.lowercased().contains($0) }
             let durable = missingRegistration || (level.isFault && action?.ask != nil) || (level == .fail && !offline)
-            let waiting = pending.contains(id)
             return CheckResult(source: action?.step ?? "Background loop registration: " + id,
                 id: checkPrefix + id,
                 title: "Background loop: \(id)",
