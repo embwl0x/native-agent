@@ -82,10 +82,10 @@ Peer turns retain agent authorship and use the shared turn engine in Core
 identity do not grant owner authority.
 
 Full Mac admits Agent's autonomous actions. macOS privacy permission resets
-still ask User. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+still ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
 Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns; ordinary Trust and domain checks still apply.
-Routine peer replies are not sends in User's name. `PeerTurnEffectPolicy`,
+Routine peer replies are not sends in the owner's name. `PeerTurnEffectPolicy`,
 TrustCenter and the action's own gates enforce these boundaries.
 
 ## Remote interoperability
@@ -166,8 +166,7 @@ do not provide a public listener or tunnel.
 
 ## Owners
 
-Paths below are relative to `Modules/NativeAgentCore/Sources/`, except the
-app route file.
+Paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
 | Owner | Responsibility |
 | --- | --- |
@@ -177,4 +176,4 @@ app route file.
 | `AgentConversations/AgentPeerStore.swift` | Saved contacts and connection proof. |
 | `ChatToolRuntime/SwiftToolDispatcher+AgentCommunication.swift` | Contact setup and route execution. |
 | `AgentLinkTransport/AgentA2AWire.swift` | A2A negotiation and wire projection. |
-| `Sources/NativeAgentApp/AgentContactRoutes.swift` | Inbound bridge, MCP and HTTP A2A routes. |
+| `Agents/AgentContactRoutes.swift` | Inbound bridge, MCP and HTTP A2A routes. |

@@ -37,7 +37,7 @@ same files at once).
 |---|---|---|
 | P1 | Helper runtime | New executable target `NativeAgentSenseHost` (JavaScriptCore runtime speaking the plug protocol over stdin/stdout), bundled in the app, JIT entitlement for the helper in dev and public builds, the JS-side SDK (`sense.js`), the Seatbelt profile builder for a sense's declared reach. Historical authored Swift records stay readable; executable growth is JavaScript only. |
 | P2 | Runner + supervision | `SenseRunner` impl in the app: spawn the helper per sense (on-call and live), progress-based stall detection, memory caps, idle-stop after entry settlement, restart live senses from their state, the state notebook storage, the `native` (in-process Swift) path, provenance on every outcome. |
-| P3 | Registry + lifecycle + sharing | `SenseRegistry` impl: storage under `<dataRoot>/senses/` (registry.json, `<id>/v<N>/` folders), versions, rollback, uses/corrections counters, CapabilityLifecycle (30-day archive, restore), lookup by corner. Share export/import with fences (export never carries notebook/User's material; import lands sandboxed, verbs off until it has run here; export from User's Mac needs User). |
+| P3 | Registry + lifecycle + sharing | `SenseRegistry` impl: storage under `<dataRoot>/abilities/` with the other parts (AbilityStore: current, previous and proposed files, run state), versions, explicit rollback, on/off and drop (no timed archive), uses/corrections counters, lookup by corner. Share export/import with fences (export never carries notebook/User's material; import lands sandboxed, verbs off until it has run here; export from User's Mac needs User). |
 | P4 | Door integration | The door consults the registry first: `mac.look`, `mac.read`, `files.read`, browser page reads serve the sense's `NativePage` when one exists; `raw:true` returns today's route; every sense-served reply carries the provenance line; `wrong:true` ("this view is wrong") on the same reads returns the view with a note pointing at `app sense.make`; sense verbs appear on the corner's page for `app {find}` / `app {read}` and invoking one runs `SenseRequest.act` inside their turn. Update `docs/TOOL_LOADING.md` for the two new arguments (User approved). |
 | P7 | Starter frame + worked examples | The sense authoring kit: the JS starter frame, the native-form builders, and worked examples (real JS senses) for: `.docx`, `.pages`, `.numbers`, `.key`, `.xlsx`, `.pptx`, `.epub`, `.rtf`/`.rtfd`, and one canvas-app accessibility example. These double as the first senses they gets. |
 | P8 | Day-one wrap | Existing readers retain their payloads: screen, Chrome page snapshots, private web fetch, visible NativeAgent browser, files and connectors. Web/browser replies name the actual reader: `builtin-web` (`stream:web`), `builtin-browser` (`stream:browser`), or `builtin-chrome` (`site:*`). |
@@ -200,8 +200,9 @@ waits have no timer and are excluded from the entry's no-progress window.
 - Read `AGENTS.md`. No automated tests or test targets. Build must pass:
   `swift build --disable-keychain -j 6`; after adding files `xcodegen --spec project.yml`;
   `swift script/check_architecture_blueprint.swift`; `swift script/check_timer_inventory.swift`.
-- Never launch, quit or install NativeAgent; never touch `~/Projects/NativeAgent/data`
-  or `persona/`; never call their bridge.
+- A worker in its worktree never launches, quits or installs NativeAgent, never
+  touches the live data root or `persona/`, never calls their bridge; whoever
+  ships the pass builds, installs and checks the installed app (AGENTS.md).
 - Smallest correct code; match surrounding style; no silent fallbacks.
 - Report model-visible text changes verbatim.
 
@@ -284,48 +285,9 @@ for `web.read` and visible browser reads); file corners are file kinds (also
 for `mac.read` with a path). A pathless `mac.read` names the front app while
 retaining the generic document reader until that corner has a sense.
 
-App observation uses a separate frame source so a background read cannot stale
-the handles in a served page. Grown app acts translate that served selection
-only to `mac.act`; Chrome acts retain the existing lease/element boundary. Both
-reenter the door under Trust in Agent's turn. Failed grown reads are explicit
-failures, never an automatic substitution of the generic page.
+Chrome's current tab contract (group membership, numeric tabs, leases) is the
+blueprint's `ChromeControl` row; this spec no longer carries it.
 
-Chrome pauses lease expiry at native disconnect and restores/renews exact
-surviving leases at accepted reconnect, then reattaches observation. User
-navigation/takeover wins. Persisted custody outlives lease release; only proven,
-unchanged agent-created tabs can be offered for close. Unknown old custody
-does not grant close authority. An adopted page returns ownership "adopted"
-and never gains close authority. Headers name captured sections, and unique
-authored DOM anchors retain their actual fragment without an allocation suffix.
-Day-one successful readers and existing sense/raw provenance remain in place.
-
-This worktree task prohibits tests, installation, launch/quit, driving apps and
-bridge verification. No new source files or tool keys are added. The Chrome
-receipt schema now admits ownership "adopted"; existing tool descriptions name
-the custody restriction.
-
-~~~text
-The tab's page changed while NativeAgent was away; Chrome left the current page with User.
- This is User's page now; never offer to close it. If they wants you to work on this current page, explicitly adopt the inactive tab with chrome.adopt_tab{tab:\(tab)}.
- For this inactive agent-created tab in the NativeAgent group, use chrome.adopt_tab{tab:\(tab)} or explicitly close it with chrome.close_tab{tab:\(tab)}.
- The tab's agent-created custody is unverified; do not offer to close it. Explicit adoption of the inactive tab is available with chrome.adopt_tab{tab:\(tab)}.
-This is User's page now. Never offer to close it; adopt the inactive tab only with a clear note that it is their current page.
-This tab is User's page now, or its agent-created custody cannot be verified. Do not close it. Explicit adoption of an inactive tab is available with chrome.adopt_tab. Nothing was sent.
-raw view · accepted Chrome tab inventory and retained custody
-Saved Chrome tab custody is invalid; no tab close authority was restored.
-raw view · private Chrome tab custody storage
-This tab is User's page now, or its agent-created custody cannot be verified. Do not close it. Explicit adoption of an inactive tab is available with chrome.adopt_tab. Nothing was changed.
-raw view · Chrome tab URL and retained custody
-This is User's page now. It was explicitly adopted for this conversation; adoption grants no permission to close it.
-This existing tab was adopted for this conversation; adoption grants no permission to close it.
-raw view · Chrome tab URL, retained custody and explicit adoption
-Reading:
-sections in the scrolled view
-Explicitly adopt an inactive orphaned tab from the NativeAgent group into this conversation. Use the tab number from chrome.status orphaned_tabs. If User took over or changed its page, say it is their page now before adoption. Refuses foreground tabs and tabs with a live lease. Ownership is adopted; adoption grants no permission to close it. Returns the lease receipt; read it with chrome.snapshot.
-Explicitly close this conversation's agent-created Chrome tab, or an inactive orphan whose can_close is true in chrome.status. Omit the target for this chat's tab, name lease_id for another held tab, or use that orphan tab number. Never offer to close User's changed or taken-over page. Refuses claimed/adopted tabs, unverified custody, active grouped tabs and focused work windows. Returns the close receipt.
-~~~
-
-"Reading: " is followed by captured section names joined with " · ".
 ## The JS sense API (P1 implements, P7 writes against it)
 
 A sense is one JS file (ES2020, no modules, no network unless declared reach

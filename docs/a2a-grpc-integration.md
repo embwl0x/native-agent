@@ -14,7 +14,7 @@ Agent reaches peers through `app` agent actions; see
 
 ## Runtime ownership
 
-`Sources/NativeAgentApp/NativeAgentA2AGRPCListener.swift` binds an ephemeral
+`Modules/NativeAgentCore/Sources/Agents/NativeAgentA2AGRPCListener.swift` binds an ephemeral
 `127.0.0.1` HTTP/2 port. Once bound, it publishes `a2a-grpc.json` in the bridge
 discovery directory and makes the port available to the agent card. Shutdown
 removes the descriptor and begins graceful transport shutdown.

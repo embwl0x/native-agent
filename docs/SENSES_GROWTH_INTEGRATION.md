@@ -1,5 +1,7 @@
 # P6 Growth lane integration
 
+> Build record (2026-10-05 lane). History, not the current contract: the senses contract is [SENSES.md](SENSES.md), the part header is [skill_manifest_spec.md](skill_manifest_spec.md), source owners are [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md). Where this record and those disagree, those win.
+
 `BackgroundGrowthLane(dataRoot:)` lives in the app, beside provider plumbing.
 Its `loopRunner` is an `EventDeadlineLoopRunner`. No tests, install, app launch,
 bridge call, live data or persona edits were used to build this package.

@@ -1,5 +1,7 @@
 # P9: context and memory provenance
 
+> Build record (2026-10-05 lane). History, not the current contract: the senses contract is [SENSES.md](SENSES.md), the part header is [skill_manifest_spec.md](skill_manifest_spec.md), source owners are [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md). Where this record and those disagree, those win.
+
 The projection is registered in `NativeContextFlowRuntime`. `SenseNewsBoard.post`
 dispatches the `sense-news` invalidation after adding news, retaining its existing
 method signature. The projection indexes

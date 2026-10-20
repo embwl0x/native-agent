@@ -12,7 +12,8 @@ All kinds have the same header and one 524,288-byte (512 KB) source limit.
 `resumed`, and runs `model.call` (purpose; the first one names `system:
 {stable, dynamic}` and `tools`), `app` (one call of the current model round,
 named by id or index, run verbatim through the turn's gates, once),
-`reply.stream`, `reply.end` (only after a model reply without calls) and
+`reply.stream`, `reply.end` (after a model reply without calls, or on an owned
+provider failure the turn ends on, incomplete) and
 `after`. Its reach is `turn.persona()`, `turn.pins()`, `turn.recall()` and
 `turn.context()`. The turn's log keeps the events, the reach answers each step
 read, the effects started (by identity: the model call id, or the effect's own
@@ -29,7 +30,7 @@ same turn replays through what came back. Not yet honoured: a later
 | **code** | The file body, outside the JSON comment; JavaScript or retained Markdown guidance. |
 | **reach** | `{capabilities: string[], readPaths: string[], hosts: string[], apps: string[]}`, all arrays default empty. `capabilities` carries the former tool permissions; paths, hosts and apps carry the former `SenseReach`. Legacy `permissions` and sense reach load into this shape; saves write `reach`. Declarations do not grant authority. |
 | **wake** | String array, default `[]` (called only). Accepted names: `schedule:<cron>`, `app.installed`, `file.changed:<path>`, `turn.ended`, `message.arrived:<transport>`; suffixes must be nonempty. While a part is on and the owner's Autonomy switch allows unattended work, each signal reaches it once with input `{signal, at, ...payload}`: a tool or skill runs through the door, a sense hears it as an event in its resident slot. `schedule:` is one TriggerScheduler job per part and schedule (fires that land while a run waits are one); `app.installed` adds `bundle_id`, `name`, `version`, `path`, `scriptable` as plain data (a bundle id at a version not seen since the first scan's baseline, once its Info.plist and declared scripting dictionary have landed); `file.changed:` adds `path` (the senses' own watch, which waits through the file's absence; the part's own writes, exactly as it left them, are not news); `turn.ended` adds `turn_id`, `outcome`, `session_id`, `trace` (its day file under `turn_traces/`; a turn the part's own run started does not wake it); `message.arrived:telegram|slack` adds `text`, `session_id`, `turn_id` and the chat/channel and user ids, once the message was handled. `agent` names whose words the input carries when they are not the owner's (a sender not allowlisted by user, a turn an untrusted agent steered); the run is then tainted as a turn would be. The run's gate chain is their own with no turn behind it: current Trust, a card for an effect that needs one (the run waits), and `home.arrive {line}` for anything it needs from them (one arrival per part, day and line, on the part's own hop-limited thread). A skill's params must take the input's keys. |
-| **face** | `{page?: string}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent. Unknown pages refuse at save and name the accepted pages. No renderer or new page is added. |
+| **face** | `{page?: string, action?: string}`, default `{}`. An authored tool's action lists on this door page, or diagnostics when absent; `action` claims an unclaimed `face.action` id the registry draws. Unknown pages refuse at save and name the accepted pages. No renderer or new page is added. |
 | **state** | Tools and skills use `host.state.get()` → saved JSON (initially `null`) and `host.state.set(value)` → `null`. One durable notebook owner, shared with senses' keyed `state.get/set`, stores it by part id at `senses/<id>/state.json` under key `part`; it survives helper restarts and app relaunch. Values are limited to 16 KiB and the notebook to 64 KiB. Validation and preview use a scratch notebook. Skill resume replays journaled state results without repeating their operations, then reads and writes durable state normally. State calls do not renew stalled execution. `abilities/state.json` remains lifecycle/run accounting only; there is no authored header `state` key. |
 | **learned** | Optional arbitrary JSON, preserved verbatim. Reserved for phase 4; no learning behavior. |
 
@@ -45,8 +46,10 @@ Senses retain their existing source-bound context lifecycle.
 Reach capability names are `app_data_read`, `app_data_write`,
 `network_localhost`, `network_public`, `network`, `shell`, `computer_files`,
 `arbitrary_file_write`, `app_read:<bundle_id>` and `app_write:<bundle_id>`.
-`model`, `connector:<id>`, `calendar`, `reminders` and `contacts` are also
-accepted names, reserved for the primitives lane; they add no behavior here.
+`model`, `connector:<id>`, `calendar`, `reminders` and `contacts` are reach
+for the host primitives (`host.model.call`, `host.fetch`, the PIM door aliases);
+`AbilityStore` names the full accepted set, including the run's screen watch
+and Mac hands.
 Unknown capability names, wake names, header keys and reach/face keys refuse by
 name. Existing lifecycle fields (`record`, `candidate`, `proof`, `sourceFiles`)
 remain store-owned. Retained sealed legacy candidate descriptors are unchanged,
@@ -88,16 +91,13 @@ Skills are JavaScript routines behind the existing app door. A matching routine
 arrives through recall or discovery; its description and signature lead to
 `skill.run`. No skill grants authority or adds an always-on tool schema.
 
-The bundled resident `habit` part wakes on `turn.ended`. `trace.recent
-{view:"shapes",turn_id,trace}` reads only the signal's exact trace day file per page and returns model-chosen app action ids,
-argument keys/types and call times, in reverse call order, without values;
-an explicit model-chosen action batch keeps its constituent call order;
-skill runs and their nested calls are excluded. A truncated envelope marks the sequence incomplete; habit skips it. Habit remembers fixed-size
-128-bit fingerprints for the last 32 turns in its notebook. A second occurrence thinks once with purpose
-`habit`, stages a skill through `skill.save {create_only:true}`, and files one `home.arrive` line.
-The save owner refuses names/identities in any retained slot or state; habit
-retries with the sequence digest suffixed to the name, without replacing a draft.
-Offered signatures remain remembered even when a proposal is dropped. There is
+The bundled resident `habit` part wakes on `turn.ended`: it reads the signal's
+trace day by rule (`trace.recent {view:"shapes"}`: model-chosen action ids,
+argument shapes and call times, skill identities included), accumulates repeated
+subsequences across the day in its notebook, and when its recurrence rule is met
+thinks once with purpose `habit`, stages a skill through `skill.save
+{create_only:true}` and files one `home.arrive` line, at most one offer a day.
+The exact rules are `Resources/abilities/habit.js`. There is
 no timer or other model call. Offered fingerprints are never evicted; a full
 notebook refuses visibly before another thought or proposal. The older repetition
 detector remains pending a scope decision: its skill-follow-up revision notices,
@@ -115,7 +115,7 @@ of this whole-sequence rule. Its removal is not behavior-equivalent.
 | `skill.enable` | Publishes the validated candidate under existing origin and owner policy. Owner review binds the complete candidate, including code, fixtures and dependency shapes. |
 | `skill.run` | Name and args matching its signature. Each call passes the ordinary turn's gates. |
 | `skill.resume` | A stopped run_id and bounded answer. Rechecks selection, host revision, admission and prior reads; claims once. |
-| `skill.quarantine`, `skill.drop`, `skill.rollback`, `skill.restore` | Explicit lifecycle changes; source remains retained. Rollback proposes retained JS for validation and admission; optional version selects an exact historical conversion. skill.read exposes converted_versions and their rollback calls. |
+| `skill.quarantine`, `skill.drop`, `skill.rollback`, `skill.restore` | Explicit lifecycle changes. Drop removes the routine; rollback swaps current and previous; optional version selects an exact historical conversion. skill.read exposes converted_versions and their rollback calls. |
 
 ```javascript
 function run(input) {
@@ -157,9 +157,9 @@ descriptions and other prose), behavioral flags and revision. Wording changes
 do not suspend admitted routines. Contract changes do; result semantics without
 a schema change require a revision bump. Frozen exact-contract aliases preserve
 admitted pre-cutover pin identities without modifying candidates or admissions.
-A write uses the version of its own read. Irreversible actions, owner-only steps
-and a step that would need a card hand back before dispatch. app.decide saves
-a bounded checkpoint. Resume returns saved receipts for landed writes; it never
+A write uses the version of its own read. A step that needs a card waits for
+the answer like any gated call; only `app.decide` hands back, saving a bounded
+checkpoint. Resume returns saved receipts for landed writes; it never
 repeats them. Changed code, admission, dependency shapes, host revision or reads
 close/refuse the old run visibly, preserving its journal and held work.
 
@@ -170,8 +170,9 @@ retain their stable identities and built-in override protections. The census
 requires overrides:built_in for the same-identity persona counterpart; save
 ratchets this restrictive marker. Rolling back
 an override selects retained JS; it never rediscovers the original markdown.
-Unused routines may archive through the existing lifecycle, with explicit
-restore. DROP retains selected code; rollback never undoes prior host effects.
+`skill.drop` removes the routine and its statistics; rollback swaps current and
+previous, keeping the admission and owner-off marks that apply; rollback never
+undoes prior host effects.
 
 ## Conversion census and cutover
 
@@ -208,46 +209,10 @@ Pack skill installs stage JS candidates through this same lifecycle; pack remova
 trashes their registry rows while retaining sources. Pack/connector inventories
 retain their manifest metadata, permission and OAuth ownership.
 
-## Manifest registry compatibility
+## Inventory
 
-The Skills owner also reads `skills/manifest_registry.json`. Its envelope is:
-
-```json
-{
-  "schemaVersion": 1,
-  "skills": {
-    "example": {
-      "state": "installed",
-      "version": "1.0.0",
-      "type": "tool",
-      "path": "/absolute/app-data/skills/example"
-    }
-  }
-}
-```
-
-It reads the Application Support location
-(`~/Library/Application Support/NativeAgent/skills/manifest_registry.json`)
-and then the app data-root location. The data-root entry wins a name collision.
-Missing `sourceRoot` and `registryPath` fields are filled from the source file.
-
-The Mac reader requires each entry's `state`, `version`, `type` and `path`;
-`installedAt` is optional. It can display a package's `manifest.json` and
-optional `README.md`. The manifest decoder requires `schemaVersion`, `name`,
-`version`, `type` and `description`. Optional fields are:
-
-| Field | Decoded shape |
-| --- | --- |
-| `author` | `name`, optional `email` and `url` |
-| `permissions`, `tags` | Arrays of strings |
-| `tools` | Array of objects with `name` and `description` |
-| `oauth` | `provider`, `scopes` array, optional `deviceFlow` Boolean |
-| `homepage` | String |
-
-These are display/registry shapes, not a universal plugin execution contract
-or a promise that declared permissions are granted.
-[SkillsJSON.swift](../Modules/NativeAgentCore/Sources/Skills/SkillsJSON.swift)
-defines the merge and list projection;
-[AppModel+SkillsIntegrations.swift](../Sources/NativeAgentApp/AppModel+SkillsIntegrations.swift)
-and [ConfigProviderDoctorModels.swift](../Sources/NativeAgentApp/Models/ConfigProviderDoctorModels.swift)
-own the Mac reader and decoded fields.
+Canonical skill records are projected by
+[InstalledSkillInventory.swift](../Modules/NativeAgentCore/Sources/Skills/InstalledSkillInventory.swift)
+and shown by
+[AppModel+SkillsIntegrations.swift](../Sources/NativeAgentApp/AppModel+SkillsIntegrations.swift).
+There is no `manifest_registry.json` reader or merge.

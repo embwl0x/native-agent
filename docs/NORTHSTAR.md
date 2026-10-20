@@ -188,7 +188,9 @@ user's end, never at ours.
 - When a change trades a bigger file, a longer build, or more work for us
   against one fewer step for a person, take the bigger file.
 - A fresh install starts with everything on; people switch off what they do
-  not want. Settings explain the cause and offer one recovery action.
+  not want. The one exception is what records the person (activity recording,
+  their hour), which is opt-in. Settings explain the cause and offer one recovery
+  action.
 - Canonical: 0.4.7 split the model out of the DMG to shrink it after a slow
   download that turned out to be a router, not the artifact. It added a
   first-launch download every person could lose. 0.4.8 put the model back;

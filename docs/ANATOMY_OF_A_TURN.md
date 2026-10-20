@@ -53,7 +53,7 @@ retains its session and origin. The chat client binds run and trace identities
 to the accepted turn.
 
 Origin survives into dispatch. An admitted remote conversation is not made
-local by text claiming to be User. Trust and peer-origin policy evaluate the
+local by text claiming to be the owner. Trust and peer-origin policy evaluate the
 actual request provenance.
 
 Source: `ChatTurnRuntime/MacChatTurnAdmission.swift` and
@@ -130,7 +130,7 @@ the tool loop:
 3. Execute, refuse or wait for an exact approval.
 4. Return the result and available outcome evidence to the model.
 
-Full Mac gives Agent autonomy, including app actions otherwise marked User's.
+Full Mac gives Agent autonomy, including app actions otherwise marked the owner's.
 Explicit blocks and actual platform access still apply. macOS privacy
 permission resets ask the owner first. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
 Agents enabled in Trust → Connected agents carry the owner's authority on

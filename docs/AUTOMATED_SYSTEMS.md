@@ -68,16 +68,16 @@ enabled state and next deadline matter more than a blanket freshness threshold.
 ## 3. Doctor — the health authority
 
 `DoctorChecks/DoctorChecks.swift` defines `SwiftNativeDoctorChecks.defaultChecks`:
-15 checks covering storage, runtime JSON, run-ledger and turn-trace integrity,
+16 checks covering storage, runtime JSON, run-ledger and turn-trace integrity,
 sessions and identity, prompt-prefix health, subconscious vitals, messages,
-persona, memory, embeddings, iCloud, operation logs and OAuth expiry.
-The app adds live checks, including background-loop health; the visible report
-is not a fixed 15-row checklist.
+persona, memory, embeddings, ability files, iCloud, operation logs and OAuth
+expiry. The app adds live checks, including background-loop health; the visible
+report is not a fixed 16-row checklist.
 
-`app {"page":"diagnostics","item":"doctor"}` runs diagnostics without repair
-and returns the health rows. `Sources/NativeAgentApp/AppToolHealthHost.swift`
-binds this read to `runDoctor(repair:false)` and the live checks.
-`doctor.repair` is a separate action, not a read-only probe.
+`app {"page":"diagnostics","item":"doctor"}` reads the saved report
+(`Sources/NativeAgentApp/AppToolPlatform.swift`) and names the run it shows;
+`doctor.run` measures afresh, and `doctor.repair` is a separate action, not a
+read-only probe.
 
 The configured `doctor_auto_run` lane runs once at launch, off their turn's path
 (`EngineLaunch` ticks it once), then on its configured interval (at least an

@@ -65,9 +65,10 @@ does not support those action-only options.
 ### Scripts
 
 `app {script}` runs JavaScriptCore with `app.read`, `app.find`,
-`app.log` and scriptable registry actions. Each call re-enters the action
-checks and adds a ledger row. A blocked action or approval wait stops the
-script without undoing earlier calls. The script has no direct network or
+`app.log` and the registry's actions. Each call re-enters the action
+checks and adds a ledger row. A call that raises a card waits for the answer
+and continues or receives the refusal; a blocked action stops the script
+without undoing earlier calls. The script has no direct network or
 filesystem API; it cannot call every action merely because the action exists.
 
 ### Authored tools, skills and MCP
@@ -81,8 +82,8 @@ filesystem API; it cannot call every action merely because the action exists.
   `skill.enable`, `skill.run`, `skill.resume` and `skill.rollback` share the code lifecycle. They grant no
   new authority; see the [manifest spec](skill_manifest_spec.md).
 - Mounted MCP tools appear as `mcp.<server>.<tool>` from the server's live
-  list, without adding model-facing tool schemas. Remote tools are not
-  scriptable.
+  list, without adding model-facing tool schemas; they are callable from
+  scripts under their ordinary gates like any action.
 
 Sources: [AppActionRegistry.swift](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppActionRegistry.swift),
 [app door](../Modules/NativeAgentCore/Sources/AppToolRuntime/AppToolExecutor+AppDoor.swift),
@@ -111,14 +112,11 @@ connectors and agent communication under the saved policy.
   Music have app pages and actions. Service-specific permissions apply.
 - **Browser:** the built-in browser and optional Chrome extension have their
   own app actions. Chrome requires the extension's connection and authority.
-- **Web search:** `web.search` tries Codex for general queries and SearXNG
-  for code queries. Unfiltered searches try the other route if the first fails
-  or returns no results; the result reports the route, elapsed time and fallback
-  reason. Non-general categories and time ranges use only SearXNG.
+- **Web search:** `web.search` uses Codex with direct web-tool access for general queries and SearXNG for other categories; a Codex failure falls back to SearXNG and the receipt keeps the route and the failure reason; a completed empty search stays on its route; a time range travels with either route.
 - **Activity:** capture has a separate consent control. Activity sharing is
   distinct from recording.
 
-Sources: [page map](../Sources/NativeAgentApp/QuietSelfAdmin.swift),
+Sources: [page vocabulary](../Modules/NativeAgentShared/Sources/NativeAgentShared/SurfaceLayout.swift),
 [workspace resolver](../Modules/NativeAgentCore/Sources/PersistenceCore/NativeAgentWorkspaceRoot.swift),
 [search routing](../Modules/NativeAgentCore/Sources/Research/Research+CodexSearch.swift).
 Chrome setup is in the [extension guide](../Extensions/NativeAgentChrome/README.md).

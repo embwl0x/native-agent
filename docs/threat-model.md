@@ -21,7 +21,7 @@ underlying Trust checks still apply.
 | Browser IPC | Separate loopback endpoint/token; browser operations reject unsafe URL schemes |
 | Paired iOS transport | Signed requests checked by `MacSyncEngine` before dispatch; pairing material owned by `PairingSecretManager` |
 | APNS | HTTP 2xx means provider acceptance, not proof of user display; `SwiftNativeAPNS.swift` reports display as unverified |
-| Peer-steered turns | `PeerTurnEffectPolicy` adds owner approval for protected effects, except for authenticated agents enabled in Trust → Connected agents; ordinary Trust and domain checks remain |
+| Peer-steered turns | A turn an untrusted agent started with its message: `PeerTurnEffectPolicy` files one card on its first effect and the owner's answer covers the turn; a read steers nothing; agents enabled in Trust → Connected agents carry the owner's authority; ordinary Trust and domain checks remain |
 | Model input from web, tools or peers | Content is input, not operator authority |
 
 Loopback is a network boundary, not privilege separation from another process
@@ -50,8 +50,8 @@ its bearer token.
   mutations retain the protected-system-path floor under Full Mac, enforced
   by `FileSystemActions.swift` and `MacControlSensitivePathFence`.
 - **Script bypass:** `AppScriptRunner.swift` gives JavaScript no direct file,
-  network or process API. Calls re-enter the app action path, with execution
-  limits and the action's scriptability check.
+  network or process API. Calls re-enter the app action path under the action's
+  ordinary gates, with execution limits.
 
 ## Approval Architecture
 
@@ -61,17 +61,18 @@ to execute. Executors still validate the requested action.
 
 For admitted operator turns, Full Mac answers ordinary per-call approval
 requests. Explicit blocks and hard security checks remain effective.
-macOS privacy permission resets still ask the owner; peer turns retain the
-protected-effect rules above.
+macOS privacy permission resets still ask the owner; a turn an untrusted agent
+started keeps its one card, as above.
 
 ## Secret Storage
 
 | Material | Owner / location |
 |---|---|
 | GitHub PAT and OAuth credentials | `GitHubCredentialStore.swift`, backed by macOS Keychain |
-| Other provider/connector OAuth and API credentials | App data under `providers/`, `oauth_tokens/`, `connectors/<id>/auth.json`, or provider-specific stores; see `Connectors+Auth.swift` and `OAuthCredentialDestinations.swift` |
+| Provider API keys | `ProviderAPIKeyStore.swift`, backed by macOS Keychain |
+| Connector OAuth and API credentials | Device-bound Keychain references for supported connectors (`ConnectorCredentialFile.swift`); remaining file-backed stores under `providers/`, `oauth_tokens/` and `connectors/<id>/auth.json` at mode `0600`; see `Connectors+Auth.swift` and `OAuthCredentialDestinations.swift` |
 | Codex OAuth credentials | App `codex_home/auth.json` and login-mode-dependent credential candidates in `LLMClient+OpenAIOAuthCredentials.swift` |
-| Local agent bridge endpoint/token | `ClaudeBridge.swift` publishes its `bridge.json` descriptor |
+| Local agent bridge endpoint/token | `ClaudeBridgeRuntime.swift` publishes the Claude lane's `bridge.json`; `AgentBridgeRuntime.swift` publishes the agent bridge's descriptor under `~/.config/nativeagent-link/` |
 | Browser IPC endpoint/token | `BrowserWindow.swift` publishes `browser_ipc.json` |
 | iOS pairing material | `PairingSecretManager.swift` |
 
@@ -83,8 +84,10 @@ needed; `NativeAgentSecretRedactor.swift` and `TurnSecretRedactor.swift` own
 shared redaction rules.
 
 Bridge descriptors use `NativePrivateFile` (mode `0600` at creation).
-`NativeLoopbackListenerParameters.swift` binds to loopback. Each install uses
-fixed ports; a collision fails rather than silently selecting another port.
+`NativeLoopbackListenerParameters.swift` binds to loopback. The HTTP listeners
+use each install's fixed ports (`InstallPaths`); a collision fails rather than
+silently selecting another port. The A2A gRPC listener binds an ephemeral port
+that its agent card advertises.
 
 ## Out Of Scope
 

@@ -1,5 +1,7 @@
 # P8 day-one adapters
 
+> Build record (2026-10-05 lane). History, not the current contract: the senses contract is [SENSES.md](SENSES.md), the part header is [skill_manifest_spec.md](skill_manifest_spec.md), source owners are [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md). Where this record and those disagree, those win.
+
 P8 adds no launch hook. P2 owns launch assembly; P4 owns sense selection.
 There are no temporary stubs and no shared-contract changes.
 

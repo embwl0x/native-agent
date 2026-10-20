@@ -1,5 +1,7 @@
 # P10 Senses surfaces handoff
 
+> Build record (2026-10-05 lane). History, not the current contract: the senses contract is [SENSES.md](SENSES.md), the part header is [skill_manifest_spec.md](skill_manifest_spec.md), source owners are [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md). Where this record and those disagree, those win.
+
 Branch: `wA/s10-surfaces`. Work stayed in this worktree. No app launch,
 quit, install, bridge call, separate automated tests or test targets.
 

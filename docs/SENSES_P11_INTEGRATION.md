@@ -1,5 +1,7 @@
 # P11 Senses integration — 2026-10-05
 
+> Build record (2026-10-05 lane). History, not the current contract: the senses contract is [SENSES.md](SENSES.md), the part header is [skill_manifest_spec.md](skill_manifest_spec.md), source owners are [ARCHITECTURE_BLUEPRINT.md](ARCHITECTURE_BLUEPRINT.md). Where this record and those disagree, those win.
+
 Branch: `wA/senses-int`. Work stayed in this worktree. No NativeAgent launch, quit, installation, bridge call, automated tests, commit or push occurred. The pre-existing `Package.resolved` change was preserved. `docs/HANDOFF_CURRENT.md` is unchanged; its present revision contains no Senses/P3/P5 integration section. The external Agent handoff was not written because it is outside the authorized worktree and sandbox.
 
 ## Joined seams

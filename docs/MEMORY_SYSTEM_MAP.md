@@ -128,7 +128,7 @@ locator to derived-state consumers. Recall-cache reuse also checks SQLite
 canonical memory while preserving its human preamble. It refuses damaged
 existing documents and gates generation on onboarding. USER.md is a projection,
 not an independent place to repair memory facts. It and the per-turn pinned
-core (`userPromptCore`, 3,500 B) carry facts about User only: user_fact,
+core (`userPromptCore`, 3,500 B) carry facts about the owner only: user_fact,
 user_preference, preference, relationship, identity and attribute. Moments
 and experiences are theirs; they reach a turn through recall, and `memory.pin`
 refuses any kind outside that list.

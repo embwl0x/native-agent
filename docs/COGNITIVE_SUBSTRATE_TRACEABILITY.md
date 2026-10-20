@@ -183,7 +183,7 @@ removed assistant-prose task ledger.
 | CCS-P8-D6 | Timeline | Source | S `+Replay.developmentalTimelineSnapshot` |
 | CCS-P8-A1 | Replay deduplication | Source | `integrateReplayChecked` checks external evidence IDs |
 | CCS-P8-A2 | Repeated evidence establishes a trait | Unverified | No general trait-validity threshold claimed |
-| CCS-P8-A3 | Inspect/resolve proposals | Source | UI `Sources/NativeAgentApp/CognitionProposalsView.swift` and `Sources/NativeAgentApp/CognitionSurfaceActions.swift`; R schema/view methods |
+| CCS-P8-A3 | Inspect/resolve proposals | Source | UI `Sources/NativeAgentApp/CognitionProposalsView.swift` (its actions included); R schema/view methods |
 | CCS-P8-A4 | Personality stability under noise | Unverified | A proposal boundary alone does not measure personality stability |
 
 ## Phase 9 - Budgeted Reflective Calls
@@ -234,5 +234,5 @@ removed assistant-prose task ledger.
 ## Next Execution Order
 
 There is no implementation queue implied by this ledger. Unverified rows
-identify evidence limits, not authorized work. Select changes from User's
+identify evidence limits, not authorized work. Select changes from the owner's
 current request and recheck the owning code before changing a row.

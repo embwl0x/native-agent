@@ -224,8 +224,9 @@ restating their storage formats.
 
 `BackgroundLoops/BackgroundLoopsManager` owns registration, execution and
 status. Core `EngineLaunch` constructs the concrete loop registrations and
-dependencies through installed native host effects. Each failure outcome refreshes one keyed Desk
-finding; receipts and execution backoff remain with the scheduler.
+dependencies through installed native host effects. Each failure outcome is a Doctor reading whose
+repair, when owed, is projected from Experiences (no parallel Desk finding); receipts and
+execution backoff remain with the scheduler.
 
 ## Source Map Convention
 
@@ -651,7 +652,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatOrchestration/`
 Directory: `Modules/NativeAgentCore/Sources/ChatSessionWork/`
 
 Manual compaction on Mac, iOS and Telegram uses `ChatOrchestrationClient.compactSession`:
-the same mechanical summary, transcript-generation bump and background distillation.
+the same pending recollection (unrendered until distillation succeeds), transcript-generation bump and background distillation.
 Foreground chat and aging share `ChatSessionAutocompactor` and `ChatCompactionDistiller`;
 aging alone requests a fixed keep-tail. Provider distillation runs outside the transcript lock.
 
@@ -750,7 +751,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatToolRuntime/`
 | `SwiftToolDispatcher+MacControlNeed.swift` | `SwiftToolDispatcher`: `macControlCategoryNeedEnvelope`, `builderFullMacRequired`, `fileOpsNeedEnvelope` |
 | `SwiftToolDispatcher+MacIntegration.swift` | `SwiftToolDispatcher`: `dispatchMacIntegrationTool`, read-only MapKit directions, distance-fraction place lookup and radius-bounded nearby place search via `impl_maps_route` / `impl_maps_search`, sharing `place` / `describe` |
 | `SwiftToolDispatcher+Markets.swift` | `SwiftToolDispatcher`: `impl_market_status`, `impl_market_watchlists`, `impl_tradingview_watchlist`, `impl_market_quote`; quote-provider recovery retains answering provider and failures |
-| `SwiftToolDispatcher+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` retain taint on readback; `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
+| `SwiftToolDispatcher+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` retain provenance on readback (a read steers nothing); `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
 | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`: `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata` |
 | `SwiftToolDispatcher+MomentTools.swift` | `SwiftToolDispatcher`: `impl_memory_moments_pending`, `impl_memory_moment_review` |
 | `SwiftToolDispatcher+OMPBridgeTools.swift` | `SwiftToolDispatcher`: `runOMPMessage`, `ompSessionSaved` |

@@ -60,20 +60,17 @@ Agent has one always-on tool: `app`.
 | `app {}` | Home: where they left off, open work, waiting items and arrivals, followed by the pages. |
 | `app {page:"providers"}` | Read a page's state, settings, version and available actions. |
 | `app {item:"…"}` | Open a name or reference returned by home; some items act immediately. |
-| `app {find:"…"}` | Find pages and actions by intent; with `page:"home"`, search their work and conversations. |
+| `app {find:"…"}` | Find pages, actions and skills by intent, from any page including home. |
 | `app {action:"…", args:{…}}` | Run one registered action. |
 | `app {script:"…"}` | Run JavaScriptCore code using the app's permitted actions, reads and search. Each action is checked separately. |
 
-Scripts stop at a blocked action or approval; completed earlier actions stay
-done. Standalone tool names are refused with a translated `app` call. There is
+Scripts stop at a blocked action and wait at a card for the answer; completed
+earlier actions stay done. Standalone tool names are refused with a translated `app` call. There is
 no tool-loading step.
 
 Self-authored executable tools follow `tool.propose` → `tool.approve` →
 `authored.<id>`, all through `app`. Mounted MCP actions appear as
-`mcp.<server>.<tool>`. `web.search` tries Codex web search first for general
-queries and SearXNG first for code queries. Unfiltered searches try the other
-route if the first fails or returns no results; the result identifies it.
-Non-general categories and time ranges use only SearXNG.
+`mcp.<server>.<tool>`. `web.search` uses Codex with direct web-tool access for general queries and SearXNG for other categories; a Codex failure falls back to SearXNG and the receipt keeps the route and the failure reason; a completed empty search stays on its route; a time range travels with either route.
 A skill is a part like a tool or a sense: one file in `abilities/` with the
 one header, guidance as `.md` or a JavaScript routine as `.js`, read through
 `skill.read` and run through `skill.run`; see the

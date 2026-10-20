@@ -42,9 +42,10 @@ Call an action as `app {"action":"github.status"}`; supply its arguments in
 
 `GitHubToolProjection.swift` bounds ordinary collections to 20 rows, issue/PR
 bodies to 1,000 characters, comments to 1,200 and diff hunks to 600.
-Full Mac follows the shared origin-aware authority rules; peer-steered GitHub
-mutations still require User's approval unless the authenticated agent is enabled
-in Trust → Connected agents. Enabled agents carry the owner's authority; ordinary
+Full Mac follows the shared origin-aware authority rules: a turn an agent the
+owner has not trusted started with its message gets one card on its first
+effect, GitHub mutations included, and the answer covers the rest of that turn.
+Agents enabled in Trust → Connected agents carry the owner's authority; ordinary
 Trust and domain checks still apply. See [Threat model](threat-model.md).
 
 ## Refresh and noise policy

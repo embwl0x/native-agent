@@ -737,11 +737,16 @@ package enum AgentConversationSession {
                                   transport: transport, scope: scope, surface: surface, dataRoot: dataRoot, perform: perform)
         }
         let ahead = (saved.queued ?? []).filter { $0.held == nil && $0.id != item.id }.count
+        // What it waits on: the earlier message's card, or a reply still coming.
+        let awaitingCard: Bool = if case .object(let receipt)? = saved.receipt { receipt["status"] == .string("waiting_approval") } else { false }
+        let blocker = awaitingCard ? "your earlier message to \(name), which waits on the person's card" : "the reply in progress from \(name)"
+        let lever = awaitingCard ? "It goes by itself once that card is decided, approved or not; agent_cancel {clear_queue: true} withdraws it."
+            : "It goes by itself, in order, when that reply settles; agent_cancel stops the reply in progress."
         return .object(["agent": .string(name), "agent_id": .string(row.agent), "conversation": .string(saved.label),
             "state": .string("queued"), "queued": .bool(true), "sent": .bool(false), "queued_id": .string(item.id),
             "queue_position": .int(Int64(ahead + 1)),
-            "detail": .string("Queued behind the reply in progress from \(name)" + (ahead > 0 ? " and \(ahead) earlier queued message\(ahead == 1 ? "" : "s")" : "")
-                + ". It goes by itself, in order, when that reply settles; do not send it again. agent_cancel stops the reply in progress.")])
+            "detail": .string("Queued behind \(blocker)" + (ahead > 0 ? " and \(ahead) earlier queued message\(ahead == 1 ? "" : "s")" : "")
+                + ". Do not send it again. " + lever)])
     }
 
     /// The thread's queued follow-ups as every read shows them: queued, sending
@@ -1300,6 +1305,9 @@ package enum AgentConversationSession {
         if !details, let last = string(shown["status"]), !readOwn.contains(last) {
             shown["last_send_status"] = .string(last)
             if let detail = shown["detail"] { shown["last_send_detail"] = detail; shown["detail"] = nil }
+            // The card's reason and remedy are the send's too; the read ran.
+            if let reason = shown["reason"] { shown["last_send_reason"] = reason; shown["reason"] = nil }
+            shown["remedy"] = nil
             shown["execution"] = nil
             shown["status"] = .string("read")
             result = .object(shown)

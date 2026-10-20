@@ -100,9 +100,10 @@ For an action, `preview:true` reports what it would do without doing it.
 from the read.
 
 Scripts can use `app.read`, `app.find`, `app.log` and the registry's
-scriptable actions, such as `app.inbox.archive(args)`. They have no direct
-file or network access. Each call is checked separately. A blocked action or
-one waiting for approval stops the script; earlier completed calls stay done.
+actions, such as `app.inbox.archive(args)`. They have no direct file or
+network access. Each call is checked separately. A call that raises a card
+waits for your answer; a blocked action stops the script; earlier completed
+calls stay done.
 
 Page reads are available in Safe. Ordinary setting changes require Work mode,
 Builder or Full Mac. The returned page states which controls the agent may
@@ -139,10 +140,7 @@ The old catalog, loading and per-area tool calls are refused with a translated
   exemption for agents enabled in Trust.
 - Mounted MCP tools appear as `mcp.<server>.<tool>` actions on the MCP page.
   Their availability depends on the server and its connection.
-- `web.search` tries Codex web search for general queries and SearXNG for
-  code queries. Unfiltered searches try the other route if the first fails or
-  returns no results, and the result explains the fallback. Non-general
-  categories and time ranges use only SearXNG.
+- `web.search` uses Codex with direct web-tool access for general queries and SearXNG for other categories; a Codex failure falls back to SearXNG and the receipt keeps the route and the failure reason; a completed empty search stays on its route; a time range travels with either route.
 - Service connections live in **Connectors**. Authentication and service
   permissions still apply when an action is available.
 

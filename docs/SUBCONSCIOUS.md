@@ -118,10 +118,10 @@ measurement of idle CPU or long-term usefulness.
 ### Reach notification privacy
 
 `Cognition/NativeCognitionRuntime+Reach.swift` owns the notification after
-Agent posts an authored reply to User's conversation. Its neutral push body is
+Agent posts an authored reply to the owner's conversation. Its neutral push body is
 “Left you something in chat. No reply needed.” It points to chat without
 including the reply or conversation-derived seed text. If the conversation
-is User's Telegram DM, Reach instead sends the authored reply there, with no
+is the owner's Telegram DM, Reach instead sends the authored reply there, with no
 additional push. Telegram delivery therefore carries their reply text; the
 neutral lock-screen/APNS body does not.
 
@@ -130,7 +130,7 @@ neutral lock-screen/APNS body does not.
 Enable the hour switch in Setup (`Sources/NativeAgentApp/SetupView.swift`);
 `studioWanderEnabled` defaults off and requires Subconscious. Configure its
 provider/model under **Providers → Memory and mind**, which owns **Creative
-exploration**. `BackgroundLoops/StudioWanderLane.swift`
+exploration**. `Cognition/StudioWanderLane.swift`
 enforces explicit enablement, the Subconscious master, and onboarding clearance
 for public-safe builds in `resolveInstallation`.
 
@@ -177,7 +177,7 @@ Approval authority comes from the current action and Trust policy; do not
 infer it from a view's strength or the capsule's wording.
 
 Bridge clients use `GET /standing_views` and `POST /standing_views/resolve`,
-implemented in `Sources/NativeAgentApp/ClaudeBridge+StandingViews.swift`.
+implemented in `Agents/ClaudeBridgeRuntime+StandingViews.swift`.
 GET returns a `standingViews` array of `{id,status,body}` records, ordered
 active, held, proposed, with body previews capped at 80 characters; opinions,
 interests and retired views are omitted. POST accepts `{id,action}`, where action is

@@ -122,6 +122,8 @@ public struct TurnRequest: Sendable {
                         _ operation: () async throws -> T) async rethrows -> T {
         if case .some(.some(let origin)) = origin, let sources = origin.peerSources {
             let taint = PeerDataTaint.current ?? PeerDataTaint()
+            // The turn's input is the agent's words: the card quotes them.
+            taint.keep(line: message)
             for source in sources { taint.mark(peer: source) }
             for source in origin.elevatedPeerSources ?? [] { taint.markElevated(peer: source) }
             // Recorded steering, including an empty record, is authoritative.

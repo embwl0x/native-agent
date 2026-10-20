@@ -66,7 +66,11 @@ public enum PermissionLaw {
         let (toolClass, level) = judge(tool: tool, input: input, posture: posture, dataRoot: dataRoot, roots: roots, capabilities: capabilities)
         let mode = posture == .fullMac ? "Full Mac" : posture == .readOnly ? "Safe" : "Work mode"
         var reason = "trust/policy.json: \(mode) judges \(tool) as \(toolClass), autonomy=\(level)."
-        if capped, let peer { reason += " Full Mac is capped to Work mode by \(peer.message)" }
+        if capped, let peer {
+            // "This turn was steered by X, so it cannot …" → who steers; the answer to its one card lifts the cap.
+            let who = peer.message.components(separatedBy: ", so ").first.map { $0.replacingOccurrences(of: "This turn was steered by ", with: "") } ?? "another agent"
+            reason += " Full Mac is capped to Work mode while \(who) steers this turn; your answer to its card lifts it."
+        }
         let remedy: JSONValue?
         if level == "auto" {
             remedy = nil

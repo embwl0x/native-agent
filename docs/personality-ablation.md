@@ -10,7 +10,7 @@ one of `cue`, `memory` or `outreach`. Settings are set with
 
 | Layer | Shows it changed a turn | Off for a test |
 |---|---|---|
-| Persona docs (SOUL, VOICE, GROWTH, pinned USER core) | `context.summary`: `persona.docChars`, `system.stableChars` | Not ablated. The text is User's and theirs. |
+| Persona docs (SOUL, VOICE, GROWTH, pinned USER core) | `context.summary`: `persona.docChars`, `system.stableChars` | Not ablated. The text is the owner's and theirs. |
 | One felt cue (Inner, Thread, Since, Reminded of, Settling, Body, Sound, Dream) | `mind.why` with lane `cue`: `winner.kind`, plus every candidate with its rank, score and source | `settings.inner_life_capsule` = false turns off the whole cue. To drop one source, `mind.reject` it with the source from `mind.why`. |
 | Body line, plus the ops line beside it | A `cue` winner of kind `body`. The ops line only appears when the posture isn't the default. | `settings.organism_kernel` = false |
 | Since we last talked | A `cue` winner of kind `since` | No switch of its own. Use the capsule switch. |

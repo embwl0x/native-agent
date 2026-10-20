@@ -26,7 +26,7 @@ writes. One artifact is limited to 16 MiB and one group to 32 MiB. Matching
 artifacts are evicted together. Unknown files and symlinks are excluded;
 downloads, generated images and user documents are outside this cache.
 
-`AppQuietToolPresentation.swift` bounds offscreen page pictures in
+`AppToolRuntime/AppToolExecutor+PagePresentation.swift` bounds offscreen page pictures in
 `diagnostics/page_shots/` to seven days, 64 PNGs and 64 MiB on each write.
 The current delivery is protected; inline continuations own their pixel bytes.
 These are replaceable diagnostics, separate from authored images.

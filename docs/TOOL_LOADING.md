@@ -17,7 +17,7 @@ requests offer it alone. The schema is defined in
 |---|---|
 | `app {}` | Home first—where they left off—then a line per page (with what blocks any of its actions) and the action IDs that work on every page; `pages_version` changes when pages, actions or readiness do. A page read lists the page's actions. |
 | `app {"page":"home"}` | Their work, arrivals, conversations and places. |
-| `app {"item":"<name or ref>","args":{…}}` | Open or act on a name returned by home or one of its rooms. Home arguments are `text` and `fields`. |
+| `app {"item":"<name or ref>","args":{…}}` | Open or act on a name returned by home or one of its rooms. Home arguments are `text`, `fields`, `conversation` and `expects_reply`. |
 | `app {"page":"home","find":"<words>"}` | Discover matching pages, actions and skills, just like find alone. |
 | `app {"page":"<page>","item":"<optional item>"}` | Read a page or one of that page's items. Page reads return a version and registered actions, including unavailable ones with their blocker. |
 | `app {"find":"<words>"}` | Discover matching pages, actions and skills. |
@@ -124,10 +124,7 @@ discovery tool.
   through the same app gates; a skill grants no new authority. See the
   [manifest spec](skill_manifest_spec.md).
 
-`web.search` tries Codex web search first for general queries. Code-shaped
-queries try SearXNG first. Unfiltered searches try the other route if the first
-fails or returns no results; the result identifies the route and any fallback
-reason. Explicit time ranges and non-general categories use only SearXNG.
+`web.search` uses Codex with direct web-tool access for general queries and SearXNG for other categories; a Codex failure falls back to SearXNG and the receipt keeps the route and the failure reason; a completed empty search stays on its route; a time range travels with either route.
 Cancellation stops the search.
 
 ## Scripts
@@ -137,8 +134,8 @@ Cancellation stops the search.
 direct filesystem, network, process or timer API. Every nested app call
 re-enters the same gate chain.
 
-Actions are scriptable unless they declare `scriptable: false` (card button
-presses). Each write retains its gates and receipt. A call that raises an
+Every registered action is callable from a script under its ordinary gates.
+Each write retains its gates and receipt. A call that raises an
 approval card waits for the settled result; a decline throws `AppError` with
 reason `declined`, which the code can catch. `card.request` likewise waits for
 the person's answer. Full Mac writes need no approval card. Home may be read;
@@ -150,7 +147,7 @@ an atomic transaction or a rollback mechanism.
 
 ## Authority and receipts
 
-Under Full Mac, Agent can also perform actions otherwise marked User's.
+Under Full Mac, Agent can also perform actions otherwise marked the owner's.
 Explicit blocks, checked policy, actual macOS grants and connector
 authentication still apply. macOS privacy permission resets always require
 the owner's approval. A turn an agent the owner has not trusted started with

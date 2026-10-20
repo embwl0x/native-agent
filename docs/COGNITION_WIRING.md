@@ -90,7 +90,7 @@ into the body. The somatic adapter never repeats this semantic judgment.
 
 Memory candidates are separately screened and staged by MemoryV2.
 `bot-` sessions skip this interpretation; peer speakers are named rather than
-treated as User. Unavailable interpretation and a successful abstention remain
+treated as the person. Unavailable interpretation and a successful abstention remain
 different outcomes.
 
 ## Attention into circulation

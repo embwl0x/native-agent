@@ -132,7 +132,7 @@ Folded actions re-enter the dispatcher under their underlying identity so
 saved Trust decisions and domain checks still bind. A page read or discovery
 result grants no authority.
 
-Full Mac gives Agent autonomy, including actions otherwise marked User's.
+Full Mac gives Agent autonomy, including actions otherwise marked the owner's.
 Checked policy, explicit blocks, actual macOS grants and connector
 authentication still govern execution. macOS privacy permission resets always
 ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.

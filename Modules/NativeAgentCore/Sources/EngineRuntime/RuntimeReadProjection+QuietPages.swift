@@ -559,7 +559,10 @@ extension RuntimeReadProjection {
             return [quietPageSection("Agents", ["Contacts and trusted switches could not be read."])]
         }
         let rows = AgentContactRow.rows(peers: peers, candidates: [], usable: usable, dataRoot: dataRoot)
-        var sections = [quietPageSection("Agents", [quietCountLine(rows.count, "contact", "contacts")])]
+        var sections = [quietPageSection("Agents", [
+            quietCountLine(rows.count, "contact", "contacts"),
+            "Opening this page only reads: contacts and switches; nothing is run. agent.contacts {discover: true} finds agents by what they speak (A2A card, MCP settings, ACP program) and runs each found program's --help and initialize under the rule a send to it uses; its result says what it read and what it ran.",
+        ])]
         if !rows.isEmpty {
             sections.append(quietPageSection("Contacts", rows.map { "\($0.displayName): \($0.pillWord) · \($0.status)" }))
         }
