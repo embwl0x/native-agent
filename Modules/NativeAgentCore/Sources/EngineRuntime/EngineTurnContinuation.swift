@@ -366,7 +366,7 @@ public struct TurnContinuationRuntime: Sendable {
     private func runOwnedContinuation(_ request: TurnRequest, helperDefinition: JSONValue?,
         operation: @escaping @Sendable () async throws -> ChatResponse) async throws -> ChatResponse {
         guard request.surface == "bot" else {
-            return try await runAdmittedContinuation(sessionID: request.sessionID) { try await operation() }
+            return try await runAdmittedContinuation(sessionID: request.sessionID, runID: request.pinnedRunID ?? nil) { try await operation() }
         }
         guard let saved = helperDefinition,
               let bot = try? JSONDecoder().decode(BotDefinition.self, from: saved.serializedData(pretty: false)),
@@ -378,7 +378,7 @@ public struct TurnContinuationRuntime: Sendable {
         let runner = BotRunner(dataRoot: dataRoot, session: { bot, _ in
             let choice = try await BotChatContract.choice(for: bot, dataRoot: self.dataRoot)
             return try await StandingBotContinuity.$currentBot.withValue(bot) {
-                try await runAdmittedContinuation(sessionID: bot.sessionID) {
+                try await runAdmittedContinuation(sessionID: bot.sessionID, runID: request.pinnedRunID ?? nil) {
                     try await ProviderTurnChoice.$current.withValue(choice) {
                         let response = try await operation()
                         responses.continuation.yield(response)
@@ -462,9 +462,10 @@ public struct TurnContinuationRuntime: Sendable {
             replyRoute: replyRoute, pinnedRunID: pinnedRunID, serviceTier: serviceTier)
     }
 
-    private func runAdmittedContinuation<T: Sendable>(sessionID: String?,
+    /// `runID`: the resumed run, so a restart's restored backlog admits it in its place.
+    private func runAdmittedContinuation<T: Sendable>(sessionID: String?, runID: String? = nil,
         operation: @escaping @Sendable () async throws -> T) async throws -> T {
-        try await TurnAdmission.shared.run(sessionID: sessionID, operation: operation)
+        try await TurnAdmission.shared.run(sessionID: sessionID, runID: runID, operation: operation)
     }
 
     private func runApprovalAdmission(sessionID: String, envelope: TurnEnvelope, prompt: String,

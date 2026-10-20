@@ -17,8 +17,6 @@ public struct HumanConversationSnapshot: Sendable {
     public let route: TurnEnvelope?
     public let messages: [ChatMessage]
     public let complete: Bool
-    /// "peer:<id>" when an untrusted bridge peer wrote its user rows.
-    public var peerOrigin: String? = nil
 }
 
 public enum HumanConversationReader {
@@ -60,27 +58,10 @@ public enum HumanConversationReader {
                 route = candidate
             }
         }
-        // 2026-09-22: a peer-opened session's words are peer data; label them so the taint latches.
-        let peerOrigin = recent.lazy.filter { $0.role == "user" }.compactMap { message -> String? in
-            let metadata = object(object(message.extras)["metadata"])
-            let origin = object(metadata["origin"])
-            let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
-            guard (string(origin["surface"]) ?? envelope?.surface)?.hasSuffix("-bridge") == true else { return nil }
-            let agent = string(origin["agent"]) ?? envelope?.agent
-            let peer: String
-            if let id = envelope?.verifiedUserId, !id.isEmpty {
-                peer = id.hasPrefix("peer:") ? id : "peer:" + id
-            } else if let agent, ["claude", "codex", "omp"].contains(agent) {
-                peer = agent
-            } else {
-                peer = "peer:unknown"
-            }
-            return PeerTrust.ownerTrusts(peer, dataRoot: dataRoot) ? nil : peer
-        }.first
         let generation = ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"
         return .init(sessionID: sessionID, title: string(row["title"]) ?? "Conversation",
                      source: string(row["source"]) ?? "app", revision: generation + ":" + (lastID ?? "unavailable"), sourceRevision: generation,
-                     lastMessageID: lastID, route: route, messages: visible, complete: complete, peerOrigin: peerOrigin)
+                     lastMessageID: lastID, route: route, messages: visible, complete: complete)
     }
     /// One conversation's latest messages (8, up to 16) and whether
     /// chat_reply can answer it: the app door's chat item read, which the
@@ -92,11 +73,29 @@ public enum HumanConversationReader {
         catch { return ChatToolOutcome.failure(error: error, tool: "app") }
         let current = ChatToolSessionContext.verifiedSessionId == id
         let canReply = !current && snapshot.lastMessageID != nil && routeAvailable(snapshot.route)
+        // Each message shown is read under its own row's stamp (a bridge turn's
+        // door, every peer that steered it) through the one per-line path.
+        var untrusted = false
         let messages = snapshot.messages.suffix(limit).map { message -> JSONValue in
             let row = object(message.extras)
-            return .object(["role": .string(message.role), "text": .string(String(message.content.prefix(6000))),
+            var value: [String: JSONValue] = ["role": .string(message.role), "text": .string(String(message.content.prefix(6000))),
                 "timestamp": .string(message.timestamp), "message_id": row["id"] ?? .null,
-                "truncated": .bool(message.content.count > 6000)])
+                "truncated": .bool(message.content.count > 6000)]
+            let metadata = object(row["metadata"])
+            let bridged = message.role == "user" && (string(object(metadata["origin"])["surface"])?.hasSuffix("-bridge") == true
+                || TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.surface.hasSuffix("-bridge") == true)
+            let stamp = ContactThread.stamp(id: string(row["id"]) ?? "", metadata: metadata)
+            let speakers = ContactThread.consume(mine: !bridged, source: stamp.source, steeredBy: stamp.steeredBy, text: message.content) {
+                PeerDataTaint.markConsumed(peer: $0, line: $1)
+            }
+            if !speakers.isEmpty {
+                let principals = speakers.map { PeerTrust.principal($0, dataRoot: dataRoot) }
+                if bridged { value["agent_id"] = .string(principals[0]) }
+                let trusted = principals.allSatisfy { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }
+                value["untrusted_remote_data"] = .bool(!trusted)
+                untrusted = untrusted || !trusted
+            }
+            return .object(value)
         }
         var result: [String: JSONValue] = ["status": .string(snapshot.complete ? "ok" : "unavailable"),
             "conversation_session_id": .string(id), "title": .string(snapshot.title),
@@ -109,10 +108,7 @@ public enum HumanConversationReader {
             "note": .string(current ? "This is your active conversation. Answer normally here; no extra send is needed."
                 : canReply ? "Reply returns to the exact human conversation and its recorded destination."
                 : "History is available, but a current exact reply route is not proven. Nothing was sent.")]
-        if let peer = snapshot.peerOrigin {
-            result["untrusted_remote_data"] = .bool(true)
-            result["agent"] = .string(peer)
-        }
+        if untrusted { result["untrusted_remote_data"] = .bool(true) }
         return .object(result)
     }
     public static func routeAvailable(_ envelope: TurnEnvelope?) -> Bool {

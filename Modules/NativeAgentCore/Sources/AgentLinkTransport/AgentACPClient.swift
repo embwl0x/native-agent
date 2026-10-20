@@ -105,6 +105,8 @@ public actor AgentACPClient {
     /// The mode ids the agent advertised when this session opened.
     private var advertised: [String]?
 
+    package init() {}
+
     /// The peer said at initialize it can reopen a session by id.
     var canRestoreSession: Bool {
         let capabilities = initialized?.objectValue?["agentCapabilities"]?.objectValue
@@ -136,73 +138,9 @@ public actor AgentACPClient {
         do {
         let reply = try await withTaskCancellationHandler {
             try Task.checkCancellation()
-            if let approvedExecutable {
-                do { try approvedExecutable.verify() } catch { throw Failure.executableChanged }
-            }
-            if !started {
-                started = true
-                // The sole supported wrapper must receive the approved path.
-                if let approvedExecutable {
-                    guard executable == approvedExecutable.path ||
-                        (executable == "/usr/bin/sandbox-exec" && arguments.count >= 3 &&
-                         arguments[0] == "-p" && arguments[2] == approvedExecutable.path)
-                    else { throw Failure.unavailable }
-                }
-                processID = try AgentACPProcess.spawn(executable: executable, arguments: arguments,
-                    directory: directory, environment: environment, input: input, output: output,
-                    approvedExecutable: approvedExecutable)
-                tree = ProcessTreeReaper.snapshot(rootPID: processID)
-                // Close parent copies of child ends so EOF is observable.
-                try? input.fileHandleForReading.close()
-                try? output.fileHandleForWriting.close()
-                let pipeReader = try AgentACPPipeReader(handle: output.fileHandleForReading)
-                self.pipeReader = pipeReader
-                try? output.fileHandleForReading.close()
-                reader = Task { [weak self] in
-                    do {
-                        var line = Data()
-                        for try await chunk in pipeReader.chunks {
-                            pipeReader.consumed()
-                            try Task.checkCancellation()
-                            for byte in chunk {
-                                if byte == 10 {
-                                    guard !line.isEmpty else { throw Failure.invalidResponse }
-                                    let value = try JSONValue.parse(line)
-                                    line.removeAll(keepingCapacity: true)
-                                    await self?.receive(value)
-                                } else {
-                                    guard line.count < 1_048_576 else { throw Failure.tooLarge }
-                                    line.append(byte)
-                                }
-                            }
-                        }
-                        await self?.fail(Failure.interrupted)
-                    } catch { await self?.fail(error) }
-                }
-            }
-            // 2026-09-22 WHY: one 300s deadline covered the handshake too, so a
-            // CLI stuck initializing burned the whole reply window.
-            deadlineGeneration += 1
-            let handshake = deadlineGeneration
-            deadline = Task { [weak self] in
-                do { try await Task.sleep(for: min(timeout, .seconds(30))) } catch { return }
-                await self?.expire(handshake)
-            }
-            if initialized == nil { initialized = try await request("initialize", [
-                "protocolVersion": .int(1), "clientCapabilities": .object([:]),
-                "clientInfo": .object(["name": .string("nativeagent"), "version": .string("1")])]) }
-            deadlineGeneration += 1
-            let replyDeadline = deadlineGeneration
-            deadline?.cancel()
-            deadline = Task { [weak self] in
-                do { try await Task.sleep(for: timeout) } catch { return }
-                await self?.expire(replyDeadline)
-            }
-            guard let initialized else { throw Failure.invalidResponse }
-            guard initialized.objectValue?["protocolVersion"] == .int(1) else {
-                throw Mismatch(method: "initialize", code: nil, detail: "it speaks ACP version "
-                    + ((try? initialized.objectValue?["protocolVersion"]?.serialize(pretty: false)) ?? "none") + "; this app speaks 1")
-            }
+            let initialized = try await handshake(executable: executable, arguments: arguments, directory: directory,
+                environment: environment, approvedExecutable: approvedExecutable, timeout: timeout)
+            arm(timeout)
             startupTimeout = .sessionStartupTimedOut
             let params: [String: JSONValue] = ["cwd": .string(directory.path), "mcpServers": .array(mcpServers)]
             var restored: JSONValue? = sessionID != nil && conversationID == sessionID ? .object([:]) : nil
@@ -308,6 +246,96 @@ public actor AgentACPClient {
             reader?.cancel()
             try? output.fileHandleForReading.close()
             throw reportedError
+        }
+    }
+
+    /// The start every exchange shares: the approved program checked, started
+    /// once, and initialize sent and held to its answer (JSON-RPC 2.0, its own
+    /// id, ACP 1), under a handshake deadline of its own.
+    private func handshake(executable: String, arguments: [String], directory: URL, environment: [String: String],
+                           approvedExecutable: AgentACPExecutable?, timeout: Duration) async throws -> JSONValue {
+        if let approvedExecutable {
+            do { try approvedExecutable.verify() } catch { throw Failure.executableChanged }
+        }
+        if !started {
+            started = true
+            // The sole supported wrapper must receive the approved path.
+            if let approvedExecutable {
+                guard executable == approvedExecutable.path ||
+                    (executable == "/usr/bin/sandbox-exec" && arguments.count >= 3 &&
+                     arguments[0] == "-p" && arguments[2] == approvedExecutable.path)
+                else { throw Failure.unavailable }
+            }
+            processID = try AgentACPProcess.spawn(executable: executable, arguments: arguments,
+                directory: directory, environment: environment, input: input, output: output,
+                approvedExecutable: approvedExecutable)
+            tree = ProcessTreeReaper.snapshot(rootPID: processID)
+            // Close parent copies of child ends so EOF is observable.
+            try? input.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
+            let pipeReader = try AgentACPPipeReader(handle: output.fileHandleForReading)
+            self.pipeReader = pipeReader
+            try? output.fileHandleForReading.close()
+            reader = Task { [weak self] in
+                do {
+                    var line = Data()
+                    for try await chunk in pipeReader.chunks {
+                        pipeReader.consumed()
+                        try Task.checkCancellation()
+                        for byte in chunk {
+                            if byte == 10 {
+                                guard !line.isEmpty else { throw Failure.invalidResponse }
+                                let value = try JSONValue.parse(line)
+                                line.removeAll(keepingCapacity: true)
+                                await self?.receive(value)
+                            } else {
+                                guard line.count < 1_048_576 else { throw Failure.tooLarge }
+                                line.append(byte)
+                            }
+                        }
+                    }
+                    await self?.fail(Failure.interrupted)
+                } catch { await self?.fail(error) }
+            }
+        }
+        // 2026-09-22 WHY: one 300s deadline covered the handshake too, so a
+        // CLI stuck initializing burned the whole reply window.
+        arm(min(timeout, .seconds(30)))
+        if initialized == nil { initialized = try await request("initialize", [
+            "protocolVersion": .int(1), "clientCapabilities": .object([:]),
+            "clientInfo": .object(["name": .string("nativeagent"), "version": .string("1")])]) }
+        guard let initialized else { throw Failure.invalidResponse }
+        guard initialized.objectValue?["protocolVersion"] == .int(1) else {
+            throw Mismatch(method: "initialize", code: nil, detail: "it speaks ACP version "
+                + ((try? initialized.objectValue?["protocolVersion"]?.serialize(pretty: false)) ?? "none") + "; this app speaks 1")
+        }
+        return initialized
+    }
+
+    /// Discovery's handshake (`AgentPeerDiscovery.acpPrograms`): exactly a
+    /// turn's start, and nothing after it; then the program is stopped.
+    package func initialize(executable: String, arguments: [String], directory: URL, environment: [String: String],
+                            approvedExecutable: AgentACPExecutable, timeout: Duration) async throws -> JSONValue {
+        guard !active, !started else { throw Failure.busy }
+        active = true
+        defer { active = false }
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await handshake(executable: executable, arguments: arguments, directory: directory,
+                                    environment: environment, approvedExecutable: approvedExecutable, timeout: timeout)
+            } onCancel: { Task { await self.cancel(error: CancellationError()) } }
+            await close()
+            return result
+        } catch { await close(); throw error }
+    }
+
+    private func arm(_ duration: Duration) {
+        deadlineGeneration += 1
+        let generation = deadlineGeneration
+        deadline?.cancel()
+        deadline = Task { [weak self] in
+            do { try await Task.sleep(for: duration) } catch { return }
+            await self?.expire(generation)
         }
     }
 
@@ -568,7 +596,8 @@ public actor AgentACPClient {
 /// shared FileHandle.AsyncBytes reader can block on an idle retained pipe and
 /// starve initialization on another connection. No blocking read or per-chunk
 /// Task is used here; the sole consumer preserves wire order and backpressure.
-private final class AgentACPPipeReader: @unchecked Sendable {
+/// The client's stdout reader; also the bounded probe's (`AgentACPExecutable.reported`).
+final class AgentACPPipeReader: @unchecked Sendable {
     let chunks: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
     private let source: any DispatchSourceRead

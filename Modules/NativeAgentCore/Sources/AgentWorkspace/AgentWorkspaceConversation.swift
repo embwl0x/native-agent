@@ -40,26 +40,25 @@ enum AgentWorkspaceConversation {
         if phase == "not_opened" { actions.removeAll() }
         var items: [AgentWorkspaceItem] = []
         if case .object(var history)? = content["session_history"] {
-            if let boundary = string(history.removeValue(forKey: "earlier_before")), UUID(uuidString: boundary) != nil {
+            if let boundary = string(history.removeValue(forKey: "earlier_before")), ContactThread.isMessageID(boundary) {
                 var earlier = latest; earlier["history_before"] = .string(boundary)
                 actions.append(.init(label: "Earlier messages", action: .open(.record(tool: "agent_read", input: earlier, title: title))))
             }
             if input["history_before"] != nil || input["history_exchange"] != nil {
                 actions.append(.init(label: "Recent messages", action: .open(source)))
             }
-            if case .array(let exchanges)? = history.removeValue(forKey: "exchanges") {
-                items = exchanges.compactMap { value in
-                    guard case .object(var exchange) = value, let id = string(exchange.removeValue(forKey: "exchange")),
-                          UUID(uuidString: id) != nil else { return nil }
+            if case .array(let messages)? = history.removeValue(forKey: "messages") {
+                items = messages.compactMap { value in
+                    guard case .object(var message) = value, let id = string(message.removeValue(forKey: "message")),
+                          ContactThread.isMessageID(id) else { return nil }
                     var selected = latest; selected["history_exchange"] = .string(id)
-                    let date = string(exchange["sent_at"]) ?? "Retained exchange"
-                    return .init(title: "You and " + (string(content["agent"]) ?? title) + " — " + date,
-                        content: .object(exchange), actions: input["history_exchange"] == .string(id) ? [] : [
-                            .init(label: "Read exchange", action: .open(.record(tool: "agent_read", input: selected, title: title)))
+                    return .init(title: (string(message["from"]) ?? title) + " — " + (string(message["at"]) ?? ""),
+                        content: .object(message), actions: input["history_exchange"] == .string(id) ? [] : [
+                            .init(label: "Read message", action: .open(.record(tool: "agent_read", input: selected, title: title)))
                         ])
                 }
             }
-            history.removeValue(forKey: "selected_exchange")
+            history.removeValue(forKey: "selected_message")
             // 2026-09-22: fixed text, the same on every read.
             history.removeValue(forKey: "coverage"); history.removeValue(forKey: "order")
             content["session_history"] = .object(history)

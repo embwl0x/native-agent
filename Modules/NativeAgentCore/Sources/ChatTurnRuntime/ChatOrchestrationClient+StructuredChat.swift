@@ -679,7 +679,8 @@ extension SwiftNativeChatOrchestrationClient {
                     guard case .object(let fields)? = row.extras else { continue }
                     let author = SwiftToolDispatcher.persistedHistoryAuthor(role: row.role, row: fields)
                     let peer = row.role == "user" ? SwiftToolDispatcher.persistedHistoryPeer(role: row.role, row: fields) : nil
-                    if author == SwiftToolDispatcher.ownerAuthor || author == "human via bridge" || peer.map(PeerDataTaint.ownerTrusts) == true
+                    if author == SwiftToolDispatcher.ownerAuthor || author == "human via bridge"
+                        || peer.map({ $0.split(separator: "\n").allSatisfy { PeerDataTaint.ownerTrusts(String($0)) } }) == true
                         || (peer == nil && envelope.verifiedUserId != nil && author == envelope.verifiedUserId) {
                         found = found || quotes(row.content)
                     }

@@ -113,92 +113,92 @@ enum AgentContactRuntime {
         let session = principal.storedConversation(turn.context)
         let attachments = turn.parts.compactMap(\.attachment)
         let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
-        // One turn at a time in this conversation: a second message waits for
-        // the first reply to finish instead of interleaving with it.
-        // The run is minted and registered for Stop here, before the session
-        // queue, and the request pins it, so the enqueued row is that same run.
+        let acceptedMessage = acceptedMessage ?? turn.accepted
+        // The run is minted here and the request pins it, so the enqueued row is that same run.
         let runID = acceptedMessage?.runId ?? UUID().uuidString
-        do {
-            return try await TurnAdmission.admittedRun(dataRoot: dataRoot, sessionID: session, runID: runID,
-                                                       waitForCapacity: acceptedMessage != nil) {
+        let enqueued: EnqueuedUserMessage
+        if let acceptedMessage { enqueued = acceptedMessage } else {
+            // Durable, and the task bound to it, before it waits its turn: a
+            // restart while it queues behind another turn in the contact's one
+            // session resumes it from this row (`AgentContactTasks.get`).
+            var request = try revalidated(principal, dataRoot: dataRoot).turnRequest(context: turn.context, plain: plain,
+                attachments: attachments, messageID: turn.requestID)
+            request.pinnedRunID = .some(runID)
+            enqueued = try await request.enqueue(on: client)
+            try await turn.bindRun(session, enqueued.runId)
+        }
+        // One turn at a time in this conversation: a second message waits for
+        // the first reply to finish instead of interleaving with it. Admission
+        // registers the run for Stop before it waits.
+        return try await TurnAdmission.admittedRun(dataRoot: dataRoot, sessionID: session, runID: runID, waitForCapacity: true) {
+            try Task.checkCancellation()
+            // A message accepted elsewhere (Dot's room, one a restart left queued) binds when admitted.
+            if acceptedMessage != nil { try await turn.bindRun(session, enqueued.runId) }
+            // The wait suspends too; bind only current authority.
+            let current = try revalidated(principal, dataRoot: dataRoot)
+            let request = current.turnRequest(context: turn.context, plain: plain,
+                attachments: attachments, messageID: turn.requestID)
+            let text = request.message
+            if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
+            return try await request.consuming(enqueued).bind {
                 try Task.checkCancellation()
-                let admitted = try revalidated(principal, dataRoot: dataRoot)
-                var acceptedRequest = admitted.turnRequest(context: turn.context, plain: plain,
-                    attachments: attachments, messageID: turn.requestID)
-                acceptedRequest.pinnedRunID = .some(runID)
-                let enqueued: EnqueuedUserMessage
-                if let accepted = acceptedMessage { enqueued = accepted }
-                else { enqueued = try await acceptedRequest.enqueue(on: client) }
-                try await turn.bindRun(session, enqueued.runId)
-                // Enqueue and run binding suspend too; bind only current authority.
-                let current = try revalidated(principal, dataRoot: dataRoot)
-                let request = current.turnRequest(context: turn.context, plain: plain,
-                    attachments: attachments, messageID: turn.requestID)
-                let text = request.message
-                if let peerID = principal.peerID { AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peerID, inbound: true) }
-                return try await request.consuming(enqueued).bind {
-                    try Task.checkCancellation()
-                    await emit(.working)
-                    let execution = client.chatStreamExecution(message: text, sessionId: session, model: "", reasoningEffort: "",
-                        fileAccess: request.fileAccess, attachments: attachments, persona: nil, surface: current.surface, suppressUserAppend: true)
-                    let outcome = try await withTaskCancellationHandler {
-                        var final: TurnEngineResult?
-                        var waiting = false
-                        var failure: String?
-                        var ranPartly = false
-                        do {
-                            for try await event in execution.events {
-                                try Task.checkCancellation()
-                                switch event {
-                                case .delta(let delta):
-                                    ranPartly = ranPartly || !delta.isEmpty
-                                    await emit(.text(delta))
-                                case .toolResult(_, let output):
-                                    ranPartly = ranPartly || !ChatToolOutcome.wasCancelled(output) || ChatToolOutcome.effectsUnknown(output)
-                                    if ChatToolOutcome.isWaitingOnPerson(output) {
-                                        if case .object(let fields) = output,
-                                           case .string(let id) = fields["approvalId"] ?? fields["approval_id"] {
-                                            await emit(.approval(id))
-                                        }
-                                        waiting = true
-                                        await emit(.waiting)
+                await emit(.working)
+                let execution = client.chatStreamExecution(message: text, sessionId: session, model: "", reasoningEffort: "",
+                    fileAccess: request.fileAccess, attachments: attachments, persona: nil, surface: current.surface, suppressUserAppend: true)
+                let outcome = try await withTaskCancellationHandler {
+                    var final: TurnEngineResult?
+                    var waiting = false
+                    var failure: String?
+                    var ranPartly = false
+                    do {
+                        for try await event in execution.events {
+                            try Task.checkCancellation()
+                            switch event {
+                            case .delta(let delta):
+                                ranPartly = ranPartly || !delta.isEmpty
+                                await emit(.text(delta))
+                            case .toolResult(_, let output):
+                                ranPartly = ranPartly || !ChatToolOutcome.wasCancelled(output) || ChatToolOutcome.effectsUnknown(output)
+                                if ChatToolOutcome.isWaitingOnPerson(output) {
+                                    if case .object(let fields) = output,
+                                       case .string(let id) = fields["approvalId"] ?? fields["approval_id"] {
+                                        await emit(.approval(id))
                                     }
-                                case .final(let result): final = result
-                                case .error(let message): failure = message
-                                case .notice, .toolUse, .replyTextSettled: break
+                                    waiting = true
+                                    await emit(.waiting)
                                 }
+                            case .final(let result): final = result
+                            case .error(let message): failure = message
+                            case .notice, .toolUse, .replyTextSettled: break
                             }
-                        } catch {
-                            // Stop is the turn's one cancel link: the run's flag.
-                            if Task.isCancelled { try? await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session) }
-                            await execution.waitForProducerTermination()
-                            throw ProviderFailure.report(error, work: ranPartly ? .ranPartly : nil) ?? error
                         }
+                    } catch {
+                        // Stop is the turn's one cancel link: the run's flag.
+                        if Task.isCancelled { try? await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session, runId: runID) }
                         await execution.waitForProducerTermination()
-                        try Task.checkCancellation()
-                        guard let final, failure == nil else {
-                            return AgentContactOutcome(state: waiting ? .inputRequired : .failed,
-                                parts: try final.map { try outputParts($0, taskID: turn.taskID, dataRoot: dataRoot) } ?? [],
-                                detail: waiting ? "Waiting for the person" : (failure ?? "The reply ended without a finished result") + ". Work: " + (ranPartly ? "ran partly." : "outcome unknown."))
-                        }
-                        let parts = try outputParts(final, taskID: turn.taskID, dataRoot: dataRoot)
-                        // Only .incomplete is an unfinished turn; an owner that cannot
-                        // say (nil) is read as finished, as the chat's own owner reads it.
-                        let state: AgentContactTaskState = waiting ? .inputRequired : (final.completionState == .incomplete ? .failed : .completed)
-                        return AgentContactOutcome(state: state, parts: parts,
-                            detail: state == .failed ? "The work did not finish" : nil)
-                    } onCancel: { Task { try? await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session) } }
-                    await MainActor.run {
-                        NotificationCenter.default.post(name: .chatTurnCompleted, object: session)
+                        throw ProviderFailure.report(error, work: ranPartly ? .ranPartly : nil) ?? error
                     }
-                    // A started memory promotion finishes on its own; the reply
-                    // and the session's next turn never wait for it.
-                    return outcome
+                    await execution.waitForProducerTermination()
+                    try Task.checkCancellation()
+                    guard let final, failure == nil else {
+                        return AgentContactOutcome(state: waiting ? .inputRequired : .failed,
+                            parts: try final.map { try outputParts($0, taskID: turn.taskID, dataRoot: dataRoot) } ?? [],
+                            detail: waiting ? "Waiting for the person" : (failure ?? "The reply ended without a finished result") + ". Work: " + (ranPartly ? "ran partly." : "outcome unknown."))
+                    }
+                    let parts = try outputParts(final, taskID: turn.taskID, dataRoot: dataRoot)
+                    // Only .incomplete is an unfinished turn; an owner that cannot
+                    // say (nil) is read as finished, as the chat's own owner reads it.
+                    let state: AgentContactTaskState = waiting ? .inputRequired : (final.completionState == .incomplete ? .failed : .completed)
+                    return AgentContactOutcome(state: state, parts: parts,
+                        detail: state == .failed ? "The work did not finish" : nil)
+                } onCancel: { Task { try? await MacChatTurnRuntime(dataRoot: dataRoot).stop(sessionId: session, runId: runID) } }
+                await MainActor.run {
+                    NotificationCenter.default.post(name: .chatTurnCompleted, object: session)
                 }
+                // A started memory promotion finishes on its own; the reply
+                // and the session's next turn never wait for it.
+                return outcome
             }
-        } catch let full as TurnAdmission.Full {
-            if acceptedMessage != nil { throw full }
-            return AgentContactOutcome(state: .failed, parts: [], detail: (full.errorDescription ?? "") + " Work: nothing ran.")
         }
     }
 

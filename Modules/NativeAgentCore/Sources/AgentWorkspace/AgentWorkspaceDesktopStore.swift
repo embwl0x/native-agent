@@ -176,7 +176,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             if tool == "agent_read" {
                 guard arguments["history_before"] == nil || arguments["history_exchange"] == nil else { return nil }
                 for key in ["history_before", "history_exchange"] {
-                    if case .string(let id)? = arguments[key], UUID(uuidString: id) == nil { return nil }
+                    if case .string(let id)? = arguments[key], !ContactThread.isMessageID(id) { return nil }
                 }
             }
             if tool == "read_file" || tool == "list_dir" {

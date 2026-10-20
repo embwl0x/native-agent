@@ -1,5 +1,6 @@
 import AgentWorkspace
 import Foundation
+import os
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
@@ -369,7 +370,8 @@ public struct AgentConversationStore: Sendable {
                 rows[i].exchanges = try AgentConversationExchange.bounded(history)
             }
             try save(rows)
-            noteReplies(was: before, now: rows[i])
+            // Read from this record's own route: the route the transport read attests it.
+            noteReplies(was: before, now: rows[i], from: rows[i].agent)
         }
     }
 
@@ -445,7 +447,8 @@ public struct AgentConversationStore: Sendable {
                 }
             }
             try save(rows)
-            noteReplies(was: identity, now: rows[i])
+            // An owner read of this record's route: that route attests the reply.
+            noteReplies(was: identity, now: rows[i], from: rows[i].agent)
             return rows[i]
         }
     }
@@ -454,7 +457,9 @@ public struct AgentConversationStore: Sendable {
     /// own session, unless her turn carries it there (being handed over, or
     /// handed over by a turn already). There it is an arrival for her too
     /// (ResidentWake), unless it came as a turn or is the person's own send.
-    private func noteReplies(was before: AgentConversationRecord, now row: AgentConversationRecord, wake: Bool = true) {
+    /// `from`/`steeredBy`: the stamp of who said the reply, as its transport attested it.
+    private func noteReplies(was before: AgentConversationRecord, now row: AgentConversationRecord, wake: Bool = true,
+                             from: String, steeredBy: [String] = []) {
         guard row.agent.hasPrefix("peer:") else { return }
         let earlier = Dictionary((before.exchanges ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
@@ -463,7 +468,8 @@ public struct AgentConversationStore: Sendable {
                   earlier[exchange.id].map({ $0.reply == nil || $0.settledAt == nil }) ?? true,
                   exchange.id != row.operationID || (row.deliveryState != "delivering" && row.deliveryRunID == nil) else { continue }
             let entry = ContactThread.Entry.reply(owner: String(row.agent.dropFirst(5)), name: row.name,
-                                                  text: reply, replyID: "agent-conversation:" + exchange.id, at: at)
+                                                  text: reply, replyID: "agent-conversation:" + exchange.id, at: at,
+                                                  from: from, steeredBy: steeredBy)
             // Its own task, carrying none of the writer's turn with it.
             Task.detached { await ContactThread.write(entry, dataRoot: root) }
             guard wake, row.personInitiated != true, row.shownInline != row.operationID + ":" + row.phase else { continue }
@@ -587,8 +593,10 @@ public struct AgentConversationStore: Sendable {
     /// nothing settles nothing. Returns whether a waiting send was settled.
     /// `landedIn`: the chat the answer itself arrived in; in the contact's own
     /// session it is already there.
+    /// `from`/`steeredBy`: the answering turn's own stamp (its door, and the
+    /// peers that steered it), carried onto any copy verbatim.
     @discardableResult public func settleReply(agent: String, messageID: String, text: String,
-                                               landedIn: String? = nil) throws -> Bool {
+                                               landedIn: String? = nil, from: String, steeredBy: [String]) throws -> Bool {
         let identity = AgentContactIdentity(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent())
         return try locked {
             var rows = try load()
@@ -605,6 +613,9 @@ public struct AgentConversationStore: Sendable {
                 jobs[0] = .object(job)
                 root["jobs"] = .array(jobs)
             } else { root["reply"] = reply }
+            // The cached reply keeps the answering turn's own stamp.
+            root["reply_from"] = .string(from)
+            root["reply_steered_by"] = .array(steeredBy.map(JSONValue.string))
             rows[index].receipt = Self.cacheReceipt(.object(root))
             rows[index].phase = "ready"
             rows[index].automaticRead = false
@@ -612,7 +623,12 @@ public struct AgentConversationStore: Sendable {
             rows[index].updatedAt = Date()
             try Self.absorbExchange(into: &rows[index])
             try save(rows)
-            if landedIn != ContactThread.session(owner: agent) { noteReplies(was: before, now: rows[index], wake: false) }
+            // Where the thread reader already reads it (any session of the
+            // record's identity), the original attested row is the reply: no copy.
+            let reader = identity.owners(String(rows[index].agent.dropFirst(5))).map { ContactThread.prefix(owner: $0) }
+            if !(landedIn.map { session in reader.contains { session.hasPrefix($0) } } ?? false) {
+                noteReplies(was: before, now: rows[index], wake: false, from: from, steeredBy: steeredBy)
+            }
             return true
         }
     }
@@ -657,7 +673,7 @@ public struct AgentConversationStore: Sendable {
             }
             if changed > 0 { try save(rows) }
             // A lane's answer here came back as a turn (or to its caller).
-            for (index, row) in before { noteReplies(was: row, now: rows[index], wake: false) }
+            for (index, row) in before { noteReplies(was: row, now: rows[index], wake: false, from: rows[index].agent) }
             return changed
         }
     }
@@ -865,6 +881,16 @@ public struct AgentConversationStore: Sendable {
             }
         }
         for row in rows { try AgentConversationExchange.validate(row.exchanges) }
+        // A send the bounded ledger lets go keeps its evidence on the record, in
+        // this same write, until its last state is on its own transcript row.
+        var released = false
+        for index in rows.indices where rows[index].agent.hasPrefix("peer:") {
+            guard let old = previous.first(where: { $0.id == rows[index].id }) else { continue }
+            let kept = Set((rows[index].exchanges ?? []).map(\.id) + (rows[index].releasing ?? []).map(\.id))
+            let letGo = (old.exchanges ?? []).filter { !kept.contains($0.id) }
+            if !letGo.isEmpty { rows[index].releasing = (rows[index].releasing ?? []) + letGo; released = true }
+        }
+        let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
         let data = try JSONEncoder().encode(rows)
         guard data.count <= 50 * 1024 * 1024 else {
             throw Failure(message: "Saved conversations exceed their storage limit; existing records were preserved.")
@@ -876,11 +902,69 @@ public struct AgentConversationStore: Sendable {
             if case .object(let receipt)? = row.receipt { return receipt["reply_state"] == .string("no_reply_expired") }
             return false
         }) {
-            let root = fileURL.deletingLastPathComponent().deletingLastPathComponent()
             Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: root) }
         }
-        try? AgentConversationLiveStore(dataRoot: fileURL.deletingLastPathComponent().deletingLastPathComponent()).merge([], records: rows)
+        try? AgentConversationLiveStore(dataRoot: root).merge([], records: rows)
         AgentConversationRunning.shared.changed() // wakes queued follow-ups
+        if released { Self.release(dataRoot: root) }
+    }
+
+    private static let releasingNow = OSAllocatedUnfairLock(initialState: (draining: false, pending: false))
+    /// The last failure reported for each held send, so an unchanged one is said once.
+    private static let releaseFailures = OSAllocatedUnfairLock(initialState: [String: String]())
+
+    /// Each let-go send's last state goes onto its own row through the
+    /// transcript owner (live or archived copy); only then does its evidence
+    /// leave the record. Runs when a save lets evidence go and when the writer
+    /// is installed (`releasePending`); a failed write stays held until then.
+    public static func releasePending(dataRoot: URL) { release(dataRoot: dataRoot) }
+
+    private static func release(dataRoot: URL) {
+        // A call during a drain is never dropped: the drain takes one more snapshot before it goes idle.
+        guard releasingNow.withLock({ state -> Bool in
+            if state.draining { state.pending = true; return false }
+            state = (true, false); return true
+        }) else { return }
+        Task.detached {
+            repeat { await drainReleasing(dataRoot: dataRoot) }
+            while releasingNow.withLock { state -> Bool in
+                if state.pending { state.pending = false; return true }
+                state.draining = false; return false
+            }
+        }
+    }
+
+    private static func drainReleasing(dataRoot: URL) async {
+        let store = AgentConversationStore(dataRoot: dataRoot)
+        guard let rows = try? store.recordsUnlocked() else { return }
+        var written: Set<String> = []
+        for row in rows where row.agent.hasPrefix("peer:") {
+            for send in row.releasing ?? [] {
+                do {
+                    try await ContactThread.attempt(.state(owner: String(row.agent.dropFirst(5)), sendID: send.id, status: send.status),
+                                                    dataRoot: dataRoot)
+                    written.insert(row.id + "/" + send.id)
+                    releaseFailures.withLock { $0[send.id] = nil }
+                } catch {
+                    let said = error.localizedDescription
+                    if releaseFailures.withLock({ $0.updateValue(said, forKey: send.id) != said }) {
+                        nativeLog("AgentConversationStore: send %@'s state stays on its record; its row could not take it: %@", send.id, said)
+                    }
+                }
+            }
+        }
+        guard !written.isEmpty else { return }
+        do {
+            try store.locked {
+                var rows = try store.load()
+                for index in rows.indices {
+                    let id = rows[index].id
+                    rows[index].releasing?.removeAll { written.contains(id + "/" + $0.id) }
+                    if rows[index].releasing?.isEmpty == true { rows[index].releasing = nil }
+                }
+                try store.save(rows)
+            }
+        } catch { nativeLog("AgentConversationStore: released sends stay on their records until the next save: %@", error.localizedDescription) }
     }
 
     /// The conversation owner publishes its identities, including held sends.

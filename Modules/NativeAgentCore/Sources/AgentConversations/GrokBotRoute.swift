@@ -161,11 +161,11 @@ public enum GrokBotRoute {
     /// earlier talk is escaped JSON data (no "<" or ">"), so nothing in a past
     /// answer can pose as the new message.
     static func withHistory(_ text: String, peer: String, messageID: String, dataRoot: URL) -> String {
-        let history = thread(peer: peer, messageID: messageID, dataRoot: dataRoot)
-        let earlier = history.prefix { $0.id != messageID }.filter { $0.prompt != nil && $0.reply != nil }.suffix(6)
+        let history = thread(peer: peer, dataRoot: dataRoot)
+        let earlier = history.prefix { $0.id != messageID }.compactMap { ask in ask.reply.map { (ask.prompt, $0) } }.suffix(6)
         let entries: [[String: String]] = earlier.flatMap { [
-            ["from": "me", "text": HerScreen.clip($0.prompt!, 1000)],
-            ["from": "you (your earlier answer)", "text": HerScreen.clip($0.reply!, 1000)]] }
+            ["from": "me", "text": HerScreen.clip($0.0, 1000)],
+            ["from": "you (your earlier answer)", "text": HerScreen.clip($0.1, 1000)]] }
         guard !entries.isEmpty, let data = try? JSONSerialization.data(withJSONObject: entries),
               let json = String(data: data, encoding: .utf8) else { return text }
         let safe = json.replacingOccurrences(of: "<", with: "\\u003c").replacingOccurrences(of: ">", with: "\\u003e")
@@ -173,10 +173,17 @@ public enum GrokBotRoute {
             + safe + "\n</conversation_so_far>\n<new_message>\n" + text + "\n</new_message>"
     }
 
-    /// The exchanges of the thread that sent this message, oldest first.
-    package static func thread(peer: String, messageID: String, dataRoot: URL) -> [AgentConversationExchange] {
-        (try? AgentConversationStore(dataRoot: dataRoot).records())?
-            .first { $0.agent == "peer:" + peer && $0.exchanges?.contains { $0.id == messageID } == true }?.exchanges ?? []
+    /// Her messages to it and the answers that came back for each, oldest
+    /// first, from its one conversation (`ContactThread`). An answer handed
+    /// over as a turn in the asking chat is not in it; a waited one is.
+    package static func thread(peer: String, dataRoot: URL) -> [(id: String, prompt: String, reply: String?)] {
+        let lines: [ContactThread.Line]
+        do { lines = try ContactThread.lines(dataRoot: dataRoot, owner: peer) }
+        catch { nativeLog("GrokBotRoute: its conversation could not be read: %@", error.localizedDescription); return [] }
+        return lines.compactMap { line in
+            guard line.mine, let id = line.sendID else { return nil }
+            return (id, line.text, lines.last { !$0.mine && $0.answers == id }?.text)
+        }
     }
 
     /// A reply the asking turn is waiting on reaches it through `wait`. True

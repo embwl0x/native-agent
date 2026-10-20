@@ -56,12 +56,14 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
         )
     }
 
-    static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> SlackSocketModeConfig? {
+    /// Nil when Slack is not connected; throws when its tokens could not be
+    /// read, which is a fault, never "not connected".
+    static func load(dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> SlackSocketModeConfig? {
         let objects = tokenObjects(dataRoot: dataRoot)
         let ingress = parseIngressPolicy(objects)
         // The tokens are Keychain's (SlackCredentials); the files say the rest.
-        let botToken = try? SlackCredentials.read(.bot, dataRoot: dataRoot)
-        let appToken = try? SlackCredentials.read(.app, dataRoot: dataRoot)
+        let botToken = try SlackCredentials.read(.bot, dataRoot: dataRoot)
+        let appToken = try SlackCredentials.read(.app, dataRoot: dataRoot)
         guard let botToken, !botToken.isEmpty,
               let appToken, !appToken.isEmpty else {
             return nil

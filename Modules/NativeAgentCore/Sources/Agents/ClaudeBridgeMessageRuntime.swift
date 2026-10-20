@@ -393,7 +393,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
                 }
                 if let claudeReplyID {
-                    Self.recordClaudeReply(to: claudeReplyID, text: rawText, sessionId: resp.sessionId ?? sessionId, owner: owner)
+                    Self.recordClaudeReply(to: claudeReplyID, text: rawText, sessionId: resp.sessionId ?? sessionId, owner: owner,
+                                            principal: principal, request: baseRequest)
                     await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? sessionId, owner: owner)
                 }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
@@ -886,7 +887,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 try await CodexCompletionLifecycle.shared.cacheResponse(resp, deliveryId: "bridge-http." + requestID, requestDigest: requestID)
                 await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? enqueued.sessionId)
                 if let claudeReplyID {
-                    Self.recordClaudeReply(to: claudeReplyID, text: claudeReplyText, sessionId: resp.sessionId ?? enqueued.sessionId, owner: owner)
+                    Self.recordClaudeReply(to: claudeReplyID, text: claudeReplyText, sessionId: resp.sessionId ?? enqueued.sessionId, owner: owner,
+                                            principal: principal, request: request)
                     await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? enqueued.sessionId, owner: owner)
                 }
                 let durationMs = Int(Date().timeIntervalSince(started) * 1000)
@@ -1126,10 +1128,15 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
 
     /// After the reply is durably in the chat: the receipt the delegation
     /// projection joins, and the answered send's conversation record settles.
-    static func recordClaudeReply(to messageID: String, text: String, sessionId: String?, owner: String) {
+    /// The answer's own row carries its door and steering (the stamp the
+    /// request wrote); any copy of it carries the same, never the send's owner.
+    static func recordClaudeReply(to messageID: String, text: String, sessionId: String?, owner: String,
+                                   principal: AgentBridgePrincipal, request: TurnRequest) {
         let dataRoot = PersistenceCore.defaultDataRoot()
+        let steeredBy: [String] = if case .some(.some(let origin)) = request.origin { origin.peerSources ?? [] } else { [] }
         _ = try? AgentConversationStore(dataRoot: dataRoot)
-            .settleReply(agent: owner, messageID: messageID, text: text, landedIn: sessionId)
+            .settleReply(agent: owner, messageID: messageID, text: text, landedIn: sessionId,
+                         from: principal.peerID.map { "peer:" + $0 } ?? "another agent", steeredBy: steeredBy)
         guard AgentContactIdentity(dataRoot: dataRoot).aliases["claude"] == owner else { return }
         let dir = messageReplyURL().deletingLastPathComponent()
         // The answer as every job retains it, so an exact read returns it, not a preview.
@@ -1332,7 +1339,7 @@ extension TurnAdmission {
             ChatCancelFlag.accept(dataRoot: dataRoot, sessionId: session, runId: $0, turnId: turnID) } }
         defer { flag.map(ChatCancelFlag.finish) }
         return try await TurnTraceContext.$turnId.withValue(turnID) {
-            try await TurnAdmission.shared.run(sessionID: sessionID, waitForCapacity: waitForCapacity, operation: operation)
+            try await TurnAdmission.shared.run(sessionID: sessionID, runID: runID, waitForCapacity: waitForCapacity, operation: operation)
         }
     }
 }

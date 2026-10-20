@@ -513,6 +513,11 @@ public enum ChatSessionRetention {
         return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
     }
 
+    /// Whether a session is one a contact owns (`contactSessionPrefix`).
+    public static func isContactSession(_ id: String) -> Bool {
+        id.range(of: "^agent-[0-9a-f]{12}-", options: .regularExpression) != nil
+    }
+
     private static func contactSessionIds(dataRoot: URL) throws -> Set<String> {
         var owners = ["codex", "claude", "omp"]
         let path = dataRoot.appendingPathComponent("agents/peers.json")
@@ -1029,3 +1034,76 @@ public enum ChatSessionRetention {
         return path
     }
 }
+
+/// A saved row's stamp, as the writer that saved it put it there, read by
+/// every reader of a row through this one projection: the door its
+/// envelope's verified userId names (`peer:<id>`), else the lane its origin
+/// names; the peers that steered it (`untrusted_sources`); and whether it is
+/// another agent's turn rather than hers or the person's. A row that only
+/// names a generic agent, or that the history import wrote (its words came
+/// from no transport: `unattested`, `<id>-reply`, `agent-live:`), attests no one.
+public struct TranscriptRowStamp: Sendable, Equatable {
+    public let source: String?
+    public let steeredBy: [String]
+    public let contact: Bool
+
+    public init(source: String?, steeredBy: [String], contact: Bool) {
+        self.source = source
+        var seen: Set<String> = []
+        // The speaker can be among its own steering sources (a reply written
+        // under the peer that steered it); the combined principal list drops
+        // the repeat, the stamp keeps the steering.
+        self.steeredBy = steeredBy.filter { !$0.isEmpty && seen.insert($0).inserted }
+        self.contact = contact
+    }
+
+    static func of(id: String, role: String, userId: String?, originAgent: String?, replyTo: String?, authored: String?,
+                   envelopeAgent: String?, surfaces: [String], byPerson: Bool, unattested: Bool, untrusted: [String]) -> Self {
+        let imported = unattested || id.hasSuffix("-reply") || replyTo?.hasPrefix("agent-live:") == true
+        let source: String? = if imported { nil }
+            else if let door = userId, !door.isEmpty { door.hasPrefix("peer:") ? door : "peer:" + door }
+            else if let agent = originAgent, !["agent", "peer", "another agent", ""].contains(agent) { agent }
+            else { nil }
+        let contact = role == "user" && !byPerson && authored != "human"
+            && (originAgent != nil || envelopeAgent != nil || surfaces.contains { $0.hasSuffix("-bridge") })
+        return .init(source: source, steeredBy: untrusted, contact: contact)
+    }
+
+    public static func of(id: String, role: String, metadata: [String: Any]?, rowSource: String? = nil) -> Self {
+        let origin = metadata?["origin"] as? [String: Any], envelope = metadata?["envelope"] as? [String: Any]
+        return of(id: id, role: role, userId: envelope?["userId"] as? String, originAgent: origin?["agent"] as? String,
+                  replyTo: origin?["replyTo"] as? String, authored: origin?["authored"] as? String, envelopeAgent: envelope?["agent"] as? String,
+                  surfaces: [origin?["surface"], envelope?["surface"], rowSource].compactMap { $0 as? String },
+                  byPerson: metadata?["byPerson"] as? Bool == true, unattested: metadata?["unattested"] as? Bool == true,
+                  untrusted: metadata?["untrusted_sources"] as? [String] ?? [])
+    }
+
+    public static func of(id: String, role: String, metadata: [String: JSONValue], rowSource: String? = nil) -> Self {
+        func text(_ value: JSONValue?) -> String? { if case .string(let text)? = value { text } else { nil } }
+        let origin: [String: JSONValue] = if case .object(let value)? = metadata["origin"] { value } else { [:] }
+        let envelope: [String: JSONValue] = if case .object(let value)? = metadata["envelope"] { value } else { [:] }
+        let untrusted: [String] = if case .array(let values)? = metadata["untrusted_sources"] { values.compactMap(text) } else { [] }
+        return of(id: id, role: role, userId: text(envelope["userId"]), originAgent: text(origin["agent"]), replyTo: text(origin["replyTo"]),
+                  authored: text(origin["authored"]), envelopeAgent: text(envelope["agent"]),
+                  surfaces: [text(origin["surface"]), text(envelope["surface"]), rowSource].compactMap { $0 },
+                  byPerson: metadata["byPerson"] == .bool(true), unattested: metadata["unattested"] == .bool(true), untrusted: untrusted)
+    }
+
+    /// As an index row keeps it beside the preview it stamps.
+    public var json: JSONValue {
+        .object(["source": source.map(JSONValue.string) ?? .null, "steered_by": .array(steeredBy.map(JSONValue.string)), "contact": .bool(contact)])
+    }
+
+    public init?(json: JSONValue?) {
+        guard case .object(let fields)? = json, case .bool(let contact)? = fields["contact"] else { return nil }
+        let source: String? = if case .string(let text)? = fields["source"] { text } else { nil }
+        let steering: [String] = if case .array(let values)? = fields["steered_by"] {
+            values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
+        } else { [] }
+        self.init(source: source, steeredBy: steering, contact: contact)
+    }
+
+    /// The index row key that carries the stamp of its `lastMessagePreview`.
+    public static let previewKey = "lastMessagePreviewStamp"
+}
+

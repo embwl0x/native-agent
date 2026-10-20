@@ -294,7 +294,7 @@ extension NativeAgentEngine {
                 Logger(subsystem: "com.nativeagent.app", category: "agents")
                     .error("lane handles not migrated: \(String(describing: error), privacy: .public)")
             }
-            _ = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: dataRoot)
+            _ = await AgentDiscoverySession.shared.candidates(refresh: true, probe: false, dataRoot: dataRoot)
             await AgentDiscoverySession.shared.watchInstalls(dataRoot: dataRoot)
         }
         Task.detached(priority: .utility) {
@@ -789,27 +789,32 @@ extension NativeAgentEngine {
     public static func makeSlackSocketModeLane(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> LoopRegistration {
-        SlackSocketModeLoop.ifConfigured(
-            dataRoot: dataRoot,
-            chatClient: { NativeAgentEngine.live.chatClient(profile: .slack) },
-            // 2026-09-22: fire-and-forget — the reply must not wait on a busy
-            // main thread just to tell the Mac UI to reload.
-            turnCompleted: { sessionID in
-                Task { @MainActor in
-                    NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
+        do {
+            return try SlackSocketModeLoop.ifConfigured(
+                dataRoot: dataRoot,
+                chatClient: { NativeAgentEngine.live.chatClient(profile: .slack) },
+                // 2026-09-22: fire-and-forget — the reply must not wait on a busy
+                // main thread just to tell the Mac UI to reload.
+                turnCompleted: { sessionID in
+                    Task { @MainActor in
+                        NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
+                    }
+                },
+                botEventIntake: { channelId, text, userId in
+                    await BotEventIntake.slackMessage(channelId: channelId, text: text,
+                                                     userId: userId, dataRoot: dataRoot,
+                                                     isAutonomyEnabled: {
+                        await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
+                    })
                 }
-            },
-            botEventIntake: { channelId, text, userId in
-                await BotEventIntake.slackMessage(channelId: channelId, text: text,
-                                                 userId: userId, dataRoot: dataRoot,
-                                                 isAutonomyEnabled: {
-                    await WorkshopBackgroundWork.unattendedWorkAllowed(dataRoot: dataRoot)
-                })
-            }
-        ).map(LoopRegistration.enabled) ?? .disabled(
-            loopId: "slack_socket_mode",
-            reason: SlackSocketModeLoop.offReason(dataRoot: dataRoot)
-        )
+            ).map(LoopRegistration.enabled) ?? .disabled(
+                loopId: "slack_socket_mode",
+                reason: SlackSocketModeLoop.offReason(dataRoot: dataRoot)
+            )
+        } catch {
+            return .unreadable(loopId: "slack_socket_mode",
+                               error: "could not read the Slack tokens: \(error.localizedDescription)")
+        }
     }
 
     // Swift Telegram long-poll loop wiring. Only enabled when

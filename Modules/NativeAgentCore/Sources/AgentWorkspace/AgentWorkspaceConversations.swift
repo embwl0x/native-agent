@@ -279,7 +279,7 @@ struct AgentWorkSession {
             let envelope = metadata?["envelope"] as? [String: Any]
             guard let surface = origin?["surface"] as? String ?? envelope?["surface"] as? String,
                   surface.hasSuffix("-bridge"),
-                  let sender = HerScreen.source(metadata), sender != "peer:unknown",
+                  let sender = ContactThread.stamp(id: row["id"] as? String ?? "", metadata: metadata).source,
                   let content = row["content"] as? String else { return nil }
             let topic = String(ContactThread.bridgedText(content).prefix(60))
             return (sender, topic)
@@ -292,7 +292,7 @@ struct AgentWorkSession {
         var found: [Self] = ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).compactMap { row in
             guard let id = HumanConversationIndex.string(row["id"]),
                   let parsed = bridgeSender(sessionID: id, dataRoot: dataRoot) else { return nil }
-            let preview = HumanConversationIndex.string(row["lastMessagePreview"]) ?? ""
+            let preview = HumanConversationIndex.shownPreview(row) ?? ""
             return .init(sessionID: id, sender: parsed.sender, topic: parsed.topic,
                          latest: String((preview.split(separator: "\n").first ?? "").prefix(160)),
                          updatedAt: HumanConversationIndex.string(row["updatedAt"]) ?? "",

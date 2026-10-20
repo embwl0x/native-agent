@@ -60,6 +60,8 @@ struct AgentContactTurn: Sendable {
     let principal: AgentBridgePrincipal
     let parts: [AgentContactPart]
     var bindRun: @Sendable (String, String) async throws -> Void = { _, _ in }
+    /// Its input already saved in the conversation: a restart left it queued.
+    var accepted: EnqueuedUserMessage? = nil
 }
 
 enum AgentContactProgress: Sendable {
@@ -103,6 +105,13 @@ public actor AgentContactTasks {
     private var approvalObservation: Task<Void, Never>?
     private var receiptObservation: AgentContactReceiptObservation?
     private var terminalPayloadWrites = 32
+    /// Set once the launch recovery has read every conversation's saved input.
+    private var launchRecovered = false
+    /// What the launch recovery found queued in a conversation, by task: its input as saved.
+    private var restoredInput: [String: AgentContactTurn] = [:]
+    /// Tasks whose turn the launch recovery resumes (queued, or a checkpoint).
+    private var resuming: Set<String> = []
+    private static let recovering = "Recovering after the restart"
 
     init(dataRoot: URL, capacity: Int = 128, runner: @escaping Runner) {
         self.dataRoot = dataRoot
@@ -403,6 +412,7 @@ public actor AgentContactTasks {
                session.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: owner)) {
                 checkpointed = try SwiftNativeChatOrchestrationClient.hasReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)
             }
+            var queued: AgentContactTurn?
             if let recovered = try canonicalReply(task) {
                 task.state = recovered.outcome.state
                 task.approvalIDs = recovered.approvals
@@ -415,6 +425,21 @@ public actor AgentContactTasks {
             } else if checkpointed {
                 task.state = .working
                 task.detail = "The interrupted turn is awaiting recovery"
+                // Only a checkpoint the launch recovery can read is resumed and holds
+                // its place; a damaged one stays owed here and gives its place up.
+                if let session = task.canonicalSession, let run = task.canonicalRunID,
+                   (try? SwiftNativeChatOrchestrationClient.hasResumableReplyCheckpoint(dataRoot: dataRoot, sessionId: session, runId: run)) == true {
+                    resuming.insert(id)
+                }
+            } else if let turn = restoredInput.removeValue(forKey: id) {
+                queued = turn
+                task.state = .working
+                task.detail = "Queued in the conversation behind the turn ahead of it"
+                resuming.insert(id)
+            } else if !launchRecovered, task.canonicalRunID != nil {
+                // Read before the launch recovery: it decides once every saved input is read.
+                task.state = .working
+                task.detail = Self.recovering
             } else {
                 task.state = .failed
                 task.detail = "The app restarted before the turn finished. Do not resend automatically."
@@ -427,6 +452,12 @@ public actor AgentContactTasks {
                                      acceptedOutputModes: task.acceptedOutputModes ?? ["*/*"])
                 order.append(id)
                 Task { await self.observeApprovals(); await self.refreshApprovals() }
+                // Its place in the conversation is held by the restored backlog
+                // (TurnAdmission.restore), so it runs in the order it was said.
+                if let queued {
+                    let runner = self.runner
+                    startWorker(id) { try await runner(queued) { progress in await self.progress(id, progress) } }
+                }
             }
         }
         try retainCompletionReplies(task)
@@ -455,6 +486,24 @@ public actor AgentContactTasks {
     public func recordReplyFetch(_ task: AgentContactTask) {
         guard task.state == .completed, let session = task.canonicalSession, let run = task.canonicalRunID else { return }
         ContactReplyReads.record(dataRoot: dataRoot, session: session, request: task.id, run: run)
+    }
+
+    /// A message a restart left queued, from its saved input (the chat owner
+    /// reads it): bound to its task and to the contact as it is now (the
+    /// runner revalidates its authority). Nil when its words or files cannot
+    /// be read back whole.
+    private func queuedTurn(_ task: AgentContactTask, input: CodexCompletionTranscriptEvidence.SavedTurnInput) -> AgentContactTurn? {
+        guard let session = task.canonicalSession, let locator = NativeAgentA2AWire.locator(task.id),
+              let peer = (try? AgentPeerStore(dataRoot: dataRoot).list())?.first(where: { $0.id == task.owner }),
+              let words = AgentBridgeSurface.message(inTurn: input.content),
+              case .success(let attachments) = input.attachments else { return nil }
+        let files: [AgentContactPart] = attachments.map {
+            .file(name: $0.name ?? "", mediaType: $0.mime, bytes: Data(base64Encoded: $0.base64) ?? Data(), metadata: .null)
+        }
+        return AgentContactTurn(taskID: task.id, context: task.context, requestID: locator.request,
+            principal: AgentBridgePrincipal(id: peer.id, peerID: peer.id, elevated: peer.elevationAllowed, displayName: peer.name),
+            parts: [.text(words)] + files, bindRun: { session, run in try await self.bindRun(task.id, session: session, run: run) },
+            accepted: EnqueuedUserMessage(sessionId: session, runId: input.runId))
     }
 
     public func recordReplyFetch(session: String, request: String, run: String) {
@@ -942,15 +991,54 @@ public actor AgentContactTasks {
     }
 
     /// At launch: every retained task whose callback is still owed an update
-    /// gets it, without waiting for its peer to ask.
-    public func redeliverOwedCallbacks() {
+    /// gets it, and every one still open recovers without waiting for its peer.
+    /// The turns a restart left in each conversation (queued, or interrupted
+    /// with a checkpoint) go back into its admission in the order they were
+    /// said there, before anything new is admitted; a queued one runs from its
+    /// saved input. One strict read of each conversation supplies both.
+    public func redeliverOwedCallbacks() async {
         let directory = dataRoot.appendingPathComponent("agents/a2a-replies")
-        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
-        for url in urls where url.pathExtension == "json" {
-            guard let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
-                  task.callbacks?.values.contains(where: { $0.delivered != task.state.rawValue }) == true else { continue }
-            _ = try? get(task.id, owner: task.owner)
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+            launchRecovered = true
+            await TurnAdmission.shared.restorationComplete()
+            return
         }
+        let open = urls.filter { $0.pathExtension == "json" }.compactMap { url -> AgentContactTask? in
+            guard let task = try? JSONDecoder().decode(AgentContactTask.self, from: Data(contentsOf: url)),
+                  !task.state.terminal || task.callbacks?.values.contains(where: { $0.delivered != task.state.rawValue }) == true else { return nil }
+            return task
+        }
+        var backlog: [AgentContactTask] = []
+        for (session, tasks) in Dictionary(grouping: open.filter { !$0.state.terminal && $0.canonicalRunID != nil }, by: { $0.canonicalSession ?? "" })
+            where !session.isEmpty {
+            let inputs: [CodexCompletionTranscriptEvidence.SavedTurnInput]
+            do { inputs = try await CodexCompletionTranscriptEvidence.savedTurnInputs(dataRoot: dataRoot, sessionId: session) }
+            catch {
+                nativeLog("AgentContactTasks: %@'s saved turns cannot be read, so they do not resume: %@", session, error.localizedDescription)
+                continue
+            }
+            let place = Dictionary(inputs.enumerated().map { ($1.runId, $0) }, uniquingKeysWith: { first, _ in first })
+            let said = tasks.filter { place[$0.canonicalRunID ?? ""] != nil }.sorted { place[$0.canonicalRunID!]! < place[$1.canonicalRunID!]! }
+            await TurnAdmission.shared.restore(sessionID: session, runs: said.compactMap(\.canonicalRunID))
+            for task in said {
+                let input = inputs[place[task.canonicalRunID!]!]
+                if input.awaitingConsumption, let turn = queuedTurn(task, input: input) { restoredInput[task.id] = turn }
+            }
+            backlog += said
+        }
+        launchRecovered = true
+        // Every backlog is back: contact conversations admit new turns behind it.
+        await TurnAdmission.shared.restorationComplete()
+        // A task read before this point holds a placeholder: read it again now.
+        for (id, record) in records where record.worker == nil && record.task.detail == Self.recovering {
+            records.removeValue(forKey: id); order.removeAll { $0 == id }
+        }
+        for task in open { _ = try? get(task.id, owner: task.owner) }
+        // A restored run nothing resumes gives up its place.
+        for task in backlog where !resuming.contains(task.id) {
+            await TurnAdmission.shared.withdraw(sessionID: task.canonicalSession!, runID: task.canonicalRunID!)
+        }
+        restoredInput.removeAll()
     }
 
     private func unsubscribe(_ task: String, _ subscriber: UUID) { records[task]?.subscribers.removeValue(forKey: subscriber) }
@@ -1052,6 +1140,10 @@ public actor AgentContactTasks {
             record.task.text = parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
         }
         record.worker = nil
+        // Ended before its turn was admitted: a restored place it held is let go.
+        if let session = record.task.canonicalSession, let run = record.task.canonicalRunID {
+            Task { await TurnAdmission.shared.withdraw(sessionID: session, runID: run) }
+        }
         do {
             if record.task.state == .canceled, let session = record.task.canonicalSession,
                let run = record.task.canonicalRunID {

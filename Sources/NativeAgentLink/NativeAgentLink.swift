@@ -4,10 +4,13 @@ import Darwin
 import PersistenceCore
 
 private enum LinkFailure: Error {
-    case invalidArguments, descriptor(String, String), transport, response, http(Int)
+    /// No descriptor, or nothing listening on its port: the app is quit or
+    /// restarting, and the request never left this process.
+    case invalidArguments, descriptor(String, String), bridgeAbsent, transport, response, http(Int)
     var label: String {
         switch self {
         case .invalidArguments: "invalid_arguments"
+        case .bridgeAbsent: "nativeagent_not_running_nothing_sent"
         case .descriptor: "bridge_descriptor_unavailable_or_unsafe"
         case .transport: "transport_outcome_unknown"
         case .response: "invalid_or_oversized_response"
@@ -50,11 +53,19 @@ private struct BridgeDescriptor {
     /// on the Mac.
     let peerSecret: String?
 
-    static func load(pathOverride: String? = nil, bearer: String? = nil) throws -> Self {
-        let path = pathOverride ?? ProcessInfo.processInfo.environment["NATIVE_AGENT_BRIDGE_DESCRIPTOR"]
+    static var path: String {
+        ProcessInfo.processInfo.environment["NATIVE_AGENT_BRIDGE_DESCRIPTOR"]
             ?? InstallPaths.current.bridgeConfigRoot.appendingPathComponent("claude-bridge/bridge.json").path
+    }
+
+    static func load(pathOverride: String? = nil, bearer: String? = nil) throws -> Self {
+        let path = pathOverride ?? Self.path
         let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
-        guard fd >= 0 else { throw LinkFailure.descriptor(path, "Descriptor open failed (errno \(errno)); the file must exist and must not be a symlink.") }
+        guard fd >= 0 else {
+            // The app removes its descriptor when it quits.
+            if errno == ENOENT { throw LinkFailure.bridgeAbsent }
+            throw LinkFailure.descriptor(path, "Descriptor open failed (errno \(errno)); the file must not be a symlink.")
+        }
         defer { Darwin.close(fd) }
         var info = stat()
         guard fstat(fd, &info) == 0 else { throw LinkFailure.descriptor(path, "Descriptor fstat failed (errno \(errno)).") }
@@ -160,6 +171,7 @@ private enum BridgeHTTP {
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
         do { (bytes, response) = try await session.bytes(for: request) }
+        catch let error as URLError where error.code == .cannotConnectToHost { throw LinkFailure.bridgeAbsent }
         catch { throw LinkFailure.transport }
         guard let http = response as? HTTPURLResponse else { throw LinkFailure.response }
         guard (200...299).contains(http.statusCode) else { throw LinkFailure.http(http.statusCode) }
@@ -391,9 +403,8 @@ private struct NativeAgentLink {
         guard let payload = try? JSONSerialization.jsonObject(with: request) as? [String: Any] else { return }
         let id = payload["id"]
         do {
-            let descriptor = try BridgeDescriptor.load()
-            // Progress notifications for this call go straight to the host.
-            let response = try await BridgeHTTP.post(payload, descriptor: descriptor, forward: { output($0) })
+            // A notification is not held for a restart; a request is.
+            let response = try await id == nil ? postToBridge(payload) : postWhenBridgeReturns(payload)
             if let id {
                 guard let response, response["jsonrpc"] as? String == "2.0",
                       let responseID = response["id"] as? NSObject,
@@ -401,6 +412,12 @@ private struct NativeAgentLink {
                 output(response)
             }
             // Notifications (HTTP 202) never produce a JSON-RPC response.
+        } catch LinkFailure.bridgeAbsent {
+            guard let id else { return }
+            let text = "NativeAgent is not running (or restarting); nothing was sent — try again in a moment."
+            output(payload["method"] as? String == "tools/call"
+                ? ["jsonrpc": "2.0", "id": id, "result": ["content": [["type": "text", "text": text]], "isError": true]]
+                : ["jsonrpc": "2.0", "id": id, "error": ["code": -32000, "message": text]])
         } catch {
             (error as? LinkFailure)?.diagnose()
             if let id {
@@ -408,5 +425,29 @@ private struct NativeAgentLink {
                         "error": ["code": -32000, "message": (error as? LinkFailure)?.label ?? "request_failed"]])
             }
         }
+    }
+
+    private static func postToBridge(_ payload: [String: Any]) async throws -> [String: Any]? {
+        // Progress notifications for this call go straight to the host.
+        try await BridgeHTTP.post(payload, descriptor: BridgeDescriptor.load(), forward: { output($0) })
+    }
+
+    /// The app quits and relaunches itself (updates, permission grants) while
+    /// this process and the host's session stay up. A request made meanwhile
+    /// waits for the relaunch to republish the descriptor (the port may
+    /// differ) and then goes through. The bound keeps the host listening when
+    /// the call lands: an established call stays inside the MCP SDK's 60 s
+    /// request timeout, `initialize` inside Claude's 30 s startup timeout.
+    private static func postWhenBridgeReturns(_ payload: [String: Any]) async throws -> [String: Any]? {
+        do { return try await postToBridge(payload) } catch LinkFailure.bridgeAbsent {}
+        // Its initial edge retries once armed, so a relaunch in between is not missed.
+        let changes = FileChangeEvents(paths: [URL(fileURLWithPath: BridgeDescriptor.path)])
+        let budget: Duration = payload["method"] as? String == "initialize" ? .seconds(20) : .seconds(30)
+        let deadline = Task { try? await Task.sleep(for: budget); changes.cancel() }
+        defer { deadline.cancel(); changes.cancel() }
+        for await _ in changes.stream {
+            do { return try await postToBridge(payload) } catch LinkFailure.bridgeAbsent {}
+        }
+        throw LinkFailure.bridgeAbsent
     }
 }

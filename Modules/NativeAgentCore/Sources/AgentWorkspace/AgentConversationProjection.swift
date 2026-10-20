@@ -29,6 +29,9 @@ public struct AgentConversationRecord: Codable, Sendable {
     public var replyRoute: [String: String]?
     public var selected: Bool = false
     public var exchanges: [AgentConversationExchange]?
+    /// Sends the bounded ledger let go whose last state is not yet on their
+    /// own transcript row: the evidence stays here until it is (`Entry.state`).
+    public var releasing: [AgentConversationExchange]?
     /// The current send was typed by the person in the contact's thread, so
     /// its answer settles here and never starts an agent turn.
     public var personInitiated: Bool?
@@ -53,6 +56,18 @@ public struct AgentConversationRecord: Codable, Sendable {
     /// A built-in delegate's stall or bad outcome on the current send, held
     /// until the continuation tells her in this chat (once per event).
     public var notice: AgentConversationNotice?
+    /// Who said the reply its receipt caches, as the writer stamped it: the
+    /// answering turn's door and steering when one wrote it there
+    /// (`reply_from`, `reply_steered_by`), else the route this record's
+    /// transport read, which is what the app wrote the receipt from.
+    public var cachedReplyStamp: (source: String, steeredBy: [String]) {
+        guard case .object(let receipt)? = receipt, case .string(let from)? = receipt["reply_from"] else { return (agent, []) }
+        let steering: [String] = if case .array(let values)? = receipt["reply_steered_by"] {
+            values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
+        } else { [] }
+        return (from, steering)
+    }
+
     package init(id: String,
                  scopeSessionID: String,
                  agent: String,
@@ -218,6 +233,34 @@ public enum ContactThread {
     /// Every session a contact owns starts with this: its id, hashed.
     public static func prefix(owner: String) -> String { ChatSessionRetention.contactSessionPrefix(owner: owner) }
 
+    /// Reading a line she is shown: for a contact's line the principal its own
+    /// row attests (another agent when it attests none), and every peer that
+    /// steered the turn that wrote it, each marked read under its own current
+    /// grant. Every presentation of thread lines consumes what it shows here,
+    /// never under the thread's owner. Returns those principals, speaker first.
+    @discardableResult
+    public static func consume(_ line: Line, mark: (_ principal: String, _ words: String) -> Void) -> [String] {
+        consume(mine: line.mine, source: line.source, steeredBy: line.steeredBy, text: line.text, mark: mark)
+    }
+
+    /// The same reading for a row shown from another chat's log (`HerScreen.logTail`).
+    @discardableResult
+    public static func consume(mine: Bool, source: String?, steeredBy: [String], text: String,
+                               mark: (_ principal: String, _ words: String) -> Void) -> [String] {
+        // One ordered list, each principal once: the speaker, then who steered it.
+        var seen: Set<String> = []
+        let speakers = ((mine ? [] : [source ?? "another agent"]) + steeredBy).filter { seen.insert($0).inserted }
+        for speaker in speakers { mark(speaker, mine ? "" : text) }
+        return speakers
+    }
+
+    /// A transcript message id a history page or selection may name: bounded,
+    /// letters, digits and hyphens (a row's UUID, or an imported `<UUID>-sent`).
+    /// Which message it is resolves by exact membership in the contact's lines.
+    public static func isMessageID(_ id: String) -> Bool {
+        (1...128).contains(id.utf8.count) && id.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+    }
+
     /// The contact's own conversation (a peer's id, or a built-in lane's
     /// name); for a peer, the one its MCP door opens.
     public static func session(owner: String) -> String { prefix(owner: owner) + "mcp-" + owner }
@@ -233,6 +276,18 @@ public enum ContactThread {
         public var fetched = false
         /// A reply's send id: the message of hers it answers.
         public var answers: String? = nil
+        /// Her send's id: the record exchange that holds its state (held, delivered, replied).
+        public var sendID: String? = nil
+        /// That state as kept on the send's own row once the ledger let it go (`Entry.state`).
+        public var sendState: String? = nil
+        /// Who said a contact's line: the principal its own row attests (the
+        /// verified door id its envelope carries, or its lane), never the
+        /// thread's owner, which can hold an associated door's words. Nil: the
+        /// row attests no one. Its grant is that principal's alone.
+        public var source: String? = nil
+        /// The peers whose words steered the turn that wrote this row
+        /// (`untrusted_sources`), each read under its own grant.
+        public var steeredBy: [String] = []
     }
 
     /// Presentation-only union for Simple and home rows. Route readers use lines.
@@ -250,7 +305,8 @@ public enum ContactThread {
         return try owners.flatMap { door -> [Line] in
             try lines(dataRoot: dataRoot, owner: door, tailBytes: tailBytes, transcripts: transcripts).map { line in
                 var line = line
-                if owners.count > 1 { line.door = identity.doors[identity.aliases["peer:" + door] == nil ? door : "peer:" + door] }
+                // The door a contact's line came through is the one its own row attests.
+                if owners.count > 1 { line.door = line.source.flatMap { identity.doors[$0] } }
                 return line
             }
         }.sorted { $0.at < $1.at }.filter { seen.insert($0.id).inserted }
@@ -287,8 +343,10 @@ public enum ContactThread {
                     $0.hasPrefix("agent-conversation:") ? String($0.dropFirst("agent-conversation:".count)) : nil
                 }
                 if role == "user" {
-                    // A peer's turns come over the agent bridge; a built-in lane's carry its name.
-                    guard envelope?["surface"] as? String == "agent-bridge" || origin?["agent"] as? String == owner else { continue }
+                    // A peer's turns come over the agent bridge; a built-in lane's carry its name; a
+                    // trusted contact's handed-over reply runs as chat and names it in its sources.
+                    guard envelope?["surface"] as? String == "agent-bridge" || origin?["agent"] as? String == owner
+                            || (origin?["peerSources"] as? [String])?.contains("peer:" + owner) == true else { continue }
                     // A reply handed to her, or a pull of Dot's room: her answer stays hers.
                     let handed = answers != nil
                         || (envelope?["correlationId"] as? String)?.hasPrefix("dot-room:") == true
@@ -307,7 +365,11 @@ public enum ContactThread {
                 found.append((Line(id: id, mine: role == "assistant", text: said, at: at,
                                    byPerson: metadata?["byPerson"] as? Bool == true,
                                    fetched: role == "assistant" && fetched.contains { $0.session == session && $0.run == run },
-                                   answers: role == "user" ? answers : nil),
+                                   answers: role == "user" ? answers : nil,
+                                   sendID: role == "assistant" ? metadata?["dotClientUserMessageID"] as? String : nil,
+                                   sendState: metadata?["sendState"] as? String,
+                                   source: role == "user" ? Self.stamp(id: id, metadata: metadata).source : nil,
+                                   steeredBy: Self.stamp(id: id, metadata: metadata).steeredBy),
                               metadata?["dotClientUserMessageID"] is String ? nil : run))
             }
         }
@@ -316,6 +378,18 @@ public enum ContactThread {
             .map(\.line).sorted { $0.at < $1.at }
         cache.withLock { $0[key] = (stamp, result) }
         return result
+    }
+
+    /// A saved row's stamp (`TranscriptRowStamp`, the one projection every
+    /// reader uses): the principal it attests and the peers that steered it.
+    static func stamp(id: String, metadata: [String: Any]?) -> (source: String?, steeredBy: [String]) {
+        let stamp = TranscriptRowStamp.of(id: id, role: "user", metadata: metadata)
+        return (stamp.source, stamp.steeredBy)
+    }
+
+    public static func stamp(id: String, metadata: [String: JSONValue]) -> (source: String?, steeredBy: [String]) {
+        let stamp = TranscriptRowStamp.of(id: id, role: "user", metadata: metadata)
+        return (stamp.source, stamp.steeredBy)
     }
 
     /// `lines` re-parsed every session file a contact owns on each Simple
@@ -360,11 +434,17 @@ public enum ContactThread {
         /// A message to the contact: hers, or the person's from its thread.
         case send(owner: String, text: String, sendID: String, byPerson: Bool)
         /// The contact's answer to a send, when no turn of hers carries it there.
-        case reply(owner: String, name: String, text: String, replyID: String, at: Date)
+        /// `from` and `steeredBy` are the stamp of whoever said it, as its own
+        /// transport attested it (the route a read went to, or the door whose
+        /// turn carried it); `owner` only places it.
+        case reply(owner: String, name: String, text: String, replyID: String, at: Date, from: String, steeredBy: [String])
+        /// A send's last state, kept on its own row when the record's bounded
+        /// ledger lets the send go: the evidence stays with the send.
+        case state(owner: String, sendID: String, status: String)
 
         var owner: String {
             switch self {
-            case .send(let owner, _, _, _), .reply(let owner, _, _, _, _): owner
+            case .send(let owner, _, _, _), .reply(let owner, _, _, _, _, _, _), .state(let owner, _, _): owner
             }
         }
     }
@@ -376,13 +456,17 @@ public enum ContactThread {
     public static func installWriter(_ write: @escaping Writer) { writer.withLock { $0 = write } }
 
     /// Appends the entry to the contact's session. The thread's own record
-    /// keeps the send either way; a failed append is logged, never retried.
+    /// keeps the send either way; a failed append is logged.
     public static func write(_ entry: Entry, dataRoot: URL) async {
-        guard let write = writer.withLock({ $0 }) else {
-            nativeLog("ContactThread: no writer installed; a message with \(entry.owner) was not saved to its session")
-            return
-        }
-        do { try await write(dataRoot, entry) }
+        do { try await attempt(entry, dataRoot: dataRoot) }
         catch { nativeLog("ContactThread: a message with \(entry.owner) was not saved to its session: \(error)") }
+    }
+
+    /// The same write, its failure the caller's to report.
+    public static func attempt(_ entry: Entry, dataRoot: URL) async throws {
+        guard let write = writer.withLock({ $0 }) else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "no conversation writer is installed yet"])
+        }
+        try await write(dataRoot, entry)
     }
 }

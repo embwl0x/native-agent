@@ -6,6 +6,8 @@ import Experiences
 /// Cached health projection; host probes and display redaction arrive from the caller.
 public enum DoctorStatusProjection {
     public static func repairProjection(_ rows: [CheckResult], dataRoot: URL) async -> [CheckResult] {
+        let projected = Dictionary(rows.compactMap { row in row.repairExperience.map { ($0.id, row) } },
+                                   uniquingKeysWith: { first, _ in first })
         let rows = rows.filter { $0.repairExperience == nil }
         do {
             let open = try await ExperienceStore.at(dataRoot).projection()
@@ -17,18 +19,31 @@ public enum DoctorStatusProjection {
                 let operation = experience.claims.first { $0.claim.hasPrefix("operation: doctor.check:") }!.claim
                 let checkID = String(operation.dropFirst("operation: doctor.check:".count))
                 let reading = rows.first { $0.id == checkID }
+                // A merge that remeasured only live rows keeps a core row as it
+                // was last projected, under the reading that run took.
+                if reading == nil, let row = projected[experience.id] { return row }
                 func claim(_ name: String) -> String? {
                     experience.claims.first { $0.claim.hasPrefix(name + ": ") }.map { String($0.claim.dropFirst(name.count + 2)) }
                 }
                 let tap = claim("tap")
                 let nativeRepair = claim("next_call") == ToolFailureError.call("app", ["action": .string("doctor.repair"), "args": .object(["check_id": .string(checkID)])])
-                return CheckResult(id: experience.id, title: reading?.title ?? checkID, status: claim("check.status") ?? "warn",
-                    detail: experience.face?.words ?? checkID, harm: claim("check.harm"), receipt: claim("check.receipt"), human_action: tap,
+                // A reading that is no longer adverse (an unknown: this launch
+                // has too little to say yet) is what is in effect now; the debt
+                // stays owed beside it, dated, since only a pass settles it.
+                // Shown alone under its old status, it read a past launch's
+                // verdict as this one's (0.6.9: Prompt Prefix Cache "fail, since
+                // this build launched at 00:13:44Z" three launches later).
+                let current = reading.flatMap { DoctorSafeRepairPolicy.isAdverse($0.status) ? nil : $0 }
+                let words = experience.face?.words ?? checkID
+                return CheckResult(id: experience.id, title: reading?.title ?? checkID, status: current?.status ?? claim("check.status") ?? "warn",
+                    detail: current.map { $0.detail + " Repair still owed since \(experience.at): " + words } ?? words,
+                    harm: claim("check.harm"), receipt: claim("check.receipt"), human_action: tap,
                     repair_available: reading?.repair_available ?? nativeRepair, ask: tap == nil ? nil : reading?.ask ?? .permission,
                     repairExperience: experience)
             }
             // Measurements remain inspectable; their unresolved failures are
-            // rendered from the experience that owns them, including unknowns.
+            // rendered from the experience that owns them, including unknowns,
+            // under the status the check reads now.
             let owedIDs = Set(owed.map(\.checkID))
             return rows.filter { !owedIDs.contains($0.id) || $0.ask != nil } + owed
         } catch {
@@ -41,7 +56,8 @@ public enum DoctorStatusProjection {
     }
 
     /// Each measurement owns its repair. A report, restart, or unknown reading
-    /// cannot accept it; only this check's passing postcondition can.
+    /// cannot accept it; only this check's passing postcondition, or a reading
+    /// that the part is off or not needed, can.
     public static func recordReadings(_ rows: [CheckResult], dataRoot: URL) async {
         let measurement = UUID().uuidString
         for row in rows where row.repairExperience == nil {
@@ -64,7 +80,10 @@ public enum DoctorStatusProjection {
                         value.map { .claim(.init(claim: key + ": " + $0, evidence: [evidence])) }
                     }, to: evidence.id)
                 }.value
-            } else if row.status == "ok" {
+            } else if ["ok", "off", "not needed"].contains(row.status) {
+                // Off by config or not needed owes nothing: the reading settles
+                // a debt met while the part was meant to run, so no later run
+                // renders it (0.6.9: Slack, never connected, stayed "fail").
                 await RepairOwed.settle(dataRoot, operation: operation, evidence: evidence).value
             }
         }

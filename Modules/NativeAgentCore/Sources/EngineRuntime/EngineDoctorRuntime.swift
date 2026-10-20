@@ -142,13 +142,22 @@ extension EngineDoctorRuntime {
         await WebSearchRoutes.codexSignedIn(dataRoot: dataRoot)
     }
 
-    public func doctorSearchSetupReading() -> String? {
+    public func doctorSearchSetupReading() async -> String? {
         let owned = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)
         guard !FileManager.default.fileExists(atPath: owned.path),
               OpenAIOAuthDirectAdapter.cliAdoptionConsent(dataRoot: dataRoot) == .allowed,
               OpenAIOAuthDirectAdapter.hasUsableTokens(at: OpenAIOAuthDirectAdapter.defaultUserCodexHome()
                 .appendingPathComponent("auth.json")) else { return nil }
-        return "Chat uses your adopted Codex CLI sign-in. General search currently requires a separate NativeAgent ChatGPT sign-in; no search has been measured."
+        // Chat's provider as routing serves the turn now, never the adoption:
+        // an adopted Codex CLI sign-in says nothing about which account chat uses.
+        let chat: String
+        do {
+            let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshotReadOnly()
+            chat = "Chat runs on " + (ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat") ?? "no active provider")
+        } catch {
+            chat = "Chat's provider could not be read (\(Self.safeDetail(error.localizedDescription)))"
+        }
+        return chat + "; general search needs a separate NativeAgent ChatGPT sign-in, which the adopted Codex CLI sign-in does not provide, and no search has been measured."
     }
 
     /// Doctor state: the local SearXNG URL for which Docker was checked and

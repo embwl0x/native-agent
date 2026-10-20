@@ -315,7 +315,9 @@ public struct AgentContactRoutes: Sendable {
         guard storedSession.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)) else {
             return ["status": "invalid_request"]
         }
-        let context = String(storedSession.dropFirst(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id).count))
+        // The task is filed under the transport's context; the session is the contact's one thread.
+        let context = protocolSession ? sessionID
+            : String(storedSession.dropFirst(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id).count))
         let taskID = "na3.\(context).\(requestID)"
         // agent_reply's wait: back the moment the reply settles (its stream
         // ends with it), or when the caller's bound passes, as agent_message waits.
@@ -369,12 +371,15 @@ public struct AgentContactRoutes: Sendable {
         let principal = peer.principal
         let requested = json["sessionId"] as? String
         let protocolSession = peer.protocolName == "mcp"
-        let stored = protocolSession ? requested.map(principal.storedConversation)
+        let prefix = AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)
+        // An MCP session id is the task's own locator as the host sent it; the
+        // turn runs in the contact's one conversation either way.
+        let stored = protocolSession ? requested.map { prefix + $0 }
             : ClaudeBridgeMessageRuntime.genericAgentSessionID(requested: requested, owner: principal.id)
-        guard let stored, stored.hasPrefix(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id)) else {
+        guard let stored, stored.hasPrefix(prefix) else {
             reply(403, ["status": "rejected", "detail": "This conversation belongs to another contact. Work: nothing ran."]); return
         }
-        let context = String(stored.dropFirst(AgentBridgePrincipal.genericAgentSessionPrefix(owner: principal.id).count))
+        let context = String(stored.dropFirst(prefix.count))
         let session = protocolSession ? context : stored
         let request = json["request_id"] as? String ?? UUID().uuidString
         let send = NativeAgentA2AWire.Send(rpcID: request, context: context, request: request,

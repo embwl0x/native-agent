@@ -857,6 +857,26 @@ public enum SystemPermissionPreflight {
         return URL(string: settingsPanePrefix + anchor)
     }
 
+    /// A grant macOS hands a process only when it launches: System Settings
+    /// itself offers "Quit & Reopen" for these.
+    public static let appliesAtLaunch: Set<SystemPermissionCapability> =
+        [.accessibility, .fullDiskAccess, .screenRecording, .inputMonitoring]
+
+    /// The launch-applied grants this process started with, read once at
+    /// launch (the app touches it first thing).
+    public static let grantedAtLaunch = Set(appliesAtLaunch.filter { status($0) == .granted })
+
+    /// The grants among a card's ids that macOS shows on now but this process
+    /// started without: it has them only after it restarts, whatever its
+    /// probe says now.
+    public static func awaitingLaunch(_ ids: [String]) -> [SystemPermissionCapability] {
+        var seen: Set<SystemPermissionCapability> = []
+        return ids.compactMap(cardSettingsCapability).filter {
+            appliesAtLaunch.contains($0) && !grantedAtLaunch.contains($0)
+                && status($0) == .granted && seen.insert($0).inserted
+        }
+    }
+
     public static func cardSettingsCapability(_ id: String) -> SystemPermissionCapability? {
         if id.hasPrefix("privacy:") {
             let capability = SystemPermissionCapability(rawValue: String(id.dropFirst(8)))

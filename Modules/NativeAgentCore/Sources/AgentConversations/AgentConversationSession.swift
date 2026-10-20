@@ -90,8 +90,8 @@ package enum AgentConversationSession {
         if historyBefore != nil || historyExchange != nil {
             guard tool == "agent_read", args["details"] != .bool(true), !agentIsBot(args),
                   historyBefore == nil || historyExchange == nil,
-                  [historyBefore, historyExchange].compactMap({ $0 }).allSatisfy({ UUID(uuidString: $0) != nil }) else {
-                throw AgentConversationStore.Failure(message: "Choose one offered session-history page or exchange. This only reads retained messages.")
+                  [historyBefore, historyExchange].compactMap({ $0 }).allSatisfy(ContactThread.isMessageID) else {
+                throw AgentConversationStore.Failure(message: "Choose one offered session-history page or message. This only reads the conversation.")
             }
         }
         let freshValue = args.removeValue(forKey: "new_conversation")
@@ -983,22 +983,26 @@ package enum AgentConversationSession {
         // A send that failed left no request id; Grok's read takes only one, so
         // refreshing would fail the whole read ("missing message_id").
         if let row { result = view(row.readInput == nil ? row : try await refresh(row, store: store, input: args, perform: perform), details: false, dataRoot: dataRoot) }
-        let exchanges = ((try? store.records()) ?? []).filter { record in
-            record.agent == agent || (record.agent.hasPrefix("peer:") && record.name.caseInsensitiveCompare(name) == .orderedSame)
-        }.flatMap { $0.exchanges ?? [] }
-        let asks = exchanges.compactMap { exchange in exchange.prompt.map { (exchange.sentAt as Date?, exchange.byPerson == true ? "the person" : "you", $0) } }
-        // Walk 4 (09-26): an answer a wait took is never handed over as a turn,
-        // so the exchanges carry it; a handed-over turn with the same words
-        // within ten minutes is that same answer, shown once.
-        let answered = exchanges.compactMap { exchange in exchange.reply.map { (exchange.settledAt ?? exchange.sentAt, $0) } }
+        // Her asks and the answers a wait took, from its one conversation (every
+        // door it has); an answer handed over as a turn lands in the chat that
+        // asked. Walk 4 (09-26): a handed-over turn with the same words within
+        // ten minutes is that same answer, shown once.
+        let said = try ContactThread.mergedLines(dataRoot: dataRoot, owner: agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent)
         let turns = await HerScreen.routineReplies(dataRoot: dataRoot).filter { turn in
-            !answered.contains { $0.1 == turn.text && abs($0.0.timeIntervalSince(turn.at ?? $0.0)) < 600 }
+            !said.contains { !$0.mine && $0.text == turn.text && abs($0.at.timeIntervalSince(turn.at ?? $0.at)) < 600 }
         }
-        let replies = answered.map { ($0.0 as Date?, name, $0.1) } + turns.map { ($0.at, name, $0.text) }
-        let talk = (asks + replies).sorted { ($0.0 ?? .distantPast) < ($1.0 ?? .distantPast) }.suffix(8)
+        typealias Said = (at: Date?, from: String, text: String, mine: Bool, source: String?, steeredBy: [String])
+        let lines: [Said] = said.map { ($0.at, $0.mine ? ($0.byPerson ? "the person" : "you") : name, $0.text, $0.mine, $0.source, $0.steeredBy) }
+        let talk = (lines + turns.map { ($0.at, name, $0.text, false, $0.source, $0.steeredBy) as Said })
+            .sorted { ($0.at ?? .distantPast) < ($1.at ?? .distantPast) }.suffix(8)
         guard case .object(var fields) = result, !talk.isEmpty else { return result }
-        if !replies.isEmpty {
-            PeerDataTaint.markConsumed(peer: peer.map { "peer:" + $0.id } ?? agent)
+        // Each line shown is read under its own row's provenance, wherever it was kept.
+        for shown in talk {
+            ContactThread.consume(mine: shown.mine, source: shown.source, steeredBy: shown.steeredBy, text: shown.text) {
+                PeerDataTaint.markConsumed(peer: $0, line: $1)
+            }
+        }
+        if talk.contains(where: { !$0.mine }) {
             // The current ask's own state comes from its request id (refreshed
             // above). A late answer to a superseded ask shows here but never
             // reads as the answer to the one still waiting.
@@ -1007,9 +1011,9 @@ package enum AgentConversationSession {
             }
             fields["untrusted_remote_data"] = .bool(true)
         }
-        fields["conversation"] = .array(talk.map { at, from, text in
-            .object(["at": at.map { .string(ISO8601DateFormatter().string(from: $0)) } ?? .null, "from": .string(from),
-                     "text": .string(HerScreen.clip(text, 800))])
+        fields["conversation"] = .array(talk.map { shown in
+            .object(["at": shown.at.map { .string(ISO8601DateFormatter().string(from: $0)) } ?? .null, "from": .string(shown.from),
+                     "text": .string(HerScreen.clip(shown.text, 800))])
         })
         fields["conversation_note"] = .string("Oldest first: the messages sent and its replies, each reply after the message it answers.")
         return .object(fields)
@@ -1097,7 +1101,7 @@ package enum AgentConversationSession {
         if fields["reply"] != nil { fields.removeValue(forKey: "conversation_note") }
         if fields["reply"] != nil, case .array? = fields["conversation"] { fields.removeValue(forKey: "conversation") }
         var thread: [String: JSONValue] = ["conversation": .string(row.label), "exchanges": .int(Int64(row.exchanges?.count ?? 0)),
-            "state": .string(row.phase), "history": .string("agent_read shows the retained exchanges.")]
+            "state": .string(row.phase), "history": .string("agent_read shows the conversation, both directions.")]
         if let id = threadID(row.agent) { thread["thread_id"] = .string(id) }
         fields["thread"] = .object(thread)
         return .object(fields)
@@ -1295,16 +1299,24 @@ package enum AgentConversationSession {
             shown["status"] = .string("read")
             result = .object(shown)
         }
-        // Cached reads retain peer provenance instead of laundering it through
-        // this presentation layer. Elevation still comes from the current owner.
-        // Compact send/wait/stop results do not present retained history.
-        let hasRemoteData = ["session_history", "live"].contains { key in
-            guard case .object(let fields)? = shown[key] else { return false }
-            return fields["untrusted_remote_data"] == .bool(true)
-        }
-        if shown["untrusted_remote_data"] == .bool(true) || !(string(shown["reply"]) ?? "").isEmpty || hasRemoteData,
-           peer?.elevationAllowed != true {
-            PeerDataTaint.markConsumed(peer: row.agent, line: string(shown["reply"]) ?? "")
+        // A cached reply shown here is the words of the row that answered this
+        // send, read under that row's own stamp; with no such row, under the
+        // stamp its writer gave the cache (the answering door, or the route
+        // the app read it from: a receipt, a live partial). The history
+        // latched each of its lines itself.
+        let liveText: String? = if case .object(let live)? = shown["live"], live["untrusted_remote_data"] == .bool(true) {
+            string(live["partial_reply"]) ?? string(live["partial_text"]) ?? ""
+        } else { nil }
+        if let reply = string(shown["reply"]) ?? liveText ?? (shown["untrusted_remote_data"] == .bool(true) && shown["session_history"] == nil ? "" : nil) {
+            let owner = row.agent.hasPrefix("peer:") ? String(row.agent.dropFirst(5)) : row.agent
+            let answered = (try? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner))?.last { !$0.mine && $0.answers == row.operationID }
+            if let answered { ContactThread.consume(answered) { PeerDataTaint.markConsumed(peer: $0, line: $1) } }
+            else {
+                let stamp = row.cachedReplyStamp
+                ContactThread.consume(mine: false, source: stamp.source, steeredBy: stamp.steeredBy, text: reply) {
+                    PeerDataTaint.markConsumed(peer: $0, line: $1)
+                }
+            }
         }
         return result
     }

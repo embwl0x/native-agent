@@ -46,11 +46,8 @@ package enum ChatWorkspaceBinding {
             }
         }
         func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue {
-            let result = await HumanConversationReader.open(sessionID: sessionID, limit: limit, dataRoot: dataRoot)
-            if case .object(let row) = result, row["untrusted_remote_data"] == .bool(true), case .string(let peer)? = row["agent"] {
-                PeerDataTaint.markConsumed(peer: peer)
-            }
-            return result
+            // The read consumed each message it shows under its own row's stamp.
+            await HumanConversationReader.open(sessionID: sessionID, limit: limit, dataRoot: dataRoot)
         }
         func presentation(_ row: AgentConversationRecord) -> JSONValue {
             AgentConversationSession.conversationPresentation(row)

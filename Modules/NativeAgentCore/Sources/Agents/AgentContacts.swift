@@ -57,19 +57,25 @@ public final class AgentContacts: Sendable {
             case let .send(owner, text, sendID, byPerson):
                 try await clients.bridgeChatClient().appendAgentConversationSend(sessionID: ContactThread.session(owner: owner),
                     text: text, clientUserMessageID: sendID, byPerson: byPerson)
-            case let .reply(owner, name, text, replyID, at):
-                // Their words, kept in their session; no turn runs on it. A
-                // built-in lane's carries its lane, as its own messages do.
-                let request = ["codex", "claude", "omp"].contains(owner)
-                    ? TurnRequest(message: Self.savedReply(owner: owner, name: name, text: text), sessionID: ContactThread.session(owner: owner),
-                        surface: "chat", origin: ChatMessageOrigin(surface: BridgeLane.bridgeSurfaceName(forSender: owner), agent: owner,
-                            authored: BridgeLane.laneAuthorship(forSender: owner), replyTo: replyID))
-                    : TurnRequest(
-                        message: Self.savedReply(owner: owner, name: name, text: text),
-                        sessionID: ContactThread.session(owner: owner), surface: AgentBridgeSurface.id,
-                        envelope: TurnEnvelope(surface: AgentBridgeSurface.id, agent: "peer", verifiedUserId: owner,
-                                               commandSignatureVerified: true, declaredRemote: true),
-                        origin: ChatMessageOrigin(surface: AgentBridgeSurface.id, agent: "agent", authored: .agent, replyTo: replyID))
+            case let .state(owner, sendID, status):
+                if try await !clients.bridgeChatClient().recordAgentConversationSendState(sessionID: ContactThread.session(owner: owner),
+                    sendID: sendID, status: status) {
+                    nativeLog("AgentContacts: send %@ has no row in its conversation; its state %@ has no line to show on", sendID, status)
+                }
+            case let .reply(owner, name, text, replyID, at, from, steeredBy):
+                // Their words, kept in their session; no turn runs on it. The row
+                // carries the stamp of who said them, never the thread's owner.
+                guard from.hasPrefix("peer:") else {
+                    throw AgentConversationStore.Failure(message: "A reply copy needs the attested door that said it; \(from) is not one.")
+                }
+                var origin = ChatMessageOrigin(surface: AgentBridgeSurface.id, agent: "agent", authored: .agent, replyTo: replyID)
+                origin.peerSources = steeredBy
+                let request = TurnRequest(
+                    message: Self.savedReply(owner: owner, name: name, text: text),
+                    sessionID: ContactThread.session(owner: owner), surface: AgentBridgeSurface.id,
+                    envelope: TurnEnvelope(surface: AgentBridgeSurface.id, agent: "peer", verifiedUserId: String(from.dropFirst(5)),
+                                           commandSignatureVerified: true, declaredRemote: true),
+                    origin: origin)
                 let iso = ISO8601DateFormatter()
                 iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 _ = try await ChatPersistenceContext.$importedMessageCreatedAt.withValue(iso.string(from: at)) {
@@ -77,6 +83,8 @@ public final class AgentContacts: Sendable {
                 }
             }
         }
+        // The writer is back: let-go sends' states waiting on it go onto their rows.
+        AgentConversationStore.releasePending(dataRoot: dataRoot)
         tasks = AgentContactTasks(dataRoot: dataRoot) { turn, emit in
             try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot, emit: emit)
         }

@@ -140,6 +140,12 @@ extension SwiftNativeChatOrchestrationClient {
         return !found.matching.isEmpty || !found.damaged.isEmpty
     }
 
+    /// A checkpoint the launch recovery can read, and so resumes; a damaged one
+    /// stays owed (`hasReplyCheckpoint`) but schedules nothing.
+    public static func hasResumableReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws -> Bool {
+        try !replyCheckpoints(dataRoot: dataRoot, sessionId: sessionId, runId: runId).matching.isEmpty
+    }
+
     public static func removeReplyCheckpoint(dataRoot: URL, sessionId: String, runId: String) throws {
         for checkpoint in try replyCheckpoints(dataRoot: dataRoot, sessionId: sessionId, runId: runId).matching {
             try checkpoint.remove(dataRoot: dataRoot)
@@ -278,14 +284,7 @@ extension SwiftNativeChatOrchestrationClient {
         request.origin = try metadata["origin"].map {
             try JSONDecoder().decode(ChatMessageOrigin.self, from: $0.serializedData(pretty: false))
         }
-        request.attachments = try CodexCompletionTranscriptEvidence.decodeAttachments(metadata["attachments"])
-        for index in request.attachments.indices {
-            if request.attachments[index].utterance?.audioReference != nil { continue }
-            guard let path = request.attachments[index].path else {
-                throw ChatOrchestrationError.underlying("The resumed turn's attachment has no saved file; restore it before resuming.")
-            }
-            request.attachments[index].base64 = try Data(contentsOf: URL(fileURLWithPath: path)).base64EncodedString()
-        }
+        request.attachments = try CodexCompletionTranscriptEvidence.savedAttachments(metadata["attachments"])
         var record = checkpoint
         let sources = rows.flatMap { row -> [String] in
             guard case .object(let fields)? = row.extras, case .object(let metadata)? = fields["metadata"],

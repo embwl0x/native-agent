@@ -67,6 +67,8 @@ public struct AppToolProviderHealth: Sendable {
 extension AppToolExecutor {
     public static func doctorStatus(
         report: some AppToolDoctorReport,
+        completedAt: Date?,
+        runningSince: Date?,
         providerHealth: @Sendable (URL) async throws -> [AppToolProviderHealth]
     ) async throws -> JSONValue {
         let dataRoot = PersistenceCore.defaultDataRoot()
@@ -89,6 +91,8 @@ extension AppToolExecutor {
         }
         return doctorStatusEnvelope(
             report: report,
+            completedAt: completedAt,
+            runningSince: runningSince,
             activeProviderID: activeProviderID,
             activeProvider: activeProvider
         )
@@ -113,8 +117,12 @@ extension AppToolExecutor {
         return String(head) + ellipsis
     }
 
+    /// The page names the run it shows, and a run in flight says so rather
+    /// than passing the report from before it off as current.
     public static func doctorStatusEnvelope(
         report: some AppToolDoctorReport,
+        completedAt: Date?,
+        runningSince: Date?,
         activeProviderID: String?,
         activeProvider: AppToolProviderHealth?
     ) -> JSONValue {
@@ -148,33 +156,36 @@ extension AppToolExecutor {
             }
             return JSONValue.object(row)
         }
-        let maintenanceIDs = Set(["oauth_token_expiry"])
+        // The path is what a chat turn on this surface waits on: the provider
+        // that answers it (live.providers), the memory store it recalls from
+        // (live.memory), the prompt prefix it is sent with
+        // (prompt_prefix_health) and the local bridges a bridge turn arrives
+        // through (live.bridges). Every other row is real but serves something
+        // else (a connector, a loop, a backup), so it shows in `status` and in
+        // its row, never as a broken path. A provider warning while the active
+        // provider is ready names another account, not this path.
+        let pathIDs: Set<String> = ["live.providers", "live.memory", "prompt_prefix_health", "live.bridges"]
         let activeProviderIsReady = activeProvider?.eligible == true
-        let maintenanceChecks = report.checks.filter { check in
-            if maintenanceIDs.contains(check.checkID) { return true }
-            return check.checkID == "live.providers"
-                && check.status.lowercased() == "warn"
-                && activeProviderIsReady
+        let pathChecks = report.checks.filter { check in
+            pathIDs.contains(check.checkID)
+                && !(check.checkID == "live.providers" && check.status.lowercased() == "warn" && activeProviderIsReady)
         }
-        let maintenanceCheckIDs = Set(maintenanceChecks.map(\.id))
-        let activeChecks = report.checks.filter { !maintenanceCheckIDs.contains($0.id) }
-        let activePathStatus = doctorRollup(activeChecks.map(\.status))
-        let maintenanceStatus = doctorRollup(maintenanceChecks.map(\.status))
         var envelope: [String: JSONValue] = [
             "status": .string(report.status),
-            "active_path_status": .string(activePathStatus),
-            "maintenance_status": .string(maintenanceStatus),
+            "report_completed_at": completedAt.map { .string(ISO8601DateFormatter().string(from: $0)) } ?? .null,
+            "active_path_status": .string(doctorRollup(pathChecks.map(\.status))),
+            "active_path_check_ids": .array(pathChecks.map { .string($0.id) }),
             "active_provider_id": activeProviderID.map(JSONValue.string) ?? .null,
             // The receipt's own word (ready, saved, failed, rejected, needs_*).
             "active_provider_status": .string(activeProvider?.authState ?? "unknown"),
-            "status_scope_note": .string("status is the global Doctor rollup; active_path_status is the independently classified path serving this surface; maintenance warnings remain visible in checks"),
+            "status_scope_note": .string("status rolls up every check; active_path_status rolls up only the checks a chat turn here depends on (active_path_check_ids); off, not needed and unmeasured rows never fail either"),
             "repaired": .bool(report.repaired),
             "check_count": .int(Int64(checks.count)),
-            "active_path_check_count": .int(Int64(activeChecks.count)),
-            "maintenance_check_count": .int(Int64(maintenanceChecks.count)),
-            "maintenance_check_ids": .array(maintenanceChecks.map { .string($0.id) }),
             "checks": .array(checks),
         ]
+        if let runningSince {
+            envelope["run_in_progress"] = .string("A Doctor run started at \(ISO8601DateFormatter().string(from: runningSince)) is in progress; this report is from before it and is not current until it finishes.")
+        }
         if activeProvider?.eligible == false, let activeProviderID {
             let target = InlineInteractionRegistry.canonicalProviderID(activeProviderID)
             envelope["next"] = .string("raise request_interaction kind=api_key target=\(target)")

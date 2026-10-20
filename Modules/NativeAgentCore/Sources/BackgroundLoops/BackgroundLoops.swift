@@ -289,11 +289,14 @@ public extension LoopRunner {
 public enum LoopRegistration: Sendable {
     case enabled(any LoopRunner)
     case disabled(loopId: String, reason: String)
+    /// Its configuration could not be read: a fault that says its cause, never
+    /// off (an unreadable credential is not "not connected").
+    case unreadable(loopId: String, error: String)
 
     public var loopId: String {
         switch self {
         case .enabled(let runner): runner.loopId
-        case .disabled(let loopId, _): loopId
+        case .disabled(let loopId, _), .unreadable(let loopId, _): loopId
         }
     }
 

@@ -199,6 +199,52 @@ public enum CodexCompletionTranscriptEvidence {
         return matches.first
     }
 
+    /// A saved user row as a restart recovers its turn.
+    public struct SavedTurnInput: Sendable {
+        public let runId: String
+        public let content: String
+        public let awaitingConsumption: Bool
+        /// Its attachments with their saved bytes (read only for input still
+        /// awaiting its turn), or why they cannot be read back whole.
+        public let attachments: Result<[MultimodalAttachment], any Error>
+    }
+
+    /// Every run's saved user input in a session, in transcript order, from one
+    /// strict read: a damaged transcript is an error, never empty history.
+    public static func savedTurnInputs(dataRoot: URL, sessionId: String) async throws -> [SavedTurnInput] {
+        guard let id = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            throw ChatOrchestrationError.underlying("invalid chat session id")
+        }
+        let (rows, report) = try await SwiftNativePersistenceCore().readJSONLReporting(
+            dataRoot.appendingPathComponent("chat/messages/\(id).jsonl"))
+        guard report.isClean else {
+            throw ChatOrchestrationError.underlying("\(id)'s transcript has unreadable rows; repair it before its saved turns resume.")
+        }
+        return rows.compactMap { row in
+            guard case .object(let fields) = row, fields["role"] == .string("user"),
+                  case .string(let run)? = fields["runId"], case .string(let content)? = fields["content"] else { return nil }
+            let metadata: [String: JSONValue] = if case .object(let value)? = fields["metadata"] { value } else { [:] }
+            let awaiting = metadata["awaitingConsumption"] == .bool(true)
+            return SavedTurnInput(runId: run, content: content, awaitingConsumption: awaiting,
+                                  attachments: awaiting ? Result { try savedAttachments(metadata["attachments"]) } : .success([]))
+        }
+    }
+
+    /// A saved user row's attachments as a resumed turn takes them: decoded,
+    /// each with its saved file's bytes. Every restart recovery of saved input
+    /// reads them here (a checkpointed turn, a contact message left queued).
+    public static func savedAttachments(_ value: JSONValue?) throws -> [MultimodalAttachment] {
+        var attachments = try decodeAttachments(value)
+        for index in attachments.indices {
+            if attachments[index].utterance?.audioReference != nil { continue }
+            guard let path = attachments[index].path else {
+                throw ChatOrchestrationError.underlying("The resumed turn's attachment has no saved file; restore it before resuming.")
+            }
+            attachments[index].base64 = try Data(contentsOf: URL(fileURLWithPath: path)).base64EncodedString()
+        }
+        return attachments
+    }
+
     static func decodeAttachments(_ value: JSONValue?) throws -> [MultimodalAttachment] {
         guard let value else { return [] }
         guard case .array(let rows) = value else { throw RecoveryError.corruptBinding }
@@ -383,7 +429,8 @@ extension SwiftNativeChatOrchestrationClient {
                 timestamp: createdAt,
                 messagesPath: path,
                 source: messageSource,
-                metadata: nil
+                metadata: nil,
+                stamp: TranscriptRowStamp.of(id: messageId, role: "assistant", metadata: partialMetadata)
             )
         } catch {
             await Self.reportTranscriptWriteFailure(
@@ -860,6 +907,38 @@ extension SwiftNativeChatOrchestrationClient {
                                 agentConversationSendByPerson: byPerson)
     }
 
+    /// A send's last state on its own row (`ContactThread.Entry.state`), once the
+    /// record's bounded ledger let the send go: in the live transcript, or the
+    /// archived copy a compaction kept. False: the send has no row anywhere,
+    /// so no line of it exists to show the state.
+    @discardableResult
+    public func recordAgentConversationSendState(sessionID: String, sendID: String, status: String) async throws -> Bool {
+        let sessionId = try Self.resolveSessionId(sessionID)
+        let files = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, sessionId: sessionId,
+            archived: ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot)).map(\.1)
+        for path in files where FileManager.default.fileExists(atPath: path.path) {
+            let found = try await persistence.withFileLock(path) {
+                let (read, report) = try await persistence.readJSONLReporting(path)
+                // An unreadable row may be the send, and would be lost in a rewrite:
+                // the evidence stays held until the transcript is repaired.
+                guard report.isClean else { throw ChatOrchestrationError.underlying("\(path.lastPathComponent) has unreadable rows") }
+                var rows = read
+                guard let index = rows.lastIndex(where: { row in
+                    guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { return false }
+                    return metadata["dotClientUserMessageID"] == .string(sendID)
+                }), case .object(var row) = rows[index], case .object(var metadata)? = row["metadata"] else { return false }
+                guard metadata["sendState"] != .string(status) else { return true }
+                metadata["sendState"] = .string(status)
+                row["metadata"] = .object(metadata)
+                rows[index] = .object(row)
+                try Self.writeJSONLAtomically(rows, to: path)
+                return true
+            }
+            if found { return true }
+        }
+        return false
+    }
+
     /// Her answer from a turn that ran in a contact's own conversation, as a
     /// row of the chat that asked for it (User 10-01). Once per `deliveryID`:
     /// a retried delivery finds its row and adds none.
@@ -931,8 +1010,12 @@ extension SwiftNativeChatOrchestrationClient {
         }
         guard changed.count > 0, case .object(let last)? = changed.last, case .string(let content)? = last["content"],
               case .string(let at)? = last["createdAt"] else { return changed.count }
-        try await syncSessionIndex(sessionId: safeSessionId, role: "assistant", content: content, timestamp: at,
-                                   messagesPath: path, source: "agent-bridge", metadata: nil)
+        let role: String = if case .string(let value)? = last["role"] { value } else { "assistant" }
+        let lastID: String = if case .string(let id)? = last["id"] { id } else { "" }
+        let lastMetadata: [String: JSONValue] = if case .object(let metadata)? = last["metadata"] { metadata } else { [:] }
+        let stamp = TranscriptRowStamp.of(id: lastID, role: role, metadata: lastMetadata, rowSource: "agent-bridge")
+        try await syncSessionIndex(sessionId: safeSessionId, role: role, content: content, timestamp: at,
+                                   messagesPath: path, source: "agent-bridge", metadata: nil, stamp: stamp)
         NotificationCenter.default.post(name: .nativeAgentChatTranscriptDidChange, object: safeSessionId)
         return changed.count
     }
@@ -1546,7 +1629,8 @@ extension SwiftNativeChatOrchestrationClient {
             timestamp: createdAt,
             messagesPath: path,
             source: messageSource,
-            metadata: metadata
+            metadata: metadata,
+            stamp: TranscriptRowStamp.of(id: messageId, role: role, metadata: metadata ?? [:], rowSource: messageSource)
         )
         // One signal for every row any door writes: an open chat and the phone
         // see Telegram, phone and agent turns as they land, not on the next turn.
@@ -2411,7 +2495,9 @@ extension SwiftNativeChatOrchestrationClient {
         timestamp: String,
         messagesPath: URL,
         source: String,
-        metadata: [String: JSONValue]?
+        metadata: [String: JSONValue]?,
+        /// The previewed row's own stamp, kept beside its preview text.
+        stamp: TranscriptRowStamp
     ) async throws {
         let dataRoot = self.dataRoot
         let sessionsPath = dataRoot
@@ -2493,7 +2579,7 @@ extension SwiftNativeChatOrchestrationClient {
                 // transcript and would clear it on the phone.
                 ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
                 row["messageCount"] = .int(Int64(messageCount))
-                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview) }
+                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
                 if let title,
                    Self.shouldReplaceSessionTitle(row["title"]) {
                     row["title"] = .string(title)
@@ -2561,7 +2647,7 @@ extension SwiftNativeChatOrchestrationClient {
                     ChatSessionIndexFile.recordContinuityParticipant(
                         in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
                 }
-                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview) }
+                if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
                 updated = row
             }
 

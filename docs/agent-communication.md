@@ -23,7 +23,7 @@ Call an action with `app {"action":"agent.message","args":{...}}`.
 
 | Action | Use |
 | --- | --- |
-| `agent.contacts` | List coding helpers, bots and saved peers. `discover: true` or a name refreshes discovery when the person asks to find agents. |
+| `agent.contacts` | List coding helpers, bots and saved peers. `discover: true` or a name refreshes discovery when the person asks to find agents: by what speaks a protocol (A2A card, ACP program, MCP settings), with a `recipe_draft` for a find no recipe knows. |
 | `agent.connect` | Connect a known host by name, a peer by endpoint, or an explicit desktop route. Disconnect with `disconnect: true` and `agent: "peer:<id>"` from contacts. |
 | `agent.message` | Send `agent` and `text`; continue this chat's current conversation with that contact. A known host can be connected in the same call through its setup gates. |
 | `agent.read` | Read the conversation and retained reply. `details: true` exposes receipts. `wait_seconds` waits 1–300 seconds on a conversation by name; it cannot be combined with exact IDs, history or listing filters. |

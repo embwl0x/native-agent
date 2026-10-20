@@ -96,7 +96,6 @@ extension SwiftToolDispatcher {
         let complete = !listingFailed && failures == 0 && malformed == 0 && sampled == 0
             && !hasMoreSessions && offset == 0 && deskAvailable
         let artifacts = candidates.prefix(limit).map(\.value)
-        for artifact in artifacts { Self.consumePersistedHistoryEvidence(artifact) }
         var result: [String: JSONValue] = [
             "status": .string(candidates.isEmpty ? (complete ? "not_found" : "incomplete") : "ok"),
             "query": .string(ArtifactContextProjection.safeText(query, cap: 500)),
@@ -200,7 +199,7 @@ enum ArtifactContextProjection {
         object(object(message.extras)["metadata"])
     }
 
-    private static func evidence(_ message: ChatMessage, sessionID: String) -> JSONValue {
+    private static func evidence(_ message: ChatMessage, sessionID: String, dataRoot: URL) -> JSONValue {
         let row = object(message.extras)
         let meta = metadata(message)
         let display = ChatTranscriptEvidenceRendering.displayContent(
@@ -212,10 +211,8 @@ enum ArtifactContextProjection {
             "session_id": .string(sessionID), "role": .string(message.role),
             "timestamp": .string(message.timestamp), "excerpt": .string(safeText(display)),
         ]
-        if let peer = SwiftToolDispatcher.persistedHistoryPeer(role: message.role, row: row) {
-            value["agent"] = .string(peer)
-            value["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(peer) && !display.isEmpty)
-        }
+        value.merge(SwiftToolDispatcher.historyEvidence(SwiftToolDispatcher.persistedHistoryPeer(role: message.role, row: row),
+                                                        words: display, dataRoot: dataRoot)) { _, new in new }
         if let id = string(row["id"]), !id.isEmpty {
             value["message_id"] = .string(id)
             value["read"] = .object(["tool": .string("read_chat_message"), "arguments": .object([
@@ -250,7 +247,7 @@ enum ArtifactContextProjection {
             // Sampling destroys adjacency: only the exact source is then
             // returned, never unrelated rows labeled neighboring conversation.
             let neighbors = sampled ? [message] : Array(messages[max(0, index - 2)...min(messages.count - 1, index + 2)])
-            let surrounding = neighbors.map { evidence($0, sessionID: sessionID) }
+            let surrounding = neighbors.map { evidence($0, sessionID: sessionID, dataRoot: dataRoot) }
             let context = neighbors.filter { $0.role != "tool" }.map { safeText($0.content) }.joined(separator: " ")
             var seen: Set<String> = []
             for ref in refs {
@@ -266,7 +263,7 @@ enum ArtifactContextProjection {
                     "matching": match.basis,
                     "source": .string(message.role == "tool" ? "retained_tool_artifact_reference" : "chat_attachment"),
                     "recorded_at": .string(message.timestamp),
-                    "source_message": evidence(message, sessionID: sessionID),
+                    "source_message": evidence(message, sessionID: sessionID, dataRoot: dataRoot),
                     "conversation_context": .array(surrounding),
                     "context_is_adjacent": .bool(!sampled),
                     "approval": .string("unresolved; no approval binding inferred"),

@@ -159,6 +159,8 @@ enum NativeAgentAppMain {
         // Mark public first launch in place before state owners initialize.
         InlineInteractionResolver.platform = AppInlineInteractionPlatformPort()
         // Every open permission card settles by itself from here on, from launch.
+        // What macOS granted this process at launch, read before anything can change it.
+        _ = SystemPermissionPreflight.grantedAtLaunch
         Task { @MainActor in InlineInteractionResolver.GrantWatch.shared.start() }
         _ = NSApplication.shared
         guard AppDelegate.claimSingleAppInstance() else { return }

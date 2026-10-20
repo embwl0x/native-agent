@@ -61,11 +61,20 @@ public actor ChatSessionIndexReconciler {
         let version: JSONValue?
     }
 
+    /// A transcript row's own stamp (`TranscriptRowStamp`), for the preview taken from it.
+    private static func stamp(_ row: [String: JSONValue]?) -> TranscriptRowStamp {
+        let metadata: [String: JSONValue] = if case .object(let value)? = row?["metadata"] { value } else { [:] }
+        return TranscriptRowStamp.of(id: string(row?["id"]) ?? "", role: string(row?["role"])?.lowercased() ?? "",
+                                     metadata: metadata, rowSource: string(row?["source"]))
+    }
+
     private struct StaleRepair: Sendable {
         let candidate: StaleCandidate
         let version: JSONValue?
         let messageCount: Int64
         let preview: String
+        /// The previewed row's own stamp, kept beside its preview text.
+        let previewStamp: TranscriptRowStamp
         /// 2026-09-06: whether the transcript held a conversational row AT ALL.
         /// An empty `preview` used to mean both "no user/assistant row" and
         /// "the last one has no readable string content" (a structured or
@@ -187,7 +196,8 @@ public actor ChatSessionIndexReconciler {
                     guard case .string(let sessionID)? = row["id"],
                           let transcript = transcriptsByID[sessionID],
                           let version = ChatSessionIndexFile.transcriptVersion(at: transcript.url),
-                          row[ChatSessionIndexFile.acknowledgedTranscriptKey] != version else { continue }
+                          row[ChatSessionIndexFile.acknowledgedTranscriptKey] != version
+                              || row[TranscriptRowStamp.previewKey] == nil else { continue }
                     guard staleRepairBudget > 0 else {
                         // Left for the next launch. The gate cost one stat.
                         report.skippedForBounds += 1
@@ -321,7 +331,10 @@ public actor ChatSessionIndexReconciler {
             let spoken = objectRows.filter { ["user", "assistant"].contains(Self.string($0["role"])?.lowercased() ?? "") }
             recoveredRow["firstMessageAt"] = spoken.first?["createdAt"] ?? spoken.first?["timestamp"]
             recoveredRow["lastMessageAt"] = spoken.last?["createdAt"] ?? spoken.last?["timestamp"]
-            if !preview.isEmpty { recoveredRow["lastMessagePreview"] = .string(preview) }
+            if !preview.isEmpty {
+                recoveredRow["lastMessagePreview"] = .string(preview)
+                recoveredRow[TranscriptRowStamp.previewKey] = Self.stamp(objectRows.last).json
+            }
             // 2026-09-06: stamp the transcript state this row was built
             // from, so the stale-row pass below does not re-open a file
             // this pass just finished reading, on this launch or any later
@@ -413,6 +426,7 @@ public actor ChatSessionIndexReconciler {
                         lastSpoken.flatMap { Self.content($0) } ?? "",
                         to: 160
                     ),
+                    previewStamp: Self.stamp(lastSpoken),
                     hasConversationalRow: lastSpoken != nil,
                     lastSpokenStamp: Self.string(lastSpoken?["createdAt"])
                         ?? Self.string(lastSpoken?["timestamp"]),
@@ -473,13 +487,26 @@ public actor ChatSessionIndexReconciler {
                         row["lastMessagePreview"] = .string("")
                         disagreed = true
                     }
+                    if row[TranscriptRowStamp.previewKey] == nil {
+                        // Nothing to quote has an empty stamp; written once so
+                        // the row leaves repair.
+                        row[TranscriptRowStamp.previewKey] = repair.previewStamp.json
+                        disagreed = true
+                    }
                 } else if repair.preview.isEmpty {
-                    // 2026-09-06: there IS a last user/assistant row, it just
-                    // has no readable string content to quote. That is not
-                    // evidence the stored preview is wrong, so the row keeps
-                    // whatever it has rather than being blanked.
-                } else if row["lastMessagePreview"] != .string(repair.preview) {
+                    // There IS a last user/assistant row, it just has no
+                    // readable string content to quote: the preview is what
+                    // that row quotes, nothing, under that row's stamp. Older
+                    // words kept here would wear a stamp that is not theirs.
+                    if row[TranscriptRowStamp.previewKey] == nil {
+                        row["lastMessagePreview"] = .string("")
+                        row[TranscriptRowStamp.previewKey] = repair.previewStamp.json
+                        disagreed = true
+                    }
+                } else if row["lastMessagePreview"] != .string(repair.preview)
+                            || row[TranscriptRowStamp.previewKey] != repair.previewStamp.json {
                     row["lastMessagePreview"] = .string(repair.preview)
+                    row[TranscriptRowStamp.previewKey] = repair.previewStamp.json
                     disagreed = true
                 }
                 // `updatedAt` orders the sidebar, so it only ever moves

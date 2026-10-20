@@ -15,9 +15,9 @@ public enum Repair {
         ]
         if let tap {
             fields["tap"] = .string(tap)
-            fields["instruction"] = .string("\(owner) decided this, and it is the person's to change: ask them to open \(tap).")
+            fields["instruction"] = .string("Decided by \(clause(owner)), which is the person's to change: ask them to open \(tap).")
         } else {
-            fields["instruction"] = .string("\(owner) decided this. Call next_call to change it, then do what you meant again.")
+            fields["instruction"] = .string("Decided by \(clause(owner)); call next_call to change it, then do what you meant again.")
         }
         return .object(fields)
     }
@@ -29,8 +29,14 @@ public enum Repair {
     public static func why(owner: String, tap: String) -> JSONValue {
         .object([
             "kind": .string("person_decides"), "owner": .string(owner), "tap": .string(tap), "next_call": .null,
-            "instruction": .string("\(owner) decides this, by the person's choice. If it should change, tell them where: \(tap)."),
+            "instruction": .string("\(clause(owner)) decides this, by the person's choice. If it should change, tell them where: \(tap)."),
         ])
+    }
+
+    /// An owner inside a sentence: one that is itself a step ("… → Save
+    /// token.") keeps no stop of its own, so the instruction reads as one.
+    private static func clause(_ owner: String) -> String {
+        owner.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
     }
 }
 

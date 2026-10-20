@@ -45,7 +45,7 @@ public struct AgentContactRow: Identifiable, Sendable {
                 + (host.commandLine == nil ? "It can message me; I cannot start a conversation with it yet."
                     : "I can start a conversation with it.")
         }
-        if let candidate { return candidate.detail + "\nA2A address: " + (candidate.endpoint ?? candidate.cardURL)!.absoluteString }
+        if let candidate { return candidate.detail + ((candidate.endpoint ?? candidate.cardURL).map { "\nA2A address: " + $0.absoluteString } ?? "") }
         guard let contact else { return "On this Mac" }
         switch contact.transport {
         case .grokBot: return "Grok Bot routine with a local reply helper."
@@ -63,7 +63,8 @@ public struct AgentContactRow: Identifiable, Sendable {
             candidate.hostID.flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
         }
         let discovered = candidates.filter { candidate in
-            candidate.cardURL != nil && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
+            // A card, or a find no recipe knows yet (its draft).
+            (candidate.cardURL != nil || candidate.draft != nil) && !peers.contains { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }
         }.map { Self(id: $0.id, name: $0.name, contact: nil, candidate: $0) }
         let contacts = (rows(peers: peers, installed: hosts, everyDoor: everyDoor) + discovered).map { row in
             var row = row

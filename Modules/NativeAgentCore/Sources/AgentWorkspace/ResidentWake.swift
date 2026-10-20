@@ -38,7 +38,8 @@ package final class ResidentWake: @unchecked Sendable {
         package var key: String?
         /// Hop count: a wake carrying this thread is one hop.
         package var thread: String?
-        /// The agent whose words the line quotes; the turn carries its authority.
+        /// The stamp of the words the line quotes (a cached job reply's: the
+        /// route its ledger entry records); the turn carries its authority.
         package var agent: String?
         package var filedAt: String?
         /// A promise waits for a change to this conversation's index row.
@@ -352,7 +353,11 @@ package final class ResidentWake: @unchecked Sendable {
         }
         RepairOwed.settle(dataRoot, operation: "home.arrivals", evidence: .init(source: "agents/resident-wake.json", id: "accepted"))
         for item in items {
-            if let peer = item.agent { AgentWorkspacePorts.current.tools.markConsumed(peer: peer) }
+            if let peer = item.agent {
+                ContactThread.consume(mine: false, source: peer, steeredBy: [], text: item.line) { peer, _ in
+                    AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
+                }
+            }
         }
         return items.isEmpty ? "No claimed arrivals await acceptance." : Self.text(items, live: true)
     }

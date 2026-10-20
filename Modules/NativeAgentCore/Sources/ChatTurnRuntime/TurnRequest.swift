@@ -1,4 +1,5 @@
 import Foundation
+import Transcripts
 import CognitiveSubstrate
 import NativeAgentCore
 import TrustCenter
@@ -234,11 +235,20 @@ public actor TurnAdmission {
 
     private struct Waiter {
         let id: UUID
+        let runID: String?
         let continuation: CheckedContinuation<Void, Error>
     }
     private var active: [String: UUID] = [:]
     private var waiting: [String: [Waiter]] = [:]
     private var capacityWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    /// The runs a restart left in a session, in the order they were said:
+    /// each is admitted before any other turn there, one after another.
+    private var backlog: [String: [String]] = [:]
+    /// Until the launch recovery has put back what a restart left in contact
+    /// conversations (`restorationComplete`), a new turn in one waits here:
+    /// nothing new is admitted there ahead of what was already said.
+    private var restoring = true
+    private var heldWhileRestoring: [CheckedContinuation<Void, Never>] = []
 
     public struct Full: LocalizedError {
         public var errorDescription: String? { "This chat has too many waiting turns. No new turn was started." }
@@ -246,11 +256,17 @@ public actor TurnAdmission {
 
     /// Nil session = a new chat nobody else can be in; runs at once.
     /// Durable arrivals wait for queue capacity; unsaved requests still fail full.
-    public func run<T>(sessionID: String?, waitForCapacity: Bool = false, isolation: isolated (any Actor)? = #isolation,
+    /// `runID` names the run, so a restored backlog admits it in its place.
+    public func run<T>(sessionID: String?, runID: String? = nil, waitForCapacity: Bool = false, isolation: isolated (any Actor)? = #isolation,
                        operation: () async throws -> T) async throws -> T {
         guard let sessionID else { return try await operation() }
         let id = UUID()
-        try await acquire(sessionID, id: id, waitForCapacity: waitForCapacity)
+        do { try await acquire(sessionID, id: id, runID: runID, waitForCapacity: waitForCapacity) }
+        catch {
+            // A restored run that will not be admitted gives up its place.
+            if let runID { await withdraw(sessionID: sessionID, runID: runID) }
+            throw error
+        }
         do {
             try Task.checkCancellation()
             let result = try await Self.$token.withValue(id, operation: operation)
@@ -264,9 +280,47 @@ public actor TurnAdmission {
         }
     }
 
-    private func acquire(_ key: String, id: UUID, waitForCapacity: Bool) async throws {
+    /// At launch, before anything new is admitted there: the runs a restart
+    /// left queued or interrupted in this session, oldest first.
+    public func restore(sessionID: String, runs: [String]) {
+        let known = backlog[sessionID] ?? []
+        let added = known + runs.filter { !known.contains($0) }
+        backlog[sessionID] = added.isEmpty ? nil : added
+    }
+
+    /// The launch recovery has restored every contact conversation's backlog.
+    public func restorationComplete() {
+        restoring = false
+        let held = heldWhileRestoring
+        heldWhileRestoring.removeAll()
+        for continuation in held { continuation.resume() }
+    }
+
+    /// A restored run that will not come (it ended, or was never resumed).
+    public func withdraw(sessionID: String, runID: String) {
+        guard var runs = backlog[sessionID], let index = runs.firstIndex(of: runID) else { return }
+        runs.remove(at: index)
+        backlog[sessionID] = runs.isEmpty ? nil : runs
+        admitNext(sessionID)
+    }
+
+    private func admissible(_ key: String, runID: String?) -> Bool {
+        guard let head = backlog[key]?.first else { return true }
+        return head == runID
+    }
+
+    private func admitted(_ key: String, runID: String?) {
+        guard let runID, backlog[key]?.first == runID else { return }
+        backlog[key]?.removeFirst()
+        if backlog[key]?.isEmpty == true { backlog.removeValue(forKey: key) }
+    }
+
+    private func acquire(_ key: String, id: UUID, runID: String?, waitForCapacity: Bool) async throws {
         try Task.checkCancellation()
-        while active[key] != nil {
+        while restoring, ChatSessionRetention.isContactSession(key), !(runID.map { backlog[key]?.contains($0) == true } ?? false) {
+            await withCheckedContinuation { heldWhileRestoring.append($0) }
+        }
+        while active[key] != nil || !admissible(key, runID: runID) {
             let hasCapacity = (waiting[key]?.count ?? 0) < 8 && waiting.values.reduce(0, { $0 + $1.count }) < 32
             guard hasCapacity || waitForCapacity else { throw Full() }
             // Registration and the capacity check share this actor. A release
@@ -274,7 +328,7 @@ public actor TurnAdmission {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     if Task.isCancelled { continuation.resume(throwing: CancellationError()) }
-                    else if hasCapacity { waiting[key, default: []].append(Waiter(id: id, continuation: continuation)) }
+                    else if hasCapacity { waiting[key, default: []].append(Waiter(id: id, runID: runID, continuation: continuation)) }
                     else { capacityWaiters[id] = continuation }
                 }
             } onCancel: {
@@ -284,6 +338,7 @@ public actor TurnAdmission {
             try Task.checkCancellation()
         }
         active[key] = id
+        admitted(key, runID: runID)
     }
 
     private func cancel(_ key: String, id: UUID) {
@@ -302,10 +357,22 @@ public actor TurnAdmission {
         guard active[key] == id else { return }
         defer { signalCapacity() }
         active.removeValue(forKey: key)
-        guard var queue = waiting.removeValue(forKey: key), !queue.isEmpty else { return }
-        let next = queue.removeFirst()
-        if !queue.isEmpty { waiting[key] = queue }
+        admitNext(key)
+    }
+
+    /// The next turn in an idle session: the restored backlog's head when it
+    /// is waiting (none while it has yet to arrive), else the oldest waiter.
+    private func admitNext(_ key: String) {
+        guard active[key] == nil, var queue = waiting[key], !queue.isEmpty else { return }
+        let index: Int
+        if let head = backlog[key]?.first {
+            guard let found = queue.firstIndex(where: { $0.runID == head }) else { return }
+            index = found
+        } else { index = 0 }
+        let next = queue.remove(at: index)
+        waiting[key] = queue.isEmpty ? nil : queue
         active[key] = next.id
+        admitted(key, runID: next.runID)
         next.continuation.resume()
     }
 

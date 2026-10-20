@@ -227,7 +227,10 @@ public final class MacChatTurnRuntime {
         return write
     }
 
-    public nonisolated func stop(sessionId: String) async throws {
+    /// `runId` stops that run alone, beside any the marker already names: one
+    /// door's task in a session other doors' queued runs share (a contact's one
+    /// conversation), where the session's in-flight list would stop them too.
+    public nonisolated func stop(sessionId: String, runId: String? = nil) async throws {
         guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             throw NSError(
                 domain: "NativeAgentChatSession",
@@ -239,7 +242,10 @@ public final class MacChatTurnRuntime {
         try await SwiftNativePersistenceCore().withFileLock(flagPath) {
             let parent = flagPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            try Data(ChatCancelFlag.stopContent(forFlagAt: flagPath).utf8).write(to: flagPath, options: .atomic)
+            let content = runId.map { run in
+                ((try? String(contentsOf: flagPath, encoding: .utf8)).map { $0 + "\n" } ?? "") + run
+            } ?? ChatCancelFlag.stopContent(forFlagAt: flagPath)
+            try Data(content.utf8).write(to: flagPath, options: .atomic)
         }
     }
 }

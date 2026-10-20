@@ -7,7 +7,7 @@ import NativeAgentCore
 public enum AgentACPProcess {
     static func spawn(executable: String, arguments: [String], directory: URL,
                       environment: [String: String], input: Pipe, output: Pipe,
-                      approvedExecutable: AgentACPExecutable? = nil) throws -> pid_t {
+                      approvedExecutable: AgentACPExecutable? = nil, errorsToOutput: Bool = false) throws -> pid_t {
         var actions: posix_spawn_file_actions_t?
         var attributes: posix_spawnattr_t?
         guard posix_spawn_file_actions_init(&actions) == 0 else { throw AgentACPClient.Failure.unavailable }
@@ -19,7 +19,8 @@ public enum AgentACPProcess {
               posix_spawn_file_actions_addchdir_np(&actions, directory.path) == 0,
               posix_spawn_file_actions_adddup2(&actions, input.fileHandleForReading.fileDescriptor, STDIN_FILENO) == 0,
               posix_spawn_file_actions_adddup2(&actions, output.fileHandleForWriting.fileDescriptor, STDOUT_FILENO) == 0,
-              posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0 else {
+              errorsToOutput ? posix_spawn_file_actions_adddup2(&actions, output.fileHandleForWriting.fileDescriptor, STDERR_FILENO) == 0
+                : posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) == 0 else {
             throw AgentACPClient.Failure.unavailable
         }
         let argv = ([executable] + arguments).map { strdup($0) } + [nil]
@@ -43,8 +44,19 @@ public enum AgentACPProcess {
                        grace: Duration = .milliseconds(200)) async {
         guard pid > 0 else { return }
         try? await Task.sleep(for: grace)
-        kill(-pid, SIGTERM)
-        if let snapshot { ProcessTreeReaper.signal(snapshot, signal: SIGTERM) }
+        // Frozen first, then the tree as it is now: a child that forked into a
+        // group of its own since is in it and cannot fork again before its
+        // signal. A stopped process takes SIGTERM only once continued.
+        var snapshot = snapshot.map { ProcessTreeReaper.snapshot(rootPID: pid, retaining: $0) }
+        kill(-pid, SIGSTOP)
+        if let frozen = snapshot {
+            ProcessTreeReaper.signal(frozen, signal: SIGSTOP)
+            snapshot = ProcessTreeReaper.snapshot(rootPID: pid, retaining: frozen)
+        }
+        for sent in [SIGTERM, SIGCONT] {
+            kill(-pid, sent)
+            if let snapshot { ProcessTreeReaper.signal(snapshot, signal: sent) }
+        }
         try? await Task.sleep(for: .milliseconds(500))
         kill(-pid, SIGSTOP)
         if let snapshot {

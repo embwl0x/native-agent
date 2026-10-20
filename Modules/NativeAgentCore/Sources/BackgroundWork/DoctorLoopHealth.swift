@@ -286,7 +286,10 @@ public enum DoctorLoopHealth {
         return LoopHealthVerdict(
             loopId: observation.name,
             level: .warn,
-            detail: "Last tick failed: \(lastError). Last tick \(age) ago."
+            // Never ticked: the lane could not be built (its configuration
+            // could not be read), so the error is why it cannot run.
+            detail: observation.lastRun == nil ? "Cannot run: \(lastError)."
+                : "Last tick failed: \(lastError). Last tick \(age) ago."
         )
     }
 

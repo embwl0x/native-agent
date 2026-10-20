@@ -28,7 +28,7 @@ Modules/NativeAgentCore/Sources/MacIntegration/MacIntegrationPermissions.swift	T
 Modules/NativeAgentCore/Sources/AgentConversations/AgentConversationSession.swift	try? await Task.sleep(for:	1	timeout_retry_deadline	AgentConversationSession.finishes: one two-second inline reply grace; expiry hands the still-running send to its tracked background owner, never establishes terminal state or retries
 Modules/NativeAgentCore/Sources/AgentWorkspace/AgentWorkspaceActionReadback.swift	*	1	timeout_retry_deadline	One 350ms loading-page readback delay per action; recheck exact tab identity, never replay the effect or poll in the background
 Modules/NativeAgentCore/Sources/Agents/GrokRoutineAccessibility.swift	*	6	timeout_retry_deadline	GrokRoutineAccessibility bounded launch, foreground, focus, paste, visible-in-chat observation, bounded chat scroll-back to the routine link and cancellation-independent routine panel cleanup; no webhook resend or background polling
-Modules/NativeAgentCore/Sources/AgentLinkTransport/AgentACPClient.swift	*	3	timeout_retry_deadline	ACP initialize and turn deadlines and retained connection idle expiry; no polling or retry
+Modules/NativeAgentCore/Sources/AgentLinkTransport/AgentACPClient.swift	*	2	timeout_retry_deadline	ACP initialize and turn deadlines and retained connection idle expiry; no polling or retry
 Modules/NativeAgentCore/Sources/AgentLinkTransport/AgentACPProcess.swift	*	2	timeout_retry_deadline	ACP bounded EOF/terminate/kill shutdown through the core process owner; no polling or retry
 # 2026-09-09: speech-permission voice replay uses existing Telegram ticks; diagnostics fallback adds no timer sites.
 # 2026-09-09: Providers second-pass disclosures and offscreen fixture stores add no timer or sleep sites.

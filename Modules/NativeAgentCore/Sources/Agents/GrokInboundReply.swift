@@ -162,8 +162,8 @@ public struct GrokInboundReply: Sendable {
         // (driven 09-20).
         // Which message it answers: unnamed, a late answer to her earlier
         // message read as the answer to her newest one (10-14, "got it" for 17 × 23).
-        let asked = GrokBotRoute.thread(peer: peer.id, messageID: pending.messageID, dataRoot: dataRoot)
-            .first { $0.id == pending.messageID }?.prompt.map { "your message \u{201C}" + HerScreen.clip($0, 120) + "\u{201D}" }
+        let asked = GrokBotRoute.thread(peer: peer.id, dataRoot: dataRoot)
+            .first { $0.id == pending.messageID }.map { "your message \u{201C}" + HerScreen.clip($0.prompt, 120) + "\u{201D}" }
         let message = AgentBridgeSurface.turnHeader(peerName: peer.displayName, elevated: peer.elevated)
             + "[This is \(peer.displayName ?? "the other agent")'s answer to \(asked ?? "a message you sent it whose text is no longer kept") in this conversation. The exchange is complete: do not send the question again. Tell the person the answer once.]\n" + text
         return TurnRequest(message: message, sessionID: pending.conversationID, surface: peer.surface, envelope: envelope,

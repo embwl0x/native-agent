@@ -1,97 +1,118 @@
 import AgentWorkspace
+import ChatTurnContracts
 import Foundation
 import PersistenceCore
 
-/// On-demand scrollback over the conversation owner's bounded display cache.
-/// It never replays messages or supplies context to a peer's model session.
+/// On-demand scrollback over the conversation itself: the one session the
+/// contact owns (`ContactThread`), both directions, whichever door or chat
+/// each message came through (User 10-20). Her sends carry their state from
+/// the record that sent them. It never replays messages or supplies context
+/// to a peer's model session.
 enum AgentConversationHistoryView {
     static func adding(to presentation: JSONValue, row: AgentConversationRecord,
-                       before: String? = nil, exchange: String? = nil, dataRoot: URL? = nil) -> JSONValue {
+                       before: String? = nil, exchange: String? = nil, dataRoot: URL) -> JSONValue {
         guard case .object(var result) = presentation else { return presentation }
         if before != nil || exchange != nil {
             // Keep live readiness for Reply, but give the selected historical
             // moment the reading space. Recent messages restores the latest.
             for key in ["reply", "reply_state", "reply_truncated", "artifacts", "parts", "evidence", "untrusted_remote_data"] { result.removeValue(forKey: key) }
-            result["viewing"] = .string("Retained session history. State and Reply controls describe the current conversation; the selected exchanges below retain their own dates and outcomes.")
+            result["viewing"] = .string("Conversation history. State and Reply controls describe the conversation now; the messages below keep their own times and states.")
         }
-        let history = row.exchanges ?? []
         var metadata: [String: JSONValue] = [
-            "coverage": .string("Retained exchanges since session scrollback was enabled, up to 32 exchanges / 64 KiB. Older or clipped text is not the complete peer transcript. The peer owns its continuing session."),
-            "retained_exchanges": .int(Int64(history.count)), "order": .string("oldest_first"),
-            "untrusted_remote_data": .bool(false)
+            "coverage": .string("Your one conversation with \(row.name), from its session: what you sent it from any chat, its replies, and the messages it started, whichever door each came through."),
+            "order": .string("oldest_first"), "untrusted_remote_data": .bool(false)
         ]
-        let selected: ArraySlice<AgentConversationExchange>
+        let owner = row.agent.hasPrefix("peer:") ? String(row.agent.dropFirst(5)) : row.agent
+        let lines: [ContactThread.Line]
+        do { lines = try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner) }
+        catch {
+            metadata["status"] = .string("unavailable")
+            metadata["detail"] = .string("This conversation's session could not be read (\(error.localizedDescription)). The conversation is preserved; no message was repeated.")
+            result["session_history"] = .object(metadata); return .object(result)
+        }
+        let selected: ArraySlice<ContactThread.Line>
         if let exchange {
-            guard let index = history.firstIndex(where: { $0.id == exchange }) else {
+            guard let index = lines.firstIndex(where: { $0.id == exchange }) else {
                 metadata["status"] = .string("unavailable")
-                metadata["detail"] = .string("That exchange is no longer in retained scrollback. The conversation is preserved; no message was repeated.")
+                metadata["detail"] = .string("That message is no longer in this conversation's session. The conversation is preserved; no message was repeated.")
                 result["session_history"] = .object(metadata); return .object(result)
             }
-            selected = history[index...index]
-            metadata["selected_exchange"] = .string(exchange)
+            selected = lines[index...index]
+            metadata["selected_message"] = .string(exchange)
             if index > 0 { metadata["earlier_before"] = .string(exchange) }
         } else {
             let end: Int
             if let before {
-                guard let index = history.firstIndex(where: { $0.id == before }) else {
+                guard let index = lines.firstIndex(where: { $0.id == before }) else {
                     metadata["status"] = .string("unavailable")
-                    metadata["detail"] = .string("This earlier-page boundary is no longer retained. Return to recent messages; no message was repeated.")
+                    metadata["detail"] = .string("This earlier-page boundary is no longer in the session. Return to recent messages; no message was repeated.")
                     result["session_history"] = .object(metadata); return .object(result)
                 }
                 end = index
-            } else { end = history.count }
-            let start = max(0, end - 4)
-            selected = history[start..<end]
-            if start > 0 { metadata["earlier_before"] = .string(history[start].id) }
-        }
-        if selected.contains(where: { !($0.reply ?? "").isEmpty }) {
-            metadata["untrusted_remote_data"] = .bool(true)
+            } else { end = lines.count }
+            let start = max(0, end - 8)
+            selected = lines[start..<end]
+            if start > 0 { metadata["earlier_before"] = .string(lines[start].id) }
         }
         // Only a problem reading history carries a status: "ok" beside a failed
         // send read as if the send were fine (walk 09-25).
-        if history.isEmpty {
-            metadata["status"] = .string("not_retained")
-            metadata["detail"] = .string("Earlier messages were not retained by this version. The latest owner result remains above. New exchanges will appear here; no history was reconstructed.")
+        if lines.isEmpty { metadata["detail"] = .string("Nothing has been said in this conversation yet.") }
+        // A send's state: the ledger of the record that sent it, from whichever
+        // chat, or its own row once the ledger let it go.
+        let sends: Result<[String: AgentConversationExchange], Error> = Result {
+            Dictionary(try AgentConversationStore(dataRoot: dataRoot).records().flatMap { ($0.exchanges ?? []) + ($0.releasing ?? []) }.map { ($0.id, $0) },
+                       uniquingKeysWith: { first, _ in first })
         }
-        // An earlier send left at waiting when the next one went is settled by
-        // now: answered if its answer came (here, or as a chat of its own), else no reply.
-        var chats: [HerScreen.BridgeChat]?
-        func answeredElsewhere(_ item: AgentConversationExchange) -> Bool {
-            guard item.status == "delivered_live", let dataRoot else { return false }
-            if chats == nil { chats = HerScreen.bridgeChats(dataRoot: dataRoot) }
-            return chats!.contains { $0.who == row.agent && ($0.heard ?? .distantPast) > item.sentAt }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        // A contact line's speaker is the principal its own row attests, by the
+        // name the person gave that contact; another agent when it attests none.
+        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
+        func speaker(_ source: String?) -> String {
+            guard let source else { return "another agent" }
+            let principal = PeerTrust.principal(source, dataRoot: dataRoot)
+            return peers.first { "peer:" + $0.id == principal }?.name ?? source
         }
-        metadata["exchanges"] = .array(selected.map { item in
+        var untrusted = false
+        let messages: [JSONValue] = selected.map { line in
             let full = exchange != nil
-            var state = item.phase
-            var answerNote: String?
-            if item.id != row.operationID, ["waiting", "sending"].contains(state) {
-                if item.reply != nil { state = "answered" }
-                else if answeredElsewhere(item) {
-                    state = "answered"
-                    answerNote = "\(row.name) answered in a chat of its own after this; that text is not kept here."
-                } else { state = "no_reply" }
-            }
             var value: [String: JSONValue] = [
-                "exchange": .string(item.id), "state": .string(state), "outcome": .string(item.status)
+                "message": .string(line.id), "at": .string(iso.string(from: line.at)),
+                // The person wrote it in the contact's thread; it isn't yours to answer.
+                "from": .string(line.byPerson ? "the person, from the contact's thread" : line.mine ? "you" : speaker(line.source)),
+                "text": .string(full ? line.text : String(line.text.prefix(800)))
             ]
-            value.merge(item.timing) { current, _ in current }
-            if let prompt = item.prompt {
-                value["you"] = .string(full ? prompt : String(prompt.prefix(600)))
-                value["your_message_truncated"] = .bool(item.promptTruncated || (!full && prompt.count > 600))
+            if !full, line.text.count > 800 { value["text_truncated"] = .bool(true) }
+            if let door = line.door { value["door"] = .string(door) }
+            if let id = line.sendID {
+                value["send"] = .string(id)
+                switch sends {
+                case .success(let ledger):
+                    value["state"] = .string(ledger[id]?.status ?? line.sendState
+                        ?? "state unavailable: this send is older than its conversation's send ledger and its row kept no state")
+                case .failure(let error):
+                    value["state"] = .string(line.sendState ?? "state unavailable: \(error.localizedDescription)")
+                }
             }
-            // The person wrote this one in the contact's thread; it isn't yours to answer.
-            if item.byPerson == true { value["sent_by"] = .string("the person, from the contact's thread") }
-            if let reply = item.reply {
-                value["peer"] = .string(row.name)
-                value["reply"] = .string(full ? reply : String(reply.prefix(800)))
-                value["reply_truncated"] = .bool(item.replyTruncated || (!full && reply.count > 800))
-            } else if let answerNote { value["reply_state"] = .string(answerNote)
-            } else if item.status == "no_reply_expired" { value["reply_state"] = .string("no_reply_expired")
-            } else if state == "no_reply" { value["reply_state"] = .string("No reply came for this message.")
-            } else { value["reply_state"] = .string("No reply retained for this exchange; status alone is not an answer.") }
+            if let answers = line.answers { value["answers_send"] = .string(answers) }
+            else if !line.mine { value["started_by"] = .string(row.name) }
+            // Each line is the words of the principal its own row attests, and of
+            // the peers that steered it, each under its own current grant: an
+            // elevated door's read never carries an associated door's lines.
+            // A contact line that attests no one is another agent's, trusted by none.
+            let speakers = ContactThread.consume(line) { PeerDataTaint.markConsumed(peer: $0, line: $1) }
+            if !speakers.isEmpty {
+                // A lane's name becomes the one contact it is, as its own turns' sources do.
+                let principals = speakers.map { PeerTrust.principal($0, dataRoot: dataRoot) }
+                let trusted = principals.allSatisfy { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }
+                if !line.mine { value["agent_id"] = .string(principals[0]) }
+                value["untrusted_remote_data"] = .bool(!trusted)
+                untrusted = untrusted || !trusted
+            }
             return .object(value)
-        })
+        }
+        metadata["messages"] = .array(messages)
+        metadata["untrusted_remote_data"] = .bool(untrusted)
         result["session_history"] = .object(metadata)
         return .object(result)
     }

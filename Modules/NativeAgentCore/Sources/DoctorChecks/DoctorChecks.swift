@@ -163,7 +163,8 @@ extension CheckResult {
     }
 
     public var repairFace: String {
-        if let words = repairExperience?.face?.words { return words }
+        // An owed row's detail is its debt's words, after the current reading when that differs.
+        if repairExperience?.face != nil { return detail }
         guard case .object(let fix)? = remedy else { return detail }
         let instruction: String = if case .string(let value)? = fix["instruction"] { value } else { "" }
         return ([detail, harm, receipt].compactMap { $0 }.joined(separator: " "))

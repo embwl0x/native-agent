@@ -89,6 +89,9 @@ enum NativeAgentMCPWire {
                       text.utf8.count <= 64000 else {
                     return failure(id, code: -32602, message: "Provide nonempty text up to 64000 UTF-8 bytes and optional session/request IDs.")
                 }
+                // The id stays the transport's task and replay locator, so a retry
+                // carries the same bytes; every id runs in the contact's one
+                // conversation with her (`storedConversation`, User 10-20).
                 let session: String
                 if let supplied = args["session_id"] {
                     guard let value = supplied as? String, validSession(value) else {
@@ -268,10 +271,10 @@ enum NativeAgentMCPWire {
     static var tools: [[String: Any]] {
         let agent = PeerFacingIdentity.agentName
         return [
-            ["name": "agent_message", "description": "Talk with \(agent). Omit session_id and your contact's usual conversation continues; the session_id returned names whichever conversation it was (the usual one has an mcp- ID too). To start a separate conversation, supply session_id as mcp- followed by a fresh UUID. The call waits up to wait_seconds and returns the reply (status answered). If it is still in progress the status is enqueued: keep the returned IDs and read the reply with agent_reply. \(heldNote)",
+            ["name": "agent_message", "description": "Talk with \(agent). You and \(agent) have one conversation: every message goes on in it, and its mcp- session_id comes back with each result. The call waits up to wait_seconds and returns the reply (status answered). If it is still in progress the status is enqueued: keep the returned IDs and read the reply with agent_reply. \(heldNote)",
              "inputSchema": ["type": "object", "properties": [
                 "text": ["type": "string", "maxLength": 64000],
-                "session_id": ["type": "string", "description": "Omit to continue your contact's usual conversation. Supply a returned ID to continue that conversation, or mcp- plus a fresh UUID to start a separate one."],
+                "session_id": ["type": "string", "description": "Optional. Your one conversation with \(agent) continues either way; a returned ID is accepted."],
                 "request_id": ["type": "string", "description": "Required canonical UUID you generate. It is this message's replay key: a retry of the SAME message must carry the same request_id, and new content needs a new one. Never resend solely because a reply is missing."],
                 "wait_seconds": ["type": "integer", "minimum": 0, "maximum": maximumWaitSeconds, "default": defaultWaitSeconds,
                                  "description": "How long this call waits for the reply. Keep the default unless your client allows longer tool calls; 0 returns as soon as the message is queued."]

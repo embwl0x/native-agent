@@ -108,6 +108,14 @@ extension HerScreen {
     /// A built-in lane's last exchanges both ways, from its own job records
     /// (what she asked, what came back), oldest first; for a record with no
     /// saved exchange history.
+    /// A job's cached reply, read under the route its ledger entry records
+    /// (the app wrote it from that lane): unattested only when it records none.
+    private static func consumeReply(_ reply: String, route: String) {
+        ContactThread.consume(mine: false, source: route.isEmpty ? nil : route, steeredBy: [], text: reply) { peer, _ in
+            AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
+        }
+    }
+
     static func laneTalk(_ agent: String, slug: String, now: Date = Date()) -> [String] {
         let mine = DelegationStatusProjector().recentJobs(now: now, limit: 30).filter { $0.agent == agent }.prefix(3).reversed()
         return mine.flatMap { job -> [String] in
@@ -118,7 +126,7 @@ extension HerScreen {
                 pad(at.map { age(now.timeIntervalSince($0)) } ?? "", 5) + pad(clip(who, 20), 10) + clip(sentence(text), 80)
             }
             let sent = nonEmpty(job.requestTextHead).map { [row(asked, "me", $0)] } ?? []
-            if let reply { return sent + [row(back, slug, reply)] }
+            if let reply { consumeReply(reply, route: job.agent); return sent + [row(back, slug, reply)] }
             // No words back: the send's own outcome, not words from them.
             let outcome = nonEmpty(job.executionError).map { "✗ " + failureReason($0) } ?? jobState(job, now: now)
             return (sent.isEmpty ? [row(asked, "me", "(message text not kept)")] : sent) + [row(back, "", outcome)]
@@ -129,7 +137,7 @@ extension HerScreen {
         guard let job = jobs(dataRoot: dataRoot, now: now).first(where: { $0.id == id }) else { return nil }
         let asked = nonEmpty(job.requestTextHead).map { plainLines($0).prefix(3).map { clip($0, 100) } } ?? [clip(jobTitle(job), 100)]
         let replyText = nonEmpty(job.agentReplyText) ?? nonEmpty(job.agentReplyTextHead) ?? nonEmpty(job.completionTextHead)
-        if replyText != nil { AgentWorkspacePorts.current.tools.markConsumed(peer: job.agent) }
+        if let replyText { consumeReply(replyText, route: job.agent) }
         var reply = replyText.map { plainLines($0).prefix(5).map { clip($0, 100) } } ?? [job.completedAt == nil ? "not back yet" : "no reply text retained"]
         if replyText == nil, deliveredLive(job) {
             reply = ["Waiting in \(job.agent.capitalized)'s inbox until its next turn; no one is answering yet."]

@@ -19,8 +19,10 @@ extension HerScreen {
         /// On a bridge, the attested source (`source`), named by `who(_:)`.
         let door: String, who: String, text: String, user: Bool
         var reply: String?
-        /// A wake's authority: "self", or the agent whose words it carried.
+        /// Who said it as its own row's stamp says (a wake's: "self", or the
+        /// agent whose words it carried), and the peers that steered it.
         var agent: String? = nil
+        var steeredBy: [String] = []
         /// What she did answering it, by name: actions that went through, and
         /// the ones she only filed for User's approval.
         var did: [String] = [], filed: [String] = []
@@ -146,11 +148,11 @@ extension HerScreen {
                 entry.open = false
                 guard metadata?["mechanicalKind"] == nil else { continue }
                 // A wake is her speaking; what it says to her is the arrival list.
+                let stamp = ContactThread.stamp(id: row["id"] as? String ?? "", metadata: metadata)
                 if wake {
-                    let agent = source(metadata)
                     entry.lines.append(.init(session: session, at: at, door: wakeDoor, who: "me",
                                              text: ChatSecretRedactor.redactText(content), user: false,
-                                             agent: agent, active: at))
+                                             agent: stamp.source, steeredBy: stamp.steeredBy, active: at))
                     entry.open = true
                     continue
                 }
@@ -166,27 +168,15 @@ extension HerScreen {
                 }
                 // A token he pasted never rides into a prompt.
                 text = ChatSecretRedactor.redactText(text.trimmingCharacters(in: .whitespacesAndNewlines))
-                let bridged = door == "bridge" ? source(metadata) ?? "peer:unknown" : nil
+                let bridged = door == "bridge" ? stamp.source ?? "another agent" : nil
                 entry.lines.append(.init(session: session, at: at, door: door, who: bridged ?? "",
                                          text: text.isEmpty ? "(no text: an image or file)" : text, user: door != "bridge",
-                                         agent: bridged, active: at))
+                                         agent: bridged, steeredBy: stamp.steeredBy, active: at))
                 entry.open = true
             default: continue
             }
         }
         if entry.lines.count > 30 { entry.lines.removeFirst(entry.lines.count - 30) }
-    }
-
-    /// Only persisted origin and verified envelope identity attest a source.
-    static func source(_ metadata: [String: Any]?) -> String? {
-        let origin = metadata?["origin"] as? [String: Any]
-        let envelope = metadata?["envelope"] as? [String: Any]
-        guard let agent = origin?["agent"] as? String ?? envelope?["agent"] as? String,
-              !agent.isEmpty else { return nil }
-        if agent == "agent" || agent == "peer" {
-            return "peer:" + (nonEmpty(envelope?["userId"] as? String) ?? "unknown")
-        }
-        return agent
     }
 
     /// Who spoke: User on his doors; on a bridge, the lane the bridge attested
@@ -250,10 +240,13 @@ extension HerScreen {
             let name = "elsewhere.\(index + 1)", who = HerScreen.who(line, person: person, peers: named)
             let exchange = exchangePages(name, line, who: who, dataRoot: dataRoot, now: now)
             for (item, page) in exchange { pages[scope + "\u{0}" + item] = page }
-            if let agent = line.agent, agent != "self" {
-                for item in exchange.keys { peers[scope + "\u{0}" + item] = [agent] }
-                if !previewing { AgentWorkspacePorts.current.tools.markConsumed(peer: agent) }
+            // Each line is read under its own row's stamp, here and when its
+            // page opens: the one ordered list, each principal once.
+            let speakers = ContactThread.consume(mine: line.agent == nil || line.agent == "self", source: line.agent,
+                                                 steeredBy: line.steeredBy, text: line.text) { peer, _ in
+                if !previewing { AgentWorkspacePorts.current.tools.markConsumed(peer: peer) }
             }
+            for item in exchange.keys where !speakers.isEmpty { peers[scope + "\u{0}" + item] = speakers }
             return pad(name, 13) + pad(line.door, 10) + pad(clip(who, 16), 10) + pad(age(now.timeIntervalSince(line.at)), 5)
                 + quoted(line.door == wakeDoor ? line.reply ?? line.text : line.text, 60)
         }
@@ -322,7 +315,7 @@ extension HerScreen {
             // Her words travel only from a wake that was hers alone, and never
             // into a turn a peer steers: a wake carrying an agent's words would
             // launder them past the taint (ResidentWake.take's own rule).
-            let hers = (wake.agent ?? "self") == "self"
+            let hers = (wake.agent ?? "self") == "self" && wake.steeredBy.isEmpty
             lines.append("Your own wake " + age(now.timeIntervalSince(wake.at)) + " ago"
                 + (hers && !peer
                     ? ": \"" + clip(plainLines(reply).joined(separator: " ").replacingOccurrences(of: "\"", with: "'"), 200) + "\""

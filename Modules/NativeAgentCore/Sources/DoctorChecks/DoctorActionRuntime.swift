@@ -59,7 +59,7 @@ public protocol DoctorActionPort: Sendable {
     func doctorTelegramSnapshot() async throws -> DoctorTelegramSnapshot
     func doctorSearchURL() async throws -> String?
     func doctorProbeSearch(base: String) async -> Bool
-    func doctorSearchSetupReading() -> String?
+    func doctorSearchSetupReading() async -> String?
     /// Codex web search, the route that answers first: is its login live?
     func doctorProbeCodexSearch() async -> Bool
     /// Doctor state: Docker was checked for this search URL and holds no SearXNG.
@@ -96,7 +96,9 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
 
     public static func mergeReport(currentChecks: [CheckResult], liveChecks: [CheckResult]) -> (status: String, checks: [CheckResult]) {
         let liveIDs = Set(liveChecks.map(\.id))
-        let checks = currentChecks.filter { $0.repairExperience == nil && !liveIDs.contains($0.id) } + liveChecks
+        // Only live rows are replaced: a core row and its owed projection stay
+        // with the reading the last full run took until the next one.
+        let checks = currentChecks.filter { !liveIDs.contains($0.checkID) } + liveChecks
         return (DoctorStatusProjection.doctorRollup(checks.map(\.status)), checks)
     }
     public func runDoctor(repair: Bool = false, repairScope: DoctorRepairScope = .automatic, checks impl: any DoctorChecksProtocol, checkID: String? = nil) async throws -> (status: String, repaired: Bool, checks: [CheckResult]) {
@@ -599,7 +601,7 @@ public struct DoctorActionRuntime<Port: DoctorActionPort>: Sendable {
     }
 
     private func searchDoctorCoverageCheck(_ raw: String, probe: Bool) async -> CheckResult {
-        if raw.isEmpty, let detail = port.doctorSearchSetupReading() {
+        if raw.isEmpty, let detail = await port.doctorSearchSetupReading() {
             return CheckResult(source: "Providers > ChatGPT", id: "live.search", title: "Search", status: "unmeasured", detail: detail)
         }
         let validCategoryURL = URL(string: raw).map {

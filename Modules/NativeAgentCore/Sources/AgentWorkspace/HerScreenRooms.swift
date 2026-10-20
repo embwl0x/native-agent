@@ -6,6 +6,7 @@ import PersistenceCore
 import Desk
 import StandingBots
 import ChatSessionWork
+import Transcripts
 
 /// Rooms (her-screen Phase 1, 2026-09-23, Agent's first read): opening a name
 /// shows a text screen in home's style. A header line (name · kind · state),
@@ -158,11 +159,18 @@ extension HerScreen {
         let owner = contact.builtIn ? contact.id : String(contact.id.dropFirst(5))
         let mainThread = (label ?? record?.label ?? "Main").caseInsensitiveCompare("Main") == .orderedSame
         let thread: [ContactThread.Line]
-        do { thread = mainThread ? try ContactThread.lines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536) : [] }
+        // Every conversation she has with this route is the route's one thread (User 10-20).
+        do { thread = try ContactThread.lines(dataRoot: dataRoot, owner: owner, tailBytes: 65_536) }
         catch { return screen([contact.name, "History unavailable"], [[error.localizedDescription]], verbs: []) }
-        if thread.contains(where: { !$0.mine }) { AgentWorkspacePorts.current.tools.markConsumed(peer: contact.id) }
-        var talk = thread.suffix(6).map {
-            line($0.at, ($0.byPerson ? person : $0.mine ? "me" : slug) + ($0.door.map { " · " + $0 } ?? ""), $0.text, now: now)
+        // The thread lines this room shows, each read under its own row's provenance.
+        var shown = Array(thread.suffix(6))
+        // A contact line's speaker is the principal its own row attests.
+        func speaker(_ source: String?) -> String {
+            guard let source else { return "another agent" }
+            return members.contains(source) ? slug : everyone.first { $0.id == source }?.name ?? source
+        }
+        var talk = shown.map {
+            line($0.at, ($0.byPerson ? person : $0.mine ? "me" : speaker($0.source)) + ($0.door.map { " · " + $0 } ?? ""), $0.text, now: now)
         }
         // Replies this room shows her, by the send each answers, with the
         // words shown: one shown exactly as saved is hers, as a wait's is.
@@ -173,46 +181,49 @@ extension HerScreen {
             // Its newest bridge chat other than the one she is in: that one is
             // already in front of her, so quoting it back only sent her on to
             // open the chat before it (chat.N) for what was actually going on.
-            let route = identity.doors[chat.who] ?? chat.who
+            // Each row's door is the one its own row attests.
+            func door(_ row: LogLine) -> String { row.source.flatMap { identity.doors[$0] ?? $0 } ?? "another agent" }
             let tail = chatTail(chat.id, dataRoot: dataRoot).suffix(6)
-            if tail.contains(where: { !$0.mine }) { AgentWorkspacePorts.current.tools.markConsumed(peer: chat.who) }
-            talk = tail.map { line($0.at, $0.mine ? "me" : slug + " · " + route, $0.text, now: now) }
+            for row in tail { consume(row) }
+            talk = tail.map { line($0.at, $0.mine ? "me" : slug + " · " + door($0), $0.text, now: now) }
             answers = [:]
+            shown = []
             // Their last message in each of the next few chats too, oldest
             // first: one newer test chat must not hide the ask before it.
             for older in theirs.filter({ $0.id != scope && $0.id != chat.id }).prefix(3) {
                 if let last = chatTail(older.id, dataRoot: dataRoot, bytes: 16_384).last(where: { !$0.mine }) {
-                    talk.insert(line(last.at, slug + " · " + route + " · session " + older.id, last.text, now: now), at: 0)
+                    consume(last)
+                    talk.insert(line(last.at, slug + " · " + door(last) + " · session " + older.id, last.text, now: now), at: 0)
                 }
             }
         }
         if mainThread, talk.isEmpty, contact.kind == "routine" {
-            // Its answers come back as chat turns, not in the send record:
-            // her asks from the record, its replies from the chat, by time.
-            let asks = (record?.exchanges ?? []).compactMap { exchange in exchange.prompt.map { (at: Optional(exchange.sentAt), text: $0, who: exchange.byPerson == true ? person : "me") } }
-            let replies = await routineReplies(dataRoot: dataRoot).map { (at: $0.at, text: $0.text, who: slug) }
-            if !replies.isEmpty { AgentWorkspacePorts.current.tools.markConsumed(peer: contact.id) }
-            talk = (asks + replies).sorted { ($0.at ?? .distantPast) < ($1.at ?? .distantPast) }.suffix(6)
-                .map { line($0.at, $0.who, $0.text, now: now) }
+            // Its answers come back as chat turns, not in its thread: her asks
+            // are in the thread (empty here), its replies in the chats that asked.
+            let replies = await routineReplies(dataRoot: dataRoot).suffix(6)
+            for reply in replies { consume(reply) }
+            talk = replies.map { line($0.at, slug, $0.text, now: now) }
         }
-        let exchanges = talk.isEmpty ? record?.exchanges ?? [] : []
-        if exchanges.count > 3 { talk.append("+\(exchanges.count - 3) earlier exchanges") }
-        for exchange in exchanges.suffix(3) {
-            // Typed by the person in the contact's thread: theirs, not mine.
-            if let prompt = exchange.prompt, !prompt.isEmpty { talk.append(line(exchange.sentAt, exchange.byPerson == true ? person : "me", prompt, now: now)) }
-            if let reply = exchange.reply, !reply.isEmpty {
-                talk.append(line(nil, slug, reply, now: now))
-                answers[exchange.id] = said(reply)
+        if mainThread, talk.isEmpty, contact.builtIn { talk = laneTalk(contact.id, slug: slug, now: now) }
+        if talk.isEmpty, let record, let reply = replyText(unwrap(record.receipt)) {
+            // The saved row that answered this send, read under its own stamp;
+            // with none, under the stamp the receipt's writer gave it.
+            if let answered = (try? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: identity))?
+                .last(where: { !$0.mine && $0.answers == record.operationID }) {
+                ContactThread.consume(answered) { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) }
+            } else {
+                let stamp = record.cachedReplyStamp
+                ContactThread.consume(mine: false, source: stamp.source, steeredBy: stamp.steeredBy, text: reply) { peer, _ in
+                    AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
+                }
             }
-        }
-        if mainThread, talk.isEmpty, exchanges.isEmpty, contact.builtIn { talk = laneTalk(contact.id, slug: slug, now: now) }
-        if talk.isEmpty, exchanges.isEmpty, let record, let reply = replyText(unwrap(record.receipt)) {
             // An older record kept only the answer; say so rather than show a reply to nothing.
             talk.append(line(record.operationStartedAt, "me", "(my message isn't kept in this older record)", now: now, talk: false))
             // Untimed like any exchange's reply: this record's updatedAt may be a later look.
             talk.append(line(nil, slug, reply, now: now))
         }
         if talk.isEmpty { talk = [record == nil ? "no messages yet" : "sent; no reply is recorded yet"] }
+        for row in shown { ContactThread.consume(row) { peer, _ in AgentWorkspacePorts.current.tools.markConsumed(peer: peer) } }
         // What became of the last send, and what `.say` does now (desk walk 4:
         // grok read only "send unconfirmed 2d"; omp's two 403s read as "no reply").
         var outcome: [String] = []
@@ -282,7 +293,11 @@ extension HerScreen {
             talk = messages.suffix(6).compactMap { message in
                 guard case .object(let row) = message, case .string(let text)? = row["text"] else { return nil }
                 let at = if case .string(let timestamp)? = row["timestamp"] { date(timestamp) } else { Optional<Date>.none }
-                return line(at, row["role"] == .string("assistant") ? "me" : who, text, now: now)
+                // Each message's speaker is its own row's stamp (chat.N's agent_id), never one chat-wide name.
+                let speaker: String = if row["role"] == .string("assistant") { "me" }
+                    else if case .string(let principal)? = row["agent_id"] { world.contacts.first { $0.id == principal }?.name ?? principal }
+                    else { person }
+                return line(at, speaker, text, now: now)
             }
             if messages.isEmpty { talk = ["no messages yet"] }
         }
@@ -293,7 +308,7 @@ extension HerScreen {
 
     /// The last messages of a chat, from the final 96 KB of its log: who
     /// said it, when, and the words without the bridge's bracketed notes.
-    static func chatTail(_ id: String, dataRoot: URL, bytes: UInt64 = 98_304) -> [(mine: Bool, text: String, at: Date?, run: String?)] {
+    static func chatTail(_ id: String, dataRoot: URL, bytes: UInt64 = 98_304) -> [LogLine] {
         guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return [] }
         let url = dataRoot.appendingPathComponent("chat/messages/\(id).jsonl")
         // Tool results can fill the whole window (the desk walk: 140 KB of them
@@ -308,7 +323,12 @@ extension HerScreen {
         return tail
     }
 
-    static func logTail(_ url: URL, bytes: UInt64, humanOnly: Bool = false) -> [(mine: Bool, text: String, at: Date?, run: String?)] {
+    /// One row of a chat log: who said it as its own row attests (`source`,
+    /// `steeredBy`; `contact`: another agent's turn, not hers or the
+    /// person's), read only through `HerScreen.consume`.
+    package typealias LogLine = (mine: Bool, text: String, at: Date?, run: String?, source: String?, steeredBy: [String], contact: Bool)
+
+    static func logTail(_ url: URL, bytes: UInt64, humanOnly: Bool = false) -> [LogLine] {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()) ?? 0
@@ -336,7 +356,17 @@ extension HerScreen {
             var text = said.joined(separator: "\n")
             if text.hasPrefix("[from: "), let end = text.range(of: "]") { text = String(text[end.upperBound...]) }
             text = text.trimmingCharacters(in: .whitespaces)
-            return text.isEmpty ? nil : (role == "assistant", text, (row["createdAt"] as? String).flatMap(date), row["runId"] as? String)
+            let stamp = TranscriptRowStamp.of(id: row["id"] as? String ?? "", role: role, metadata: row["metadata"] as? [String: Any],
+                                              rowSource: row["source"] as? String)
+            return text.isEmpty ? nil : (role == "assistant", text, (row["createdAt"] as? String).flatMap(date), row["runId"] as? String,
+                stamp.contact ? stamp.source : nil, stamp.steeredBy, stamp.contact)
+        }
+    }
+
+    /// A shown log row, read under its own row's provenance.
+    private static func consume(_ row: LogLine) {
+        ContactThread.consume(mine: !row.contact, source: row.source, steeredBy: row.steeredBy, text: row.text) { peer, _ in
+            AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
         }
     }
 
@@ -345,7 +375,7 @@ extension HerScreen {
     /// request's run id. The newest five answered requests, found in bounded
     /// (256 KB) tails of that chat's log and its three newest compacted copies; kept until the
     /// request folder or those logs change. Newest last.
-    package static func routineReplies(dataRoot: URL) async -> [(at: Date?, text: String)] {
+    package static func routineReplies(dataRoot: URL) async -> [LogLine] {
         let dir = dataRoot.appendingPathComponent("agents/grok-requests", isDirectory: true)
         let requests = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
             .filter { $0.pathExtension == "json" }
@@ -370,18 +400,16 @@ extension HerScreen {
         }
         let files = chats.flatMap(logs)
         let runs = Set(requests.map { $0.run.uppercased() })
-        let found: [ReplyLine] = await HerMemo.shared.value(dataRoot.standardizedFileURL.path + "\u{0}routine",
+        return await HerMemo.shared.value(dataRoot.standardizedFileURL.path + "\u{0}routine",
                 stamp: stamps(dir) + files.map(stamp)) {
             var seen: Set<String> = []
             return files.flatMap { logTail($0, bytes: 262_144) }
                 .filter { !$0.mine && $0.run.map { runs.contains($0.uppercased()) } == true && seen.insert($0.text).inserted }
-                .map { ReplyLine(at: $0.at, text: $0.text) }
+                // Each is the routine's own answer turn, whatever surface it ran on.
+                .map { ($0.mine, $0.text, $0.at, $0.run, $0.source, $0.steeredBy, true) }
                 .sorted { ($0.at ?? .distantPast) < ($1.at ?? .distantPast) }
         }
-        return found.map { ($0.at, $0.text) }
     }
-
-    private struct ReplyLine { let at: Date?; let text: String }
 
     // MARK: Desk
 
@@ -848,7 +876,11 @@ extension HerScreen {
                 let ledger = try ResidentWake.checkedRead(dataRoot)
                 arrivals = [("PENDING FOR ME", ledger.pending), ("RECENT ARRIVALS", ledger.recent)].map { label, items in
                     let rows = items.sorted { $0.at > $1.at }.flatMap { item in
-                        if !previewing, let agent = item.agent { AgentWorkspacePorts.current.tools.markConsumed(peer: agent) }
+                        if !previewing, let agent = item.agent {
+                            ContactThread.consume(mine: false, source: agent, steeredBy: [], text: item.line) { peer, _ in
+                                AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
+                            }
+                        }
                         let eventAt = item.filedAt.flatMap(date) ?? item.recovery?.checkedAt
                         let when = eventAt.map { friendly($0, now: now) } ?? "logged " + friendly(item.at, now: now)
                         return wrap(item.id + " · " + when + " · " + item.reason)

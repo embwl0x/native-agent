@@ -139,8 +139,10 @@ before attempting its repair. Each check names the state it read; executable
 native repairs carry their check id, and only a declared code defect asks the builder. Sign-ins and
 permissions use `Repair.why`, retaining the person's control without a debt.
 The existing `doctor.repair` action accepts `check_id` to repair only that check.
-Only that check's `ok` postcondition accepts it. Unknown/off readings, registration
-restarts, delivery of a repair request and archived Desk identities do not.
+Only that check's `ok` postcondition, or a reading that the part is off or not
+needed (an off part owes nothing), accepts it. Unknown readings, registration
+restarts, delivery of a repair request and archived Desk identities do not; while
+the current reading is unknown, Doctor shows the debt dated under that status.
 One failure is one experience: meeting it again while it is owed adds evidence to
 the open one, so no reader can feed the projection that runs it.
 Home, the agent's Desk, Doctor and the health pill project the experience face.

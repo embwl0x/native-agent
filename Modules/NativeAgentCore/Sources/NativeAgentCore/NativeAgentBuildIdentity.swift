@@ -91,6 +91,8 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             "sourceDirty": sourceDirty,
             "sourceContentID": sourceContentID ?? NSNull(),
             "writtenAt": ISO8601DateFormatter().string(from: at),
+            // Which process this launch is: the same build relaunched is a new window.
+            "pid": Int(ProcessInfo.processInfo.processIdentifier),
         ]
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])

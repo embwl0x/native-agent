@@ -82,7 +82,7 @@ enum DoctorWindowFloor {
         guard let stamp = launchStamp(root: root, identity: .current), stamp <= now else {
             return DoctorMeasurementWindow(
                 floor: now.addingTimeInterval(-fallbackWindow),
-                describedAs: "no launch stamp for the running build on disk, so the window"
+                describedAs: "no launch stamp for this launch on disk, so the window"
                     + " falls back to the last 24h"
             )
         }
@@ -94,9 +94,9 @@ enum DoctorWindowFloor {
         )
     }
 
-    /// The launch descriptor's `writtenAt`, but ONLY when its build identity is
-    /// the build now running. A stamp left by a previous build would put the
-    /// floor before the change under observation, which is the whole bug.
+    /// The launch descriptor's `writtenAt`, but ONLY when this process wrote it
+    /// for the build now running. A stamp left by a previous build would put
+    /// the floor before the change under observation, which is the whole bug.
     private static func launchStamp(root: URL, identity: NativeAgentBuildIdentity) -> Date? {
         launchStamp(path: root.appendingPathComponent(NativeAgentBuildIdentity.launchStampFilename), identity: identity)
     }
@@ -108,8 +108,11 @@ enum DoctorWindowFloor {
               let writtenAt = object["writtenAt"]?.stringValue,
               let stamp = TurnTraceEvent.parseISO8601(writtenAt)
         else { return nil }
+        // One a previous launch left (this launch's write failed, or an older
+        // bundle stamped no pid) is refused, and the row says it has no stamp.
         guard object["build"]?.stringValue == identity.build,
-              object["version"]?.stringValue == identity.version
+              object["version"]?.stringValue == identity.version,
+              object["pid"] == .int(Int64(ProcessInfo.processInfo.processIdentifier))
         else { return nil }
         // A revision recorded on the stamp must match the running one. Absent
         // on either side is tolerated (older bundles did not stamp it); a

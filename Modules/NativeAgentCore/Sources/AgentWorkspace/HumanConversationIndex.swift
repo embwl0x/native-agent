@@ -35,12 +35,32 @@ package enum HumanConversationIndex {
                 "surface": row["source"] ?? .string("app"), "updated_at": row["updatedAt"] ?? .null,
                 "revision": .string(ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"),
                 "source_revision": .string(ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"),
-                "preview": .string(String((string(row["lastMessagePreview"]) ?? "").prefix(400)))])
+                "preview": .string(String((shownPreview(row) ?? "").prefix(400)))])
         }
         let next = offset + selected.count
         return .object(["status": .string("ok"), "conversations": .array(conversations),
             "offset": .int(Int64(offset)), "has_more": .bool(next < rows.count),
             "next_offset": next < rows.count ? .int(Int64(next)) : .null,
             "note": .string("Open a conversation to read its current messages and available reply action.")])
+    }
+
+    /// The stamp the index keeps beside its preview, written from the same
+    /// row the preview quotes. Nil: an older row whose preview has no stamp.
+    package static func previewStamp(_ row: [String: JSONValue]) -> TranscriptRowStamp? {
+        TranscriptRowStamp(json: row[TranscriptRowStamp.previewKey])
+    }
+
+    /// A preview as it is shown now: read under its stored stamp through the
+    /// one per-line path first; a preview with no stamp is not shown at all.
+    package static func shownPreview(_ row: [String: JSONValue]) -> String? {
+        guard let text = string(row["lastMessagePreview"]), let stamp = previewStamp(row) else { return nil }
+        consume(stamp, text: text)
+        return text
+    }
+
+    package static func consume(_ stamp: TranscriptRowStamp, text: String) {
+        ContactThread.consume(mine: !stamp.contact, source: stamp.source, steeredBy: stamp.steeredBy, text: text) { peer, _ in
+            AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
+        }
     }
 }

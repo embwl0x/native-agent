@@ -67,8 +67,9 @@ public final class DoctorFacade {
     /// A run is in flight: the Run button, the pill and Support Snapshot wait.
     public var isRunning = false
     public var runStartedAt: Date?
-    /// When the last full run completed. Cleared for the whole of a run, so
-    /// Support Snapshot never reuses a report from before one.
+    /// When the run that produced `report` completed. It stays through the
+    /// next run, so a page read mid-run names the report it shows (Support
+    /// Snapshot is refused while `isRunning`), and clears if that run fails.
     public var reportCompletedAt: Date?
     /// This runtime's health, as of the last probe.
     public var health: RuntimeHealth?
@@ -83,32 +84,33 @@ public final class DoctorFacade {
 
     /// Admission for every Doctor run on this root — Run, Repair, onboarding
     /// and the automatic passes — so two never overlap and a click during a
-    /// pass is told so. The reuse stamp is cleared for the whole run: Support
-    /// Snapshot never reuses a report from before one.
+    /// pass is told so.
     public func admitRun() -> Bool {
         guard !isRunning else { return false }
         isRunning = true
         runStartedAt = Date()
-        reportCompletedAt = nil
         return true
     }
 
     /// Completion: the report a finished run produced lands with its stamp;
-    /// a run that threw leaves the last report standing.
+    /// a run that threw or was cancelled leaves the last report standing but
+    /// clears its stamp, so nothing (Support Snapshot's reuse) takes that
+    /// rollup as current after a newer run failed to confirm it.
     public func finishRun(_ finished: DoctorReport?) {
-        if let finished {
-            report = finished
-            reportCompletedAt = Date()
-        }
+        if let finished { report = finished }
+        reportCompletedAt = finished == nil ? nil : Date()
         isRunning = false
         runStartedAt = nil
     }
 
     public func toolStatusEnvelope() async throws -> JSONValue {
         guard let report else {
-            return AppToolExecutor.failure("doctor_not_run", "No Doctor report yet. Run doctor.run, then read this page.")
+            return AppToolExecutor.failure(isRunning ? "doctor_running" : "doctor_not_run", isRunning
+                ? "A Doctor run is in progress and this launch has no report yet; read this page again when it finishes."
+                : "No Doctor report yet. Run doctor.run, then read this page.")
         }
-        return try await AppToolExecutor.doctorStatus(report: report) { dataRoot in
+        return try await AppToolExecutor.doctorStatus(report: report, completedAt: reportCompletedAt,
+                                                      runningSince: runStartedAt) { dataRoot in
             try await ProvidersFacade(dataRoot: dataRoot).list().map {
                 AppToolProviderHealth(providerID: $0.provider_id, authState: $0.auth_status.state,
                                       eligible: $0.auth_status.eligible)

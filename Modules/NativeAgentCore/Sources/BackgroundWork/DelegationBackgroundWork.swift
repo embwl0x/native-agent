@@ -267,7 +267,8 @@ public struct DelegationBackgroundWork: Sendable {
                     if signIn { line += ": its sign-in failed or expired" } else if let head { line += ": \"\(head)\"" }
                     ResidentWake.shared.request(dataRoot: dataRoot, reason: "what resolved", items: [.init(
                         id: "wake-failed:\(job.source):\(job.id)", line: line, thread: "wake:" + job.agent,
-                        agent: signIn || head == nil ? nil : job.agent, home: true)])
+                        // The quoted head is stamped with the route its ledger entry records.
+                        agent: signIn || head == nil || job.agent.isEmpty ? nil : job.agent, home: true)])
                 }
                 return await recordBoundDelegationSettlement(dataRoot: dataRoot, job: job)
             },

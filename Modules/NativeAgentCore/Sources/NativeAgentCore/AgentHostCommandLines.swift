@@ -17,6 +17,9 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     public static let messagePlaceholder = "{{message}}"
     public static let sessionPlaceholder = "{{session}}"
     public static let replyFilePlaceholder = "{{reply_file}}"
+    /// What the conversation is called on the agent's side, where its CLI
+    /// lets a session be named: "NativeAgent · <her name> · <label>".
+    public static let sessionNamePlaceholder = "{{session_name}}"
 
     /// The executable name, resolved through the recipe and the login PATH.
     public let executable: String
@@ -52,6 +55,9 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     public let timeoutSeconds: Int
     /// The documentation these flags were checked against.
     public let documentation: String
+    /// The oldest release that takes these flags (Claude Code's --name came
+    /// in 2.1.76). nil: any release.
+    public let minimumVersion: String?
 
     public var continuesConversations: Bool { !continuation.isEmpty }
 
@@ -59,7 +65,7 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
                 replyFileName: String? = nil, capturesThreadID: Bool = false, jsonResultReply: Bool = false,
                 resultFields: [String: String]? = nil,
                 automaticMCPProbe: Bool = true, stream: Stream? = nil, permissionFlags: PermissionFlags? = nil,
-                timeoutSeconds: Int, documentation: String) {
+                timeoutSeconds: Int, documentation: String, minimumVersion: String? = nil) {
         self.executable = executable
         self.arguments = arguments
         self.continuation = continuation
@@ -72,6 +78,20 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         self.permissionFlags = permissionFlags
         self.timeoutSeconds = timeoutSeconds
         self.documentation = documentation
+        self.minimumVersion = minimumVersion
+    }
+
+    /// Why a program that reported `reported` (its `--version` text) cannot
+    /// run these flags: older than `minimumVersion`, or no version to read.
+    /// Nil when it is new enough.
+    public func versionFailure(program: String, reported: String?) -> String? {
+        guard let minimumVersion else { return nil }
+        guard let found = reported?.range(of: #"\d+(\.\d+)+"#, options: .regularExpression).map({ String(reported![$0]) }) else {
+            return "\(program)'s version could not be read (\(program) --version), so whether it takes this recipe's flags (from \(minimumVersion)) is unknown. Update \(program), then Agents > Verify. Nothing was sent."
+        }
+        let have = found.split(separator: ".").compactMap { Int($0) }, need = minimumVersion.split(separator: ".").compactMap { Int($0) }
+        guard have.lexicographicallyPrecedes(need) else { return nil }
+        return "\(program) is \(found); this connection needs \(minimumVersion) or newer (\(documentation)). Update \(program), then Agents > Verify. Nothing was sent."
     }
 
     /// Only the protocol event supplies identity; prose/tool output cannot.
@@ -180,13 +200,17 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
     /// One argv, with every placeholder replaced as a WHOLE argument. A first
     /// message opens the conversation; `resuming` continues one the caller
     /// already has an identity for.
-    public func argv(message: String, session: String?, resuming: Bool, replyFilePath: String?) -> [String] {
+    /// `sessionName` is read only when the template names the session.
+    public func argv(message: String, session: String?, resuming: Bool, replyFilePath: String?,
+                     sessionName: () -> String) -> [String] {
         let template = (resuming && continuesConversations) ? continuation : arguments
+        let name = template.contains(Self.sessionNamePlaceholder) ? sessionName() : ""
         return template.map { argument in
             switch argument {
             case Self.messagePlaceholder: return message
             case Self.sessionPlaceholder: return session ?? ""
             case Self.replyFilePlaceholder: return replyFilePath ?? ""
+            case Self.sessionNamePlaceholder: return name
             default:
                 // Bind option values in the same argv element, so a message
                 // beginning with '-' can never become an option.
@@ -229,13 +253,14 @@ public enum AgentHostCommandLines {
             documentation: "https://www.antigravity.google/docs/cli/headless/"),
         "claude-code": AgentHostCommandLine(
             executable: "claude",
-            arguments: ["-p", "--output-format", "json", "--", AgentHostCommandLine.messagePlaceholder],
+            arguments: ["-p", "--output-format", "json", "--name", AgentHostCommandLine.sessionNamePlaceholder,
+                        "--", AgentHostCommandLine.messagePlaceholder],
             continuation: ["-p", "--output-format", "json", "--resume", AgentHostCommandLine.sessionPlaceholder,
                            "--", AgentHostCommandLine.messagePlaceholder],
             capturesThreadID: true, jsonResultReply: true,
             resultFields: ["reply": "result", "session": "session_id", "status": "subtype", "success": "success", "error": "is_error", "errors": "errors"],
             automaticMCPProbe: false, permissionFlags: .claude, timeoutSeconds: 300,
-            documentation: "https://code.claude.com/docs/en/headless"),
+            documentation: "https://code.claude.com/docs/en/headless", minimumVersion: "2.1.76"),
         // JSONL thread.started carries the CLI-minted identity. Resume uses
         // that exact UUID, never --last or a guessed private rollout path.
         "codex": AgentHostCommandLine(

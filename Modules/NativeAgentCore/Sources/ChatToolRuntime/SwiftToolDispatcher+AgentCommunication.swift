@@ -8,6 +8,7 @@ import TrustCenter
 import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
+import PersonaEngine
 import StandingBots
 import ProviderRouting
 
@@ -105,7 +106,17 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                          "capabilities": .array([.string("message"), .string("read")]), "read_inputs": .array([])])
             }
             let connected = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
-            let found = savedMatch ? [] : await AgentDiscoverySession.shared.candidates(refresh: refresh, dataRoot: dataRoot)
+            // An explicit discover may run what it finds (--help, initialize), under the rule a send runs it by.
+            var launch: AgentPeerDiscovery.Launch?
+            if refresh, !savedMatch {
+                launch = .refused("running a found program needs this app's Full Mac file access on this surface")
+                if usesCanonicalBody, await fullMacToolAccess(surface: surface).fileOpsAllowed {
+                    let origin = SecurityOriginContext.currentTurn(verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)
+                    launch = await agentProgramLaunch(SwiftNativeSecurityCenter(dataRoot: dataRoot)
+                        .drivenAgentLaunchPermission(tool: tool, origin: origin)).launch
+                }
+            }
+            let found = savedMatch ? [] : await AgentDiscoverySession.shared.candidates(refresh: refresh, launch: launch, dataRoot: dataRoot)
             contacts += found.filter { candidate in
                 if let host = candidate.hostID {
                     return AgentHostDirectory.rows.first { $0.id == host }?.requiresWorkspace == true || !connected.contains(host)
@@ -762,7 +773,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             return .object(value)
         }
         if proposal.row.acp != nil {
-            let version = try await proposal.executable?.reportedVersion(environment: proposal.row.installation.launchEnvironment())
+            let version = try await proposal.executable?.reported(environment: proposal.row.installation.launchEnvironment())
             proposal.executable?.version = version
             // The person already answered this named connect in chat (or Full Mac
             // allows it): a second card here is filed where the chat never shows
@@ -904,7 +915,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let path = URL(fileURLWithPath: installed).standardizedFileURL.resolvingSymlinksInPath().path
         if let approved = contact.approvedACPExecutable, approved.path == path, approved.isCurrent { return contact }
         // Its version, for the startup check (startupBlocker) and the contact's version note.
-        let version = try? await AgentACPExecutable.capture(path: path).reportedVersion(environment: environment)
+        let version = try? await AgentACPExecutable.capture(path: path).reported(environment: environment)
         guard (try? store.approveExecutable(peerID: contact.id, path: path, version: version)) == true else { return contact }
         return (try? store.list())?.first { $0.id == contact.id } ?? contact
     }
@@ -919,6 +930,30 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             said.append("no session/load or session/resume — a continued conversation starts a new one")
         }
         return said.isEmpty ? "recorded its protocol version and session support" : said.joined(separator: "; ")
+    }
+
+    /// THE RULE FOR RUNNING ANOTHER AGENT'S PROGRAM, a send's and an explicit
+    /// discover's handshake alike: Full Mac runs it as is; otherwise it runs
+    /// inside the builder sandbox and never reads the bridge directory. Denied
+    /// or locked down, nothing runs and `refused` is the receipt that says why.
+    private func agentProgramLaunch(_ permission: DrivenAgentLaunchPermission) async
+        -> (launch: AgentPeerDiscovery.Launch, refused: [String: JSONValue]) {
+        func refused(_ status: String, _ detail: String, reason: String? = nil) -> (launch: AgentPeerDiscovery.Launch, refused: [String: JSONValue]) {
+            var receipt: [String: JSONValue] = ["status": .string(status), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail)]
+            if let reason { receipt["reason"] = .string(reason) }
+            return (.refused(detail), receipt)
+        }
+        if case .denied(let reason) = permission { return refused("failed", "Nothing was launched: \(reason).", reason: "launch_blocked") }
+        guard permission != .fullMac else { return (.run { executable, arguments in [executable] + arguments }, [:]) }
+        let sandbox = await Self.builderShellSandboxMode(dataRoot: dataRoot)
+        guard sandbox != .lockedDown else { return refused("unavailable", "Running another agent is turned off in the current permission settings.") }
+        // 2026-09-22: the peer never reads the main bridge bearer; its link
+        // uses the url-only descriptor outside this directory.
+        let bridgeDir = Self.sbplEscapeLiteral(AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot)
+            .standardizedFileURL.resolvingSymlinksInPath().path)
+        let profile = (sandbox == .developerFullMac ? Self.builderDeveloperSandboxProfile(dataRoot: dataRoot)
+            : Self.builderSandboxProfile(dataRoot: dataRoot)) + "\n(deny file-read* (subpath \"\(bridgeDir)\"))"
+        return (.run { executable, arguments in ["/usr/bin/sandbox-exec", "-p", profile, executable] + arguments }, [:])
     }
 
     private func hostACPRun(contact: AgentPeerContact, message: String, conversationID: String?, store: AgentPeerStore,
@@ -980,28 +1015,13 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 .object(["name": .string($0.key), "value": .string($0.value)])
             })])
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        if case .denied(let reason) = launchPermission {
+        let rule = await agentProgramLaunch(launchPermission)
+        guard case .run(let wrap) = rule.launch else {
             await AgentACPConnections.shared.revoke(peer: contact.id)
-            return .object(["status": .string("failed"), "reason": .string("launch_blocked"),
-                "sent": .bool(false), "completed": .bool(false), "detail": .string("Nothing was launched: \(reason).")])
+            return .object(rule.refused)
         }
-        let sandbox: BuilderShellSandboxMode = launchPermission == .fullMac
-            ? .off : await Self.builderShellSandboxMode(dataRoot: dataRoot)
-        guard sandbox != .lockedDown else {
-            await AgentACPConnections.shared.revoke(peer: contact.id)
-            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                "detail": .string("Running another agent is turned off in the current permission settings.")])
-        }
-        let unrestricted = launchPermission == .fullMac
-        let program = unrestricted ? executable : "/usr/bin/sandbox-exec"
-        // 2026-09-22: the peer never reads the main bridge bearer; its link
-        // uses the url-only descriptor outside this directory.
-        let bridgeDir = Self.sbplEscapeLiteral(AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot)
-            .standardizedFileURL.resolvingSymlinksInPath().path)
-        let arguments = unrestricted ? line.arguments : ["-p",
-            (sandbox == .developerFullMac ? Self.builderDeveloperSandboxProfile(dataRoot: dataRoot)
-                : Self.builderSandboxProfile(dataRoot: dataRoot))
-                + "\n(deny file-read* (subpath \"\(bridgeDir)\"))", executable] + line.arguments
+        let command = wrap(executable, line.arguments)
+        let program = command[0], arguments = Array(command.dropFirst())
         let approvalContext = AgentACPApproval.Context.current
         let decidedSessionID = ChatToolSessionContext.verifiedSessionId
         let childEnvironment = try row.installation.launchEnvironment()
@@ -1345,6 +1365,11 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 return .object(result)
             }
             result["executable"] = .string(executable)
+            if line.minimumVersion != nil, let tooOld = line.versionFailure(program: line.executable,
+                reported: try? await AgentACPExecutable.capture(path: executable).reported(environment: row.installation.launchEnvironment())) {
+                result["detail"] = .string("\(row.displayName)'s readiness check failed: \(tooOld)")
+                return .object(result)
+            }
             guard let recipe else {
                 result["detail"] = .string("\(row.displayName)'s recipe is unavailable; no prompt was sent.")
                 return .object(result)
@@ -1394,6 +1419,16 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let launch = await Self.drivenAgentLaunch(tool: "agent_message", surface: surface, contact: contact,
                                                   name: row.displayName, dataRoot: dataRoot)
         guard let executable = launch.executable else { return launch.deniedResult! }
+        if line.minimumVersion != nil {
+            // The approved program's receipt keeps the version it reported, read
+            // once when it was approved; the launch re-verifies those exact bytes.
+            var reported = (try? store.list())?.first { $0.id == contact.id }?.acpExecutable.flatMap { $0.path == executable ? $0.version : nil }
+            if reported == nil {
+                reported = try? await AgentACPExecutable.capture(path: executable).reported(environment: row.installation.launchEnvironment())
+                if let reported { _ = try? store.approveExecutable(peerID: contact.id, path: executable, version: reported) }
+            }
+            if let tooOld = line.versionFailure(program: line.executable, reported: reported) { return honest("unavailable", tooOld) }
+        }
         let launchArguments = launch.arguments
         // ONE directory per agent, inside the workspace the command runner
         // already confines writes to. It was a fresh one per message until the
@@ -1424,7 +1459,15 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             }
         }
         let outgoing = probeNonce.map { AgentHostDirectory.probeText(appName: Self.appDisplayName, nonce: $0) } ?? message
-        let argv = launchArguments + line.argv(message: outgoing, session: session, resuming: resuming, replyFilePath: replyFile)
+        let argv = launchArguments + line.argv(message: outgoing, session: session, resuming: resuming,
+                                               replyFilePath: replyFile) {
+            // Named on its side the way she knows it, so the person recognizes it there.
+            let label = AgentConversationLiveContext.target?.recordID.flatMap { id in
+                (try? AgentConversationStore(dataRoot: dataRoot).records())?.first { $0.id == id }?.label
+            } ?? "Main"
+            let her = PersonaCompiler.agentDisplayName(dataRoot: dataRoot)
+            return (["NativeAgent"] + (her == "NativeAgent" ? [] : [her]) + [label]).joined(separator: " · ")
+        }
         // Retain bounded protocol output before the runner clips stdout for
         // display; streaming events also reach the live view as they arrive.
         let (lines, linesIn) = AsyncStream<String>.makeStream()

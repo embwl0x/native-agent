@@ -90,12 +90,13 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         // Latch on the RESULT's own provenance label rather than on a list of
         // tool names, so a transport added later is covered the day it starts
         // labelling its output honestly.
-        if let peer = Self.remoteProvenance(in: result, depth: 0) {
+        let peers = Self.remoteProvenances(in: result)
+        if !peers.isEmpty {
             let line = Self.peerLine(in: result, depth: 0) ?? ""
             // Trusted transports label their own content before returning it.
             // A selected route or a result-supplied name cannot clear a nested
             // source's explicit untrusted provenance.
-            PeerDataTaint.markConsumed(peer: peer, line: line)
+            for peer in peers { PeerDataTaint.markConsumed(peer: peer, line: line) }
         }
         return result
     }
@@ -149,17 +150,21 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         }
     }
 
-    /// Live and retained bridge replies use the identity of their local route
-    /// or store, with the person's current trust applied before returning text.
+    /// A lane's reply, a run she just made or one its ledger or saved wakeup
+    /// cached: the app wrote it from the route it ran on, so it is stamped
+    /// with that route (`agent`: the contact's door, or the lane) and read
+    /// through `ContactThread.consume`. A trusted route never steers.
     static func labelled(_ result: JSONValue, agent: String, dataRoot: URL) -> JSONValue {
         guard case .object(var fields) = result,
-              ["reply", "agent_reply_text", "agent_reply_text_head", "completion_text_head"].contains(where: {
-                  guard case .string(let reply)? = fields[$0] else { return false }
-                  return !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-              }) else { return result }
+              let reply = ["reply", "agent_reply_text", "agent_reply_text_head", "completion_text_head"].lazy.compactMap({ key -> String? in
+                  guard case .string(let reply)? = fields[key], !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                  return reply
+              }).first else { return result }
         fields["agent"] = .string(agent)
-        fields["untrusted_remote_data"] = .bool(!PeerTrust.ownerTrusts(agent, dataRoot: dataRoot))
-        PeerDataTaint.markConsumed(peer: agent)
+        let speakers = ContactThread.consume(mine: false, source: agent.isEmpty ? nil : agent, steeredBy: [], text: reply) {
+            PeerDataTaint.markConsumed(peer: $0, line: $1)
+        }
+        fields["untrusted_remote_data"] = .bool(!speakers.allSatisfy { PeerTrust.ownerTrusts(PeerTrust.principal($0, dataRoot: dataRoot), dataRoot: dataRoot) })
         return .object(fields)
     }
 
@@ -209,36 +214,37 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         }
     }
 
-    /// One result is one transport. The app's own top-level object names the door
-    /// it read from (`agent` or `agent_id` as "peer:<id>", the attested id that
-    /// carries the person's grant); peer content nested inside it is that door's,
-    /// so it latches the attested id, never a display name the peer could have
-    /// written. Only a result whose top level names no door latches a nested
-    /// name, which grants nothing.
-    static func remoteProvenance(in value: JSONValue, depth: Int) -> String? {
-        guard depth < 6 else { return nil }
-        if depth == 0, case .object(let top) = value, let attested = attestedPeerID(top), carriesProvenanceFlag(value, depth: 0) {
-            return attested
+    /// Every source a labelled result names, each latched under its own grant:
+    /// the door the app's own top-level object read from (`agent`/`agent_id`
+    /// as "peer:<id>", the attested id that carries the person's grant), and
+    /// each flagged object inside it (a history line's own `agent_id` and
+    /// `steered_by`). Latching more names never lifts one: a name a peer wrote
+    /// can add a latch, never clear the door's own.
+    static func remoteProvenances(in value: JSONValue) -> [String] {
+        var found: [String] = []
+        func add(_ peer: String) {
+            let peer = peer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !peer.isEmpty, !found.contains(peer) { found.append(peer) }
         }
-        switch value {
-        case .object(let object):
-            if provenanceFlags.contains(where: { if case .bool(true)? = object[$0] { return true } else { return false } }) {
-                if let attested = attestedPeerID(object) { return attested }
-                if case .string(let agent)? = object["agent"],
-                   !agent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return agent }
+        if case .object(let top) = value, let attested = attestedPeerID(top), carriesProvenanceFlag(value, depth: 0) { add(attested) }
+        func walk(_ value: JSONValue, depth: Int) {
+            guard depth < 6 else { return }
+            switch value {
+            case .object(let object):
+                if provenanceFlags.contains(where: { if case .bool(true)? = object[$0] { return true } else { return false } }) {
+                    if let attested = attestedPeerID(object) { add(attested) }
+                    else if case .string(let agent)? = object["agent"] { add(agent) }
+                    if case .array(let steering)? = object["steered_by"] {
+                        for case .string(let peer) in steering { add(peer) }
+                    }
+                }
+                for (_, nested) in object { walk(nested, depth: depth + 1) }
+            case .array(let items): for item in items { walk(item, depth: depth + 1) }
+            default: return
             }
-            for (_, nested) in object {
-                if let found = remoteProvenance(in: nested, depth: depth + 1) { return found }
-            }
-            return nil
-        case .array(let items):
-            for item in items {
-                if let found = remoteProvenance(in: item, depth: depth + 1) { return found }
-            }
-            return nil
-        default:
-            return nil
         }
+        walk(value, depth: 0)
+        return found
     }
 
     private static func attestedPeerID(_ object: [String: JSONValue]) -> String? {

@@ -21,8 +21,8 @@ extension SlackSocketModeLoop {
         chatClient makeChatClient: () -> any ChatOrchestrationClient,
         turnCompleted: @escaping @Sendable (_ sessionID: String) -> Void,
         botEventIntake: @escaping SlackBotEventIntake
-    ) -> SlackSocketModeLoop? {
-        guard let cfg = SlackSocketModeConfig.load(dataRoot: dataRoot), cfg.enabled else {
+    ) throws -> SlackSocketModeLoop? {
+        guard let cfg = try SlackSocketModeConfig.load(dataRoot: dataRoot), cfg.enabled else {
             return nil
         }
         let slackSessions = SlackSessionStore(dataRoot: dataRoot)

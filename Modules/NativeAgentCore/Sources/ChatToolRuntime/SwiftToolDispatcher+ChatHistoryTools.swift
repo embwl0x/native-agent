@@ -445,12 +445,7 @@ extension SwiftToolDispatcher {
                         "preview": .string(String(preview(message).prefix(160))),
                     ]
                     if let id = message.messageId { row["message_id"] = .string(id) }
-                    if let peer = message.peer {
-                        let who = Self.attestedHistoryPeer(peer, dataRoot: dataRoot)
-                        row["agent"] = .string(peer)
-                        if who != peer { row["agent_id"] = .string(who) }
-                        row["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(who))
-                    }
+                    row.merge(Self.historyEvidence(message.peer, words: preview(message), dataRoot: dataRoot)) { _, new in new }
                     return JSONValue.object(row)
                 }
                 let digest: JSONValue = .object([
@@ -462,7 +457,6 @@ extension SwiftToolDispatcher {
                     "own_message_count": .int(Int64(ownMessages.count)),
                     "own_messages": .array(own),
                 ])
-                Self.consumePersistedHistoryEvidence(digest)
                 return digest
             }
             var obj: [String: JSONValue] = [
@@ -481,12 +475,7 @@ extension SwiftToolDispatcher {
                 obj["author"] = .string(author)
                 obj["author_route"] = .string(hit.authorRoute ?? "unknown")
             }
-            if let peer = hit.peer {
-                let who = Self.attestedHistoryPeer(peer, dataRoot: dataRoot)
-                obj["agent"] = .string(peer)
-                if who != peer { obj["agent_id"] = .string(who) }
-                obj["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(who) && !preview(hit).isEmpty)
-            }
+            obj.merge(Self.historyEvidence(hit.peer, words: preview(hit), dataRoot: dataRoot)) { _, new in new }
             if workContextQuery != nil {
                 obj["ranking_basis"] = .string([
                     "same_turn_tool_activity_without_history_lookup",
@@ -507,7 +496,6 @@ extension SwiftToolDispatcher {
             if continuityMode { obj["surrounding_messages"] = .array(Self.continuityNeighbors(
                 rows: hit.neighbors, startIndex: max(0, hit.messageIndex - 2), index: hit.messageIndex,
                 roleFilter: roleFilter, authorFilter: authorFilter, sessionId: hit.sessionId, excludingRunID: excludingRunID, dataRoot: dataRoot)) }
-            Self.consumePersistedHistoryEvidence(.object(obj))
             return .object(obj)
         }
         var response: [String: JSONValue] = [
@@ -789,56 +777,78 @@ extension SwiftToolDispatcher {
         PeerTrust.principal(label, dataRoot: dataRoot)
     }
 
+    /// A history row's principals as its own stamp says (`ContactThread.stamp`),
+    /// speaker first: a bridge turn's door (another agent when it attests no
+    /// one) and every peer that steered the row; a tool receipt's labelled
+    /// sources. Kept with the row as one newline-separated value.
     package static func persistedHistoryPeer(role: String, row: [String: JSONValue]) -> String? {
+        let principals = persistedHistoryPrincipals(role: role, row: row)
+        return principals.isEmpty ? nil : principals.joined(separator: "\n")
+    }
+
+    private static func persistedHistoryPrincipals(role: String, row: [String: JSONValue]) -> [String] {
         let metadata = persistedHistoryMetadata(row: row)
-        if case .array(let saved)? = metadata["untrusted_sources"] {
-            let sources = saved.compactMap { if case .string(let source) = $0, !source.isEmpty { return source }; return nil }
-            if !sources.isEmpty {
-                // Stored taint names who the words came from. Whether the person
-                // trusts that who is decided now, by its attested id, never by a
-                // name and never by the decision in force when the words were kept.
-                return sources.first { $0.hasPrefix("peer:") } ?? sources[0]
+        // Every row carries the steering its writer stamped, whoever spoke.
+        let stamp = ContactThread.stamp(id: HumanConversationReader.string(row["id"]) ?? "", metadata: metadata)
+        let spoke: [String]
+        switch role.lowercased() {
+        case "tool": spoke = toolReceiptSources(row: row, metadata: metadata)
+        case "user":
+            let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
+            let origin = HumanConversationReader.object(metadata["origin"])
+            let surface = HumanConversationReader.string(origin["surface"]) ?? envelope?.surface ?? ""
+            let bridged = surface.hasSuffix("-bridge") || PeerTurnEffectPolicy.isPeerBridge(surface: surface)
+            spoke = bridged ? [stamp.source ?? "another agent"] : []
+        default: spoke = []
+        }
+        return Array(NSOrderedSet(array: spoke + stamp.steeredBy)) as? [String] ?? []
+    }
+
+    /// The sources a tool receipt's own result labels, or its routed contact.
+    private static func toolReceiptSources(row: [String: JSONValue], metadata: [String: JSONValue]) -> [String] {
+        let tool = HumanConversationReader.string(metadata["toolName"] ?? row["toolName"]
+            ?? metadata["name"] ?? row["name"]) ?? ""
+        let storedInput = metadata["inputJSON"] ?? row["inputJSON"]
+        let input: [String: JSONValue]
+        if case .string(let text)? = storedInput,
+           let parsed = try? JSONValue.parse(Data(text.utf8)) {
+            input = HumanConversationReader.object(parsed)
+        } else {
+            input = HumanConversationReader.object(storedInput)
+        }
+        for key in ["receiptEvidence", "resultSummary", "resultBody", "content", "text"] {
+            let stored = metadata[key] ?? row[key]
+            let result: JSONValue?
+            if case .string(let text)? = stored { result = try? JSONValue.parse(Data(text.utf8)) }
+            else { result = stored }
+            if let result {
+                let peers = PeerDataTaintDispatcher.remoteProvenances(in: result)
+                if !peers.isEmpty { return peers }
             }
         }
-        if role.lowercased() == "tool" {
-            let tool = HumanConversationReader.string(metadata["toolName"] ?? row["toolName"]
-                ?? metadata["name"] ?? row["name"]) ?? ""
-            let storedInput = metadata["inputJSON"] ?? row["inputJSON"]
-            let input: [String: JSONValue]
-            if case .string(let text)? = storedInput,
-               let parsed = try? JSONValue.parse(Data(text.utf8)) {
-                input = HumanConversationReader.object(parsed)
-            } else {
-                input = HumanConversationReader.object(storedInput)
-            }
-            for key in ["receiptEvidence", "resultSummary", "resultBody", "content", "text"] {
-                let stored = metadata[key] ?? row[key]
-                let result: JSONValue?
-                if case .string(let text)? = stored { result = try? JSONValue.parse(Data(text.utf8)) }
-                else { result = stored }
-                if let result, let peer = PeerDataTaintDispatcher.remoteProvenance(in: result, depth: 0) {
-                    return peer
-                }
-            }
-            if let peer = PeerDataTaintDispatcher.routedContact(tool: tool, input: input) { return peer }
-            // Clipped routing cannot attest a trusted contact. Keep peer
-            // receipts subject to the approval floor when that identity is lost.
-            if ["agent_message", "agent_read"].contains(ToolNameAliases.ranTool(tool, input: input)) {
-                return "peer:unknown"
-            }
-            if ["read_page", "browser.chrome_snapshot", "browser.read_text", "browser.read_links"]
-                .contains(ToolNameAliases.ranTool(tool, input: input)) { return "web content" }
-            return nil
+        if let peer = PeerDataTaintDispatcher.routedContact(tool: tool, input: input) { return [peer] }
+        // Clipped routing cannot attest a trusted contact. Keep peer
+        // receipts subject to the approval floor when that identity is lost.
+        if ["agent_message", "agent_read"].contains(ToolNameAliases.ranTool(tool, input: input)) {
+            return ["peer:unknown"]
         }
-        guard role.lowercased() == "user" else { return nil }
-        let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
-        let origin = HumanConversationReader.object(metadata["origin"])
-        let surface = HumanConversationReader.string(origin["surface"]) ?? envelope?.surface ?? ""
-        guard surface.hasSuffix("-bridge") || PeerTurnEffectPolicy.isPeerBridge(surface: surface) else { return nil }
-        if let agent = HumanConversationReader.string(origin["agent"]) ?? envelope?.agent,
-           ["codex", "claude", "omp"].contains(agent) { return agent }
-        let id = envelope?.verifiedUserId ?? "unknown"
-        return id.hasPrefix("peer:") ? id : "peer:" + id
+        if ["read_page", "browser.chrome_snapshot", "browser.read_text", "browser.read_links"]
+            .contains(ToolNameAliases.ranTool(tool, input: input)) { return ["web content"] }
+        return []
+    }
+
+    /// A history row's evidence fields: its principals, speaker first. The
+    /// result is read once, at the turn's one consumption boundary for tool
+    /// results (`PeerDataTaintDispatcher`), each principal under its own grant.
+    package static func historyEvidence(_ peer: String?, words: String, dataRoot: URL) -> [String: JSONValue] {
+        let principals = (peer ?? "").split(separator: "\n").map(String.init)
+        guard let speaker = principals.first else { return [:] }
+        let attested = principals.map { attestedHistoryPeer($0, dataRoot: dataRoot) }
+        var fields: [String: JSONValue] = ["agent": .string(speaker),
+            "untrusted_remote_data": .bool(!attested.allSatisfy(PeerDataTaint.ownerTrusts) && !words.isEmpty)]
+        if attested[0] != speaker { fields["agent_id"] = .string(attested[0]) }
+        if principals.count > 1 { fields["steered_by"] = .array(principals.dropFirst().map(JSONValue.string)) }
+        return fields
     }
 
     private static func persistedHistoryRoute(row: [String: JSONValue]) -> String? {
@@ -873,10 +883,13 @@ extension SwiftToolDispatcher {
         switch value {
         case .object(let fields):
             // A peer's words read now steer; a memory's provenance in the receipt does not.
-            if case .bool(true)? = fields["untrusted_remote_data"],
-               case .string(let peer)? = fields["agent"] {
+            if case .string(let peer)? = fields["agent"],
+               fields["untrusted_remote_data"] == .bool(true) || fields["steered_by"] != nil {
                 let line = HumanConversationReader.string(fields["preview"] ?? fields["excerpt"] ?? fields["text"]) ?? ""
-                PeerDataTaint.markConsumed(peer: peer, line: line)
+                let steering: [String] = if case .array(let values)? = fields["steered_by"] {
+                    values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
+                } else { [] }
+                ContactThread.consume(mine: false, source: peer, steeredBy: steering, text: line) { PeerDataTaint.markConsumed(peer: $0, line: $1) }
             }
             for child in fields.values { consumePersistedHistoryEvidence(child) }
         case .array(let values):
@@ -910,12 +923,7 @@ extension SwiftToolDispatcher {
                 result["author"] = .string(author)
                 result["author_route"] = .string(cached.route ?? "unknown")
             }
-            if let peer = cached.peer {
-                let who = Self.attestedHistoryPeer(peer, dataRoot: dataRoot)
-                result["agent"] = .string(peer)
-                if who != peer { result["agent_id"] = .string(who) }
-                result["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(who) && !display.isEmpty)
-            }
+            result.merge(Self.historyEvidence(cached.peer, words: display, dataRoot: dataRoot)) { _, new in new }
             if let excludingRunID, cached.runId == excludingRunID { return nil }
             result["timestamp"] = cached.timestamp.map(JSONValue.string)
             if let messageId = cached.messageId, !messageId.isEmpty {
@@ -1202,13 +1210,9 @@ extension SwiftToolDispatcher {
                 }
             }
         }
-        if case .object(let row)? = found.message.extras,
-           let peer = Self.persistedHistoryPeer(role: found.message.role, row: row) {
-            let who = Self.attestedHistoryPeer(peer, dataRoot: dataRoot)
-            response["agent"] = .string(peer)
-            if who != peer { response["agent_id"] = .string(who) }
-            response["untrusted_remote_data"] = .bool(!PeerDataTaint.ownerTrusts(who) && !page.isEmpty)
-            if !page.isEmpty { PeerDataTaint.markConsumed(peer: who, line: page) }
+        if case .object(let row)? = found.message.extras {
+            response.merge(Self.historyEvidence(Self.persistedHistoryPeer(role: found.message.role, row: row),
+                                                words: page, dataRoot: dataRoot)) { _, new in new }
         }
         if found.stats.malformedRowCount > 0 || found.stats.invalidShapeRowCount > 0 {
             response["message_index"] = .null

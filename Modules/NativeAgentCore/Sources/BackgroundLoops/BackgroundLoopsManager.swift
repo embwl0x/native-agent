@@ -557,6 +557,11 @@ public actor BackgroundLoopsManager {
                     runCount: 0, lastError: nil, disabledReason: reason,
                     lastResult: "skipped: " + LoopTickOutcome.offPrefix + reason
                 ))
+            } else if case .unreadable(let loopId, let error) = registration {
+                result.append(LoopStatus(
+                    name: loopId, interval: 0, lastRun: nil, nextRun: nil,
+                    runCount: 0, lastError: error
+                ))
             }
         }
         return result.sorted { $0.name < $1.name }
@@ -599,6 +604,7 @@ public actor BackgroundLoopsManager {
         }
         guard let runner = managedRunner(loopId: loopId) else {
             if case .disabled(_, let reason) = registrations[loopId] { return .off(reason) }
+            if case .unreadable(_, let error) = registrations[loopId] { return .failed(error: error) }
             return .failed(error: "loop not registered: \(loopId)")
         }
         return await executeRegisteredTick(
@@ -717,6 +723,7 @@ public actor BackgroundLoopsManager {
         }
         guard let runner = managedRunner(loopId: loopId) else {
             if case .disabled(_, let reason) = registrations[loopId] { return .off(reason) }
+            if case .unreadable(_, let error) = registrations[loopId] { return .failed(error: error) }
             return .failed(error: "loop not registered: \(loopId)")
         }
         // Cheap early rejection. This is NOT the authoritative decision: the

@@ -193,11 +193,14 @@ actor ChatGPTDotConversation {
         let session = principal(peer).storedConversation("mcp-" + peer.id)
         let transcript = dataRoot.appendingPathComponent("chat/messages/\(session).jsonl")
         let source = try await SwiftNativePersistenceCore().readJSONLReporting(transcript)
-        let rows = source.rows.reversed().compactMap { value -> [String: JSONValue]? in
-            guard case .object(let row) = value, case .string(let text)? = row["content"],
+        let saved = source.rows.reversed().compactMap { value -> [String: JSONValue]? in
+            guard case .object(let row) = value, case .string? = row["content"],
                   row["role"] == .string("user") || row["role"] == .string("assistant") else { return nil }
-            return ["id": row["id"] ?? .null, "at": row["createdAt"] ?? .null,
-                    "from": .string(Self.author(of: row, peer: peer)), "text": .string(text)]
+            return row
+        }
+        let rows = saved.map { row -> [String: JSONValue] in
+            ["id": row["id"] ?? .null, "at": row["createdAt"] ?? .null,
+             "from": .string(Self.author(of: row, peer: peer)), "text": row["content"] ?? .null]
         }
         let version = SHA256.hash(data: try JSONValue.array(rows.map { .object($0) }).serializedData(pretty: false))
             .map { String(format: "%02x", $0) }.joined()
@@ -222,6 +225,7 @@ actor ChatGPTDotConversation {
             row["text_offset"] = .int(Int64(textOffset))
             row["text_has_more"] = .bool(textOffset + part.count < text.count)
             selected.append(.object(row))
+            Self.consume(saved[index], peer: peer)
             remaining -= part.count
             textOffset += part.count
             if textOffset < text.count { break }
@@ -383,12 +387,12 @@ actor ChatGPTDotConversation {
             AgentPeerStore(dataRoot: dataRoot).recordProof(peerID: peer.id, inbound: true)
         }
         rows = try await persistence.tailJSONL(transcript, limit: 100, maxBytes: 1_048_576)
-        PeerDataTaint.markConsumed(peer: "peer:" + peer.id)
         return .object(["status": .string("ready"), "agent": .string(peer.name), "agent_id": .string("peer:" + peer.id),
                         "conversation_id": .string(session), "untrusted_remote_data": .bool(true),
                         "conversation": .array(rows.compactMap { value -> JSONValue? in
                             guard case .object(let row) = value, let text = row["content"],
                                   row["role"] == .string("user") || row["role"] == .string("assistant") else { return nil }
+                            Self.consume(row, peer: peer)
                             return .object(["id": row["id"] ?? .null, "at": row["createdAt"] ?? .null,
                                             "from": .string(Self.author(of: row, peer: peer)), "text": text])
                         })])
@@ -404,16 +408,33 @@ actor ChatGPTDotConversation {
     /// Who wrote a row of Dot's session. The person talks to her here on
     /// purpose, so a user row is Dot's only when it came over his bridge (it
     /// carries his origin stamp); the rest are the person's own words.
+    /// A room row's speaker as its own row's stamp says: the person, her, Dot,
+    /// or another agent when the row attests no one.
     private static func author(of row: [String: JSONValue], peer: AgentPeerContact) -> String {
         if case .object(let metadata)? = row["metadata"], metadata["byPerson"] == .bool(true) { return "the person" }
         guard row["role"] == .string("user") else { return "Agent" }
-        guard case .object(let metadata)? = row["metadata"] else { return "the person" }
-        if metadata["origin"] != nil { return peer.name }
-        if case .object(let envelope)? = metadata["envelope"],
-           envelope["surface"] == .string("agent-bridge") || envelope["userId"] == .string(peer.id) {
-            return peer.name
+        guard bridged(row, peer: peer), case .object(let metadata)? = row["metadata"] else { return "the person" }
+        let source = ContactThread.stamp(id: id(row), metadata: metadata).source
+        return source == "peer:" + peer.id ? peer.name : source ?? "another agent"
+    }
+
+    private static func bridged(_ row: [String: JSONValue], peer: AgentPeerContact) -> Bool {
+        guard row["role"] == .string("user"), case .object(let metadata)? = row["metadata"], metadata["byPerson"] != .bool(true) else { return false }
+        if metadata["origin"] != nil { return true }
+        guard case .object(let envelope)? = metadata["envelope"] else { return false }
+        return envelope["surface"] == .string("agent-bridge") || envelope["userId"] == .string(peer.id)
+    }
+
+    private static func id(_ row: [String: JSONValue]) -> String { if case .string(let id)? = row["id"] { id } else { "" } }
+
+    /// A room row she is shown, read under its own row's stamp.
+    private static func consume(_ row: [String: JSONValue], peer: AgentPeerContact) {
+        let metadata: [String: JSONValue] = if case .object(let value)? = row["metadata"] { value } else { [:] }
+        let stamp = ContactThread.stamp(id: id(row), metadata: metadata)
+        let text: String = if case .string(let text)? = row["content"] { text } else { "" }
+        ContactThread.consume(mine: !bridged(row, peer: peer), source: stamp.source, steeredBy: stamp.steeredBy, text: text) {
+            PeerDataTaint.markConsumed(peer: $0, line: $1)
         }
-        return "the person"
     }
 
     private func roomDate(_ text: String) -> Date? {

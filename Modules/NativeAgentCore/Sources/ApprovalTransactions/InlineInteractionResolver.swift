@@ -848,8 +848,28 @@ public enum InlineInteractionResolver {
             }
             guard missing.isEmpty else {
                 let names = missing.map { InlineInteractionRegistry.macCapabilityDisplayName($0) }
+                // A launch-applied grant's probe can stay denied until the
+                // process restarts, so a denial does not prove the switch is off.
+                var seen: Set<SystemPermissionCapability> = []
+                let launchApplied = missing.compactMap(SystemPermissionPreflight.cardSettingsCapability).filter {
+                    SystemPermissionPreflight.appliesAtLaunch.contains($0) && seen.insert($0).inserted
+                }
+                let restart = launchApplied.isEmpty ? "" : " If you turned "
+                    + InlineInteractionRegistry.englishList(launchApplied.map(\.displayName))
+                    + " on, it takes effect only after I restart. Tell me to restart and I will, then Try again here."
                 return .failure(
-                    "Still not allowed: \(InlineInteractionRegistry.englishList(names))."
+                    "Still not allowed: \(InlineInteractionRegistry.englishList(names))." + restart
+                )
+            }
+            // On in System Settings, but a grant macOS applies only at launch
+            // is not this process's until it restarts: the card does not
+            // settle on a probe that agrees too early.
+            let atLaunch = SystemPermissionPreflight.awaitingLaunch(interaction.allTargets)
+            guard atLaunch.isEmpty else {
+                let names = InlineInteractionRegistry.englishList(atLaunch.map(\.displayName))
+                return .failure(
+                    "\(names) is on, and it takes effect only after I restart. "
+                    + "Tell me to restart and I will, then Try again here."
                 )
             }
             if let blocked = await platform.cardBlockReason(interaction.allTargets, mode: interaction.mode) {

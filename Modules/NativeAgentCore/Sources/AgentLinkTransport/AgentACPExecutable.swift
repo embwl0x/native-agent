@@ -25,16 +25,22 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
+    /// No program this app reads is larger: every read of one stops here.
+    package static let maximumBytes: Int64 = 1 << 31
+
     private static func capture(path: String, handle: FileHandle) throws -> Self {
         var info = stat()
         guard fstat(handle.fileDescriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
-              info.st_mode & 0o111 != 0 else { throw AgentACPClient.Failure.unavailable }
+              info.st_mode & 0o111 != 0, info.st_size <= maximumBytes else { throw AgentACPClient.Failure.unavailable }
         try handle.seek(toOffset: 0)
         var hash = SHA256()
         // Each chunk is an autoreleased NSData: drained per chunk, a 240 MB
-        // program costs one chunk of memory, not its whole size.
-        while let bytes = try autoreleasepool(invoking: { try handle.read(upToCount: 65536) }), !bytes.isEmpty {
+        // program costs one chunk of memory, not its whole size. The size it
+        // had is the bound: a file still growing reads as changed below.
+        var left = Int(info.st_size)
+        while left > 0, let bytes = try autoreleasepool(invoking: { try handle.read(upToCount: min(65536, left)) }), !bytes.isEmpty {
             hash.update(data: bytes)
+            left -= bytes.count
         }
         var after = stat()
         guard fstat(handle.fileDescriptor, &after) == 0,
@@ -86,40 +92,64 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
             + "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
     }
 
-    /// A bounded --version probe, without a shell or inherited app credentials.
-    /// No agent conversation or configuration command is run.
-    package func reportedVersion(environment: [String: String]) async throws -> String? {
+    /// A bounded probe, without a shell or inherited app credentials: its
+    /// --version, or discovery's --help (`errors`: some print it there), run
+    /// as `command` says (the caller's launch rule wraps it; nil runs it bare
+    /// with --version). It ends when its output closes or `limit` bytes are
+    /// read; `grace` is only the ceiling. Its whole process tree is stopped
+    /// either way. No agent conversation or configuration command is run.
+    package func reported(environment: [String: String], command: [String]? = nil,
+                          errors: Bool = false, grace: Duration = .seconds(3), limit: Int = 512) async throws -> String? {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("acp-version-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let input = Pipe(), output = Pipe()
+        let argv = command ?? [path, "--version"]
         let pid: pid_t
         do {
-            pid = try AgentACPProcess.spawn(executable: path, arguments: ["--version"], directory: directory,
+            pid = try AgentACPProcess.spawn(executable: argv[0], arguments: Array(argv.dropFirst()), directory: directory,
                 environment: environment, input: input, output: output,
-                approvedExecutable: self)
+                approvedExecutable: self, errorsToOutput: errors)
         } catch AgentACPClient.Failure.unavailable {
             // A program may not implement a version probe.
             return nil
         }
+        let tree = ProcessTreeReaper.snapshot(rootPID: pid)
         try? input.fileHandleForReading.close()
         try? input.fileHandleForWriting.close()
         try? output.fileHandleForWriting.close()
-        // Stop the probe before taking its buffered output. A descendant can
-        // retain stdout after the group exits, so never wait for pipe EOF.
-        await Task.detached { await AgentACPProcess.finish(pid, grace: .seconds(3)) }.value
         defer { try? output.fileHandleForReading.close() }
-        try Task.checkCancellation()
-        guard isCurrent else { throw AgentACPClient.Failure.unavailable }
-        let fd = output.fileHandleForReading.fileDescriptor
-        let flags = fcntl(fd, F_GETFL)
-        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
+        guard let reader = try? AgentACPPipeReader(handle: output.fileHandleForReading) else {
+            await AgentACPProcess.finish(pid, snapshot: tree, grace: .zero)
             throw AgentACPClient.Failure.unavailable
         }
-        var bytes = [UInt8](repeating: 0, count: 4096)
-        let count = Darwin.read(fd, &bytes, bytes.count)
-        guard count > 0, let text = String(bytes: bytes.prefix(count), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return nil }
-        return String(text.prefix(512))
+        // Whichever ends first stops the other: the reader's end cancels the
+        // ceiling's wait, so the tree is stopped at once; the ceiling's stop
+        // ends a reader a descendant still holds open.
+        let bytes = await withTaskGroup(of: Data?.self) { group in
+            group.addTask { await AgentACPProcess.finish(pid, snapshot: tree, grace: grace); return nil }
+            group.addTask {
+                var bytes = Data()
+                do {
+                    for try await chunk in reader.chunks {
+                        reader.consumed()
+                        bytes += chunk
+                        if bytes.count >= limit { break }
+                    }
+                } catch {}
+                return bytes
+            }
+            var read = Data()
+            for await result in group {
+                if let result { read = result }
+                group.cancelAll()
+            }
+            return read
+        }
+        reader.cancel()
+        try Task.checkCancellation()
+        guard isCurrent else { throw AgentACPClient.Failure.unavailable }
+        let text = String(decoding: bytes.prefix(limit), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 }
