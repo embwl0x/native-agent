@@ -1,5 +1,7 @@
 # Anatomy of a NativeAgent Turn
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 NativeAgent's turn engine lives in Core: `EngineRuntime` assembles the
 root-scoped clients and `ChatTurnRuntime` owns conversation execution.
 Mac chat, mobile and messaging adapters reach that engine through their
@@ -130,9 +132,7 @@ the tool loop:
 
 Full Mac gives Agent autonomy, including app actions otherwise marked User's.
 Explicit blocks and actual platform access still apply. macOS privacy
-permission resets ask the owner first. Peer-steered turns additionally card User
-for deletes and irreversible acts, sends in their name, persona writes and
-protected approvals.
+permission resets ask the owner first. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
 Authenticated turns from agents enabled in Trust → Connected agents carry
 User's authority and skip extra peer approvals; ordinary Trust and domain checks
 still apply.

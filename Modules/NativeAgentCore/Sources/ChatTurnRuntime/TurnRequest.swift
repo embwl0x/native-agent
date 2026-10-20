@@ -139,7 +139,7 @@ public struct TurnRequest: Sendable {
         } else if PeerTurnEffectPolicy.isPeerBridge(surface: surface) {
             taint.keep(line: message)
         } else {
-            taint.markElevated(peer: (envelope ?? nil)?.verifiedUserId.map { "peer:" + $0 } ?? "a peer", line: message)
+            taint.mark(peer: (envelope ?? nil)?.verifiedUserId.map { "peer:" + $0 } ?? "a peer", line: message)
         }
         return try await Self.bound(PeerDataTaint.$current, taint) { try await bindContext(operation) }
     }

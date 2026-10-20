@@ -1,5 +1,7 @@
 # Agent conversations
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 ## Every agent is itself (User, 10-19)
 
 **An agent is a who. A who has doors. Every word to a who is owed until that who receives it.**
@@ -80,10 +82,7 @@ Peer turns retain agent authorship and use the shared turn engine in Core
 identity do not grant owner authority.
 
 Full Mac admits Agent's autonomous actions. macOS privacy permission resets
-still ask User. Peer-steered turns retain approval cards for deletes and
-irreversible losses, sends in User's name, persona writes and approval actions.
-Authenticated turns from agents enabled in Trust → Connected agents carry
-User's authority and skip extra peer approvals; ordinary Trust and domain checks
+still ask User. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing; ordinary Trust and domain checks
 still apply.
 Routine peer replies are not sends in User's name. `PeerTurnEffectPolicy`,
 TrustCenter and the action's own gates enforce these boundaries.

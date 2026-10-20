@@ -1,4 +1,6 @@
 # NativeAgent Continuous Cognitive Substrate
+
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
 ## Engineering and Research Blueprint for a Persistent Artificial Subject
 
 ## 0. Purpose
@@ -186,10 +188,7 @@ additional agent tool.
 
 Trust remains an execution boundary. Full Mac admits autonomous action for
 authorized origins under checked policy; macOS privacy permission resets
-still require the owner. Peer-steered turns retain approval cards for
-destructive/irreversible acts, sends in the owner's name, persona writes and
-approval actions. Authenticated turns from agents enabled in Trust → Connected
-agents carry User's authority and skip extra peer approvals; ordinary Trust and
+still require the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing; ordinary Trust and
 domain checks still apply. The relevant owners are
 `TrustCenter/SecurityCenter.swift`, `SecurityCenter+FullMacPolicy.swift`
 and `PeerTurnEffectPolicy.swift`.

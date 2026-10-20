@@ -1,5 +1,7 @@
 # NativeAgent Architecture Blueprint
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 Source-owner map for the running app. Start with [NORTHSTAR](NORTHSTAR.md)
 for intent and the [documentation guide](README.md) for task-specific reading.
 The tables name current declarations and selected entry points, not exhaustive
@@ -99,8 +101,8 @@ turns remain allowed. `CapabilityLifecycle.Store` declares ability directories
 for their owners and the shared raw-file mutation fence; raw mutations require
 lifecycle actions, including case aliases. `AgentBridgePrincipal.turnRequest` supplies the common
 principal binding for peer chat, named message lanes and raw bridge tools through `TurnRequest.bind`.
-Carried work retains every steering principal, including currently trusted peers;
-ability writes read the current elevation switch after resume.
+Carried work retains every steering principal, including currently trusted peers, and the
+elevation the person's answer gave the run; ability writes read the current elevation switch after resume.
 Usage accounting and material reads remain allowed; growth writes use the same refusal. Owner-attributed off state
 survives agent/peer restore, enable, rollback and publication; only explicit owner
 command paths may clear it.
@@ -201,9 +203,10 @@ before Xcode embeds it; development and release signing seal it.
 
 `TrustCenter` and `SecurityCenter` retain effect-time authority. Full Mac uses
 the operator's selected autonomy; macOS privacy-permission resets still require
-explicit approval. `PeerTurnEffectPolicy` retains owner approval for
-peer-steered app primitive writes, deletes/irreversible acts, sends in the owner's name, persona
-writes and the protected app approval actions. `ApprovalTransactions` owns the
+explicit approval. `PeerTurnEffectPolicy` files the one card of a peer-steered turn: a turn an
+untrusted agent started with its message; its first effect of any kind cards once, quoting the ask,
+and the answer elevates the run (`PeerDataTaint.elevate`) so nothing more in it asks. Reading an
+agent's words steers nothing (`markConsumed` latches nothing). `ApprovalTransactions` owns the
 corresponding approval execution paths. Authenticated turns from agents enabled
 in Trust → Connected agents carry User's authority and skip extra peer approvals;
 ordinary Trust and domain checks still apply.
@@ -786,7 +789,7 @@ Directory: `Modules/NativeAgentCore/Sources/ChatTurnContracts/`
 | `ChatToolBridges.swift` | `PureToolArgumentValidating` protocol; `argumentRefusal` |
 | `ChatToolSessionContext.swift` | `ChatToolSessionContext` enum; `rendersInlineCards`, `withReplyRoute`; `TurnEnvelope.workIdentity` carries attribution, `answerExperienceID` carries the owed answer through continuations; neither grants authority |
 | `ChatTurnExecution.swift` | `ChatTurnExecution` class; `bindHistoryRunID`, `keepCapabilityNote` |
-| `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `markConsumed`; ability write refusal reads current origin principal and live/carried peer steering |
+| `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `markConsumed` (latches nothing: a read steers nothing), `elevate` (the person answered the run's card); ability write refusal reads current origin principal and live/carried peer steering |
 | `SwarmChatClientFactory.swift` | `SwarmChatClientFactory` protocol; `makeClient` |
 | `ToolDispatchRecord.swift` | `ToolDispatchRecord` struct; retains the call resolved before execution for outcome attribution and argument evidence |
 | `ToolNoticeBus.swift` | `ToolNoticeBus` enum |

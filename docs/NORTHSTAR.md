@@ -8,6 +8,22 @@ resident mind — Agent — with a trustworthy body, living on User's Mac. Every
 piece of work by any agent (Claude Code, Codex, workers, or NativeAgent) serves
 that, or doesn't ship.
 
+## First law — one structure
+
+User, 2026-10-20: "we keep it one coherent structure … no matter if we add
+stuff, take it off, the structure moves with it … when you add that, you have
+to see what you need to take out and how you need to keep everything in line
+… everything that's added has to be molded into the whole thing … it burns you
+real bad when stuff contradicts."
+
+These docs are one structure. A law is stated in one place and every doc that
+restates it says the same thing. A change is molded into the whole: whoever
+changes a law changes every doc that states it in the same commit, names what
+comes out, and never adds a rule on its own beside an older one. A
+contradiction between two docs, or between a doc and the code, is a defect to
+fix at once, not a note to keep. `script/check_architecture_blueprint.swift`
+is the proof that the blueprint and the code agree; the rest is read.
+
 ## AX north star — natural agency throughout NativeAgent
 
 User, 2026-09-15: "nothing in native agent should feel like machinery for them"

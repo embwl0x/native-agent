@@ -1,5 +1,7 @@
 # Cognition Wiring — the connection map
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 This map follows the core owners that connect turns, memory, cognition and
 body state. [SUBCONSCIOUS.md](SUBCONSCIOUS.md) describes the inner-life layers;
 [ORGANISM.md](ORGANISM.md) details the body;
@@ -207,9 +209,10 @@ in cognition receipts. See [ORGANISM.md](ORGANISM.md) for body dynamics.
 Feeling, attention and reflection cannot enlarge action authority.
 `TrustCenter/SecurityCenter.swift` applies checked Full Mac authority and
 retains owner confirmation for macOS privacy permission resets.
-`TrustCenter/PeerTurnEffectPolicy.swift` keeps approval requirements for
-peer-steered deletes and irreversible acts, sends in User's name, persona writes
-and the protected approval actions. `app` executes through those existing
+`TrustCenter/PeerTurnEffectPolicy.swift` files the one card of a peer-steered
+turn (a turn an untrusted agent started with its message; its first effect
+cards once, quoting the ask, and the answer covers the rest of the turn; a
+read steers nothing). `app` executes through those existing
 gates; a cognitive suggestion is not an approval. Authenticated turns from
 agents enabled in Trust → Connected agents carry User's authority and skip
 extra peer approvals; ordinary Trust and domain checks still apply.

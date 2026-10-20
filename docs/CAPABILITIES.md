@@ -1,5 +1,7 @@
 # NativeAgent capabilities
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 A map of the current source. This is not a release receipt or an installed-app
 check. For operation, read [User and Agent Guide](USER_GUIDE.md); for exact
 file ownership, use [Architecture Blueprint](ARCHITECTURE_BLUEPRINT.md).
@@ -188,10 +190,7 @@ approval and has no expiry timer. Explicit user blocks, origin authentication,
 macOS grants and hard domain refusals remain authoritative. **macOS privacy
 permission resets always ask the owner first.**
 
-Peer-steered turns keep additional owner decisions even under Full Mac:
-deletes and irreversible acts, sends or posts in the owner's name, persona
-writes and approvals. Routine peer conversation is exempt from that extra
-approval requirement.
+A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing.
 Authenticated turns from agents enabled in Trust → Connected agents carry
 User's authority and skip extra peer approvals; ordinary Trust and domain checks
 still apply.

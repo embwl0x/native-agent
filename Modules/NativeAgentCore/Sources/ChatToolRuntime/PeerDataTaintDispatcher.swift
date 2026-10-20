@@ -32,10 +32,12 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
                                     surface: String, fullMac: Bool, protectedAction: Bool,
                                     peerName: String? = nil) -> (requester: String?, required: Bool) {
         let taint = PeerDataTaint.current
-        let requester = PeerDataTaint.trustedTurn && taint?.isTainted != true ? nil : PeerTurnEffectPolicy.peerRequester(
+        // The person answered this command's card: its peers steer no more of this run.
+        let answered = !(taint?.elevatedSources ?? []).isEmpty
+        let requester = answered || (PeerDataTaint.trustedTurn && taint?.isTainted != true) ? nil : PeerTurnEffectPolicy.peerRequester(
             surface: surface, peerID: ChatToolSessionContext.envelope?.verifiedUserId, peerName: peerName,
             taintSource: taint.flatMap { $0.isTainted ? $0.sourceDescription : nil })
-        let steered = requester != nil || !(taint?.elevatedSources ?? []).isEmpty
+        let steered = requester != nil
         let required = steered && (fullMac
             ? PeerTurnEffectPolicy.requiresPeerApproval(tool, capabilities: capabilities, input: input, fullMac: true)
             : requester != nil && protectedAction)

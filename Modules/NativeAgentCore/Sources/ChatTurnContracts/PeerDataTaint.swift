@@ -93,10 +93,21 @@ public final class PeerDataTaint: @unchecked Sendable {
         return try await $current.withValue(PeerDataTaint(), operation: operation, isolation: isolation)
     }
 
-    /// Latch: this turn has now read a remote peer's words. `line` is the
-    /// newest of them, kept so the person's card can quote it.
-    public static func markConsumed(peer: String, line: String = "") {
-        current?.mark(peer: peer, line: line)
+    /// Reading a peer's words steers nothing (User 10-20: "only the message
+    /// with a command from an outside agent", "not when it's sending messages
+    /// all the time"). What she reads is labelled where it is shown; a turn is
+    /// the peer's only when the peer started it (`TurnRequest.bind`), and that
+    /// turn's one card covers the rest of it (`elevate`).
+    public static func markConsumed(peer: String, line: String = "") {}
+
+    /// The person answered this turn's card: its steering peers act for the
+    /// rest of the turn (and the steps it hands on) without another card.
+    /// The floor (senses, tools, skills, Trust) still holds.
+    public func elevate(peer: String) {
+        let name = Self.principal(peer.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard Self.isAgent(name) else { return }
+        lock.lock(); defer { lock.unlock() }
+        if !elevated.contains(name) { elevated.append(name) }
     }
 
     /// The peer's words without latching a source: a bridge turn is the
@@ -213,13 +224,15 @@ public final class PeerDataTaint: @unchecked Sendable {
         sources.append(name)
     }
 
-    /// Carried elevation is an identity record, not a saved permission grant.
+    /// Carried elevation is an identity record for this run, not a saved
+    /// permission grant: the person answered the command's card.
     public static func markElevated(peer: String, line: String = "") {
         current?.markElevated(peer: peer, line: line)
     }
 
     public func markElevated(peer: String, line: String = "") {
-        mark(peer: peer, line: line)
+        keep(line: line)
+        elevate(peer: peer)
     }
 
     public var elevatedSources: [String] {

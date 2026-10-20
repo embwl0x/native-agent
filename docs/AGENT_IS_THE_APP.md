@@ -1,5 +1,7 @@
 # The agent is the app
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 The design NativeAgent is building toward (User + Claude, 2026-10-14; draft 4). NORTHSTAR clause 8 is its one-paragraph form. The build notes at the end carry code anchors and proofs for the lanes.
 
 We say "they are the app" because Agent is ours. For everyone else: the agent is the app.

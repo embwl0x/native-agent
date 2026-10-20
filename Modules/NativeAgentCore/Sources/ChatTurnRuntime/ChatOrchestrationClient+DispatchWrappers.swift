@@ -548,14 +548,18 @@ final class AutonomyGatedDispatcher: ToolDispatchClient, @unchecked Sendable {
         let peerApproval = PeerDataTaintDispatcher.peerApproval(tool: tool, capabilities: envelope.capabilities, input: input,
             surface: surface, fullMac: fullMacOn, protectedAction: protectedAction, peerName: peerDisplayName(peerID: peerTurnID))
         let requester = peerApproval.requester
-        // A peer the person elevated frees everything but the floor.
-        let elevatedBy = taint?.elevatedSources ?? []
+        // The person answered this command's card (one card per command, User
+        // 10-20): the peers that steer this run act for the rest of it.
+        if approvedReplayAuthorizes || injectionReplayApprovalID != nil, let taint, requester != nil {
+            for source in taint.checkpointSources where !PeerDataTaint.ownerTrusts(source) { taint.elevate(peer: source) }
+            if let peerTurnID { taint.elevate(peer: "peer:" + peerTurnID) }
+        }
         if !approvedReplayAuthorizes, injectionReplayApprovalID == nil,
-           peerReasonMayReplace, requester != nil || !elevatedBy.isEmpty {
+           peerReasonMayReplace, requester != nil {
             if fullMacOn, peerApproval.required {
                 // The Full Mac floor (Agent 10-02): the card names the peer
-                // and quotes the line of theirs that led here.
-                let sources = taint?.isTainted == true ? taint?.checkpointSources ?? [] : requester == nil ? elevatedBy : []
+                // that steers and quotes the line of theirs that led here.
+                let sources = (taint?.checkpointSources ?? []).filter { !PeerDataTaint.ownerTrusts($0) }
                 let named = sources.map { source -> String in
                     if source.hasPrefix("peer:") { return peerDisplayName(peerID: String(source.dropFirst(5))) ?? source }
                     return source.contains(" ") ? source : source.prefix(1).uppercased() + source.dropFirst()
