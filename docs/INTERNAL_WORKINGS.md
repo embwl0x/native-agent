@@ -135,8 +135,9 @@ result grants no authority.
 Full Mac gives Agent autonomy, including actions otherwise marked User's.
 Checked policy, explicit blocks, actual macOS grants and connector
 authentication still govern execution. macOS privacy permission resets always
-ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing; ordinary Trust and domain checks
-still apply.
+ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply.
 
 Approval-gated effects consume a durable single-use claim immediately before
 dispatch. Replay validates the exact tool, input, surface and payload digest;
@@ -182,8 +183,9 @@ memory or permission stores. See [Cognition Wiring](COGNITION_WIRING.md),
 
 ## 5. One persistent mind, specialist hands
 
-The `codex.message` and `omp.message` actions and home's `claude.say` connect
-Agent to configured specialist harnesses. The returned conversation identity
+`agent.message` to a coding contact (Codex, Claude Code, OMP) connects Agent
+to a specialist harness; on an install that set those lanes up, `codex.message`,
+`omp.message` and home's `claude.say` are the same doors by their older names. The returned conversation identity
 supports a contextual follow-up using `conversation_mode=resume` and
 `conversation_id`; unrelated work uses a new conversation.
 

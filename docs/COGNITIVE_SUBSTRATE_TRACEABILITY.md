@@ -29,7 +29,7 @@ Paths are relative to `Modules/NativeAgentCore/Sources/`.
 | Store | `CognitiveSubstrate/CognitiveSQLiteStore.swift` and `CognitiveSQLiteStore+Reads.swift` |
 | Engine | `EngineRuntime/NativeAgentEngine.swift` |
 | UI | `Sources/NativeAgentApp/CognitionObservatoryView.swift` and its extensions, relative to repository root |
-| Loops | App `Sources/NativeAgentApp/BackgroundLoopsAssembly+Cognition.swift` and Core `Cognition/CognitiveBackgroundLoops.swift` |
+| Loops | Core `EngineRuntime/EngineLaunch.swift` and Core `Cognition/CognitiveBackgroundLoops.swift` |
 
 Engine assembles R with host ports. R coordinates the substrate and organism;
 S's extensions share one actor. T consumes the same turn projection for chat.

@@ -1,5 +1,7 @@
 # Automated Systems — architecture map + health probes
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 This map identifies the registered background work, its owners and the
 evidence to inspect. It describes code, not the health of a particular running
 installation. Checks should be small and tied to the system being diagnosed.
@@ -24,7 +26,7 @@ Paths below are relative to that root unless identified as source paths.
 | `BackgroundLoops/BackgroundLoopsManager.swift` | Registrations, lifecycle, execution gates and status. |
 | `BackgroundLoops/BackgroundLoops.swift` | Scheduler timing, outcomes, durable clocks and failure receipts. |
 | `BackgroundWork` | Maintenance, work, heartbeat and connector runner bodies. |
-| `Sources/NativeAgentApp/BackgroundLoopsAssembly*.swift` | Construct dependencies and supply the registered manifest. |
+| `EngineRuntime/EngineLaunch.swift` | Constructs the loop registrations and their dependencies through the installed host effects. |
 | `SchedulerExecution/SchedulerDueJobRunner.swift` | Execute due persisted scheduler jobs. |
 | `DeviceSync/MacSyncEngine*.swift` | Mobile command transport and snapshots. |
 
@@ -77,26 +79,26 @@ and returns the health rows. `Sources/NativeAgentApp/AppToolHealthHost.swift`
 binds this read to `runDoctor(repair:false)` and the live checks.
 `doctor.repair` is a separate action, not a read-only probe.
 
-The configured `doctor_auto_run` lane runs at launch, when a health row turns
-from ok to adverse, and weekly; it runs every safe repair and files one inbox
-ask for the sign-ins and permissions it cannot do itself. Its
-`doctor/latest.json` contains:
+The configured `doctor_auto_run` lane runs once at launch, off their turn's path
+(`EngineLaunch` ticks it once), then on its configured interval (at least an
+hour); it runs every safe repair and files one inbox ask for the sign-ins and
+permissions it cannot do itself. Its `doctor/latest.json` contains:
 
 - `measuredAt`: when measurement began;
 - `runAt`: when the snapshot was published;
-- `checks`: the findings.
+- `report_completed_at`, `run_in_progress`: which run the page shows and
+  whether one is still running;
+- `checks`: the findings. An off or not-needed reading settles an owed repair;
+  an unreadable config is a fault with its file, never "off".
 
 An empty set is not persisted as a clean bill of health. Some behavioral
 checks memoize, so publication time alone does not establish freshness.
 
-`Sources/NativeAgentApp/DoctorFirstTurnRefresh.swift` observes the first
-durably persisted turn terminal after launch, drains the trace bus and requests
-one fresh auto-doctor measurement. The configured enable switch still governs.
-
 ## 4. The loop manifest — every registered lane
 
-`Sources/NativeAgentApp/BackgroundLoopsAssembly.swift:assembleAllLoops()`
-registers **21 lanes**. The table gives production defaults; enabled state,
+`EngineRuntime/EngineLaunch.swift` registers the lanes. The table gives the
+lanes and their production defaults as of this writing; the installed set is
+`logs/background_loop_state.json` and Doctor's `live.loops` row. Enabled state,
 event deadlines, backoff and saved configuration determine actual work.
 
 | loopId | Default wake or backstop | Work |
@@ -185,11 +187,11 @@ For after-turn promotion, proposal review and recall, see
 to be made, not automatically an automation failure. Read its origin, bound
 action, decision and execution outcome.
 
-Full Mac does not remove macOS privacy-reset approval or the peer-origin
-floors for deletes and irreversible acts, sends in User's name, persona writes
-and protected approvals. Authenticated turns from agents enabled in Trust →
-Connected agents carry User's authority and skip extra peer approvals; ordinary
-Trust and domain checks still apply. Work lanes such as Workshop and self-healing
+Full Mac does not remove macOS privacy-reset approval. A turn an untrusted
+agent started with its message gets one card on its first effect, and the
+answer covers the rest of that turn; a read steers nothing. Agents enabled in
+Trust → Connected agents carry the owner's authority on authenticated turns;
+ordinary Trust and domain checks still apply. Work lanes such as Workshop and self-healing
 check unattended-work admission; per-lane enable switches remain separate. A scheduler
 wake does not grant authority.
 

@@ -137,7 +137,7 @@ Analytic decay needs no repeating checkpoint.
 
 Dream/REM somatic signals trigger replay and reflection admission through
 `NativeCognitionRuntime+Organism.swift`. The app's
-`Sources/NativeAgentApp/BackgroundLoopsAssembly+Cognition.swift` retains
+`EngineRuntime/EngineLaunch.swift` retains
 daily recovery registrations implemented by `Cognition/CognitiveBackgroundLoops.swift`.
 A reflection sweep requests spontaneous admission, so a quiet state need not
 spend a call.
@@ -188,8 +188,9 @@ additional agent tool.
 
 Trust remains an execution boundary. Full Mac admits autonomous action for
 authorized origins under checked policy; macOS privacy permission resets
-still require the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing; ordinary Trust and
-domain checks still apply. The relevant owners are
+still require the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply. The relevant owners are
 `TrustCenter/SecurityCenter.swift`, `SecurityCenter+FullMacPolicy.swift`
 and `PeerTurnEffectPolicy.swift`.
 

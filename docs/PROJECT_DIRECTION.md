@@ -74,8 +74,10 @@ Self-authored executable tools follow `tool.propose` → `tool.approve` →
 queries and SearXNG first for code queries. Unfiltered searches try the other
 route if the first fails or returns no results; the result identifies it.
 Non-general categories and time ranges use only SearXNG.
-Procedure skills are guidance, read through `skill.read`; see the
-[skill contract](skill_manifest_spec.md).
+A skill is a part like a tool or a sense: one file in `abilities/` with the
+one header, guidance as `.md` or a JavaScript routine as `.js`, read through
+`skill.read` and run through `skill.run`; see the
+[part header and skill contract](skill_manifest_spec.md).
 
 ## Authority
 
@@ -83,16 +85,16 @@ Under Full Mac, Agent acts autonomously on admitted surfaces without routine
 approval cards. Explicit blocks and security checks still apply; macOS grants
 remain separate. **Resetting macOS privacy permissions always asks the owner.**
 
-A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing. These boundaries live in
+A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. These boundaries live in
 `SecurityCenter.swift` and `PeerTurnEffectPolicy.swift`, not in prompt guesses.
-Authenticated turns from agents enabled in Trust → Connected agents carry
-User's authority and skip extra peer approvals; ordinary Trust and domain checks
-still apply.
+Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply.
 
 ## Guardrails For Future Work
 
 - Add capability through the existing app action registry and owners.
-- Keep skill guidance separate from executable code and authority.
+- A part (tool, skill, sense, their turn) never carries authority: every effect
+  it makes goes through Trust at effect time.
 - Preserve canonical state and truthful receipts; do not hide broken state
   with fallback loops or duplicate stores.
 - Keep private runtime state, credentials and live persona material out of

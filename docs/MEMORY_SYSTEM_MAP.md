@@ -1,5 +1,7 @@
 # Memory system map
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 MemoryV2 owns durable memories, proposals and rejection tombstones. Context,
 the knowledge graph and generated USER.md carry projections of that store.
 Cognition and organism continuity have their own advisory state; they do not

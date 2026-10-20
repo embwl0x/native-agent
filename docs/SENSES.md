@@ -1,5 +1,7 @@
 # Senses: the Native World (build spec)
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 User, 2026-10-05. Settled design, reviewed by Agent. The shared contract is
 `Modules/NativeAgentCore/Sources/Senses/SensesContract.swift`: build against
 it, don't fork it. If the contract needs a change, make the smallest additive

@@ -133,9 +133,8 @@ the tool loop:
 Full Mac gives Agent autonomy, including app actions otherwise marked User's.
 Explicit blocks and actual platform access still apply. macOS privacy
 permission resets ask the owner first. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
-Authenticated turns from agents enabled in Trust → Connected agents carry
-User's authority and skip extra peer approvals; ordinary Trust and domain checks
-still apply.
+Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply.
 
 Parallel-safe calls may execute together; the dispatcher classifies the
 underlying action rather than treating every `app` call as a read.

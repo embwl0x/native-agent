@@ -31,7 +31,9 @@ Source: [NativeAgentEngine.swift](../Modules/NativeAgentCore/Sources/EngineRunti
 - **Telegram and Slack:** messaging surfaces with their own conversation
   origins and the shared engine's provider, context and action policy.
 - **Local bridges and agent contacts:** authenticated conversations and coding
-  handoffs. Local clients discover the loopback address and bearer token from
+  handoffs. The bundled `nativeagent-link` helper and HTTP agent clients read
+  the agent bridge's descriptor under `~/.config/nativeagent-link/` and send
+  each contact's own credential; the older Claude/Codex lane keeps
   `~/.config/claude-bridge/bridge.json`.
 
 Built-in Codex/Claude Code bridge lanes deny external MCP tools. Built-in
@@ -190,10 +192,9 @@ approval and has no expiry timer. Explicit user blocks, origin authentication,
 macOS grants and hard domain refusals remain authoritative. **macOS privacy
 permission resets always ask the owner first.**
 
-A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing.
-Authenticated turns from agents enabled in Trust → Connected agents carry
-User's authority and skip extra peer approvals; ordinary Trust and domain checks
-still apply.
+A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply.
 
 A returned protocol response, approval or builder report is evidence, not
 automatic proof that the requested effect completed. Inspect the receipt and

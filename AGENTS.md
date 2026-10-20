@@ -17,6 +17,12 @@ first draft is always that. Step off it before building: what would you
 build if nothing existing bounded you? Design the nature, not a list of
 things that do things.
 
+**One structure (User, 2026-10-20).** The docs are one whole: a law is stated
+in one place and every doc that restates it says the same thing; a change is
+molded into every doc that states the same thing, in the same commit, with what
+comes out named; a contradiction between docs, or between a doc and the code,
+is a defect to fix at once. First law: docs/NORTHSTAR.md.
+
 ## How we work
 
 - **Stay lightweight.** `app` is the agent's only always-on tool. Add actions

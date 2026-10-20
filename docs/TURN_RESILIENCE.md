@@ -1,5 +1,7 @@
 # Turn resilience map
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 How a turn keeps working, stops, and leaves evidence. One brain, many doors:
 `EngineRuntime/EngineTurns.swift` holds Mac turn state through
 `MacChatTurnRuntime`; `ChatTurnRuntime` owns the shared turn engine.
@@ -183,9 +185,10 @@ ends). Acceptance writes it before
 any context is built; the shared loop writes it again before each provider
 iteration and before dispatch, its part log carrying their final words for a
 resume to settle with; durable tool receipts
-advance its step count and peer sources in the same checkpoint write. Receipts
-also retain their latched sources, which recovery consumes without weakening
-saved taint when peer trust changes. It keeps identity, input, envelope and reply
+advance its step count and the turn's steering peers in the same checkpoint
+write. Receipts retain the sources their results labelled (provenance); a
+steered turn's checkpoint keeps its steering peers and the person's answer, so
+a resume continues under the same one card, never a second. It keeps identity, input, envelope and reply
 route, iteration, kept prose, working notes and a possibly running step, never the
 provider message array. Input attachment bytes stay in `chat/attachments/`;
 their existing transcript metadata supplies the saved paths.

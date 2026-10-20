@@ -1,5 +1,7 @@
 # NativeAgent Threat Model
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 ## Current Runtime Assumption
 
 `NativeAgent.app` hosts the runtime in-process. The shared turn engine lives
@@ -31,11 +33,12 @@ its bearer token.
 - **Untrusted origin inheriting Full Mac:** `SecurityCenter+FullMacPolicy.swift`
   checks the concrete origin and saved policy. Authenticated, admitted remote
   operator surfaces may use Full Mac; a remote surface label alone grants nothing.
-- **Peer-driven protected effects:** even under Full Mac, peer turns card User
-  for deletes/irreversible acts, sends in their name, persona writes and approval
-  actions. Authenticated turns from agents enabled in Trust → Connected agents
-  carry User's authority and skip extra peer approvals. Lower Trust modes and
-  ordinary domain checks retain their restrictions.
+- **An untrusted agent's command:** even under Full Mac, a turn an agent the
+  owner has not trusted started with its message files one card on its first
+  effect, quoting what the agent asked; the owner's answer covers the rest of
+  that turn. Reading any agent's words steers nothing. Agents enabled in
+  Trust → Connected agents carry the owner's authority on authenticated turns.
+  Lower Trust modes and ordinary domain checks retain their restrictions.
 - **Privacy reset without consent:** `SecurityCenter.swift` requires explicit
   approval for `system_permission_reset`, including under Full Mac.
 - **Approval substitution or replay:** `ApprovalReplayAuthorizer.swift`

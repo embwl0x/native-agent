@@ -44,7 +44,7 @@ Call an action as `app {"action":"github.status"}`; supply its arguments in
 bodies to 1,000 characters, comments to 1,200 and diff hunks to 600.
 Full Mac follows the shared origin-aware authority rules; peer-steered GitHub
 mutations still require User's approval unless the authenticated agent is enabled
-in Trust → Connected agents. Enabled agents carry User's authority; ordinary
+in Trust → Connected agents. Enabled agents carry the owner's authority; ordinary
 Trust and domain checks still apply. See [Threat model](threat-model.md).
 
 ## Refresh and noise policy
@@ -80,4 +80,4 @@ digest read is not proof that an external mutation succeeded.
 
 Implementation: `Modules/NativeAgentCore/Sources/GitHubConnector/`,
 `BackgroundWork/GitHubTrackingBackgroundWork.swift` and the app's
-`BackgroundLoopsAssembly+GitHubTracking.swift`.
+`EngineRuntime/EngineLaunch.swift`.

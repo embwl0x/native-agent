@@ -185,7 +185,7 @@ delivery.
 | Dream | `SchedulerExecution/SchedulerDueJobRunner+Selection.swift` registers `nativeagent-nightly-dream`; execution calls the platform dream action and `DreamREMCycle/DreamCycleRunner.swift`. | `dream_diary/<date>.md`, receipts and mood/somatic feedback. |
 | REM | The same scheduler registers `nativeagent-weekly-rem`; `DreamREMCycle/REMConsolidator.swift` runs consolidation. | REM proposals, reviewed growth and pins. |
 | Microcycle | `NativeCognitionRuntime.scheduleDirtyMicrocycle` after admitted state changes. | Coalesced substrate processing and persistence. |
-| Replay/reflection | Dream/REM commit signals; `Sources/NativeAgentApp/BackgroundLoopsAssembly+Cognition.swift` supplies daily integrity sweeps. | Replayed continuity and gated reflective work. |
+| Replay/reflection | Dream/REM commit signals; `EngineRuntime/EngineLaunch.swift` supplies daily integrity sweeps. | Replayed continuity and gated reflective work. |
 | Memory maintenance | `BackgroundWork/MemoryConsolidationHygieneRunner.swift`. | Candidate staging, hygiene and reconciliation through MemoryV2 owners. |
 
 ### Staged is not applied
@@ -213,6 +213,5 @@ retains owner confirmation for macOS privacy permission resets.
 turn (a turn an untrusted agent started with its message; its first effect
 cards once, quoting the ask, and the answer covers the rest of the turn; a
 read steers nothing). `app` executes through those existing
-gates; a cognitive suggestion is not an approval. Authenticated turns from
-agents enabled in Trust → Connected agents carry User's authority and skip
-extra peer approvals; ordinary Trust and domain checks still apply.
+gates; a cognitive suggestion is not an approval. Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply.

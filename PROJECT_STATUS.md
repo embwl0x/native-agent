@@ -1,6 +1,6 @@
 # NativeAgent Project Status
 
-Source status: 2026-10-02. This describes the checkout, not a release or
+Source status: 2026-10-20. This describes the checkout, not a release or
 installed-app verification. Release history lives in [CHANGELOG.md](CHANGELOG.md)
 and [release notes](docs/release-notes/).
 
@@ -19,7 +19,7 @@ desktop read-only.
 
 | Area | Current source contract |
 |---|---|
-| Releases | Mac v0.6.0 is the current public release as of 2026-10-09 (0.5.1 shipped 2026-10-04) (Developer ID signed, notarized, Sparkle). The 2026-10-02 source snapshot recorded iPhone 0.5.1 (19) in App Review. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
+| Releases | Mac v0.6.9 is the current public release as of 2026-10-20 (Developer ID signed, notarized, Sparkle). The iPhone companion ships through TestFlight. The [Releases page](https://github.com/embwl0x/native-agent/releases) is authoritative for what has shipped. |
 | Agent interface | `app` is the only always-on tool. `app {}` is home; `page`, `item`, `find`, `action` and JavaScriptCore `script` reach capabilities through `AppActionRegistry`. |
 | Discovery | Pages and actions arrive in tool results. Retired tool names are refused with a translated `app` call; there is nothing to load or unload. |
 | Growth and MCP | Tools, skills and senses share `data/abilities/`: one current file, optional previous/proposed files and independent run state; exact admission/proof, previous-version rollback and final drop. Mounted MCP tools become `mcp.<server>.<tool>` actions. |
@@ -27,7 +27,7 @@ desktop read-only.
 | Memory | MemoryV2 stores durable memories; Fluid Context prepares bounded context. |
 | Work | Desk holds durable work. Helpers run in their own conversations with saved model choices. |
 | Providers | Chat, Work, and Memory and mind are the three routing groups; Work and Memory and mind inherit Chat unless configured. |
-| Trust | Full Mac grants autonomy without a timer. macOS privacy permission resets still ask the owner; peer-steered deletes, irreversible acts, sends in the owner's name, persona writes and approvals retain cards, except for authenticated agents enabled in Trust → Connected agents. Those agents carry User's authority; ordinary Trust and domain checks remain. |
+| Trust | Full Mac grants autonomy without a timer. macOS privacy permission resets still ask the owner. A turn an agent you have not trusted started with its message gets one card on its first effect, and the answer covers the rest of that turn; a read steers nothing. Agents enabled in Trust → Connected agents carry the owner's authority on authenticated turns; ordinary Trust and domain checks remain. |
 
 ## Known limits
 

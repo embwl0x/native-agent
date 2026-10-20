@@ -239,8 +239,13 @@ public final class PeerDataTaint: @unchecked Sendable {
         lock.withLock { elevated }.filter { !Self.ownerTrusts($0) }
     }
 
+    /// Steered: a source the owner does not trust and the person has not
+    /// answered for this run. One card per command (User 10-20): once the
+    /// card is answered, nothing in the run is steered any more, the floor
+    /// (senses, tools, skills, Trust) included.
     public var isTainted: Bool {
-        checkpointSources.contains { !Self.ownerTrusts($0) }
+        let answered = lock.withLock { elevated }
+        return checkpointSources.contains { !Self.ownerTrusts($0) && !answered.contains($0) }
     }
 
     /// Every steering principal survives carry and resume; trust is never saved.

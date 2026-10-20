@@ -102,7 +102,7 @@ whole substrate during that read.
 delay. `NativeCognitionRuntime+Deadlines.swift` owns maintenance and residual
 repair deadlines; continuous decay is projected at read time. App assembly
 retains daily maintenance, replay and reflection registrations as recovery
-sweeps (`Sources/NativeAgentApp/BackgroundLoopsAssembly+Cognition.swift`).
+sweeps (`EngineRuntime/EngineLaunch.swift`).
 
 Reflection has an enable switch, an in-flight reservation and a rolling
 24-hour call ceiling. Spontaneous reflection also requires unresolved load;

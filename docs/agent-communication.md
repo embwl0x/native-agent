@@ -82,8 +82,9 @@ Peer turns retain agent authorship and use the shared turn engine in Core
 identity do not grant owner authority.
 
 Full Mac admits Agent's autonomous actions. macOS privacy permission resets
-still ask User. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing. Authenticated turns from agents enabled in Trust → Connected agents carry User's authority and ask nothing; ordinary Trust and domain checks
-still apply.
+still ask User. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
+Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply.
 Routine peer replies are not sends in User's name. `PeerTurnEffectPolicy`,
 TrustCenter and the action's own gates enforce these boundaries.
 
@@ -143,8 +144,8 @@ Content-Type returns 415, and an unsupported version header returns 400.
 
 ### Local command and reply recovery
 
-The installed helper is
-`~/Applications/NativeAgent.app/Contents/MacOS/nativeagent-link`.
+The installed helper is `nativeagent-link` inside the installed app bundle
+(`/Applications/NativeAgent.app/Contents/MacOS/nativeagent-link`).
 Use the generated connection's environment for these commands:
 
 ```text

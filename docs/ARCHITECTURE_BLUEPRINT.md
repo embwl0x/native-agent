@@ -207,9 +207,8 @@ explicit approval. `PeerTurnEffectPolicy` files the one card of a peer-steered t
 untrusted agent started with its message; its first effect of any kind cards once, quoting the ask,
 and the answer elevates the run (`PeerDataTaint.elevate`) so nothing more in it asks. Reading an
 agent's words steers nothing (`markConsumed` latches nothing). `ApprovalTransactions` owns the
-corresponding approval execution paths. Authenticated turns from agents enabled
-in Trust → Connected agents carry User's authority and skip extra peer approvals;
-ordinary Trust and domain checks still apply.
+corresponding approval execution paths. Agents enabled in Trust → Connected agents carry the owner's authority on
+authenticated turns; ordinary Trust and domain checks still apply.
 
 ## State Ownership
 

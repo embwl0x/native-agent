@@ -1,5 +1,7 @@
 # Tool loading: the contract
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 NativeAgent is Agent's only tool: one always-on `app` schema. Pages, action
 arguments and results travel through that tool. This is a design contract;
 changing it requires User's authorization.
@@ -151,12 +153,12 @@ an atomic transaction or a rollback mechanism.
 Under Full Mac, Agent can also perform actions otherwise marked User's.
 Explicit blocks, checked policy, actual macOS grants and connector
 authentication still apply. macOS privacy permission resets always require
-the owner's approval. Peer-steered turns additionally ask User for deletes and
-irreversible acts, sends in their name, persona writes and protected approvals.
-`SecurityCenter` and `PeerTurnEffectPolicy` own those decisions.
-Authenticated turns from agents enabled in Trust → Connected agents carry
-User's authority and skip extra peer approvals; ordinary Trust and domain checks
-still apply.
+the owner's approval. A turn an agent the owner has not trusted started with
+its message files one card on its first effect, quoting what the agent asked;
+the owner's answer covers the rest of that turn. Reading any agent's words
+steers nothing. `SecurityCenter` and `PeerTurnEffectPolicy` own those
+decisions. Agents enabled in Trust → Connected agents carry the owner's
+authority on authenticated turns; ordinary Trust and domain checks still apply.
 
 `tools.contract` records the actual wire schema count and bytes.
 `turn.terminal` includes `discoveryToolDispatchCount` for executed

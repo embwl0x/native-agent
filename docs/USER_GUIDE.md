@@ -1,5 +1,7 @@
 # NativeAgent user and agent guide
 
+> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+
 Start with a conversation. Connect services and grant access as the work needs
 them.
 
@@ -177,14 +179,15 @@ authentication and macOS permissions remain in force.
 **Resetting macOS privacy permissions always asks the owner first**, including
 under Full Mac.
 
-**Agents enabled in Trust → Connected agents carry User's authority on
+**Agents enabled in Trust → Connected agents carry the owner's authority on
 authenticated turns.** They do not receive extra peer approval requirements;
 ordinary Trust, domain, service and macOS permission checks still apply.
 
-**Other peer-steered turns have an additional boundary.** Under Full Mac, deletes
-and irreversible acts, sends or posts in the owner's name, persona writes and
-approvals still raise the owner's card. Routine conversation with a connected
-peer is allowed. More restrictive Trust modes can require additional approvals.
+**An agent you have not trusted gets one card per command.** A turn such an
+agent starts with its message files one card on its first effect, quoting what
+it asked; your answer covers the rest of that turn. Reading any agent's words
+steers nothing, and conversing with agents or telling them what to do asks
+nothing. More restrictive Trust modes can require their own approvals.
 
 Resolve requested approvals in Today. An approval authorizes a step; the
 action's receipt and the service that owns the effect establish what actually
@@ -239,15 +242,19 @@ Configure messaging services under **Connectors**. Each surface keeps its
 conversation origin while sharing the engine's context, provider and action
 policy.
 
-Local bridge clients read `~/.config/claude-bridge/bridge.json` for the
-current loopback URL and bearer token. Do not hardcode a port. See
+The bundled `nativeagent-link` helper and HTTP agent clients read the agent
+bridge's descriptor under `~/.config/nativeagent-link/` for the current
+loopback URL; each contact sends its own credential. The older Claude/Codex
+lane keeps `~/.config/claude-bridge/bridge.json`. Do not hardcode a port. See
 [Agent conversations](agent-communication.md) for connected peers and
 [Codex bridge](CODEX_BRIDGE_DIAGNOSTICS.md) for diagnostics.
 
 ### Codex and Claude Code as specialist builders
 
 The agent can hand a bounded work order to a local coding session through
-`app`: `codex.message` for Codex, and `claude.say` from home for Claude Code.
+`app`: `agent.message` to the Codex or Claude Code contact; on an install
+that set those lanes up, their older names `codex.message` and `claude.say`
+still work as the same doors.
 Install and sign into the corresponding coding product on the Mac; the
 bundled bridge workers also require Node.js.
 
