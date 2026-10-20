@@ -749,8 +749,10 @@ public struct AgentConversationStore: Sendable {
     /// a denial racing a queued follow-up's begin. Approval storage is checked;
     /// unavailable authority leaves the exchange untouched.
     private func reconcileDeniedApprovals(_ rows: inout [AgentConversationRecord]) throws -> Bool {
+        // The receipt alone says the send waits on a card; a record that left
+        // "attention" another way (a stop, a release) still settles its denial.
         let held = rows.indices.filter {
-            guard rows[$0].phase == "attention", case .object(let receipt)? = rows[$0].receipt else { return false }
+            guard case .object(let receipt)? = rows[$0].receipt else { return false }
             return receipt["approvalId"] != nil && ["waiting_approval", "waiting_for_approval", "waiting for approval",
                 "approval_filed", "approval_required"].contains(receipt["status"].flatMap { if case .string(let s) = $0 { s } else { nil } } ?? "")
         }
